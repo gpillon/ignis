@@ -177,19 +177,47 @@ and such a load holds two **round shapes**, on one set of buffers:
   up to 4 lanes, so that a round never carries more than the 64 columns of 8
   lanes of 8.
 
-A verify round takes one shape for all its lanes. In this build every round
-runs at the base shape: a load past 7 drafts decodes what a load at 7 does,
-and costs it what [the configuration reference](../configuration/context-and-speculation.md)
-states below 8 lanes (at 8 lanes, a few hundred bytes). The measurement switch
-`IGNIS_ROUND_SHAPE=extended` ([Testing](../contributing/testing.md)) runs
-every round of 4 lanes or fewer at the extended shape instead, a round with a
-lane held to a grammar excepted. An extended round attends in chunks of 8
-columns (6 over `bf16` KV), each reading what the one before appended: on
-ignis's own route where the load's rounds take it (an RTX 50 or RTX PRO card
-over `hq-e8-2b`), on the vendored chunked route elsewhere, the same bytes
-either way. The VRAM plan holds both shapes, and the
-extended shape's captured graphs hold about 20 MiB outside it. A load at 7
-drafts or fewer has the one shape it had. The MTP head keeps 0 to 7.
+A verify round takes one shape for all its lanes, chosen before it launches
+from what each lane's own earlier rounds did, the **shape rule**:
+
+- a request starts at the base shape;
+- after a base round that drafted all 7 and had all 7 taken
+  (`--spec-shape-enter-accepted`, 7), it asks for the extended shape;
+- after an extended round, it keeps asking while that round had at least 6
+  drafts taken (`--spec-shape-stay-accepted`, 6), and asks for the base shape
+  again when it had fewer;
+- a base round its token budget cut short changes nothing.
+
+A round of 1 to 4 lanes runs at the extended shape when every lane in it asks
+for it, so no request pays the wider round for another; a round of 5 to 8
+lanes, or one with a lane held to a grammar, runs at the base shape. Text the
+drafter predicts far ahead (a JSON answer, a long tool call's arguments) goes
+extended and stays there; free text rarely takes all 7, so it stays at the
+base shape and decodes as at 7 drafts (a greedy answer can differ at a
+near-tie where the shape changes, below). A request evicted and restored
+keeps what it asked. `/metrics` counts the rounds at each shape
+(`ignis_speculative_shape_rounds_total`) and, per position up to the window,
+the drafts proposed and taken.
+
+A load past 7 drafts costs what [the configuration reference](../configuration/context-and-speculation.md)
+states below 8 lanes (at 8 lanes, a few hundred bytes); the VRAM plan holds
+both shapes, and the extended shape's captured graphs hold about 20 MiB
+outside it. The measurement switch `IGNIS_ROUND_SHAPE=base|extended`
+([Testing](../contributing/testing.md)) forces every round to one shape over
+the rule. A load at 7 drafts or fewer has the one shape it had. The MTP head
+keeps 0 to 7.
+
+An extended round attends in chunks of 8 columns (6 over `bf16` KV), each
+reading what the one before appended: on ignis's own route where the load's
+rounds take it (an RTX 50 or RTX PRO card over `hq-e8-2b`), on the vendored
+chunked route elsewhere, the same bytes either way.
+
+The two shapes compute a column's logits up to rounding, not bit for bit:
+past 8 columns a lane the round takes other routes, and the extended round is
+held to the base round's numerical class, not to its bytes
+([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)).
+So a greedy answer can differ at a near-tie where a round of one shape runs in
+place of the other, as it can between speculation on and off.
 
 ## MTP, for the 27B
 

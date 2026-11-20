@@ -205,9 +205,12 @@ pub const QWEN27B_PROCESS_STATE_BYTES: u64 = 58_728_448;
 /// (each twice), 16,781,312 at three, 20,975,616 at four, and at eight lanes,
 /// whose extended shape has four, 18,878,464 at windows of 8 and 15 alike and
 /// under `IGNIS_DECODE_GRAPH_COPIES=1` too (536,485,888 B, then 555,364,352).
-/// Four lanes take the lower reading. A cold 15-draft load's process held
-/// 534,388,736 B after its teardown, a cold 7-draft load's 513,417,216: the
-/// same state, 2 MiB apart from one run to the next. It is kept for the
+/// Four lanes take the lower reading. A process whose first load was at 15
+/// drafts held 534,388,736 B after its teardown (twice), 20,971,520 B over a
+/// cold 7-draft load's 513,417,216 and 2 MiB over a 15-draft load after a
+/// 7-draft one (532,295,680 B every time): its reload adds back 4,620,288 B
+/// less than it holds, 2 MiB more than a 7-draft reload leaves, the safe
+/// side. It is kept for the
 /// context's life: a 7-draft load after a 15-draft one leaves the process
 /// holding what the 15-draft load left. The widest, 77,606,912 B with
 /// [`QWEN27B_PROCESS_STATE_BYTES`], is still under the 83,894,272 B of the

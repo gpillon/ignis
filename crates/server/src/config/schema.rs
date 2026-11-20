@@ -686,6 +686,22 @@ config_group! {
         /// smallest set of them holding this share of its probability. A
         /// speed setting only.
         drafter_top_p: Decimal = 950, decimal(0.0, 1.0), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// The shape rule's entry: past 7 drafts, where each of the 27B's
+        /// DFlash2 verify rounds runs at the base shape (8 columns a lane) or
+        /// the extended one (the window + 1), the drafts of a base round's
+        /// full 7 a lane must have taken to ask the extended shape for its
+        /// next round, 1..=7. A round of 1 to 4 lanes runs extended when
+        /// every lane in it asks; one of 5 to 8 lanes never does. A speed
+        /// setting only: either shape commits the target's text.
+        shape_enter_accepted: Tokens = ignis_core::ShapeRule::DEFAULT_ENTER_ACCEPTED,
+            between(1, ignis_core::BASE_SHAPE_DRAFT_TOKENS as i64), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// The shape rule's stay: the drafts an extended round must take for
+        /// its lane to keep asking the extended shape, 1 to the draft window
+        /// (a value past it is refused, naming the window: no extended round
+        /// could take it). A lane that takes fewer asks the base shape again.
+        /// A speed setting only.
+        shape_stay_accepted: Tokens = ignis_core::ShapeRule::DEFAULT_STAY_ACCEPTED,
+            between(1, ignis_core::DFLASH2_MAX_DRAFT_TOKENS as i64), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
     }
 }
 

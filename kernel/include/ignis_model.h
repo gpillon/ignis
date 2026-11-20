@@ -569,6 +569,17 @@ struct ignis_model_load_options {
    * by one word. */
   float drafter_temperature_factor;
   float drafter_top_p;
+  /* GitHub #689 (spec #684): the shape rule's thresholds on a DFlash2 load
+   * past IGNIS_BASE_SHAPE_DRAFT_TOKENS (kernel/src/round_shape.h
+   * `asks_extended`), read only there: the drafts a full base round must
+   * take for its lane to ask the extended shape, 1..IGNIS_BASE_SHAPE_DRAFT_TOKENS
+   * (0 = 7, every one), and the drafts an extended round must take for its
+   * lane to keep asking it, 1..`draft_tokens` (0 = 6). A value outside its
+   * range is refused, naming the field: past the window no round could keep
+   * a lane at the extended shape. Appended at the end: the struct grew by
+   * two words. */
+  uint32_t shape_enter_accepted;
+  uint32_t shape_stay_accepted;
 };
 
 /* GitHub #576 (spec #574, ADR 0090): how a verify round's sampling lanes

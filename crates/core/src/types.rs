@@ -682,6 +682,10 @@ pub struct SpecCounters {
     pub drafted_at: [u32; DRAFT_POSITIONS],
     /// Rounds that committed the draft at position `j + 1`.
     pub accepted_at: [u32; DRAFT_POSITIONS],
+    /// GitHub #689: of `rounds`, those that ran at the load's extended round
+    /// shape; the rest ran at its base shape, the only one of a load at 7
+    /// drafts or fewer.
+    pub extended_rounds: u32,
 }
 
 /// Draft positions the counters can carry: those a load at the widest
@@ -709,7 +713,14 @@ impl SpecCounters {
             accepted,
             drafted_at,
             accepted_at,
+            extended_rounds: 0,
         }
+    }
+
+    /// The same counters with every round at the extended round shape where
+    /// `extended` (GitHub #689): a verify round's own, read off its run.
+    pub fn at_shape(self, extended: bool) -> Self {
+        Self { extended_rounds: if extended { self.rounds } else { 0 }, ..self }
     }
 
     /// The per-position acceptance as the reference prints it: the
@@ -754,6 +765,7 @@ impl std::ops::Add for SpecCounters {
             accepted: self.accepted.saturating_add(other.accepted),
             drafted_at,
             accepted_at,
+            extended_rounds: self.extended_rounds.saturating_add(other.extended_rounds),
         }
     }
 }

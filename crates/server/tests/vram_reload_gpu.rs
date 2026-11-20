@@ -73,9 +73,11 @@ fn options(draft_tokens: Option<u32>) -> ignis_server::config::Config {
 const HELD_SLACK_BYTES: u64 = 16 << 20;
 
 /// How much more of what the process holds the two-shape reload may leave
-/// un-added than the 7-draft reload left (GitHub #687): the 2 MiB a reading
-/// moves from one run to the next, either way. Without its extended shape's
-/// state the add-back left 18 MiB more.
+/// un-added than the 7-draft reload left (GitHub #687): the 2 MiB a 7-draft
+/// load's reading moved from one run to the next (GitHub #680), and by which
+/// a process whose first load is at 15 drafts holds more than one that loaded
+/// 7 drafts first. Without its extended shape's state the add-back left 18 MiB
+/// more.
 #[cfg(windows)]
 const UNDER_SLACK_BYTES: u64 = 4 << 20;
 
@@ -131,7 +133,7 @@ fn added_back_and_held(context: ignis_runtime::ContextCharge, reading: &str, tor
         process_bytes,
     );
     println!(
-        "context measured at {} B ({reading}); per-process figure {process_bytes:?}; a reload adds back {} B ({})",
+        "after {torn_down}: context measured at {} B ({reading}); per-process figure {process_bytes:?}; a reload adds back {} B ({})",
         context.bytes,
         held.bytes,
         held.source.as_str()

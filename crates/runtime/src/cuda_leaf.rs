@@ -610,7 +610,8 @@ impl CudaLeaf {
                 let accepted = (run.tokens.len() as u32).saturating_sub(1).min(run.extent);
                 LaneRun {
                     tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
-                    spec: Some(SpecCounters::round(run.extent, accepted)),
+                    // GitHub #689: and the round's shape.
+                    spec: Some(SpecCounters::round(run.extent, accepted).at_shape(run.extended)),
                     drawn_probability: None,
                     redirected: run.redirected,
                 }

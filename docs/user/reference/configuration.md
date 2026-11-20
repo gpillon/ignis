@@ -1096,6 +1096,34 @@ Under `sampled`, the drafter's temperature as a factor of the request's: a reque
 
 Under `sampled`, the drafter's top-p over its candidates: the smallest set of them holding this share of its probability. A speed setting only.
 
+### `spec.shape_enter_accepted`
+
+| | |
+|---|---|
+| Flag | `--spec-shape-enter-accepted` |
+| Env var | `IGNIS_SPEC_SHAPE_ENTER_ACCEPTED` |
+| Kind | `tokens` |
+| Default | `7` |
+| Rule | 1..=7 |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+The shape rule's entry: past 7 drafts, where each of the 27B's DFlash2 verify rounds runs at the base shape (8 columns a lane) or the extended one (the window + 1), the drafts of a base round's full 7 a lane must have taken to ask the extended shape for its next round, 1..=7. A round of 1 to 4 lanes runs extended when every lane in it asks; one of 5 to 8 lanes never does. A speed setting only: either shape commits the target's text.
+
+### `spec.shape_stay_accepted`
+
+| | |
+|---|---|
+| Flag | `--spec-shape-stay-accepted` |
+| Env var | `IGNIS_SPEC_SHAPE_STAY_ACCEPTED` |
+| Kind | `tokens` |
+| Default | `6` |
+| Rule | 1..=15 |
+| Models | Qwen3.8-27B |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+The shape rule's stay: the drafts an extended round must take for its lane to keep asking the extended shape, 1 to the draft window (a value past it is refused, naming the window: no extended round could take it). A lane that takes fewer asks the base shape again. A speed setting only.
+
 ## vision
 
 ### `vision.enabled`

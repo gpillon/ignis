@@ -280,7 +280,7 @@ fn the_drafter_floor_leaves_every_retained_window_as_today() {
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
         return;
     }
-    assert_eq!(snapshot_format_version(), 5, "this test reads the version-5 blob layout");
+    assert_eq!(snapshot_format_version(), 6, "this test reads the version-6 blob layout");
     assert_eq!(PUBLISH % PAGE, 0, "a prefix is whole pages");
     assert_eq!(OPENER / PAGE, PUBLISH / PAGE, "the opener lies in the page after the prefix");
     let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));

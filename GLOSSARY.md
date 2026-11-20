@@ -1149,8 +1149,9 @@ verify and drafter-append graphs per lane count.
 The 27B's verify round at 8 columns a lane (7 drafts) at every lane count up
 to the load's lanes: the one **round shape** of a load at a **draft window**
 of 7 or fewer, and on a DFlash2 load past 7 the shape every round takes unless
-it is extended (#687). Its buffers are the load's: allocated once, each at the
-larger of the two shapes' sizes.
+the **shape rule** has every lane in it ask the extended one (#687, #689). Its
+buffers are the load's: allocated once, each at the larger of the two shapes'
+sizes.
 
 **Extended shape**:
 On a DFlash2 load whose **draft window** is 8..15, the 27B's verify round at
@@ -1162,6 +1163,22 @@ record of either shape is current only while no later round of either has
 written the logits they share. Its one-lane attention runs the vendored
 chunked small-T loop, never the prompt route. Not "wide" or "narrow": those
 are the **Near-tie**'s computations.
+
+**Shape rule**:
+What a lane of a DFlash2 load past 7 drafts asks of its next **verify round**,
+the **base shape** or the **extended shape**, from its own earlier rounds,
+which the host has before the next round launches (#689). A lane with no
+history asks the base shape; after a base round that drafted the whole 7 it
+asks the extended one when at least `spec.shape_enter_accepted` (7) were
+taken, and a base round its budget cut short leaves its ask as it was; after
+an extended round it asks while that round took at least
+`spec.shape_stay_accepted` (6). It reads what the target accepted, never what
+a stop or a grammar's cut kept, and no confidence from the drafter. The ask is
+the sequence's: a snapshot and a restore carry it, a prefix or checkpoint
+claim starts without it. A round of 1..4 lanes is extended when every lane in
+it asks (the shape policy `all`); a round of 5..8 lanes never is.
+`IGNIS_ROUND_SHAPE=base|extended` forces either shape over it, for
+measurement.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify
@@ -1254,7 +1271,11 @@ replay walks are distributed as live rounds under the rule are. On a 27B load
 built for the **MTP head** (GitHub #626) the head's chain proposes in the pass
 as in a live round; the head drafts under the fixed draft only, so only greedy
 lanes are forced, and fed the text its own rounds committed a forced round is
-those rounds bit for bit.
+those rounds bit for bit. On a DFlash2 load of two **round shapes** (#692) a
+forced round may name its shape, which it then runs at whatever would choose
+one, and the drafts it verifies in place of its drafter's: offered the recording
+itself, every column holds the recorded text and the round commits its whole
+shape, the rows the extended round's numerical class is held by (ADR 0104).
 
 **Proposal readout**:
 The drafter's proposals at a sequence's frontier, read without running a round

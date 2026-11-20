@@ -167,7 +167,7 @@ pub use rope_scaling::{
     DEFAULT_YARN_BETA_FAST, DEFAULT_YARN_BETA_SLOW, DEFAULT_YARN_TEMPERATURE,
     MAX_YARN_FACTOR, RopeScaling, RopeScalingError, RopeSetting, TRAINED_POSITION_ENVELOPE,
 };
-pub use speculation::{BASE_SHAPE_DRAFT_TOKENS, DFLASH2_MAX_DRAFT_TOKENS, DraftRule, DrafterSampling, EXTENDED_SHAPE_MAX_LANES, MTP_MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, RoundShape, Speculation, SpeculativeBackend, VERIFY_ONLY_MAX_DRAFT_TOKENS, WIDEST_DRAFT_TOKENS};
+pub use speculation::{BASE_SHAPE_DRAFT_TOKENS, DFLASH2_MAX_DRAFT_TOKENS, DraftRule, DrafterSampling, EXTENDED_SHAPE_MAX_LANES, MTP_MAX_DRAFT_TOKENS, ProposalHead, ProposalHeadSetting, RoundShape, ShapeRule, Speculation, SpeculativeBackend, VERIFY_ONLY_MAX_DRAFT_TOKENS, WIDEST_DRAFT_TOKENS};
 pub use vision::{
     DEFAULT_VISION_MAX_TOKENS, EmbeddingWidth, VISION_MAX_TOKENS_LIMIT, VISION_OBJECTS, Vision,
     VisionEnvelopeOutOfRange, VisionResidency, VisionWidthMismatch,
