@@ -1,5 +1,6 @@
 ---
 status: accepted
+amended-by: [ADR-0104]
 ---
 
 # ADR 0056 — speculation past 8 verify rows is numerically equivalent, not bit-exact

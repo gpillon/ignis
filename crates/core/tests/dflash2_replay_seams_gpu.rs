@@ -24,6 +24,15 @@
 //!   round's real logits, through the body's own head -- and it refuses more
 //!   lanes than the load decodes (GitHub #336: the round's logits are sized
 //!   for them).
+//! - **The round shapes** (GitHub #692): on a DFlash2 load of two (its window
+//!   15, hq-e8-2b, the served KV), every seam reads the shape it is asked for
+//!   by its window -- the proposal readout the drafts that shape's round
+//!   verifies, the verify logits readout that shape's rows at its stride, and
+//!   a refusal after a round of the other shape -- and a teacher-forced round
+//!   named a shape runs at it whatever `IGNIS_ROUND_SHAPE` says, verifying
+//!   the drafts it is named in place of its drafter's; the plain round's
+//!   logits readout (`dflash2_readout::plain_round_logits`) reads the rows its
+//!   draw read.
 //!
 //! Forced and live are compared at the same width only: between widths a
 //! near-tie may resolve differently (`support/near_tie.rs`), which is no
@@ -45,11 +54,14 @@ use ignis_core::dflash2_readout::{self, Dflash2Proposal, TOP_K};
 use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, Model};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
+use ignis_core::speculation::BASE_SHAPE_DRAFT_TOKENS;
 use ignis_core::step::{
-    capture_decode_graphs, decode_program_verify_forced, decode_program_verify_runs, prefill_program_sampled,
-    LaneVerifyRun, SamplingParams, VerifyLane,
+    capture_decode_graphs, decode_program_batch, decode_program_verify_forced, decode_program_verify_forced_with,
+    decode_program_verify_runs, prefill_program_sampled, LaneVerifyRun, SamplingParams, TeacherForcing, VerifyLane,
 };
-use ignis_core::{KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend};
+use ignis_core::{
+    DraftRule, DrafterSampling, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, Speculation, SpeculativeBackend,
+};
 
 const NVFP4: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
 const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_trellis_sc30-v2.ninfer";
@@ -479,4 +491,242 @@ fn seams(model: &Model, prompts: &[Vec<i32>], stop_ids: &[i32], decode_lanes: u3
     let err = dflash2_readout::propose(model, &pool, &seq, WINDOW, WINDOW, false)
         .expect_err("a window one column behind was read");
     assert!(err.contains("extent-0"), "the wrong refusal: {err}");
+}
+
+/// GitHub #692 (spec #684): the extended shape's load, DFlash2 at its widest
+/// window, two lanes; on hq-e8-2b, the served KV, on which the round identity
+/// test holds a load of two shapes.
+const TWO_SHAPE_WINDOW: u32 = 15;
+const TWO_SHAPE_CONTEXT: u32 = 1024;
+
+fn set_round_shape(value: &str) {
+    // SAFETY (test-only): the switch is read by the leaf on this thread, at
+    // the next verify round; no other test of this binary reads it.
+    unsafe { std::env::set_var("IGNIS_ROUND_SHAPE", value) };
+}
+
+/// GitHub #692 (spec #684): on a DFlash2 load of two round shapes the seams
+/// read the shape they are asked for, by its window. The proposal readout at a
+/// shape's window reads the drafts the next round at that shape verifies; the
+/// verify logits readout at a shape's window reads that shape's rows, each
+/// lane's `window + 1` (row `j`'s argmax the token the round licensed after
+/// column `j`), and refuses after a round of the other shape, whose rows are
+/// at another stride; a teacher-forced round named a shape runs at it, and
+/// one named drafts verifies them in place of its drafter's. Each in both
+/// directions, extended to base and back, at two lanes; the plain round's
+/// logits readout reads the rows its draw read.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn on_a_load_of_two_round_shapes_the_seams_read_the_shape_they_are_asked_for() {
+    let path = Path::new(NVFP4);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {NVFP4}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
+    let prompts: Vec<Vec<i32>> = PROMPTS
+        .iter()
+        .map(|p| {
+            frontend
+                .tokenizer()
+                .encode(&format!("<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+                .unwrap_or_else(|e| panic!("tokenize: {e}"))
+                .into_iter()
+                .map(|id| i32::try_from(id).expect("token id fits i32"))
+                .collect()
+        })
+        .collect();
+    let (plan, handles) =
+        bind_model_scope_27b(&reader, Some(DraftModule::Dflash2)).unwrap_or_else(|e| panic!("bind: {e}"));
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let mut artifact = match materialize(&reader, &plan, &mut device, None) {
+        Ok(artifact) => artifact,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("materialize text + dflash2: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    {
+        // The server's rule for DFlash2, under which a sampling lane may be
+        // forced too, so the refusal below is the forced drafts' own.
+        let spec = Speculation::new(SpeculativeBackend::Dflash2, TWO_SHAPE_WINDOW)
+            .unwrap()
+            .with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+        let model = load_qwen38_27b_with_decode_lanes(
+            &reader,
+            &artifact,
+            &handles,
+            PREFILL_CHUNK,
+            TWO_SHAPE_CONTEXT,
+            KvFormat::HqE8_2b,
+            Some(spec),
+            None,
+            RopeScaling::NONE,
+            PrefillAttention::default(),
+            PrefillLinear::default(),
+            2,
+        )
+        .unwrap_or_else(|e| panic!("model load: {e}"));
+        let pool = SeqPool::create_with_speculation(
+            &ModelConfig::qwen38_27b(),
+            &SeqPoolBudget {
+                kv_format: KvFormat::HqE8_2b,
+                kv_page_group_count: TWO_SHAPE_CONTEXT.div_ceil(64) * 2,
+                max_context_tokens: TWO_SHAPE_CONTEXT,
+                slot_count: 2,
+                retained_slot_count: 0,
+                retained_host_slot_count: 0,
+            },
+            Some(SpeculativeBackend::Dflash2),
+        )
+        .unwrap_or_else(|e| panic!("seq pool create: {e}"));
+        let _ = capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
+        two_shape_seams(&model, &pool, &prompts);
+    }
+    set_round_shape("base");
+    let _ = artifact.release_arena(&mut device);
+}
+
+fn two_shape_seams(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>]) {
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    let argmax = |row: &[u16]| -> i32 {
+        let value = |v: u16| f32::from_bits(u32::from(v) << 16);
+        let mut best = 0usize;
+        for (id, &v) in row.iter().enumerate() {
+            if value(v) > value(row[best]) {
+                best = id;
+            }
+        }
+        best as i32
+    };
+    let mut seqs: Vec<Seq<'_>> = (0..2).map(|_| pool.alloc(TWO_SHAPE_CONTEXT).unwrap()).collect();
+    for (seq, prompt) in seqs.iter_mut().zip(prompts) {
+        prefill(model, pool, seq, prompt);
+    }
+
+    let base = BASE_SHAPE_DRAFT_TOKENS;
+    for (k, other, switch) in [(TWO_SHAPE_WINDOW, base, "extended"), (base, TWO_SHAPE_WINDOW, "base"), (TWO_SHAPE_WINDOW, base, "extended")] {
+        let label = format!("the shape of {k} drafts");
+        let columns = k as usize + 1;
+        // The proposal readout at the shape's window: the drafts the round at
+        // that shape verifies, which a greedy round accepts only as the
+        // tokens it commits.
+        let reads: Vec<Dflash2Proposal> = seqs
+            .iter()
+            .map(|seq| dflash2_readout::propose(model, pool, seq, k, k, false).unwrap_or_else(|e| panic!("{label}: readout: {e}")))
+            .collect();
+        assert!(reads.iter().all(|read| read.window() == k as usize), "{label}: the readout's drafts");
+        set_round_shape(switch);
+        let mut refs: Vec<&mut Seq<'_>> = seqs.iter_mut().collect();
+        let runs = decode_program_verify_runs(model, pool, &mut refs, &greedy_lanes(2), TWO_SHAPE_WINDOW)
+            .unwrap_or_else(|e| panic!("{label}: round: {e}"));
+        // The verify logits readout at the shape's window: its rows at its
+        // stride, lane 1's after lane 0's `k + 1`.
+        let logits = dflash2_readout::verify_logits(model, 2, k).unwrap_or_else(|e| panic!("{label}: verify logits: {e}"));
+        assert_eq!(logits.len(), 2 * columns * vocab, "{label}: the rows read");
+        for (i, (run, read)) in runs.iter().zip(&reads).enumerate() {
+            assert_eq!(run.extent, k, "{label}: lane {i} ran at the shape");
+            let accepted = run.tokens.len() - 1;
+            assert_eq!(&run.tokens[1..], &read.drafts[..accepted], "{label}: lane {i}'s accepted drafts are the read ones");
+            let row = |j: usize| &logits[(i * columns + j) * vocab..(i * columns + j + 1) * vocab];
+            for j in 0..accepted {
+                assert_eq!(argmax(row(j)), run.tokens[j + 1], "{label}: lane {i}'s row {j} is not its licensed draft's");
+            }
+            assert_eq!(argmax(row(accepted)), seqs[i].pending_token().unwrap(), "{label}: lane {i}'s row {accepted} is not its correction's");
+        }
+        // The other shape's rows are not in the buffer: refused, not read at
+        // their stride; a window no shape has, and more lanes than the shape
+        // runs, are refused too.
+        let err = dflash2_readout::verify_logits(model, 1, other).expect_err("the other shape's rows");
+        assert!(err.contains(&format!("the latest verify round ran the round shape of {k} drafts")), "{label}: the wrong refusal: {err}");
+        let err = dflash2_readout::verify_logits(model, 1, 9).expect_err("a window no shape has");
+        assert!(err.contains("not the load's draft window 15 nor its base shape's 7"), "{label}: the wrong refusal: {err}");
+        let err = dflash2_readout::propose(model, pool, &seqs[0], 9, 9, false).expect_err("a window no shape has");
+        assert!(err.contains("not the load's draft window 15 nor its base shape's 7"), "{label}: the wrong refusal: {err}");
+
+        // A teacher-forced round named this shape and drafts the drafter
+        // would not propose -- prompt 2's tokens -- runs at the shape, whatever
+        // the switch names, and commits them all: the anchor, then the drafts.
+        set_round_shape(if switch == "base" { "extended" } else { "base" });
+        let drafts: Vec<Vec<i32>> = (0..2).map(|i| (0..TWO_SHAPE_WINDOW as usize).map(|j| prompts[2][(i + j) % prompts[2].len()]).collect()).collect();
+        let recordings: Vec<Vec<i32>> = drafts.iter().map(|d| d.iter().copied().chain([d[0]]).collect()).collect();
+        let draft_refs: Vec<&[i32]> = drafts.iter().map(Vec::as_slice).collect();
+        let recording_refs: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
+        let anchors: Vec<i32> = seqs.iter().map(|seq| seq.pending_token().unwrap()).collect();
+        let forcing = TeacherForcing { shape_window: Some(k), drafts: Some(&draft_refs) };
+        let mut refs: Vec<&mut Seq<'_>> = seqs.iter_mut().collect();
+        let runs = decode_program_verify_forced_with(model, pool, &mut refs, &greedy_lanes(2), TWO_SHAPE_WINDOW, &recording_refs, forcing)
+            .unwrap_or_else(|e| panic!("{label}: forced drafts: {e}"));
+        for (i, run) in runs.iter().enumerate() {
+            let expected: Vec<i32> = [anchors[i]].into_iter().chain(drafts[i][..k as usize].iter().copied()).collect();
+            assert_eq!((run.extent, &run.tokens), (k, &expected), "{label}: lane {i} verifies the forced drafts at the shape named");
+            assert_eq!(seqs[i].pending_token(), Some(recordings[i][k as usize]), "{label}: lane {i}'s recorded successor is pending");
+        }
+        dflash2_readout::verify_logits(model, 2, k).unwrap_or_else(|e| panic!("{label}: the forced round's rows: {e}"));
+    }
+    set_round_shape("base");
+
+    // The plain round's logits readout: each lane's row is the one its draw
+    // read. Last of the readouts: a plain round leaves a DFlash2 lane's window
+    // a column behind its frontier, which the proposal readout refuses.
+    let mut refs: Vec<&mut Seq<'_>> = seqs.iter_mut().collect();
+    decode_program_batch(model, pool, &mut refs).unwrap_or_else(|e| panic!("plain round: {e}"));
+    let rows = dflash2_readout::plain_round_logits(model, 2).unwrap_or_else(|e| panic!("plain round logits: {e}"));
+    for (i, seq) in seqs.iter().enumerate() {
+        assert_eq!(argmax(&rows[i * vocab..(i + 1) * vocab]), seq.pending_token().unwrap(), "plain round lane {i}: its row");
+    }
+    let err = dflash2_readout::plain_round_logits(model, 3).expect_err("more lanes than the load decodes");
+    assert!(err.contains("decode lanes"), "the wrong refusal: {err}");
+
+    // The forced drafts and shape refuse what they cannot name: a window no
+    // shape has, a sampling lane, drafts of the wrong length.
+    let recording = vec![prompts[2][0]; TWO_SHAPE_WINDOW as usize + 1];
+    let drafts = vec![prompts[2][0]; TWO_SHAPE_WINDOW as usize];
+    let err = decode_program_verify_forced_with(
+        model,
+        pool,
+        &mut [&mut seqs[0]],
+        &greedy_lanes(1),
+        TWO_SHAPE_WINDOW,
+        &[&recording],
+        TeacherForcing { shape_window: Some(9), drafts: None },
+    )
+    .expect_err("a window no shape has");
+    assert!(err.contains("no round shape of this load"), "the wrong refusal: {err}");
+    let sampled = VerifyLane {
+        sampling: SamplingParams { temperature: 1.0, top_k: 20, top_p: 0.95, seed: 7, ..SamplingParams::greedy() },
+        ..VerifyLane::greedy(&[])
+    };
+    let err = decode_program_verify_forced_with(
+        model,
+        pool,
+        &mut [&mut seqs[0]],
+        &[sampled],
+        TWO_SHAPE_WINDOW,
+        &[&recording],
+        TeacherForcing { shape_window: None, drafts: Some(&[drafts.as_slice()]) },
+    )
+    .expect_err("a sampling lane offered drafts");
+    assert!(err.contains("forced_drafts ride greedy lanes"), "the wrong refusal: {err}");
+    let err = decode_program_verify_forced_with(
+        model,
+        pool,
+        &mut [&mut seqs[0]],
+        &greedy_lanes(1),
+        TWO_SHAPE_WINDOW,
+        &[&recording],
+        TeacherForcing { shape_window: None, drafts: Some(&[&drafts[..3]]) },
+    )
+    .expect_err("short forced drafts");
+    assert!(err.contains("not the window"), "the wrong refusal: {err}");
 }

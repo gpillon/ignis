@@ -12,8 +12,13 @@
 //! (`prefill_program_span_hidden`, the prefill options' `out_span_hidden`) are
 //! the same kind of seam. GitHub #626: so is the head's chain readout
 //! (`mtp_readout::chain`, the leaf's `ignis_mtp_readout_chain`), which the
-//! `mtp_readout` name already holds. The replays that call the seams are
-//! examples (`crates/runtime/examples/`), outside every directory scanned.
+//! `mtp_readout` name already holds. GitHub #692: so are a teacher-forced
+//! round's named shape and drafts (`step::TeacherForcing`, the decode
+//! options' `forced_shape_window` and `forced_drafts`, which the leaf reads
+//! only beside `forced_tokens` and its verify graphs refuse) and the plain
+//! round's logits readout (`dflash2_readout::plain_round_logits`). The
+//! replays that call the seams are examples (`crates/runtime/examples/`),
+//! outside every directory scanned.
 
 use std::path::{Path, PathBuf};
 
@@ -39,7 +44,7 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The seams' names, as code would call them.
-const SEAMS: [&str; 8] = [
+const SEAMS: [&str; 12] = [
     "decode_program_verify_forced",
     "dflash2_readout",
     "forced_tokens",
@@ -48,6 +53,10 @@ const SEAMS: [&str; 8] = [
     "mtp_readout",
     "prefill_program_span_hidden",
     "out_span_hidden",
+    "TeacherForcing",
+    "forced_drafts",
+    "forced_shape_window",
+    "plain_round_logits",
 ];
 
 /// The core crate's files that define the seams, and its root, which

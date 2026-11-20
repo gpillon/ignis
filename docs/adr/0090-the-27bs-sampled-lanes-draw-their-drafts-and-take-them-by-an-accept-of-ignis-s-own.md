@@ -1,5 +1,6 @@
 ---
 status: accepted
+amended-by: [ADR-0104]
 ---
 
 # The 27B's sampled lanes draw their drafts and take them by an accept of ignis's own

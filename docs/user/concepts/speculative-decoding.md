@@ -187,6 +187,13 @@ lane held to a grammar excepted. The VRAM plan holds both shapes, and the
 extended shape's captured graphs hold about 20 MiB outside it. A load at 7
 drafts or fewer has the one shape it had. The MTP head keeps 0 to 7.
 
+The two shapes compute a column's logits up to rounding, not bit for bit:
+past 8 columns a lane the round takes other routes, and the extended round is
+held to the base round's numerical class, not to its bytes
+([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)).
+So a greedy answer can differ at a near-tie where a round of one shape runs in
+place of the other, as it can between speculation on and off.
+
 ## MTP, for the 27B
 
 Every 27B artifact carries the checkpoint's own **multi-token-prediction

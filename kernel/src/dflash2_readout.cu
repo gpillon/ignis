@@ -30,6 +30,16 @@ int32_t fail(std::string message) {
 static_assert(IGNIS_DFLASH2_READOUT_TOP_K == kDflash2SelectorTopK,
               "the readout's candidate rows are the selector's top-k");
 
+// GitHub #692: the windows of the load's round shapes, for a refusal: "the load's draft window 7", or
+// on a load of two "the load's draft window 15 nor its base shape's 7".
+std::string shape_windows(const ignis_model &model) {
+  if (model.extended_shape == nullptr) {
+    return "the load's draft window " + std::to_string(model.base_shape->window);
+  }
+  return "the load's draft window " + std::to_string(model.extended_shape->window) + " nor its base shape's " +
+         std::to_string(model.base_shape->window);
+}
+
 } // namespace
 
 extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis_seq_pool *pool,
@@ -56,18 +66,22 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
   if (!ignis_seq_belongs_to(*pool, *seq)) {
     return fail("ignis_dflash2_readout: the sequence was not drawn from this pool");
   }
-  // GitHub #686: the forward of the load's base shape, its one shape.
-  IgnisVerifyRound &verify = *model->base_shape;
-  const std::uint32_t k = verify.window;
-  // The caller sized every output by its window; the copies below are the
-  // load's, so another window would over- or under-run them.
-  if (readout->window != k) {
-    return fail("ignis_dflash2_readout: window " + std::to_string(readout->window) +
-                " is not the load's draft window " + std::to_string(k));
+  // GitHub #692: the forward of the round shape the caller's window names --
+  // the load's one shape, or on a load of two its base shape (window
+  // IGNIS_BASE_SHAPE_DRAFT_TOKENS) or its extended one (the load's window):
+  // the drafts the next round at that shape verifies. The caller sized every
+  // output by its window and the copies below are the shape's, so a window no
+  // shape has would over- or under-run them.
+  IgnisVerifyRound *const shape = ignis_round_shape_at(*model, readout->window);
+  if (shape == nullptr) {
+    return fail("ignis_dflash2_readout: window " + std::to_string(readout->window) + " is not " +
+                shape_windows(*model));
   }
+  IgnisVerifyRound &verify = *shape;
+  const std::uint32_t k = verify.window;
   if (readout->extent > k) {
     return fail("ignis_dflash2_readout: extent " + std::to_string(readout->extent) +
-                " is past the load's window of " + std::to_string(k));
+                " is past the round shape's window of " + std::to_string(k));
   }
   const std::uint64_t capacity = ignis_seq_token_capacity(*seq);
   if (seq->position + readout->extent >= capacity) {
@@ -177,22 +191,33 @@ extern "C" int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32
   if (model == nullptr || out_logits == nullptr) {
     return fail("ignis_verify_readout_logits: null argument");
   }
-  // GitHub #686: the logits of the load's base shape, its one shape.
-  const IgnisVerifyRound *const verify = model->base_shape.get();
-  if (verify == nullptr) {
+  if (model->base_shape == nullptr) {
     return fail("ignis_verify_readout_logits: this model was loaded without a draft window");
   }
-  // The caller sized `out_logits` by its window; the copy below is the
-  // load's `k + 1` rows a lane.
-  if (window != verify->window) {
-    return fail("ignis_verify_readout_logits: window " + std::to_string(window) +
-                " is not the load's draft window " + std::to_string(verify->window));
+  // GitHub #692: the logits of the round shape the caller's window names --
+  // the load's one shape, or on a load of two its base or its extended shape
+  // -- read at that shape's stride, `k + 1` rows a lane, which is what the
+  // caller sized `out_logits` by. The two shapes write one buffer, each at
+  // its own stride, so the rows are that shape's only when the latest verify
+  // round ran it: after a round of the other shape the read is refused.
+  const IgnisVerifyRound *const verify = ignis_round_shape_at(*model, window);
+  if (verify == nullptr) {
+    return fail("ignis_verify_readout_logits: window " + std::to_string(window) + " is not " +
+                shape_windows(*model));
+  }
+  const IgnisVerifyRound *const latest = ignis_latest_verify_shape(*model);
+  if (latest != nullptr && latest != verify) {
+    return fail("ignis_verify_readout_logits: the latest verify round ran the round shape of " +
+                std::to_string(latest->window) + " drafts, not the one of " + std::to_string(window) +
+                ": its rows are at the other shape's stride");
   }
   // GitHub #336: the round's buffers, its logits included, are sized for the
-  // load's decode lanes, not for IGNIS_DECODE_MAX_BATCH.
-  if (lanes == 0 || lanes > model->decode_lanes) {
-    return fail("ignis_verify_readout_logits: lanes " + std::to_string(lanes) +
-                " is not in 1.." + std::to_string(model->decode_lanes) + ", the load's decode lanes");
+  // load's decode lanes, not for IGNIS_DECODE_MAX_BATCH; GitHub #692: a
+  // shape's rows for at most the lanes it runs.
+  if (lanes == 0 || lanes > verify->lanes) {
+    return fail("ignis_verify_readout_logits: lanes " + std::to_string(lanes) + " is not in 1.." +
+                std::to_string(verify->lanes) +
+                (verify->extended() ? ", the extended shape's lanes" : ", the load's decode lanes"));
   }
   // `[vocab, k+1, B]` with the vocabulary fastest: the first `lanes` lanes
   // are one contiguous prefix.
@@ -206,6 +231,31 @@ extern "C" int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32
   if (err != cudaSuccess) {
     return fail(std::string("ignis_verify_readout_logits: cudaMemcpyAsync failed: ") +
                 cudaGetErrorString(err));
+  }
+  return 0;
+}
+
+extern "C" int32_t ignis_decode_readout_logits(struct ignis_model *model, uint32_t lanes, uint16_t *out_logits) {
+  if (model == nullptr || out_logits == nullptr) {
+    return fail("ignis_decode_readout_logits: null argument");
+  }
+  if (model->flash_next || model->sampling_decode_logits == nullptr) {
+    return fail("ignis_decode_readout_logits: the 27B's decode logits only");
+  }
+  if (lanes == 0 || lanes > model->decode_lanes) {
+    return fail("ignis_decode_readout_logits: lanes " + std::to_string(lanes) + " is not in 1.." +
+                std::to_string(model->decode_lanes) + ", the load's decode lanes");
+  }
+  // `[vocab, decode_lanes]` with the vocabulary fastest, lane i's row at
+  // column i: the first `lanes` lanes are one contiguous prefix.
+  const std::size_t bytes = static_cast<std::size_t>(model->vocab) * lanes * sizeof(std::uint16_t);
+  cudaError_t err =
+      cudaMemcpyAsync(out_logits, model->sampling_decode_logits->p, bytes, cudaMemcpyDeviceToHost, model->stream);
+  if (err == cudaSuccess) {
+    err = cudaStreamSynchronize(model->stream);
+  }
+  if (err != cudaSuccess) {
+    return fail(std::string("ignis_decode_readout_logits: cudaMemcpyAsync failed: ") + cudaGetErrorString(err));
   }
   return 0;
 }
