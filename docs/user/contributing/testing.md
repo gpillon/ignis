@@ -272,6 +272,24 @@ IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 \
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the
 three is everything.
 
+### The extended round's numerical class
+
+`crates/core/tests/extended_round_class_gpu.rs` holds the 27B's extended
+verify round to its base round's numerical class
+([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)),
+on the NVFP4 artifact with DFlash2 at 15 draft tokens under FP8 exception
+weights, on an RTX 5090 (another card skips it). Speculation off writes each
+prompt's greedy text; both shapes are then teacher-forced to it at 1 to 4
+lanes, once offered the text as their drafts and once replaying their captured
+graphs on the drafter's own drafts, and every extended row is held to the base
+row at the same text index and lane count, in BF16 ulps, by bounds named in the
+file with their measured values. It loads once and takes about two and a half
+minutes:
+
+```sh
+cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture
+```
+
 ## The speech executor's CPU legs
 
 The speech executor's kernels and ops are checked against fp64 in the default

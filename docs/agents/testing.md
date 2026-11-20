@@ -362,6 +362,15 @@ teacher-forced rounds. The recorded token after a lane's run is its pending
 token, so it must be a vocabulary id; the pad past a recording's end is taken
 only after a stop id, and leaves no pending token until a prefill gives one.
 Only greedy lanes may be forced, and only on 27B loads.
+On a DFlash2 load of two round shapes (GitHub #692) the seams read the shape
+their window names: the proposal readout runs that shape's forward, the verify
+logits readout reads that shape's rows and refuses after a round of the other
+shape, and a forced round may name its shape and its drafts
+(`step::decode_program_verify_forced_with`, `TeacherForcing`), running at that
+shape whatever `IGNIS_ROUND_SHAPE` says and, offered drafts, eagerly. The plain
+round's rows come from `dflash2_readout::plain_round_logits`. The numerical
+class of the extended round (`crates/core/tests/extended_round_class_gpu.rs`,
+ADR 0104) stands on all of them.
 The same instruments under the 27B's MTP head (GitHub #626,
 `crates/core/tests/mtp_replay_seams_gpu.rs`, both bodies): the chain readout
 (`mtp_readout::chain`) runs the round's own chain once, eagerly at width 1,
