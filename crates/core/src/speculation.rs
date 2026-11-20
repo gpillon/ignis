@@ -997,6 +997,41 @@ impl Dflash2RoundBuffers {
 mod tests {
     use super::*;
 
+    /// GitHub #689, #690 (ADR 0046): the shape rule's and the shape policy's
+    /// defaults are declared once, here (and the server's schema takes
+    /// them); the leaf repeats them only as what a load's 0 stands for, and
+    /// the range of a period ratio, in named constants of
+    /// `kernel/src/round_shape.h`, which this reads as text and holds to
+    /// these. No toolchain: a value changed on one side alone goes red here.
+    #[test]
+    fn the_leafs_shape_defaults_are_the_cores() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/src/round_shape.h");
+        let header = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let constant = |name: &str| -> String {
+            let line = header
+                .lines()
+                .find(|line| line.starts_with("inline constexpr") && line.contains(&format!(" {name} = ")))
+                .unwrap_or_else(|| panic!("round_shape.h declares no `{name} = ...;` line"));
+            let value = line.split_once(" = ").expect("an initializer").1;
+            value.trim_end().strip_suffix(';').unwrap_or_else(|| panic!("`{name}` ends its line")).trim().to_owned()
+        };
+        let number = |name: &str| constant(name).parse::<u32>().unwrap_or_else(|e| panic!("`{name}`: {e}"));
+        assert_eq!(number("kDefaultEnterAccepted"), ShapeRule::DEFAULT_ENTER_ACCEPTED);
+        assert_eq!(number("kDefaultStayAccepted"), ShapeRule::DEFAULT_STAY_ACCEPTED);
+        assert_eq!(number("kDefaultEstimateRounds"), ShapeEstimate::DEFAULT_ROUNDS);
+        let ratios: Vec<u32> = constant("kDefaultPeriodRatios")
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+            .map(|ratio| ratio.trim().parse().unwrap_or_else(|e| panic!("kDefaultPeriodRatios: {e}")))
+            .collect();
+        assert_eq!(ratios, ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI);
+        assert_eq!(
+            number("kPeriodRatioMinMilli")..=number("kPeriodRatioMaxMilli"),
+            ShapeEstimate::PERIOD_RATIO_MILLI_RANGE
+        );
+    }
+
     /// ADR 0063: `auto` is a third spelling of the setting, not a third
     /// head, and resolves to the full head; the two heads stay themselves.
     #[test]

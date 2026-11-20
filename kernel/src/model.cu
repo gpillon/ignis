@@ -1793,7 +1793,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
                  : name == "shape_estimate_rounds"
                      ? " must be in 1.." + std::to_string(IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS) +
                            " (0: the default), the rounds a lane keeps"
-                     : " must each be in 1000..2000 thousandths (0: that lane count's default)"));
+                     : " must each be in " + std::to_string(ignis::round_shape::kPeriodRatioMinMilli) + ".." +
+                           std::to_string(ignis::round_shape::kPeriodRatioMaxMilli) +
+                           " thousandths (0: that lane count's default)"));
       return nullptr;
     }
   }
