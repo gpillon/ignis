@@ -40,7 +40,7 @@ inline bool has_extended_shape(int32_t backend, uint32_t draft_tokens) {
 inline constexpr std::uint32_t kDefaultEnterAccepted = 7;
 inline constexpr std::uint32_t kDefaultStayAccepted = 6;
 inline constexpr std::uint32_t kDefaultEstimateRounds = 16;
-inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1150, 1230, 1270, 1310};
+inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1128, 1290, 1363, 1344};
 inline constexpr std::uint32_t kPeriodRatioMinMilli = 1000;
 inline constexpr std::uint32_t kPeriodRatioMaxMilli = 2000;
 
@@ -145,14 +145,16 @@ struct ShapePolicy {
   Policy policy = Policy::kAggregate;
   // The recorded rounds a lane's estimate reads, its most recent. 16: a lane whose extended rounds
   // do not pay is granted one again once its window no longer holds one, so a lane beside it that
-  // does not ask pays one extended round in 17 for it -- about 1% of its rate at two lanes, where an
-  // extended round costs it about 19% -- and a lane whose text turns predictable waits at most 16
-  // rounds behind an estimate from before. Provisional, as the ratios are.
+  // does not ask pays one extended round in 17 for it -- under 2% of its rate at two lanes, where an
+  // extended round costs it about 22% -- and a lane whose text turns predictable waits at most 16
+  // rounds behind an estimate from before. Provisional.
   std::uint32_t estimate_rounds = kDefaultEstimateRounds;
   // The extended round's period over the base round's, in thousandths, at 1..4 lanes: measured on
-  // the RTX 5090 at 1, 2 and 4 lanes before the cost levers (1.15, 1.23, 1.31), 3 lanes the line
-  // between 2 and 4 -- provisional until measured with the build they ship in. The one-lane entry
-  // is not read: a lane alone runs at the shape it asks.
+  // the RTX 5090 (1.128, 1.29, 1.363, 1.344; GPU clock, FP8 exception weights, the default cost
+  // levers and route, a matched context, two orders pooled). At 3 and 4 lanes the card's 575 W
+  // power limit lowers the extended round's clock, so 3 lanes measured above 4 in either order: not
+  // a slip. The ratio grows with context; these are its value at about 3.5-5K tokens. The one-lane
+  // entry is not read: a lane alone runs at the shape it asks.
   std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> period_ratios = kDefaultPeriodRatios;
 };
 

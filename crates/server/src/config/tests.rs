@@ -1991,7 +1991,7 @@ fn the_shape_rules_thresholds_ride_the_speculation_and_a_stay_past_the_window_is
 }
 
 /// GitHub #690: the shape policy rides the speculation, `aggregate` over each
-/// lane's last 16 rounds at the period ratios 1.15, 1.23, 1.27 and 1.31
+/// lane's last 16 rounds at the period ratios 1.128, 1.29, 1.363 and 1.344
 /// unless named, by flag, env or file (the ratios a list of four there), each
 /// a visible, patchable reload of the 27B's; the effective configuration
 /// writes them in the 27B's section, from which a start reads them back. A
@@ -2006,7 +2006,7 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
     };
     let wide = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"];
     let with = |more: &[&'static str]| -> Vec<&'static str> { wide.iter().chain(more).copied().collect() };
-    assert_eq!(policy(&config(&wide)), Some((ShapePolicy::Aggregate, 16, [1150, 1230, 1270, 1310])));
+    assert_eq!(policy(&config(&wide)), Some((ShapePolicy::Aggregate, 16, [1128, 1290, 1363, 1344])));
     let named = config(&with(&["--spec-shape-policy", "all", "--spec-shape-estimate-rounds", "8", "--spec-shape-period-ratios", "1,1.2,1.25,2"]));
     assert_eq!(policy(&named), Some((ShapePolicy::All, 8, [1000, 1200, 1250, 2000])));
     let env = env_map(&[

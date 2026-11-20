@@ -196,23 +196,26 @@ in who pays the wider round:
 - `aggregate`, the default, runs the round extended when the drafts its asking
   requests are expected to take past position 7 exceed what the wider round
   costs every request in it: the extended round's period over the base
-  round's at that lane count (`--spec-shape-period-ratios`, 1.23 at two
+  round's at that lane count (`--spec-shape-period-ratios`, 1.29 at two
   lanes), less one, times the tokens every request is expected to take a
   round. Each request's expectations come from its own last 16 verify rounds
   (`--spec-shape-estimate-rounds`); a request that asks with no extended round
   among them is granted one, so that its estimate has something to read. A
   request that does not ask then pays for its neighbour when the round as a
   whole gains: estimated from the measured periods, a JSON answer beside a
-  conversation gains about 21% together, the JSON answer +38% and the
-  conversation -19%, while a moderately predictable answer beside a
+  conversation gains about 15% together, the JSON answer +32% and the
+  conversation -22%, while a moderately predictable answer beside a
   conversation does not pass and stays at the base shape.
 - `all` runs it extended only when every lane in it asks, so no request ever
   pays the wider round for another: the JSON answer beside a conversation
   then gains nothing.
 
-The window and the ratios are provisional: the ratios were measured on the
-RTX 5090 at 1, 2 and 4 lanes before the extended round's cost levers, 3 lanes
-between them. A request held to a grammar (`response_format`, a held tool's
+The ratios are measured on the RTX 5090 with the extended round's cost levers
+on, at about 3.5-5K tokens of context: 1.128, 1.29, 1.363 and 1.344 at 1 to 4
+lanes. The ratio grows with context, and at 3 and 4 lanes the card's power
+limit lowers the extended round's clock, so 3 lanes reads above 4. On other
+cards they are unmeasured, and the window is provisional. A request held to a
+grammar (`response_format`, a held tool's
 calls) asks as any other does: its rounds take the shape the rule and the
 policy give them, the grammar's check cuts each run at its first miss at that
 shape, and the rule and the policy count the drafts the model took, not the

@@ -1912,7 +1912,7 @@ pub(crate) fn decimal_text(thousandths: u32) -> String {
 }
 
 /// GitHub #690: the shape policy's period ratios as their flag would spell
-/// them (`1.15,1.23,1.27,1.31`).
+/// them (`1.128,1.29,1.363,1.344`).
 pub(crate) fn ratios_text(ratios: [u32; 4]) -> String {
     ratios.map(decimal_text).join(",")
 }

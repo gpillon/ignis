@@ -1116,7 +1116,7 @@ mod tests {
             speculation_text(the_27b, LoadSpeculation::Runs(Some(wide))),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=7 shape_stay_accepted=6 shape_policy=aggregate shape_estimate_rounds=16 \
-             shape_period_ratios=1.15,1.23,1.27,1.31"
+             shape_period_ratios=1.128,1.29,1.363,1.344"
         );
         let all = wide
             .with_shape_rule(ShapeRule::new(5, 12).unwrap())

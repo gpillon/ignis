@@ -383,10 +383,10 @@ void check_aggregate() {
       {"one lane asking, its extended rounds no longer paying", {1}, {kStopped}, true, true},
       {"one lane asking, its window holding no extended round", {1}, {kUnread}, true, true},
       {"one lane not asking", {0}, {kJson}, false, false},
-      // Two lanes. A JSON answer beside a conversation: 5.44 drafts past 7 against 0.23 x 11.44.
+      // Two lanes. A JSON answer beside a conversation: 5.44 drafts past 7 against 0.29 x 11.44.
       {"two lanes: a JSON answer asking beside a conversation", {1, 0}, {kJson, kConversation}, true, false},
       {"two lanes: a conversation beside a JSON answer asking", {0, 1}, {kConversation, kJson}, true, false},
-      // A moderately predictable answer beside a conversation: 1.75 against 0.23 x 9.19.
+      // A moderately predictable answer beside a conversation: 1.75 against 0.29 x 9.19.
       {"two lanes: a moderately predictable answer asking beside a conversation", {1, 0},
        {kModerate, kConversation}, false, false},
       {"two lanes, both asking, both paying", {1, 1}, {kJson, kJson}, true, true},
@@ -400,17 +400,18 @@ void check_aggregate() {
       {"two lanes: a lane granted beside one whose extended rounds stopped paying", {1, 1}, {kStopped, kUnread},
        true, true},
       // A lane with no round yet is expected to take a full base round: 8 tokens, the most the wider
-      // round can cost it (at 0 the moderately predictable answer would pass: 1.75 > 0.23 x 5.69).
+      // round can cost it (at 0 the moderately predictable answer would pass: 1.75 > 0.29 x 5.69).
       {"two lanes: a JSON answer asking beside a lane with no round yet", {1, 0}, {kJson, kNewcomer}, true, false},
       {"two lanes: a moderately predictable answer asking beside a lane with no round yet", {1, 0},
        {kModerate, kNewcomer}, false, false},
       {"two lanes, no lane asking", {0, 0}, {kJson, kJson}, false, false},
       {"two lanes, no lane asking, one with no extended round", {0, 0}, {kUnread, kConversation}, false, false},
-      // The boundary: 10 rounds of 8 tokens and 23 drafts past 7 over 10 extended rounds, beside 10
-      // rounds of 2 tokens: 2.3 against 0.23 x 10 is not more, 2.4 is.
-      {"two lanes, the gain equal to the cost: base", {1, 0}, {{10, 80, 10, 23}, {10, 20, 0, 0}}, false, false},
-      {"two lanes, the gain past the cost: extended", {1, 0}, {{10, 80, 10, 24}, {10, 20, 0, 0}}, true, false},
-      // Three lanes, 0.27 the cost.
+      // The boundary: 10 rounds of 8 tokens and 29 drafts past 7 over 10 extended rounds, beside 10
+      // rounds of 2 tokens: 2.9 against 0.29 x 10 is not more, 3 is.
+      {"two lanes, the gain equal to the cost: base", {1, 0}, {{10, 80, 10, 29}, {10, 20, 0, 0}}, false, false},
+      {"two lanes, the gain past the cost: extended", {1, 0}, {{10, 80, 10, 30}, {10, 20, 0, 0}}, true, false},
+      // Three lanes, 0.363 the cost: a JSON answer still carries two conversations (5.44 against
+      // 0.363 x 14.94).
       {"three lanes: a JSON answer asking beside two conversations", {1, 0, 0},
        {kJson, kConversation, kConversation}, true, false},
       {"three lanes: some asking", {1, 1, 0}, {kJson, kModerate, kConversation}, true, false},
@@ -418,8 +419,12 @@ void check_aggregate() {
        {kModerate, kConversation, kConversation}, false, false},
       {"three lanes, every lane asking, none paying past 7", {1, 1, 1}, {kStopped, kStopped, kStopped}, false,
        true},
-      {"three lanes, every lane asking and paying", {1, 1, 1}, {kModerate, kModerate, kModerate}, true, true},
-      // Four lanes, 0.31: one JSON answer no longer carries three conversations (5.44 against 0.31 x
+      // Three moderately predictable answers, every lane asking: each one's 1.75 past 7 is under its
+      // own 0.363 x 5.69, so `aggregate` keeps them at the base shape where `all` extends them.
+      {"three lanes, every lane asking, each paying less than it costs", {1, 1, 1},
+       {kModerate, kModerate, kModerate}, false, true},
+      {"three lanes, every lane asking and paying", {1, 1, 1}, {kJson, kJson, kJson}, true, true},
+      // Four lanes, 0.344: one JSON answer no longer carries three conversations (5.44 against 0.344 x
       // 18.44), two do.
       {"four lanes: a JSON answer asking beside three conversations", {1, 0, 0, 0},
        {kJson, kConversation, kConversation, kConversation}, false, false},
@@ -476,8 +481,8 @@ void check_aggregate() {
 void check_the_policy_options() {
   const ShapePolicy defaults{};
   check(defaults.policy == Policy::kAggregate && defaults.estimate_rounds == 16 &&
-            defaults.period_ratios == std::array<std::uint32_t, 4>{1150, 1230, 1270, 1310},
-        "the defaults: `aggregate`, 16 rounds, ratios 1.15, 1.23, 1.27, 1.31");
+            defaults.period_ratios == std::array<std::uint32_t, 4>{1128, 1290, 1363, 1344},
+        "the defaults: `aggregate`, 16 rounds, ratios 1.128, 1.29, 1.363, 1.344");
   struct Row {
     const char *what;
     std::uint32_t policy;
@@ -508,7 +513,7 @@ void check_the_policy_options() {
   const std::array<std::uint32_t, 4> some = {0, 1100, 0, 1500};
   check(ignis::round_shape::policy_of(IGNIS_SHAPE_POLICY_ALL, 8, some.data(), got) == nullptr &&
             got.policy == Policy::kAll && got.estimate_rounds == 8 &&
-            got.period_ratios == std::array<std::uint32_t, 4>{1150, 1100, 1270, 1500},
+            got.period_ratios == std::array<std::uint32_t, 4>{1128, 1100, 1363, 1500},
         "a ratio of 0 is that lane count's default, the others as given");
 }
 
@@ -585,7 +590,7 @@ void check_a_pairs_course() {
       {7, false},   // 9
       {7, false},   // 10: rounds 6-9
       {15, true},   // 11: granted again; takes all 15: 8 past 7
-      {15, true},   // 12: 8 past 7 against 0.23 x 11 tokens: extended
+      {15, true},   // 12: 8 past 7 against 0.29 x 11 tokens: extended
       {15, true},   // 13
   };
   for (const ShapePolicy &policy : {aggregate, all}) {

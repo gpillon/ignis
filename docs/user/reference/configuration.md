@@ -1159,11 +1159,11 @@ Under `aggregate`, the verify rounds of its own, the most recent, a lane's expec
 | Flag | `--spec-shape-period-ratios` |
 | Env var | `IGNIS_SPEC_SHAPE_PERIOD_RATIOS` |
 | Kind | `ratio,ratio,ratio,ratio` |
-| Default | `[1.15,1.23,1.27,1.31]` |
+| Default | `[1.128,1.29,1.363,1.344]` |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Under `aggregate`, an extended round's period over a base round's at 1, 2, 3 and 4 lanes, each 1 to 2: what the wider round costs every lane in it. Measured on the RTX 5090 at 1, 2 and 4 lanes, 3 lanes between them; provisional. The one-lane entry is not read: a lane alone runs at the shape it asks. A speed setting only.
+Under `aggregate`, an extended round's period over a base round's at 1, 2, 3 and 4 lanes, each 1 to 2: what the wider round costs every lane in it. Measured on the RTX 5090 with FP8 exception weights and the default cost levers, at about 3.5-5K tokens of context (the ratio grows with context); at 3 and 4 lanes the card's power limit lowers the extended round's clock, so 3 lanes reads above 4. Unmeasured on other cards. The one-lane entry is not read: a lane alone runs at the shape it asks. A speed setting only.
 
 ## vision
 

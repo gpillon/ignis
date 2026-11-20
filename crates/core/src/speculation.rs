@@ -597,9 +597,9 @@ pub const SHAPE_ESTIMATE_MAX_ROUNDS: u32 = 64;
 /// (the server's `spec.shape_estimate_rounds`), and the extended round's
 /// period over the base round's at 1 to [`EXTENDED_SHAPE_MAX_LANES`] lanes, in
 /// thousandths (`spec.shape_period_ratios`; the one-lane entry is not read, a
-/// lane alone running at the shape it asks). Both defaults are provisional:
-/// the ratios are the RTX 5090's measured before the cost levers, three lanes
-/// the line between two and four.
+/// lane alone running at the shape it asks). The window's default is
+/// provisional; the ratios' are measured on the RTX 5090
+/// ([`Self::DEFAULT_PERIOD_RATIOS_MILLI`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShapeEstimate {
     rounds: u32,
@@ -609,11 +609,18 @@ pub struct ShapeEstimate {
 impl ShapeEstimate {
     /// 16 rounds: a lane whose extended rounds do not pay is granted one
     /// again once its window holds none, which a lane beside it pays for
-    /// once in 17 rounds -- about 1% of its rate at two lanes -- and a lane
+    /// once in 17 rounds -- under 2% of its rate at two lanes -- and a lane
     /// whose text turns predictable waits at most 16 rounds.
     pub const DEFAULT_ROUNDS: u32 = 16;
-    /// 1.15, 1.23, 1.27 and 1.31 at 1 to 4 lanes.
-    pub const DEFAULT_PERIOD_RATIOS_MILLI: [u32; EXTENDED_SHAPE_MAX_LANES as usize] = [1150, 1230, 1270, 1310];
+    /// 1.128, 1.29, 1.363 and 1.344 at 1 to 4 lanes: measured on the RTX
+    /// 5090 on the GPU clock (round timing), FP8 exception weights, the
+    /// `hq-e8-2b` cache, the default cost levers and route, the extended
+    /// round's period over the base round's at the same lane count and a
+    /// matched context, pooled over two orders. At 3 and 4 lanes the card's
+    /// 575 W power limit lowers the extended round's clock, so 3 lanes
+    /// measured above 4 in either order (not a slip); and the ratio grows with
+    /// context, these being its value at about 3.5-5K tokens.
+    pub const DEFAULT_PERIOD_RATIOS_MILLI: [u32; EXTENDED_SHAPE_MAX_LANES as usize] = [1128, 1290, 1363, 1344];
     /// The narrowest and widest ratio taken: an extended round costs at
     /// least a base round and at most twice one, for at most twice its
     /// columns.

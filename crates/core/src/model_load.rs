@@ -1789,7 +1789,7 @@ mod tests {
             .expect("options");
         assert_eq!((options.draft_tokens, options.shape_enter_accepted, options.shape_stay_accepted), (15, 5, 12));
         // GitHub #690: and the shape policy, `aggregate` at its defaults unless named.
-        assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (0, 16, [1150, 1230, 1270, 1310]));
+        assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (0, 16, [1128, 1290, 1363, 1344]));
         let all = wide.with_shape_policy(
             crate::speculation::ShapePolicy::All,
             crate::speculation::ShapeEstimate::new(8, [1000, 1200, 1300, 2000]).unwrap(),

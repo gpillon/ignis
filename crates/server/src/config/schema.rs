@@ -722,9 +722,12 @@ config_group! {
             between(1, ignis_core::SHAPE_ESTIMATE_MAX_ROUNDS as i64), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
         /// Under `aggregate`, an extended round's period over a base round's
         /// at 1, 2, 3 and 4 lanes, each 1 to 2: what the wider round costs
-        /// every lane in it. Measured on the RTX 5090 at 1, 2 and 4 lanes, 3
-        /// lanes between them; provisional. The one-lane entry is not read: a
-        /// lane alone runs at the shape it asks. A speed setting only.
+        /// every lane in it. Measured on the RTX 5090 with FP8 exception
+        /// weights and the default cost levers, at about 3.5-5K tokens of
+        /// context (the ratio grows with context); at 3 and 4 lanes the card's
+        /// power limit lowers the extended round's clock, so 3 lanes reads
+        /// above 4. Unmeasured on other cards. The one-lane entry is not read:
+        /// a lane alone runs at the shape it asks. A speed setting only.
         shape_period_ratios: PeriodRatios = ignis_core::ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI, NO_RULE, QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
     }
