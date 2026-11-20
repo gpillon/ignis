@@ -187,8 +187,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
             last_error = ignis_image_gemm_last_error;
             rc = ignis_image_quantize_tokens(x.data, t, w.k, scratch.codes, scratch.scales, stream);
             if (rc == 0) {
-                rc = ignis_image_gemm_w8a8_add(w.qdata, w.n, w.k, scratch.codes, scratch.scales, t,
-                                               residual_out.data, stream);
+                // GitHub #693: the 16-token tile up to 16 tokens, unless IGNIS_FP8_W8A8_TILE16=0 names the default one.
+                rc = fe::takes_tile16(t)
+                         ? ignis_image_gemm_w8a8_add_tile16(w.qdata, w.n, w.k, scratch.codes, scratch.scales, t,
+                                                            residual_out.data, stream)
+                         : ignis_image_gemm_w8a8_add(w.qdata, w.n, w.k, scratch.codes, scratch.scales, t,
+                                                     residual_out.data, stream);
             }
         } else {
             rc = ignis_fp8_linear_add(w.qdata, w.n, w.k, x.data, t, residual_out.data, stream);

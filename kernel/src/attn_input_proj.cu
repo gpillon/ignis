@@ -152,8 +152,12 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
             last_error = ignis_image_gemm_last_error;
             rc = ignis_image_quantize_tokens(x.data, cols, fe::kHidden, scratch.codes, scratch.scales, stream);
             if (rc == 0) {
-                rc = ignis_image_gemm_w8a8_grouped(segments, fe::kQkgvSegments, fe::kHidden, scratch.codes,
-                                                   scratch.scales, cols, 0, stream);
+                // GitHub #693: the 16-token tile up to 16 tokens, unless IGNIS_FP8_W8A8_TILE16=0 names the default one.
+                rc = fe::takes_tile16(cols)
+                         ? ignis_image_gemm_w8a8_grouped_tile16(segments, fe::kQkgvSegments, fe::kHidden,
+                                                                scratch.codes, scratch.scales, cols, 0, stream)
+                         : ignis_image_gemm_w8a8_grouped(segments, fe::kQkgvSegments, fe::kHidden, scratch.codes,
+                                                         scratch.scales, cols, 0, stream);
             }
         } else if (cols <= fe::kGemvTokens) {
             // GitHub #678: the paired form, unless IGNIS_FP8_GEMV_PAIRED=0 names the one-row form.

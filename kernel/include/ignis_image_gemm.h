@@ -67,6 +67,21 @@ int32_t ignis_image_gemm_w8a8_grouped(const ignis_fp8_segment *segments, uint32_
 int32_t ignis_image_gemm_w8a8_add(const void *weight, uint32_t rows, uint32_t cols, const void *codes,
                                   const float *scales, uint32_t tokens, void *residual, void *stream);
 
+/* GitHub #693 (spec #684): ignis_image_gemm_w8a8_grouped and ignis_image_gemm_w8a8_add on a tile of
+ * 16 tokens and 64 output rows a CTA, for a call of 1..IGNIS_IMAGE_GEMM_TILE16_MAX_TOKENS tokens --
+ * the 27B's exception matrices at 9..16 tokens. The default tile holds 128 tokens and 256 output
+ * rows: such a call fills an eighth of it. Each output takes the same k32 steps in the same order
+ * as on the default tile, so the same bits. The arguments and limits of the calls they stand in
+ * for, and more tokens refused. ignis_image_gemm_tile16_launches counts their launches since the
+ * process started: how a test tells which tile a caller ran. */
+#define IGNIS_IMAGE_GEMM_TILE16_MAX_TOKENS 16
+int32_t ignis_image_gemm_w8a8_grouped_tile16(const ignis_fp8_segment *segments, uint32_t count, uint32_t cols,
+                                             const void *codes, const float *scales, uint32_t tokens,
+                                             uint32_t y_f32, void *stream);
+int32_t ignis_image_gemm_w8a8_add_tile16(const void *weight, uint32_t rows, uint32_t cols, const void *codes,
+                                         const float *scales, uint32_t tokens, void *residual, void *stream);
+uint64_t ignis_image_gemm_tile16_launches(void);
+
 /* Thread-local message from the most recent failed call. Never NULL. */
 const char *ignis_image_gemm_last_error(void);
 

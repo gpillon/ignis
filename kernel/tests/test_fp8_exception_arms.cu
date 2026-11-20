@@ -17,6 +17,13 @@
 //   paired (GitHub #678) the form qkgv's GEMV calls take, as the measurement switch
 //          IGNIS_FP8_GEMV_PAIRED names it at each call: unset or `1` the grouped GEMV's paired form,
 //          `0` its one-row form, any other value refused by name; out never takes the paired form.
+//   tile16 (GitHub #693) the W8A8 GEMM's 16-token tile at the 27B's real shapes, 9..16 tokens: the
+//          grouped q | k | gate | v [14336][5120] (BF16 and fp32 outputs) and the [5120][6144]
+//          output projection (fp32 output and the residual add) bit for bit the default tile, each
+//          tile's outputs poisoned apart first; and the tile a dispatcher takes, by the tile's
+//          launch counter, as the measurement switch IGNIS_FP8_W8A8_TILE16 names it at each call:
+//          unset or `1` the 16-token tile for an AllowA8 call of 9..16 tokens and no other, `0`
+//          the default tile at every width, any other value refused by name.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
@@ -398,6 +405,150 @@ void paired_arms() {
   set_environment(kSwitch, nullptr);
 }
 
+// GitHub #693: the 16-token tile's outputs against the default tile's, byte for byte, over the
+// whole output of every exception matrix's real shape at 9..16 tokens. The two outputs start from
+// different bytes, so an output a tile skips cannot pass on what the other left.
+void tile16_bits() {
+  const fe::QkgvLayout layout = fe::qkgv_layout();
+  const std::vector<uint32_t> blocks(fe::kQkgvSegmentRows, fe::kQkgvSegmentRows + fe::kQkgvSegments);
+  const std::vector<uint64_t> offsets(layout.at, layout.at + fe::kQkgvSegments);
+  const auto qkgv = convert(5100, blocks, kHidden, offsets, layout.at[fe::kQkgvSegments]);
+  const uint64_t out_bytes = ignis_fp8_payload_bytes(kHidden, kOutCols);
+  const auto out = convert(5200, {static_cast<uint32_t>(kHidden)}, kOutCols, {0}, out_bytes);
+  for (int tokens = 9; tokens <= 16; ++tokens) {
+    for (uint32_t y_f32 : {0u, 1u}) {
+      const std::size_t width = y_f32 != 0 ? 4 : 2;
+      const std::vector<uint16_t> x = activations(5300 + tokens, tokens, kHidden);
+      DeviceBytes dx(x.size() * 2), codes(static_cast<std::size_t>(tokens) * kHidden),
+          scales(static_cast<std::size_t>(tokens) * 4);
+      upload(dx, x);
+      MOE_RC(ignis_image_quantize_tokens(dx.p, tokens, kHidden, codes.p, scales.as<float>(), nullptr));
+      std::vector<std::unique_ptr<DeviceBytes>> today, tile16;
+      ignis_fp8_segment a[fe::kQkgvSegments], b[fe::kQkgvSegments];
+      for (int o = 0; o < fe::kQkgvSegments; ++o) {
+        const std::size_t bytes = static_cast<std::size_t>(tokens) * fe::kQkgvSegmentRows[o] * width;
+        today.push_back(std::make_unique<DeviceBytes>(bytes));
+        tile16.push_back(std::make_unique<DeviceBytes>(bytes));
+        MOE_CUDA(cudaMemset(today.back()->p, 0xA5, bytes));
+        MOE_CUDA(cudaMemset(tile16.back()->p, 0x5A, bytes));
+        const uint8_t *w = qkgv->fp8.as<uint8_t>() + layout.at[o];
+        a[o] = ignis_fp8_segment{w, fe::kQkgvSegmentRows[o], today.back()->p};
+        b[o] = ignis_fp8_segment{w, fe::kQkgvSegmentRows[o], tile16.back()->p};
+      }
+      MOE_RC(ignis_image_gemm_w8a8_grouped(a, fe::kQkgvSegments, kHidden, codes.p, scales.as<float>(), tokens, y_f32,
+                                           nullptr));
+      MOE_RC(ignis_image_gemm_w8a8_grouped_tile16(b, fe::kQkgvSegments, kHidden, codes.p, scales.as<float>(), tokens,
+                                                  y_f32, nullptr));
+      MOE_CUDA(cudaDeviceSynchronize());
+      bool same = true;
+      for (int o = 0; o < fe::kQkgvSegments; ++o) {
+        same = same && download<uint8_t>(today[o]->p, today[o]->bytes) == download<uint8_t>(tile16[o]->p, tile16[o]->bytes);
+      }
+      const std::string what = "qkgv [14336][5120] x " + std::to_string(tokens) + " tokens, " + (y_f32 ? "fp32" : "BF16");
+      std::printf("  tile16 %s: %s the default tile\n", what.c_str(), same ? "bit-identical to" : "DIFFERS from");
+      check(same, "tile16 " + what + ": the default tile's bytes");
+    }
+
+    const std::vector<uint16_t> x = activations(5400 + tokens, tokens, kOutCols);
+    DeviceBytes dx(x.size() * 2), codes(static_cast<std::size_t>(tokens) * kOutCols),
+        scales(static_cast<std::size_t>(tokens) * 4);
+    upload(dx, x);
+    MOE_RC(ignis_image_quantize_tokens(dx.p, tokens, kOutCols, codes.p, scales.as<float>(), nullptr));
+    const std::size_t n = static_cast<std::size_t>(tokens) * kHidden;
+    DeviceBytes y_today(n * 4), y_tile16(n * 4);
+    MOE_CUDA(cudaMemset(y_today.p, 0xA5, n * 4));
+    MOE_CUDA(cudaMemset(y_tile16.p, 0x5A, n * 4));
+    const ignis_fp8_segment a{out->fp8.p, static_cast<uint32_t>(kHidden), y_today.p};
+    const ignis_fp8_segment b{out->fp8.p, static_cast<uint32_t>(kHidden), y_tile16.p};
+    MOE_RC(ignis_image_gemm_w8a8_grouped(&a, 1, kOutCols, codes.p, scales.as<float>(), tokens, 1, nullptr));
+    MOE_RC(ignis_image_gemm_w8a8_grouped_tile16(&b, 1, kOutCols, codes.p, scales.as<float>(), tokens, 1, nullptr));
+    std::vector<uint16_t> res(n);
+    for (std::size_t i = 0; i < n; ++i) res[i] = f32_to_bf16(hash_uniform(5500 + tokens, i, 3.0f));
+    DeviceBytes r_today(n * 2), r_tile16(n * 2);
+    upload(r_today, res);
+    upload(r_tile16, res);
+    MOE_RC(ignis_image_gemm_w8a8_add(out->fp8.p, kHidden, kOutCols, codes.p, scales.as<float>(), tokens, r_today.p,
+                                     nullptr));
+    MOE_RC(ignis_image_gemm_w8a8_add_tile16(out->fp8.p, kHidden, kOutCols, codes.p, scales.as<float>(), tokens,
+                                            r_tile16.p, nullptr));
+    MOE_CUDA(cudaDeviceSynchronize());
+    const bool y_same = download<uint8_t>(y_today.p, n * 4) == download<uint8_t>(y_tile16.p, n * 4);
+    const auto added = download<uint16_t>(r_tile16.p, n);
+    const bool add_same = download<uint16_t>(r_today.p, n) == added;
+    const bool moved = added != res;
+    const std::string what = "out [5120][6144] x " + std::to_string(tokens) + " tokens";
+    std::printf("  tile16 %s: fp32 %s, residual add %s the default tile\n", what.c_str(),
+                y_same ? "bit-identical to" : "DIFFERS from", add_same ? "bit-identical to" : "DIFFERS from");
+    check(y_same, "tile16 " + what + ", fp32: the default tile's bytes");
+    check(add_same, "tile16 " + what + ", residual add: the default tile's bytes");
+    check(moved, "tile16 " + what + ": the residual add wrote the residual");
+  }
+  // Past 16 tokens the tile refuses the call.
+  DeviceBytes codes(17 * kHidden), scales(17 * 4), y(17 * 6144 * 2);
+  const ignis_fp8_segment s{qkgv->fp8.p, 6144, y.p};
+  check(ignis_image_gemm_w8a8_grouped_tile16(&s, 1, kHidden, codes.p, scales.as<float>(), 17, 0, nullptr) != 0,
+        "tile16: 17 tokens refused");
+}
+
+// GitHub #693: which tile the dispatchers' W8A8 calls take, by the 16-token tile's launch counter,
+// on zeroed weights: one launch a call of 9..16 tokens under AllowA8 unless IGNIS_FP8_W8A8_TILE16=0,
+// none at 8 tokens (the BF16-activation route), at 17 or under A16Only.
+void tile16_arms() {
+  constexpr const char *kSwitch = "IGNIS_FP8_W8A8_TILE16";
+  const fe::QkgvLayout layout = fe::qkgv_layout();
+  DeviceBytes qkgv(layout.at[fe::kQkgvSegments]), out(ignis_fp8_payload_bytes(kHidden, kOutCols));
+  MOE_CUDA(cudaMemset(qkgv.p, 0, qkgv.bytes));
+  MOE_CUDA(cudaMemset(out.p, 0, out.bytes));
+  const ninfer::Weight wq = fp8_weight(qkgv.p, fe::kQkgvRows, kHidden, qkgv.bytes);
+  const ninfer::Weight wo = fp8_weight(out.p, kHidden, kOutCols, out.bytes);
+  const std::vector<uint16_t> x = activations(5600, 17, kOutCols);
+  DeviceBytes dx(x.size() * 2), dr(17 * kHidden * 2);
+  upload(dx, x);
+  const char *const values[3] = {nullptr, "1", "0"};
+  for (const char *value : values) {
+    set_environment(kSwitch, value);
+    const bool tile16 = value == nullptr || std::strcmp(value, "1") == 0;
+    const std::string named = std::string(kSwitch) + (value == nullptr ? " unset" : std::string("=") + value);
+    for (int tokens : {8, 9, 16, 17}) {
+      for (LinearPolicy policy : {LinearPolicy::A16Only, LinearPolicy::AllowA8}) {
+        const uint64_t want = tile16 && policy == LinearPolicy::AllowA8 && tokens > fe::kGemvTokens && tokens <= 16;
+        const char *name = policy == LinearPolicy::A16Only ? "A16" : "A8";
+        Qkgv o(tokens);
+        uint64_t before = ignis_image_gemm_tile16_launches();
+        run_qkgv(wq, dx, tokens, o, policy);
+        uint64_t launches = ignis_image_gemm_tile16_launches() - before;
+        std::printf("  tile16 %s: qkgv %s x %d tokens, %llu 16-token tile launch(es)\n", named.c_str(), name, tokens,
+                    static_cast<unsigned long long>(launches));
+        check(launches == want, named + ": qkgv " + name + " x " + std::to_string(tokens) + " takes the " +
+                                    (want == 1 ? "16-token" : "default") + " tile");
+        const std::size_t capacity = ninfer::ops::linear_add_workspace_capacity_bytes(
+            ninfer::QType::FP8_E4M3FN_ROW_BF16S, kHidden, kOutCols, policy, 1, tokens);
+        ninfer::DeviceArena arena(capacity > 0 ? capacity : 256);
+        const ninfer::Tensor tx(dx.p, ninfer::DType::BF16, {kOutCols, tokens});
+        ninfer::Tensor tr(dr.p, ninfer::DType::BF16, {kHidden, tokens});
+        before = ignis_image_gemm_tile16_launches();
+        ninfer::ops::linear_add(tx, wo, tr, policy, arena, nullptr);
+        MOE_CUDA(cudaDeviceSynchronize());
+        launches = ignis_image_gemm_tile16_launches() - before;
+        std::printf("  tile16 %s: out %s x %d tokens, %llu 16-token tile launch(es)\n", named.c_str(), name, tokens,
+                    static_cast<unsigned long long>(launches));
+        check(launches == want, named + ": out " + name + " x " + std::to_string(tokens) + " takes the " +
+                                    (want == 1 ? "16-token" : "default") + " tile");
+      }
+    }
+  }
+  set_environment(kSwitch, "2");
+  bool refused = false;
+  try {
+    Qkgv o(9);
+    run_qkgv(wq, dx, 9, o, LinearPolicy::AllowA8);
+  } catch (const std::invalid_argument &e) {
+    refused = std::string(e.what()).find(kSwitch) != std::string::npos;
+  }
+  check(refused, std::string(kSwitch) + "=2 refused by name");
+  set_environment(kSwitch, nullptr);
+}
+
 }  // namespace
 
 int main() {
@@ -412,6 +563,8 @@ int main() {
   qkgv_arms();
   out_arms();
   paired_arms();
+  tile16_bits();
+  tile16_arms();
   if (g_failed != 0) {
     std::fprintf(stderr, "test_fp8_exception_arms: %d failure(s)\n", g_failed);
     return 1;
