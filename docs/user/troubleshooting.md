@@ -377,6 +377,18 @@ larger than the fixed figure the plan charges too little by the difference,
 which comes out of the headroom. Restart the server while the card is quiet
 to measure it again ([Every byte planned](why-ignis/every-byte-planned.md#how-it-works)).
 
+### WARN `ignis.runtime.verify_graph_capture_incomplete`
+
+"verify graph capture: these widths of the round shape run their verify rounds
+eagerly", with the shape's draft `window`, its `widths` and the capture's
+`error`. From 0.11.0 a 27B load captures each round shape's verify graphs at
+every lane count it serves (a DFlash2 load past 7 draft tokens has two,
+[past seven drafts](concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+A width whose graph could not be captured still serves: its rounds run eagerly,
+the same tokens without the graph's speed. The load goes on. Usually the card
+was short of memory for the graph at load; restart the server with the card
+quiet, or with more `--vram-headroom-bytes`.
+
 ### `--spec-backend mtp` refuses the start
 
 Flash-Next's MTP head needs its companion container

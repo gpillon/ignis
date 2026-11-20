@@ -597,11 +597,14 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
           kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
           attention_heads, stream);
     } else if (one_lane_in_chunks) {
-      // GitHub #687: the vendored chunked small-T route's loop
-      // (kernel/vendor/src/ops/wrapper/gqa_attention.cpp `launch_chunked_small_t`)
-      // at one lane, which its resolver does not give the 27B's 24 heads:
-      // each chunk of the tile appends its columns' K/V and attends from its
-      // first column of the lane's, its partials in a scope of their own.
+      // GitHub #687: the vendored chunked small-T route's loop at one lane,
+      // which its resolver does not give the 27B's 24 heads: each chunk of the
+      // tile appends its columns' K/V and attends from its first column of the
+      // lane's, its partials in a scope of their own. Restated, not changed,
+      // from the reference, gpillon/ninfer, commit
+      // a00648cb828457986cf5b4b4f712b4cbcd7af0d1 (kernel/vendor/manifest.json),
+      // Apache-2.0: src/ops/wrapper/gqa_attention.cpp `launch_chunked_small_t`
+      // (kernel/NOTICE); the launcher is the vendored one, called.
       for (std::int32_t begin = 0; begin < lane_tokens; begin += small_t_tile) {
         const std::int32_t count = std::min(small_t_tile, lane_tokens - begin);
         auto chunk_scope = attention_workspace.scope();

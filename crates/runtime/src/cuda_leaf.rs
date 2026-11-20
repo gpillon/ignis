@@ -828,11 +828,11 @@ impl StepLeaf for CudaLeaf {
         // GitHub #80: structured, not a raw `eprintln!` -- this still fires
         // exactly once per model load (never per-token/decode-round), same
         // frequency class as `ignis.process.started`.
-        // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80/#102).
         // GitHub #687: and each round shape's window, lanes and verify graph
         // nodes, the base shape first (its nodes are `verify_nodes`).
         let round_shapes: Vec<(u32, u32, [u32; 8])> =
             graphs.shapes().iter().map(|shape| (shape.window, shape.lanes, shape.verify_graph_nodes)).collect();
+        // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80/#102).
         tracing::info!(
             name: "ignis.runtime.decode_graph_capture",
             ready = capture.ready_count(),
