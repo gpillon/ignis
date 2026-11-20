@@ -248,6 +248,29 @@ the other. They are no configuration fields: `GET /v1/config` and
   load runs no such product. It is read at each call, so a graph keeps the
   tile its capture read; any other value refuses the load, naming the
   variable.
+- `IGNIS_DFLASH2_APPEND_KV_ONLY=0` (from 0.11.0) gives the 27B's DFlash2
+  drafter its whole q, k and v product back in the append after a verify
+  round, the comparison a speed measurement of the append needs. Unset, or
+  `1`, an append of 5 to 32 columns (a round at the base shape of 1 to 4
+  lanes, one at the extended shape of 1 or 2) projects only the key and value
+  rows the drafter keeps, a third of the product, and they are the whole
+  product's rows byte for byte (`ignis_kernel_dflash2_small_t_test`), so the
+  tokens are the same (the round identity test below, arm
+  `dflash2-append-qkv`). A wider append, and the append of a prefill chunk or
+  of a carried anchor, keep the whole product either way. It is read at each call, so a graph keeps the
+  product its capture read; any other value refuses the load, naming the
+  variable.
+- `IGNIS_DFLASH2_SMALL_T_FILL=0` (from 0.11.0) gives the 27B's DFlash2
+  drafter's conv projections and q, k and v product their vendored launch
+  back for a call of 5 to 16 columns, 8 or 16 warps a block, the comparison a
+  speed measurement of the launch needs. Unset, or `1`, such a call (a round
+  at the base shape of 1 or 2 lanes, one at the extended shape of 1) runs on
+  blocks of 4 warps, two or four times as many, whose outputs are the
+  vendored launch's byte for byte (`ignis_kernel_dflash2_small_t_test`), so
+  the tokens are the same (the round identity test below, arm
+  `dflash2-small-t-vendored`). A wider call keeps the vendored launch either
+  way, as do the drafter's other products. It is read at each call, so a graph keeps the launch its capture
+  read; any other value refuses the load, naming the variable.
 - `IGNIS_GDN_GATING=chain|branch` (from 0.11.0) picks, at each capture of
   the decode graphs, where each GDN layer of the 27B computes its gating (the
   a and b products of the layer's normed input and the decay and update gates
@@ -269,8 +292,9 @@ the other. They are no configuration fields: `GET /v1/config` and
   round at the base shape, 8 columns a lane, the round of a load at 7 drafts
   token for token. `extended`: every round of 1 to 4 lanes at the extended
   shape, the window + 1 columns a lane. Under all three a round of 5 to 8
-  lanes, or one with a lane held to a grammar, runs at the base shape, and
-  each round's outcome still moves its lanes' asks. Both
+  lanes runs at the base shape, a round with a lane held to a grammar takes
+  its shape as any other does, and each round's outcome still moves its
+  lanes' asks. Both
   shapes' verify and drafter-append graphs are captured at every load, so
   the switch flips between rounds of one load with no capture. A load at 7
   drafts or fewer, an MTP load and Flash-Next never read it. Any other value
@@ -294,9 +318,9 @@ and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
 extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
 under the shape rule (`nvfp4-dflash2-w15-rule`), every round's shape held to
 what its lanes asked and the same lanes taken from the base shape to the
-extended one and back on live and teacher-forced rounds at 1 to 4 lanes; the
-16 GB class's trellis artifact, which the 16 GB and 24 GB profiles load, the
-same way at each profile's lanes (`trellis-16gb-w15-rule` at 2,
+extended one and back on live, host-cut and teacher-forced rounds at 1 to 4
+lanes; the 16 GB class's trellis artifact, which the 16 GB and 24 GB profiles
+load, the same way at each profile's lanes (`trellis-16gb-w15-rule` at 2,
 `trellis-24gb-w15-rule` at 8) and at 8 draft tokens under
 `IGNIS_ROUND_SHAPE=extended` (`trellis-16gb-w8`); a second test holds a
 15-draft load's base rounds to a 7-draft load's tokens, on the NVFP4 artifact

@@ -15,8 +15,8 @@
 //      at the extended shape, and an entry threshold past the base window could never send one
 //      there, so a load refuses either, naming the field.
 //   3. The shape policy `all`: a round of 1..4 lanes is extended when every lane in it asks, a round
-//      of 5..8 lanes always at the base shape, a load with no extended shape never extended, and a
-//      round with a lane whose commit the host cuts at the base shape (#687).
+//      of 5..8 lanes always at the base shape, and a load with no extended shape never extended. A
+//      lane whose commit the host cuts asks like any other (#691): the policy reads no host cut.
 //   4. The switch as a round reads it: unset (or empty) the rule and the policy, `base` and
 //      `extended` forcing a shape over them, any other value refused naming the variable.
 //   5. The round timing where shapes alternate (kernel/src/round_timing.h): each round's period
@@ -222,11 +222,9 @@ void check_the_policy() {
       const std::vector<std::uint8_t> all(lanes, 1);
       const std::vector<std::uint8_t> none(lanes, 0);
       // A load with no extended shape never runs one, whatever its lanes ask.
-      check(!runs_extended(named, all.data(), lanes, /*extended_lanes=*/0, false), at + ", no extended shape: base");
-      // A round with a lane whose commit the host cuts keeps the base shape (#687; #691 changes it).
-      check(!runs_extended(named, all.data(), lanes, kExtendedLanes, /*host_cut=*/true), at + ", a host cut: base");
-      const bool every = runs_extended(named, all.data(), lanes, kExtendedLanes, false);
-      const bool nobody = runs_extended(named, none.data(), lanes, kExtendedLanes, false);
+      check(!runs_extended(named, all.data(), lanes, /*extended_lanes=*/0), at + ", no extended shape: base");
+      const bool every = runs_extended(named, all.data(), lanes, kExtendedLanes);
+      const bool nobody = runs_extended(named, none.data(), lanes, kExtendedLanes);
       if (lanes > kExtendedLanes) {
         check(!every && !nobody, at + ": past the extended shape's 4 lanes, base whatever they ask");
         continue;
@@ -246,7 +244,7 @@ void check_the_policy() {
         for (std::size_t quiet = 0; quiet < lanes; ++quiet) {
           std::vector<std::uint8_t> asks(lanes, 1);
           asks[quiet] = 0;
-          check(!runs_extended(named, asks.data(), lanes, kExtendedLanes, false),
+          check(!runs_extended(named, asks.data(), lanes, kExtendedLanes),
                 at + ", lane " + std::to_string(quiet) + " not asking: base");
         }
         break;
@@ -283,7 +281,7 @@ void check_a_lanes_course() {
   std::size_t at = 0;
   for (const Step &step : course) {
     const std::uint8_t lane = asks ? 1 : 0;
-    const bool extended = runs_extended(Named::kRule, &lane, 1, /*extended_lanes=*/4, false);
+    const bool extended = runs_extended(Named::kRule, &lane, 1, /*extended_lanes=*/4);
     check(extended == step.extended, "a lane's course, round " + std::to_string(at) + " runs " +
                                          (step.extended ? "extended" : "base"));
     const std::int32_t extent = step.budget_extent >= 0 ? step.budget_extent : extended ? kWindow : kBase;

@@ -3131,15 +3131,11 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           set_error(std::string("ignis_program_decode: ") + e.what());
           return -1;
         }
-        const bool host_cut = options->host_cut_lanes != nullptr &&
-                              std::any_of(options->host_cut_lanes, options->host_cut_lanes + batch_size,
-                                          [](std::uint8_t cut) { return cut != 0; });
         std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> asks{};
         for (uint64_t i = 0; i < batch_size; ++i) {
           asks[i] = sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
         }
-        if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes,
-                                              host_cut)) {
+        if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes)) {
           shape = model->extended_shape.get();
         }
       }

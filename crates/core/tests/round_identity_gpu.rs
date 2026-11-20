@@ -86,13 +86,12 @@
 //! `nvfp4-vision-w15` (lane 0 under a rope delta) are such loads, and every
 //! arm of them runs, the reference included, under [`ROUND_SHAPE`]`=extended`
 //! ([`Load::round_shape`]): their verify rounds are extended at widths 1 to
-//! [`EXTENDED_LANES`], and at the base shape past them and wherever the host
-//! cuts a run (a round with a host-cut lane keeps the base shape). Every
-//! verify round asserts the drafts its shape carries ([`round_drafts`]), so
-//! each arm holds the extended round -- from its graphs, eager, deferred and
-//! synchronized, timed, teacher-forced -- to the reference's tokens beside
-//! the base one, and the program's stats report both shapes
-//! ([`round_shape_stats`]).
+//! [`EXTENDED_LANES`], and at the base shape past them; a round whose runs the
+//! host cuts takes its shape like any other (#691). Every verify round asserts
+//! the drafts its shape carries ([`round_drafts`]), so each arm holds the
+//! extended round -- from its graphs, eager, deferred and synchronized, timed,
+//! host-cut, teacher-forced -- to the reference's tokens beside the base one,
+//! and the program's stats report both shapes ([`round_shape_stats`]).
 //!
 //! The base shape of such a load is the round of a load at [`BASE_WINDOW`]
 //! drafts, token for token: the second test here
@@ -117,9 +116,10 @@
 //! fall wherever the text puts them, the same in every arm as in the
 //! reference. Then, at each width the extended shape runs, the session takes
 //! the same lanes from the base shape to the extended one and back, on a live
-//! verify round and on a teacher-forced one, by naming [`ROUND_SHAPE`] for one
-//! round at a time ([`CROSSING`]), and gives the rule the round after: a fold
-//! in flight, a forced round and each arm's switch all cross the change.
+//! verify round, on one the host cuts (#691) and on a teacher-forced one, by
+//! naming [`ROUND_SHAPE`] for one round at a time ([`CROSSING`]), and gives
+//! the rule the round after: a fold in flight, a cut, a forced round and each
+//! arm's switch all cross the change.
 //!
 //! # The trellis body's two shapes (#695)
 //!
@@ -253,6 +253,9 @@ const ARMS: &[Arm] = &[
     // #689's arms, below this line.
 
     // #691's arms, below this line.
+    // None: a round whose runs the host cuts is a kind of round every arm rides
+    // ([`Round::Cut`]), at both shapes on the two-shape loads and across them in
+    // the rule load's crossings ([`CROSSING_KINDS`]).
 
     // #693's arm, below this line.
     // The FP8 exception products' 128-token tile at 9-16 tokens, main's: an `fp8` load's lever
@@ -263,6 +266,15 @@ const ARMS: &[Arm] = &[
     Arm { name: TILE128_ARM, switches: &[("IGNIS_FP8_W8A8_TILE16", "0")], graphs: true },
 
     // #694's arms, below this line.
+    // The drafter's append projecting its whole q | k | v product, main's: the lever projects only
+    // the key and value rows it keeps in an append of 5-32 columns (a base round at 1-4 lanes, an
+    // extended one at 1-2, 11 and 22 columns on the window of 10); a wider append, a prefill
+    // chunk's taps and a carried anchor project the whole product either way.
+    Arm { name: "dflash2-append-qkv", switches: &[("IGNIS_DFLASH2_APPEND_KV_ONLY", "0")], graphs: true },
+    // The drafter forward's conv projections and q | k | v on the vendored launch, main's: the lever
+    // runs them on 4 warps a CTA at 5-16 columns (a base round at 1-2 lanes, an extended one at 1,
+    // 11 columns on the window of 10); a wider round runs the vendored launch either way.
+    Arm { name: "dflash2-small-t-vendored", switches: &[("IGNIS_DFLASH2_SMALL_T_FILL", "0")], graphs: true },
 
     // #695's arms, below this line.
 ];
@@ -283,8 +295,9 @@ const TWO_SHAPE_LOADS: [&str; 3] = ["nvfp4-dflash2-w15", "trellis-16gb-w15-rule"
 /// rule load's lanes cross at each width the extended shape runs: from the
 /// base shape to the extended one and back, then the rule's own.
 const CROSSING: [Option<&str>; 4] = [Some("base"), Some("extended"), Some("base"), None];
-/// The kinds of round each crossing runs on: live and teacher-forced.
-const CROSSING_KINDS: [Round; 2] = [Round::Verify, Round::Forced];
+/// The kinds of round each crossing runs on: live, host-cut (#691) and
+/// teacher-forced.
+const CROSSING_KINDS: [Round; 3] = [Round::Verify, Round::Cut, Round::Forced];
 
 /// #688: the switch that names the route of an extended round's attention,
 /// read at each capture ([`extended_attention`]).
@@ -293,15 +306,15 @@ const EXTENDED_ATTENTION: &str = "IGNIS_EXTENDED_ATTENTION";
 /// #687: the drafts a verify round of `width` lanes carries each lane on
 /// `load`: the load's window on a load of one shape; on a load of two, the
 /// window at the extended shape, where the round has no more than
-/// [`EXTENDED_LANES`] lanes and no lane the host cuts and the shape [`ROUND_SHAPE`]
+/// [`EXTENDED_LANES`] lanes and the shape [`ROUND_SHAPE`]
 /// names (`named`) is `extended`, or (#689) with it unset every lane asks
-/// (`every_lane_asks`), and the base shape's [`BASE_WINDOW`] otherwise.
-fn round_drafts(load: &Load, width: usize, host_cut: bool, named: Option<&str>, every_lane_asks: bool) -> u32 {
+/// (`every_lane_asks`), and the base shape's [`BASE_WINDOW`] otherwise. #691:
+/// a round whose runs the host cuts is no exception.
+fn round_drafts(load: &Load, width: usize, named: Option<&str>, every_lane_asks: bool) -> u32 {
     if !load.two_shapes() {
         return load.window;
     }
     let extended = width <= EXTENDED_LANES
-        && !host_cut
         && match named {
             Some(value) => value == "extended",
             None => every_lane_asks,
@@ -948,7 +961,7 @@ fn ride(
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
                 expect_replay(model, pool, graphs, &what);
                 // #687: every lane drafts its round shape's whole window.
-                let drafts = round_drafts(load, width, round == Round::Cut, named, every_lane_asks);
+                let drafts = round_drafts(load, width, named, every_lane_asks);
                 for (index, (&lane, run)) in riding.iter().zip(runs).enumerate() {
                     assert_eq!(run.extent, drafts, "{what}: lane {lane} drafts its round shape's whole window");
                     assert_eq!(run.extended, load.two_shapes() && drafts == load.window, "{what}: lane {lane}'s round shape");
@@ -985,7 +998,7 @@ fn ride(
                 let on_device = lanes.iter().any(|lane| lane.sampling.temperature > 0.0);
                 expect_replay(model, pool, graphs && !on_device, &what);
                 // #689: a teacher-forced round takes its shape as a live one does.
-                let drafts = round_drafts(load, width, false, named, every_lane_asks);
+                let drafts = round_drafts(load, width, named, every_lane_asks);
                 for (&lane, run) in riding.iter().zip(runs) {
                     assert_eq!(run.extent, drafts, "{what}: lane {lane} drafts its round shape's whole window");
                     assert_eq!(run.extended, load.two_shapes() && drafts == load.window, "{what}: lane {lane}'s round shape");

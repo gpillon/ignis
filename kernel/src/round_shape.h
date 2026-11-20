@@ -85,12 +85,12 @@ inline Named read_switch() {
 
 // Whether a verify round of `lanes` lanes runs at the extended shape, `asks[i]` nonzero where lane i
 // asks it: on a load that has one (`extended_lanes` its most lanes, 0 without one), at no more lanes
-// than it runs, with no lane whose commit the host cuts (`host_cut`: such a round keeps the base
-// shape), and then by `named`: unset, the shape policy `all`, the round extended when every lane in
-// it asks, so that no lane pays for another; under `extended` every such round; under `base` none.
-inline bool runs_extended(Named named, const std::uint8_t *asks, std::uint64_t lanes, std::uint32_t extended_lanes,
-                          bool host_cut) {
-  if (named == Named::kBase || extended_lanes == 0 || lanes > extended_lanes || host_cut) {
+// than it runs, and then by `named`: unset, the shape policy `all`, the round extended when every lane
+// in it asks, so that no lane pays for another; under `extended` every such round; under `base` none.
+// GitHub #691: a lane whose commit the host cuts (a grammar's) asks like any other, and its round
+// takes the shape this gives it: the cut reads the run at the round's own stride.
+inline bool runs_extended(Named named, const std::uint8_t *asks, std::uint64_t lanes, std::uint32_t extended_lanes) {
+  if (named == Named::kBase || extended_lanes == 0 || lanes > extended_lanes) {
     return false;
   }
   if (named == Named::kExtended) {
