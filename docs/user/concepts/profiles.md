@@ -63,9 +63,9 @@ Every profile drafts 7 tokens a round. From 0.11.0 a DFlash2 load may name
 up to 15 on any card (`--spec-draft-tokens`), at the
 VRAM [the configuration reference](../configuration/context-and-speculation.md)
 states for the profile's lanes. Its rounds are held correct on the RTX 5090
-on both 27B artifacts, the trellis one at the 16 and 24 GB profiles' lanes;
-its speed is unmeasured off the RTX 5090, so no other profile's default
-moves.
+on the NVFP4 artifact and on the 16 GB trellis artifact, the one the 16 and
+24 GB profiles load, at their lanes; its speed is unmeasured off the RTX
+5090, so no other profile's default moves.
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` and `rtx-12gb` are
@@ -355,10 +355,10 @@ Why each:
 - **The 5090's values for the 27B.** The headroom, the 2,048-token chunk,
   DFlash2 at 7 drafts and vision in host RAM are what `rtx5090` gives the
   27B; the lanes and the drafter's head stay at their defaults.
-- **Past 7 drafts, the same pages.** At eight lanes both
+- **Past 7 drafts, within one KV page.** At eight lanes both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes)
-  are 64 columns, so `--spec-draft-tokens 15` plans 528 bytes more than 7, and
-  8 or 12 nothing, the KV pool's pages unchanged (planned on the RTX 5090 at
+  are 64 columns, so `--spec-draft-tokens 15` plans 528 bytes more than 7,
+  within one KV page, and 8 or 12 nothing (planned on the RTX 5090 at
   this profile's shape). Its rounds are held to a 7-draft load's tokens and
   numerical class on the RTX 5090; whether it is faster on a 24 GB card is not
   measured, so the default stays 7, and off compute capability 12.0 the

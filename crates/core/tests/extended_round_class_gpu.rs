@@ -130,8 +130,8 @@ use logit_drift::{row_drift, within, RowDrift};
 // rounds over 3,205, at 1 to 4 lanes. "The trellis body" (#695): its own
 // test's run of 2026-11-20 (the `sc30` artifact, BF16, hq-e8-2b), forced
 // rounds over 3,360 rows and graph rounds over 3,255, at 1 to 4 lanes; its
-// rows sit about 1 ulp from speculation off's where the NVFP4 body's sit 14
-// to 18, so it is far inside every bound below.
+// rows sit a median 1 ulp from speculation off's where the NVFP4 body's sit
+// about 12 in this test, so it is far inside every bound below.
 
 /// The extended row against the base row after the same tokens: no logit
 /// further than this, in BF16 ulps at the base row's largest magnitude.
