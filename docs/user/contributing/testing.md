@@ -336,9 +336,10 @@ profiles load, the same way at each profile's lanes (`trellis-16gb-w15-rule`
 at 2, `trellis-24gb-w15-rule` at 8) and at 8 draft tokens under
 `IGNIS_ROUND_SHAPE=extended` (`trellis-16gb-w8`); a second test holds a
 15-draft load's base rounds to a 7-draft load's tokens, on the NVFP4 artifact
-and on both trellis loads at 15; and a third holds a prefill whose last chunk is 9 to 16 tokens to the same
-logits, bit for bit, under `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is
-held to the graphs' replay with every switch unset; a change behind a switch
+and on both trellis loads at 15; and a third holds a prefill whose last
+chunk is 9 to 16 tokens to the same logits, bit for bit, under
+`IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is held to the graphs' replay
+with every switch unset; a change behind a switch
 of its own adds that switch as an arm, as the file says. The whole run
 materializes nineteen loads in turn for the first test and eight for the
 second, so a narrow one is the usual run:
@@ -359,9 +360,10 @@ verify round to its base round's numerical class
 ([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)),
 on the NVFP4 artifact with DFlash2 at 15 draft tokens under FP8 exception
 weights, and in a second test on the 16 GB class's trellis artifact under its
-own exception weights, BF16, on an RTX 5090 (another card skips both). Speculation off writes each
-prompt's greedy text; both shapes are then teacher-forced to it at 1 to 4
-lanes, once offered the text as their drafts and once replaying their captured
+own exception weights, BF16, on an RTX 5090 (another card skips both).
+Speculation off writes each prompt's greedy text; both shapes are then
+teacher-forced to it at 1 to 4 lanes, once offered the text as their drafts
+and once replaying their captured
 graphs on the drafter's own drafts, and every extended row is held to the base
 row at the same text index and lane count, in BF16 ulps, by bounds named in the
 file with their measured values. Each test loads once and takes about two and
