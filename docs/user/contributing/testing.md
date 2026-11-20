@@ -212,8 +212,8 @@ the other. They are no configuration fields: `GET /v1/config` and
 - `IGNIS_EXTENDED_ATTENTION=ours|vendored` (from 0.11.0) picks, at each
   capture of the decode graphs, the attention route of the extended round (a
   DFlash2 load of the 27B past 7 draft tokens, `IGNIS_ROUND_SHAPE` below). Its
-  9 to 16 columns a lane run in chunks of 8 columns (of 6 over `bf16` KV), the
-  second chunk reading the keys and values the first appended. Unset, or
+  9 to 16 columns a lane run in chunks of 8 columns (of 6 over `bf16` KV),
+  each chunk reading the keys and values the one before appended. Unset, or
   `ours`: wherever the load's decode and verify rounds take ignis's own route
   (`IGNIS_HQ_DECODE_ATTENTION` above), the extended round's chunks take it
   too; `vendored` runs them on the vendored chunked route, the comparison a
