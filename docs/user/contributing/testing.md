@@ -239,9 +239,10 @@ the other. They are no configuration fields: `GET /v1/config` and
   `1`, an append of 5 to 32 columns (a round at the base shape of 1 to 4
   lanes, one at the extended shape of 1 or 2) projects only the key and value
   rows the drafter keeps, a third of the product, and they are the whole
-  product's rows byte for byte (`ignis_kernel_dflash2_small_t_test`). A wider
-  append, and the append of a prefill chunk or of a carried anchor, keep the
-  whole product either way. It is read at each call, so a graph keeps the
+  product's rows byte for byte (`ignis_kernel_dflash2_small_t_test`), so the
+  tokens are the same (the round identity test below, arm
+  `dflash2-append-qkv`). A wider append, and the append of a prefill chunk or
+  of a carried anchor, keep the whole product either way. It is read at each call, so a graph keeps the
   product its capture read; any other value refuses the load, naming the
   variable.
 - `IGNIS_DFLASH2_SMALL_T_FILL=0` (from 0.11.0) gives the 27B's DFlash2
@@ -250,9 +251,10 @@ the other. They are no configuration fields: `GET /v1/config` and
   speed measurement of the launch needs. Unset, or `1`, such a call (a round
   at the base shape of 1 or 2 lanes, one at the extended shape of 1) runs on
   blocks of 4 warps, two or four times as many, whose outputs are the
-  vendored launch's byte for byte (`ignis_kernel_dflash2_small_t_test`). A
-  wider call keeps the vendored launch either way, as do the drafter's other
-  products. It is read at each call, so a graph keeps the launch its capture
+  vendored launch's byte for byte (`ignis_kernel_dflash2_small_t_test`), so
+  the tokens are the same (the round identity test below, arm
+  `dflash2-small-t-vendored`). A wider call keeps the vendored launch either
+  way, as do the drafter's other products. It is read at each call, so a graph keeps the launch its capture
   read; any other value refuses the load, naming the variable.
 - `IGNIS_GDN_GATING=chain|branch` (from 0.11.0) picks, at each capture of
   the decode graphs, where each GDN layer of the 27B computes its gating (the
