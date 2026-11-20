@@ -312,7 +312,8 @@ the other. They are no configuration fields: `GET /v1/config` and
   and rounds, and how many of them ran eagerly, are in the program's stats;
   `ignis.runtime.decode_graph_capture` lists the shapes (`round_shapes`), and
   `ignis.runtime.verify_graph_capture_incomplete` names a shape's widths whose
-  verify graph could not be captured, whose rounds run eagerly.
+  verify graph, or drafter's append graph (`graph`), could not be captured,
+  whose rounds run that part eagerly.
 
 ### The round identity test
 

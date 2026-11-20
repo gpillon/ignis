@@ -379,15 +379,17 @@ to measure it again ([Every byte planned](why-ignis/every-byte-planned.md#how-it
 
 ### WARN `ignis.runtime.verify_graph_capture_incomplete`
 
-"verify graph capture: these widths of the round shape run their verify rounds
-eagerly", with the shape's draft `window`, its `widths` and the capture's
-`error`. From 0.11.0 a 27B load captures each round shape's verify graphs at
-every lane count it serves (a DFlash2 load past 7 draft tokens has two,
+"verify graph capture: these widths of the round shape run this graph's part of
+their verify rounds eagerly", with the shape's draft `window`, the `graph`
+(`verify`, or `drafter_append`: DFlash2's append after the round), its `widths`
+and the capture's `error`. From 0.11.0 a 27B load captures each round shape's
+verify graphs, and a DFlash2 load the drafter's append after them, at every
+lane count it serves (a DFlash2 load past 7 draft tokens has two shapes,
 [past seven drafts](concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
-A width whose graph could not be captured still serves: its rounds run eagerly,
-the same tokens without the graph's speed. The load goes on. Usually the card
-was short of memory for the graph at load; restart the server with the card
-quiet, or with more `--vram-headroom-bytes`.
+A width whose graph could not be captured still serves: that part of its
+rounds runs eagerly, the same tokens without the graph's speed. The load goes
+on. Usually the card was short of memory for the graph at load; restart the
+server with the card quiet, or with more `--vram-headroom-bytes`.
 
 ### `--spec-backend mtp` refuses the start
 

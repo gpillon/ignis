@@ -585,7 +585,18 @@ impl RoundShapeStats {
     /// was not captured, so whose rounds run eagerly: none on a capture that
     /// reached every width.
     pub fn widths_without_a_graph(&self) -> Vec<u32> {
-        (1..=self.lanes.min(8)).filter(|&width| self.verify_graph_ready_mask & (1 << (width - 1)) == 0).collect()
+        Self::widths_outside(self.verify_graph_ready_mask, self.lanes)
+    }
+
+    /// The same for the drafter's append after a round at the shape
+    /// ([`RoundShapeStats::drafter_append_graph_ready_mask`]): every width
+    /// on a load that captures no append graph at all.
+    pub fn widths_without_an_append_graph(&self) -> Vec<u32> {
+        Self::widths_outside(self.drafter_append_graph_ready_mask, self.lanes)
+    }
+
+    fn widths_outside(mask: u32, lanes: u32) -> Vec<u32> {
+        (1..=lanes.min(8)).filter(|&width| mask & (1 << (width - 1)) == 0).collect()
     }
 }
 
