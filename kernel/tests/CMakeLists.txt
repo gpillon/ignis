@@ -753,6 +753,22 @@ target_include_directories(ignis_kernel_nvfp4_a16_mma_test PRIVATE ${IGNIS_VENDO
 target_link_libraries(ignis_kernel_nvfp4_a16_mma_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_nvfp4_a16_mma_test COMMAND ignis_kernel_nvfp4_a16_mma_test)
 
+# OURS (GitHub #694): the DFlash2 drafter's launches of the vendored small-T
+# kernel (kernel/src/dflash2_small_t.h) -- the append's key and value rows alone
+# and the forward's small products on 4 warps a CTA -- held bit for bit to
+# today's products at every width each takes, the base and the extended block
+# among them, and the route each call takes as the measurement switches
+# IGNIS_DFLASH2_APPEND_KV_ONLY and IGNIS_DFLASH2_SMALL_T_FILL name it. No
+# SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_dflash2_small_t_test
+  test_dflash2_small_t.cpp
+  ${IGNIS_VENDOR_DIR}/tests/ops/linear/linear_test_common.cpp
+)
+target_include_directories(ignis_kernel_dflash2_small_t_test PRIVATE ${IGNIS_VENDOR_DIR}/tests
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_dflash2_small_t_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_dflash2_small_t_test COMMAND ignis_kernel_dflash2_small_t_test)
+
 # OURS: the same route timed against the vendored small-T GEMVs on one weight.
 # A timing is a finding, not a pass/fail, so a tool and NOT registered with
 # CTest.
