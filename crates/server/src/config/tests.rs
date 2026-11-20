@@ -1990,6 +1990,76 @@ fn the_shape_rules_thresholds_ride_the_speculation_and_a_stay_past_the_window_is
     }
 }
 
+/// GitHub #690: the shape policy rides the speculation, `aggregate` over each
+/// lane's last 16 rounds at the period ratios 1.15, 1.23, 1.27 and 1.31
+/// unless named, by flag, env or file (the ratios a list of four there), each
+/// a visible, patchable reload of the 27B's; the effective configuration
+/// writes them in the 27B's section, from which a start reads them back. A
+/// policy that is neither, a window outside 1..=64 and a table that is not
+/// four ratios in 1..=2 are refused by name, and so is each where no DFlash2
+/// drafts.
+#[test]
+fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_period_ratios() {
+    use ignis_core::ShapePolicy;
+    let policy = |config: &Config| {
+        config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().rounds(), s.shape_estimate().period_ratios_milli()))
+    };
+    let wide = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"];
+    let with = |more: &[&'static str]| -> Vec<&'static str> { wide.iter().chain(more).copied().collect() };
+    assert_eq!(policy(&config(&wide)), Some((ShapePolicy::Aggregate, 16, [1150, 1230, 1270, 1310])));
+    let named = config(&with(&["--spec-shape-policy", "all", "--spec-shape-estimate-rounds", "8", "--spec-shape-period-ratios", "1,1.2,1.25,2"]));
+    assert_eq!(policy(&named), Some((ShapePolicy::All, 8, [1000, 1200, 1250, 2000])));
+    let env = env_map(&[
+        ("IGNIS_SPEC_BACKEND", "dflash2"),
+        ("IGNIS_SPEC_DRAFT_TOKENS", "10"),
+        ("IGNIS_SPEC_SHAPE_POLICY", "aggregate"),
+        ("IGNIS_SPEC_SHAPE_ESTIMATE_ROUNDS", "64"),
+        ("IGNIS_SPEC_SHAPE_PERIOD_RATIOS", "1.1;1.2;1.3;1.4"),
+    ]);
+    assert_eq!(policy(&expect_config(resolve(&[], env).expect("resolve"))), Some((ShapePolicy::Aggregate, 64, [1100, 1200, 1300, 1400])));
+    for name in ["shape_policy", "shape_estimate_rounds", "shape_period_ratios"] {
+        let meta = schema::field("spec", name).unwrap();
+        assert!(meta.reload_required && meta.visible && meta.patchable, "spec.{name}: a visible, patchable reload");
+        assert!(meta.applies.refused_by(ModelFamily::FlashNext) && !meta.applies.refused_by(ModelFamily::Qwen38_27b), "spec.{name}: the 27B's");
+    }
+    let document = file::effective_document(&named);
+    let section = &document["spec"][field::scope(ModelFamily::Qwen38_27b)];
+    assert_eq!(
+        (section["shape_policy"].clone(), section["shape_estimate_rounds"].clone(), section["shape_period_ratios"].clone()),
+        (serde_json::json!("all"), serde_json::json!(8), serde_json::json!([1.0, 1.2, 1.25, 2.0])),
+        "{document}"
+    );
+    for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
+        let files = MemFiles::with(&[(name, &format.write(&document))]);
+        let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(policy(&read), Some((ShapePolicy::All, 8, [1000, 1200, 1250, 2000])), "{name}");
+    }
+    // Outside the fields' ranges, and a table that is not four ratios.
+    for (flag, raw) in [
+        ("--spec-shape-policy", "some"),
+        ("--spec-shape-estimate-rounds", "0"),
+        ("--spec-shape-estimate-rounds", "65"),
+        ("--spec-shape-period-ratios", "1.15,1.23,1.31"),
+        ("--spec-shape-period-ratios", "1.15,1.23,1.27,1.31,1.4"),
+        ("--spec-shape-period-ratios", "1.15,0.9,1.27,1.31"),
+        ("--spec-shape-period-ratios", "1.15,1.23,2.1,1.31"),
+        ("--spec-shape-period-ratios", "1.15,fast,1.27,1.31"),
+    ] {
+        let err = refused(&with(&[flag, raw]));
+        assert!(err.contains(flag) && err.contains(raw), "{flag} {raw}: {err}");
+    }
+    // Where no DFlash2 drafts: no backend, `off`, and the 27B's MTP head.
+    for flag in [["--spec-shape-policy", "all"], ["--spec-shape-estimate-rounds", "8"], ["--spec-shape-period-ratios", "1.1,1.2,1.3,1.4"]] {
+        let err = refused(&["--profile", "none", flag[0], flag[1]]);
+        assert!(err.contains(flag[0]) && err.contains("--spec-backend"), "{err}");
+        let err = refused(&["--spec-backend", "off", flag[0], flag[1]]);
+        assert!(err.contains(flag[0]) && err.contains("off"), "{err}");
+        let err = the_27b_mtp(&["--spec-backend", "mtp", flag[0], flag[1]]).expect_err("DFlash2's").0;
+        assert!(err.contains(flag[0]) && err.contains("the shape policy"), "{err}");
+    }
+}
+
 #[test]
 fn mtp_takes_no_proposal_head_and_spec_off_takes_no_draft_options() {
     let err = refused(&["--spec-backend", "mtp", "--spec-draft-head", "shortlist"]);

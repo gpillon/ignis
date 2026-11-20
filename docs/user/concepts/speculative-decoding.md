@@ -188,14 +188,36 @@ from what each lane's own earlier rounds did, the **shape rule**:
   again when it had fewer;
 - a base round its token budget cut short changes nothing.
 
-A round of 1 to 4 lanes runs at the extended shape when every lane in it asks
-for it, so no request pays the wider round for another; a round of 5 to 8
-lanes, or one with a lane held to a grammar, runs at the base shape. Text the
-drafter predicts far ahead (a JSON answer, a long tool call's arguments) goes
-extended and stays there; free text rarely takes all 7, so it stays at the
-base shape and decodes as at 7 drafts (a greedy answer can differ at a
-near-tie where the shape changes, below). A request evicted and restored
-keeps what it asked. `/metrics` counts the rounds at each shape
+The **shape policy** (`--spec-shape-policy`) then turns the lanes' asks into
+the round's shape. A request alone runs at the shape it asks, and a round of 5
+to 8 lanes, or one with a lane held to a grammar, at the base shape, under
+either policy. At 2 to 4 lanes they differ in who pays the wider round:
+
+- `aggregate`, the default, runs the round extended when the drafts its asking
+  requests are expected to take past position 7 exceed what the wider round
+  costs every request in it: the extended round's period over the base
+  round's at that lane count (`--spec-shape-period-ratios`, 1.23 at two
+  lanes), less one, times the tokens every request is expected to take a
+  round. Each request's expectations come from its own last 16 verify rounds
+  (`--spec-shape-estimate-rounds`); a request that asks with no extended round
+  among them is granted one, so that its estimate has something to read. A
+  request that does not ask then pays for its neighbour when the round as a
+  whole gains: estimated from the measured periods, a JSON answer beside a
+  conversation gains about 21% together, the JSON answer +38% and the
+  conversation -19%, while a moderately predictable answer beside a
+  conversation does not pass and stays at the base shape.
+- `all` runs it extended only when every lane in it asks, so no request ever
+  pays the wider round for another: the JSON answer beside a conversation
+  then gains nothing.
+
+The window and the ratios are provisional: the ratios were measured on the
+RTX 5090 at 1, 2 and 4 lanes before the extended round's cost levers, 3 lanes
+between them. Text the drafter predicts far ahead (a JSON answer, a long tool
+call's arguments) goes extended and stays there; free text rarely takes all
+7, so it stays at the base shape and decodes as at 7 drafts (a greedy answer
+can differ at a near-tie where the shape changes, below). A request evicted
+and restored keeps what it asked; its recent rounds for `aggregate` start
+again. `/metrics` counts the rounds at each shape
 (`ignis_speculative_shape_rounds_total`) and, per position up to the window,
 the drafts proposed and taken.
 
@@ -204,7 +226,7 @@ states below 8 lanes (at 8 lanes, a few hundred bytes); the VRAM plan holds
 both shapes, and the extended shape's captured graphs hold about 20 MiB
 outside it. The measurement switch `IGNIS_ROUND_SHAPE=base|extended`
 ([Testing](../contributing/testing.md)) forces every round to one shape over
-the rule. A load at 7 drafts or fewer has the one shape it had. The MTP head
+the rule and the policy. A load at 7 drafts or fewer has the one shape it had. The MTP head
 keeps 0 to 7.
 
 The two shapes compute a column's logits up to rounding, not bit for bit:

@@ -288,7 +288,8 @@ text before the loop, with a nudge. See
 
 **Round shape.** The columns a lane and the most lanes of a 27B verify round:
 the *base shape*, or from 0.11.0 on a DFlash2 load past 7 drafts the *extended
-shape*, one for all of a round's lanes, which the *shape rule* chooses. See
+shape*, one for all of a round's lanes, which the *shape rule* and the *shape
+policy* choose. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Row budget.** The most rows one Flash-Next MTP verify round may take across all
@@ -301,12 +302,21 @@ from its own distribution and the round takes it by the ratio of the model's
 probability to the drafter's, so the text keeps the model's distribution. See
 [speculative decoding](../concepts/speculative-decoding.md#acceptance-under-sampling).
 
+**Shape policy.** From 0.11.0, on a DFlash2 load past 7 drafts, how a verify
+round of 1 to 4 lanes takes its shape from what its requests ask
+(`--spec-shape-policy`): `aggregate`, the default, extended when the drafts the
+asking requests are expected to take past position 7 exceed what the wider round
+costs every request in it, from each request's own recent rounds; `all`,
+extended only when every request asks, so no request pays for another. A request
+alone runs at the shape it asks under either. See
+[speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
+
 **Shape rule.** From 0.11.0, on a DFlash2 load past 7 drafts, what each request
 asks of its next verify round from its own earlier rounds: the *extended shape*
 after a base round that took all 7 drafts, while its extended rounds take 6 or
 more (`--spec-shape-enter-accepted`, `--spec-shape-stay-accepted`), the *base
-shape* otherwise. A round of 1 to 4 lanes is extended when every lane in it asks.
-See [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
+shape* otherwise. The *shape policy* turns a round's asks into its shape. See
+[speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Scope.** A model family's own section of a field: `qwen38` for the 27B,
 `qwen38flashnext` for Flash-Next. A value in a scope wins over the general one

@@ -1710,6 +1710,10 @@ fn derive_speculation(
         // GitHub #689: the shape rule's thresholds.
         ("shape_enter_accepted", Some(s.shape_enter_accepted.to_string())),
         ("shape_stay_accepted", Some(s.shape_stay_accepted.to_string())),
+        // GitHub #690: the shape policy's three.
+        ("shape_policy", Some(s.shape_policy.as_str().to_owned())),
+        ("shape_estimate_rounds", Some(s.shape_estimate_rounds.to_string())),
+        ("shape_period_ratios", Some(ratios_text(s.shape_period_ratios))),
     ]
     .map(|(name, value)| (name, value.filter(|_| named(name))));
     let backend = match s.backend {
@@ -1824,6 +1828,11 @@ fn derive_speculation(
             spelled("spec", "draft_tokens"),
         ))
     })?;
+    // GitHub #690: the shape policy, its estimate window and its period
+    // ratios, each in its field's range; every load without an extended shape
+    // never reads them.
+    let estimate = ignis_core::ShapeEstimate::new(s.shape_estimate_rounds, s.shape_period_ratios).map_err(ConfigError)?;
+    let speculation = speculation.with_shape_policy(s.shape_policy, estimate);
     Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
 }
 
@@ -1858,6 +1867,10 @@ fn refuse_dflash2s_settings_under_mtp(resolution: &Resolution, spelled: &impl Fn
         // GitHub #689: the shape rule chooses between DFlash2's round shapes.
         ("shape_enter_accepted", named("shape_enter_accepted").then(|| s.shape_enter_accepted.to_string()), "the shape rule"),
         ("shape_stay_accepted", named("shape_stay_accepted").then(|| s.shape_stay_accepted.to_string()), "the shape rule"),
+        // GitHub #690: and the shape policy chooses each round's from them.
+        ("shape_policy", named("shape_policy").then(|| s.shape_policy.as_str().to_owned()), "the shape policy"),
+        ("shape_estimate_rounds", named("shape_estimate_rounds").then(|| s.shape_estimate_rounds.to_string()), "the shape policy"),
+        ("shape_period_ratios", named("shape_period_ratios").then(|| ratios_text(s.shape_period_ratios)), "the shape policy"),
     ];
     for (name, value, what) in refused {
         if let Some(value) = value {
@@ -1875,6 +1888,12 @@ fn refuse_dflash2s_settings_under_mtp(resolution: &Resolution, spelled: &impl Fn
 /// what an error and the load's log write.
 pub(crate) fn decimal_text(thousandths: u32) -> String {
     (f64::from(thousandths) / 1000.0).to_string()
+}
+
+/// GitHub #690: the shape policy's period ratios as their flag would spell
+/// them (`1.15,1.23,1.27,1.31`).
+pub(crate) fn ratios_text(ratios: [u32; 4]) -> String {
+    ratios.map(decimal_text).join(",")
 }
 
 /// `--vision-enabled`, `--vision-max-tokens`,
@@ -2084,6 +2103,9 @@ fn fit_family(
             "drafter_top_p",
             "shape_enter_accepted",
             "shape_stay_accepted",
+            "shape_policy",
+            "shape_estimate_rounds",
+            "shape_period_ratios",
         ] {
             if resolution.explicit("spec", name) {
                 fitted.dropped.push(schema::field("spec", name).expect("declared").flag());

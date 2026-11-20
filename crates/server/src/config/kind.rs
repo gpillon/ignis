@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
-use ignis_core::{DraftRule, ExceptionWeightsSetting, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, SpeculativeBackend, VisionResidency};
+use ignis_core::{DraftRule, ExceptionWeightsSetting, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, ShapeEstimate, ShapePolicy, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
 use super::{ApiKey, ApiKeySetting, Expose, SoloWidth, SpecChoice};
@@ -254,6 +254,10 @@ count_kind!(
 count_kind!(
     /// A count of nesting levels.
     Levels: u32, "levels", "level count"
+);
+count_kind!(
+    /// A count of verify rounds.
+    Rounds: u32, "rounds", "round count"
 );
 
 /// The speech model's compute threads (spec speech/01): a count, or `auto`,
@@ -907,6 +911,68 @@ impl FieldKind for DraftRuleKind {
 
     fn render(value: &DraftRule) -> Value {
         Value::String(value.as_str().to_owned())
+    }
+}
+
+/// The shape policy (GitHub #690): `aggregate` or `all`.
+pub struct ShapePolicyKind;
+
+impl FieldKind for ShapePolicyKind {
+    type Value = ShapePolicy;
+    const TAG: &'static str = "shape policy";
+
+    fn parse(raw: &str) -> Result<ShapePolicy, String> {
+        ShapePolicy::parse(&raw.to_ascii_lowercase())
+    }
+
+    fn render(value: &ShapePolicy) -> Value {
+        Value::String(value.as_str().to_owned())
+    }
+}
+
+/// The shape policy's period ratios (GitHub #690): four decimal numbers,
+/// `,`- or `;`-separated (a file's list of four), the extended round's period
+/// over the base round's at 1 to 4 lanes, each from 1 to 2, kept as
+/// thousandths as [`Decimal`] keeps one.
+pub struct PeriodRatios;
+
+impl FieldKind for PeriodRatios {
+    type Value = [u32; 4];
+    const TAG: &'static str = "ratio,ratio,ratio,ratio";
+
+    fn parse(raw: &str) -> Result<Self::Value, String> {
+        let ratios: Vec<&str> = raw.split([',', ';']).map(str::trim).collect();
+        let mut table = [0u32; 4];
+        if ratios.len() != table.len() {
+            return Err(format!("expects four ratios, at 1, 2, 3 and 4 lanes, got `{raw}`"));
+        }
+        for (entry, ratio) in table.iter_mut().zip(ratios) {
+            *entry = Decimal::thousandths(ratio)
+                .filter(|milli| ShapeEstimate::PERIOD_RATIO_MILLI_RANGE.contains(milli))
+                .ok_or_else(|| format!("expects four ratios from 1 to 2, got `{raw}`"))?;
+        }
+        Ok(table)
+    }
+
+    fn render(value: &Self::Value) -> Value {
+        Value::Array(value.iter().map(|&milli| Decimal::written(milli)).collect())
+    }
+
+    fn file_text(value: &Value) -> Result<Option<String>, String> {
+        match value {
+            Value::Array(items) => Ok(Some(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        Value::Number(n) => Ok(n.to_string()),
+                        Value::String(s) => Ok(s.clone()),
+                        _ => Err("lists something that is not a ratio".to_owned()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .join(","),
+            )),
+            other => scalar_text(other),
+        }
     }
 }
 

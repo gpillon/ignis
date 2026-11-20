@@ -402,8 +402,10 @@ qwen3.8-flash-next` fetches both
 On the 27B's MTP load the settings only DFlash2 reads are refused where you
 named them: `--spec-draft-rule sampled`, `--spec-drafter-temperature-factor`,
 `--spec-drafter-top-p` and, from 0.11.0, the shape rule's
-`--spec-shape-enter-accepted` and `--spec-shape-stay-accepted` (by a flag or an
-env var at any value, in a config file at a value other than the default) and
+`--spec-shape-enter-accepted` and `--spec-shape-stay-accepted` and the shape
+policy's `--spec-shape-policy`, `--spec-shape-estimate-rounds` and
+`--spec-shape-period-ratios` (by a flag or an env var at any value, in a config
+file at a value other than the default) and
 `--spec-draft-head shortlist`. Remove them, or scope them to a DFlash2 load.
 `--spec-draft-rule fixed` names the head's own rule and is accepted
 ([context, KV and speculation](configuration/context-and-speculation.md)).

@@ -690,9 +690,10 @@ config_group! {
         /// DFlash2 verify rounds runs at the base shape (8 columns a lane) or
         /// the extended one (the window + 1), the drafts of a base round's
         /// full 7 a lane must have taken to ask the extended shape for its
-        /// next round, 1..=7. A round of 1 to 4 lanes runs extended when
-        /// every lane in it asks; one of 5 to 8 lanes never does. A speed
-        /// setting only: either shape commits the target's text.
+        /// next round, 1..=7. A round of 1 to 4 lanes takes its shape from
+        /// its lanes' asks by `shape_policy`; one of 5 to 8 lanes is never
+        /// extended. A speed setting only: either shape commits the target's
+        /// text.
         shape_enter_accepted: Tokens = ignis_core::ShapeRule::DEFAULT_ENTER_ACCEPTED,
             between(1, ignis_core::BASE_SHAPE_DRAFT_TOKENS as i64), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
         /// The shape rule's stay: the drafts an extended round must take for
@@ -702,6 +703,30 @@ config_group! {
         /// A speed setting only.
         shape_stay_accepted: Tokens = ignis_core::ShapeRule::DEFAULT_STAY_ACCEPTED,
             between(1, ignis_core::DFLASH2_MAX_DRAFT_TOKENS as i64), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// The shape policy, which turns the lanes' asks into a round's shape
+        /// past 7 drafts: `aggregate` runs a round of 2 to 4 lanes extended
+        /// when the drafts its asking lanes are expected to take past
+        /// position 7 exceed what the wider round costs every lane in it, so
+        /// a lane that does not ask pays for its neighbour when the round as
+        /// a whole gains; `all` only when every lane asks, so no lane pays
+        /// for another. A lane alone runs at the shape it asks under either.
+        /// A speed setting only.
+        shape_policy: ShapePolicyKind = ignis_core::ShapePolicy::Aggregate, Validator::OneOf(&ignis_core::ShapePolicy::NAMES),
+            QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// Under `aggregate`, the verify rounds of its own, the most recent,
+        /// a lane's expectations are read over: the tokens it takes a base
+        /// round, and the drafts past position 7 its extended rounds take. A
+        /// lane that asks with no extended round among them is granted one.
+        /// Provisional. A speed setting only.
+        shape_estimate_rounds: Rounds = ignis_core::ShapeEstimate::DEFAULT_ROUNDS,
+            between(1, ignis_core::SHAPE_ESTIMATE_MAX_ROUNDS as i64), QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
+        /// Under `aggregate`, an extended round's period over a base round's
+        /// at 1, 2, 3 and 4 lanes, each 1 to 2: what the wider round costs
+        /// every lane in it. Measured on the RTX 5090 at 1, 2 and 4 lanes, 3
+        /// lanes between them; provisional. The one-lane entry is not read: a
+        /// lane alone runs at the shape it asks. A speed setting only.
+        shape_period_ratios: PeriodRatios = ignis_core::ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI, NO_RULE, QWEN38_ONLY,
+            [Visible, Patchable, ReloadRequired];
     }
 }
 
