@@ -38,8 +38,10 @@
 //!
 //!   Each kind runs at 1, 2, 3 and 4 lanes, a lane a prompt; the forced rounds
 //!   of one group of lanes stand at one text index, the graph rounds of a lane
-//!   whose text runs out leave the round. Every round asserts the shape it ran
-//!   at (its drafts, the shape's round count) and whether it ran eagerly.
+//!   whose text runs out leave the round, so a graph cell of `n` lanes ends
+//!   on narrower rounds, and its base and extended rows at one index can come
+//!   from rounds of different widths. Every round asserts the shape it ran at
+//!   (its drafts, the shape's round count) and whether it ran eagerly.
 //!
 //! # What is held, and to what
 //!
@@ -59,15 +61,16 @@
 //!   pick that differs only where the base row rates the two within the
 //!   class's near tie (below);
 //! - **the class**: how far the extended rows sit from speculation off's
-//!   against how far the base rows sit from them, over every lane of a kind
-//!   together: the median, the 90th percentile and the widest row no further
+//!   against how far the base rows sit from them, at each lane count of a
+//!   kind and over all of them together: the median, the 90th percentile and
+//!   the widest row no further
 //!   than the base rows' by [`CLASS_MEDIAN_MARGIN`], [`CLASS_P90_MARGIN`] and
 //!   [`CLASS_WIDEST_MARGIN`]; no more picks moved from spec-off's than
 //!   [`CLASS_MOVED_PICKS_MARGIN`] times those the base rows moved plus
-//!   [`CLASS_MOVED_PICKS_ALLOWANCE`], and none at a gap past the class's
-//!   near tie: ADR 0056's [`PICK_GAP_ULPS`], or [`CLASS_PICK_GAP_MARGIN`]
-//!   times the widest gap at which the base rows move a pick from spec-off's,
-//!   whichever is more;
+//!   [`CLASS_MOVED_PICKS_ALLOWANCE`]; and, over every lane count of a kind
+//!   together, none at a gap past the class's near tie: ADR 0056's
+//!   [`PICK_GAP_ULPS`], or [`CLASS_PICK_GAP_MARGIN`] times the widest gap at
+//!   which the base rows move a pick from spec-off's, whichever is more;
 //! - **the text's likelihood**: each lane's mean log-probability of `T` under
 //!   the extended rows within [`EXTENDED_VS_BASE_LOG_PROB_NATS`] of the base
 //!   rows';
@@ -135,9 +138,9 @@ const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 /// What a lane's median row of that pair stays within. Measured medians:
 /// prototype 14.0, 14.2, 19.5, 22.3, 20.1, 14.7 (the furthest of the three
 /// prompts); this test, forced rounds 14.0 to 16.1 at one lane and 0.0 to 0.5
-/// at two to four (both shapes then take the routes of more than 8 columns,
-/// and commit every column), graph rounds 0.0 to 16.0; 32 is the next power
-/// of two above.
+/// at two to four, graph rounds 13.6 to 16.0 at one lane and 11.8 to 14.2 at
+/// two to four but for the code prompt's 0.0 there (neither split is
+/// explained); 32 is the next power of two above.
 const EXTENDED_VS_BASE_TYPICAL_ULPS: f32 = 32.0;
 
 /// ADR 0056's near tie, in the reference row's ulps: the floor of the class's
@@ -149,7 +152,7 @@ const PICK_GAP_ULPS: f32 = logit_drift::PICK_GAP_ULPS;
 /// The class, median: the extended rows' median distance from speculation
 /// off's rows over the base rows'. Measured ratios: prototype 0.96, 1.01,
 /// 1.01, 1.00, 1.01, 1.01; this test, forced rounds 1.00 (0.99 to 1.00 by lane
-/// count), graph rounds 1.02 (0.99 to 1.03).
+/// count), graph rounds 1.02 (0.99 to 1.03). Held at each lane count too.
 const CLASS_MEDIAN_MARGIN: f32 = 1.25;
 
 /// The class, 90th percentile. Measured ratios: prototype 0.86, 1.03, 1.02,
@@ -167,7 +170,9 @@ const CLASS_WIDEST_MARGIN: f32 = 1.5;
 /// [`CLASS_MOVED_PICKS_ALLOWANCE`] more (a count of a few picks has no ratio
 /// worth a margin). Measured, extended against base: prototype 0 and 2, 3 and
 /// 5, 0 and 0, 155 and 176, 58 and 63, 15 and 14; this test, forced rounds 90
-/// and 89, graph rounds 76 and 73.
+/// and 89 (25 and 24, 25 and 25, 15 and 15, 25 and 25 at 1 to 4 lanes), graph
+/// rounds 76 and 73 (19 and 20, 19 and 21, 12 and 11, 26 and 21: 26 against a
+/// bound of 28 at 4 lanes).
 const CLASS_MOVED_PICKS_MARGIN: f32 = 1.25;
 const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 
@@ -180,10 +185,14 @@ const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 /// extended round tighter than its base round is. Measured, the widest gap
 /// from spec-off, extended over base: prototype none over 5.0, 4.0 over 4.0,
 /// none over none, 26 over 42, 37 over 22 (1.68), 6.0 over 11.0; this test,
-/// forced rounds 12.0 over 12.0, graph rounds 22.0 over 12.0 (1.83). The
-/// widest gap between the shapes: prototype 0 to 8 on texts of this test's
-/// length, 82.5 on the long answers; this test, forced rounds 8.0, graph
-/// rounds 17.0, where ADR 0056's 16 alone failed the test's first run.
+/// over each kind's lane counts together (the bound's reading), forced rounds
+/// 12.0 over 12.0 and graph rounds 22.0 over 12.0 (1.83); at one lane count
+/// the graph rounds' 4 lanes read 22.0 over 9.0 (2.44), past this margin there.
+/// The widest gap between the shapes: prototype 0 to 8 on texts of this
+/// test's length, 82.5 on the long answers; this test, forced rounds 8.0,
+/// graph rounds 17.0 (one lane, over a base widest of 12.0 there), where ADR
+/// 0056's 16 alone, the bound between the shapes before this one, failed the
+/// test's first run.
 const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 
 /// A lane's mean log-probability of the text under the extended rows against
@@ -496,8 +505,10 @@ impl Class {
         }
     }
 
-    /// The class bounds over these rows; each excess a line in `failures`.
-    fn hold(&self, label: &str, failures: &mut Vec<String>) {
+    /// The class's distances and moved picks over these rows, held at each
+    /// lane count and over a kind's rows together; each excess a line in
+    /// `failures`.
+    fn hold_distances(&self, label: &str, failures: &mut Vec<String>) {
         for (name, p, margin) in [("median", 0.5, CLASS_MEDIAN_MARGIN), ("90th percentile", 0.9, CLASS_P90_MARGIN), ("widest", 1.0, CLASS_WIDEST_MARGIN)] {
             let (extended, base) = (self.extended_off.at(p), self.base_off.at(p));
             if extended > margin * base {
@@ -514,6 +525,14 @@ impl Class {
                 "{label}, the class: the extended rows moved {moved_extended} picks from spec-off's, the base rows {moved_base}: past {CLASS_MOVED_PICKS_MARGIN} times them and {CLASS_MOVED_PICKS_ALLOWANCE}"
             ));
         }
+    }
+
+    /// The class's near tie and the control, over a kind's rows together. The
+    /// near tie rests on the widest gap at which the base rows move a pick, one
+    /// pick's of 11 to 25 a lane count moves, so it is read over every lane
+    /// count of the kind, as the control's median is; each excess a line in
+    /// `failures`.
+    fn hold_near_tie(&self, label: &str, failures: &mut Vec<String>) {
         let gap_bound = PICK_GAP_ULPS.max(CLASS_PICK_GAP_MARGIN * self.base_off.widest_gap());
         println!(
             "  class, the near tie {gap_bound:.1} ulps: the widest moved gap from spec-off's, extended {:.1}, base {:.1}; between the shapes {:.1}",
@@ -737,14 +756,17 @@ fn an_extended_rounds_rows_are_the_base_rounds_class() {
                         width_class.extend(&lane_class);
                     }
                 }
-                width_class.print(&format!("{kind:?} rounds at {width} lanes"));
+                let width_label = format!("{kind:?} rounds at {width} lanes");
+                width_class.print(&width_label);
+                width_class.hold_distances(&width_label, &mut failures);
                 kind_class.extend(&width_class);
             }
             // The class: the extended rows' distance from speculation off's
             // against the base rows', over every lane of the kind.
             let label = format!("{kind:?} rounds, 1 to {EXTENDED_SHAPE_MAX_LANES} lanes");
             kind_class.print(&label);
-            kind_class.hold(&label, &mut failures);
+            kind_class.hold_distances(&label, &mut failures);
+            kind_class.hold_near_tie(&label, &mut failures);
         }
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));

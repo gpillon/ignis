@@ -56,13 +56,15 @@ holds every extended row to the base row at the same text index and lane count:
 
 - a row within **256 BF16 ulps** at the base row's largest magnitude, and a lane's median row within **32**;
 - each lane's mean log-probability of the text within **0.02 nats** a token of the base rows';
-- **the class**: the extended rows' distance from the plain rows over the base rows', over every lane of a kind of
-  round together, at most **1.25** at the median and at the 90th percentile and **1.5** at the widest row; no more
-  picks moved from the plain rows' than **1.25 times** the base rows' **plus 2**;
-- **the class's near tie**: a pick the extended round moves, from the plain row's or from the base row's, only where
-  the reference row rates the two within ADR 0056's **16 ulps** or within **twice** the widest gap at which the base
-  rows move a pick from the plain rows', whichever is more. The base round itself moves picks past 16 ulps (to 42 on
-  the long answers), so ADR 0056's near tie alone would hold the extended round tighter than its base round is;
+- **the class**: the extended rows' distance from the plain rows over the base rows', at each lane count of a kind
+  of round and over all of them together, at most **1.25** at the median and at the 90th percentile and **1.5** at
+  the widest row; no more picks moved from the plain rows' than **1.25 times** the base rows' **plus 2**;
+- **the class's near tie**, over every lane count of a kind together: a pick the extended round moves, from the plain
+  row's or from the base row's, only where the reference row rates the two within ADR 0056's **16 ulps** or within
+  **twice** the widest gap at which the base rows move a pick from the plain rows', whichever is more. The base round
+  itself moves picks past 16 ulps (to 42 on the long answers), so ADR 0056's near tie alone would hold the extended
+  round tighter than its base round is; and the widest gap is one pick's of the 11 to 25 a lane count moves, so it is
+  read over the kind's lane counts together;
 - **a control**: an extended row against the plain row one index on, another context, whose median must sit past
   **twice** the right rows' median and twice the typical bound, or the bounds could not tell a right row from a wrong
   one.
@@ -81,13 +83,28 @@ graph rows:
 | class ratio, median / 90th percentile / widest | 1.25 / 1.25 / 1.5 | 0.86-1.25 | 1.00 / 1.00 / 1.00 | 1.02 / 0.99 / 1.03 |
 | picks moved from the plain rows, extended and base | 1.25 x + 2 | 15 and 14 | 90 and 89 | 76 and 73 |
 | widest moved gap, extended over base; between the shapes | 2 x, floor 16 | 6.0 over 11.0; 8.0 | 12.0 over 12.0; 8.0 | 22.0 over 12.0; 17.0 |
+| the same, at one lane count, the furthest | | | 12.0 over 11.0 (1 lane) | 22.0 over 9.0 (4 lanes) |
 | control's median, over the right rows' and the typical bound | 2 x | 14x | 14.0x, 5.2x | 13.8x, 5.2x |
 
-At 2 to 4 lanes the two shapes' forced rows are equal to within 1 ulp: both shapes then take the routes of more than 8
-columns and commit every column; the graph rounds differ there as much as at one lane, their uncommitted columns being
-the drafter's. ADR 0056's 16-ulp near tie between the shapes failed the test's first run once, a pick moved at 17 ulps
-on a one-lane graph round, inside the class's near tie of 24. The margins (1.25, 1.5, 1.25 + 2, 2) are proposed above
-the widest ratios measured; the owner confirms or replaces them, and this ADR stays `proposed` until then.
+At each lane count the distance ratios read 0.94 to 1.06 and the moved picks at most 26 against a bound of 28. At 2
+to 4 lanes the two shapes' forced rows agree within 1 ulp, and the graph rows of the code prompt within 1 ulp too,
+while the other prompts' graph rows differ there as much as at one lane: observed, not explained. A graph cell's
+rounds narrow as its lanes' texts run out, so its base and extended rows at one index can come from rounds of
+different widths.
+
+Two readings are the owner's, beside the margins. The test held a pick moved between the shapes to ADR 0056's 16 ulps
+at first; its first run failed once, a pick moved at 17 ulps on a one-lane graph round (the base rows' widest gap there
+12.0), and the class's near tie took its place: a bound changed after a failure, inside the class it states. And the
+near tie is read over a kind's lane counts together: at the graph rounds' 4 lanes alone the extended rows move a pick at
+22.0 ulps where the base rows' widest is 9.0, 2.44 times, past the margin of 2 there. The margins (1.25, 1.5, 1.25 + 2,
+2) are proposed above the widest ratios measured but that one; the owner confirms or replaces them, and this ADR stays
+`proposed` until then.
+
+**What this amends.** In ADR 0056, the method of a verify round past 8 rows held teacher-forced, row by row, reaches
+the 27B's DFlash2 round, its reference the base round rather than speculation off. In ADR 0090, the sampled draft draws
+and accepts at up to 15 drafts a lane, the sampler's 16 columns, and the drafter's q it keeps is 128 bytes a draft a lane:
+896 at seven drafts, 1,920 at fifteen. In ADR 0095, the 27B's two drafters no longer share a range: DFlash2 takes 1 to
+15 and the MTP head keeps 0 to 7, so a window named beside one is that drafter's own.
 
 ## Considered options
 
