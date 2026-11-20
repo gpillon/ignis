@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 amends: [ADR-0056, ADR-0090, ADR-0095]
 ---
 
@@ -92,13 +92,13 @@ while the other prompts' graph rows differ there as much as at one lane: observe
 rounds narrow as its lanes' texts run out, so its base and extended rows at one index can come from rounds of
 different widths.
 
-Two readings are the owner's, beside the margins. The test held a pick moved between the shapes to ADR 0056's 16 ulps
+Two readings were the owner's, beside the margins. The test held a pick moved between the shapes to ADR 0056's 16 ulps
 at first; its first run failed once, a pick moved at 17 ulps on a one-lane graph round (the base rows' widest gap there
 12.0), and the class's near tie took its place: a bound changed after a failure, inside the class it states. And the
 near tie is read over a kind's lane counts together: at the graph rounds' 4 lanes alone the extended rows move a pick at
 22.0 ulps where the base rows' widest is 9.0, 2.44 times, past the margin of 2 there. The margins (1.25, 1.5, 1.25 + 2,
-2) are proposed above the widest ratios measured but that one; the owner confirms or replaces them, and this ADR stays
-`proposed` until then.
+2) sit above the widest ratios measured but that one. The owner confirmed the margins, the class's near tie in place of
+16 ulps, and its reading over a kind's lane counts together on 2026-11-20.
 
 **What this amends.** In ADR 0056, the method of a verify round past 8 rows held teacher-forced, row by row, reaches
 the 27B's DFlash2 round, its reference the base round rather than speculation off. In ADR 0090, the sampled draft draws
