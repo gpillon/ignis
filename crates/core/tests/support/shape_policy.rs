@@ -71,9 +71,12 @@ impl Lane {
     }
 }
 
-/// Whether a round of `lanes` (1 to 4 of them, the switch unset) runs at the
-/// extended shape under `policy`.
+/// Whether a round of `lanes` runs at the extended shape under `policy`, the
+/// switch unset: never past the extended shape's 4 lanes.
 pub fn extends(policy: ShapePolicy, estimate: ShapeEstimate, lanes: &[&Lane]) -> bool {
+    if lanes.len() > estimate.period_ratios_milli().len() {
+        return false;
+    }
     match policy {
         ShapePolicy::All => lanes.iter().all(|lane| lane.asks),
         ShapePolicy::Aggregate if lanes.len() == 1 => lanes[0].asks,
