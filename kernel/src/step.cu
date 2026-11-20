@@ -21,6 +21,7 @@
 #include "ignis_seq_internal.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "round_shape.h"
 #include "mtp_head.h"
 #include "permitted_tokens.h"
 #include "step_internal.h"
@@ -332,14 +333,23 @@ std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
 // GitHub #590: whether the scores `kept` names are still the ones its draw
 // was made from -- a decode-logits column no later round or prefill draw has
 // written, or the verify logits of the last verify round, the one that cut
-// the lane's commit (GitHub #686: the load's base shape's, its one shape).
+// the lane's commit. GitHub #687: a load's two round shapes write one logits
+// buffer, so the last verify round is the latest of either shape's, whose
+// stamps both come from the model's one counter; a record's column is the
+// buffer's own, at the stride of the round that wrote it.
 bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept) {
   if (kept.source == IgnisKeptSource::kVerifyLogits) {
     const IgnisVerifyRound *verify = model->base_shape.get();
-    return verify != nullptr &&
-           static_cast<std::uint64_t>(kept.column) <
-               static_cast<std::uint64_t>(model->decode_lanes) * (verify->window + 1) &&
-           verify->kept_epoch == kept.epoch;
+    if (verify == nullptr) {
+      return false;
+    }
+    std::uint64_t latest = verify->kept_epoch;
+    if (model->extended_shape != nullptr) {
+      latest = std::max(latest, model->extended_shape->kept_epoch);
+    }
+    const std::uint64_t columns =
+        verify->logits->bytes / (static_cast<std::uint64_t>(model->vocab) * sizeof(std::uint16_t));
+    return static_cast<std::uint64_t>(kept.column) < columns && latest == kept.epoch;
   }
   return static_cast<std::uint32_t>(kept.column) < model->decode_lanes &&
          model->kept_column_epochs[static_cast<std::size_t>(kept.column)] == kept.epoch;
@@ -2187,6 +2197,12 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
                          int32_t *out_token_ids) {
   const std::uint32_t k = verify.window;
   const std::uint32_t lane_columns = k + 1;
+  // GitHub #687: the caller's arrays are strided by the load's window
+  // (`speculative_window`), the round's buffers by its shape's: equal on a
+  // load of one shape, and on a load of two at its extended shape; a base
+  // round there reads the first 8 of each lane's 16 and writes as many.
+  const std::uint32_t caller_k = options.speculative_window;
+  const std::uint32_t caller_columns = caller_k + 1;
   const auto batch = static_cast<std::int32_t>(batch_size);
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   // GitHub #619: what fills the round's proposal follows the load's drafter.
@@ -2284,7 +2300,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       slots[i] = seq->slot;
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
       for (uint64_t j = 0; j < extent && !in_leaf; ++j) {
-        drafts[i * k + j] = options.drafts[i * k + j];
+        drafts[i * k + j] = options.drafts[i * caller_k + j];
       }
       // The lane's rotation positions: the traversal's own column rule with
       // the sequence's delta added. A text sequence's delta is 0, so the two
@@ -2302,7 +2318,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       // lane's in such a round, so that no refusal after the pass leaves a
       // penalty row the device already counted in.
       if (forced_on_device) {
-        const std::int32_t *forced = options.forced_tokens + i * lane_columns;
+        const std::int32_t *forced = options.forced_tokens + i * caller_columns;
         const std::int32_t bad = ignis_teacher_forced_first_bad_successor(
             anchors[i], forced, extents[i], static_cast<std::int32_t>(model->vocab), sampling[i].stop_ids,
             sampling[i].stop_id_count);
@@ -2413,10 +2429,17 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
         }
       }
     } clear_forced_tokens;
+    // GitHub #687: at the round's stride, each lane's first `k + 1` of the
+    // caller's row; a pageable copy staged before the call returns.
+    std::vector<std::int32_t> forced_rows;
     if (forced_on_device) {
-      const std::size_t forced_bytes = static_cast<std::size_t>(lane_columns) * batch_size * sizeof(std::int32_t);
+      forced_rows.resize(static_cast<std::size_t>(lane_columns) * batch_size);
+      for (uint64_t i = 0; i < batch_size; ++i) {
+        std::copy_n(options.forced_tokens + i * caller_columns, lane_columns, forced_rows.data() + i * lane_columns);
+      }
+      const std::size_t forced_bytes = forced_rows.size() * sizeof(std::int32_t);
       forced_device = std::make_unique<ninfer::DeviceBuffer>(forced_bytes);
-      if (!stage(*forced_device, options.forced_tokens, forced_bytes, "forced tokens")) {
+      if (!stage(*forced_device, forced_rows.data(), forced_bytes, "forced tokens")) {
         return -1;
       }
       verify.forced_tokens = static_cast<const std::int32_t *>(forced_device->p);
@@ -2506,7 +2529,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
         }
       }
       for (uint64_t i = 0; i < batch_size; ++i) {
-        const std::int32_t *forced = options.forced_tokens + i * lane_columns;
+        const std::int32_t *forced = options.forced_tokens + i * caller_columns;
         // GitHub #577 (test-only): a sampling lane forced on the device has
         // its verdict already, the recording's run by the forced coin; one
         // that is not the recording's is the device's fault, and refused.
@@ -2587,7 +2610,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       next_pending[i] = cut.next_pending;
       redirected[i] = cut.redirected;
       for (std::int32_t j = 0; j < c; ++j) {
-        out_token_ids[i * lane_columns + j] = run[static_cast<std::size_t>(j)];
+        out_token_ids[i * caller_columns + j] = run[static_cast<std::size_t>(j)];
       }
       fold_rows[i] = ninfer::ops::GdnReplayFoldRow{.linear_state_slot = slots[i],
                                                    .commit_columns = c};
@@ -2878,6 +2901,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     }
     model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;
+    // GitHub #687: the round in its shape's stats.
+    ++verify.rounds;
+    verify.eager_rounds += use_graph ? 0 : 1;
     round_timing_collect(model, model->verify_timing, "verify");
   } catch (const std::exception &e) {
     set_error(std::string("ignis_program_decode: ") + e.what());
@@ -2975,9 +3001,11 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       return -1;
     }
     if (options->speculative_window != 0) {
-      // GitHub #686: the round's shape, the load's base shape, its one shape.
-      IgnisVerifyRound *const shape = model->base_shape.get();
-      const uint32_t loaded = shape == nullptr ? 0 : shape->window;
+      // GitHub #686: the round's shape, chosen here and handed to the round.
+      // GitHub #687: the load's window is its widest, its extended shape's on
+      // a load of two.
+      IgnisVerifyRound *shape = model->base_shape.get();
+      const uint32_t loaded = shape == nullptr ? 0 : model->draft_tokens;
       if (options->speculative_window != loaded) {
         set_error("ignis_program_decode: speculative_window " +
                   std::to_string(options->speculative_window) + " is not the window this model was loaded with (" +
@@ -2998,6 +3026,25 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           set_error("ignis_program_decode: a permitted token set cannot ride a verify round (index " +
                     std::to_string(i) + ")");
           return -1;
+        }
+      }
+      // GitHub #687: on a load of two round shapes, the round runs at its base
+      // shape unless IGNIS_ROUND_SHAPE, read here at each round, names the
+      // extended one, which takes a round of no more lanes than it runs and no
+      // lane whose commit the host cuts (kernel/src/round_shape.h).
+      if (model->extended_shape != nullptr) {
+        ignis::round_shape::Named named = ignis::round_shape::Named::kBase;
+        try {
+          named = ignis::round_shape::read_switch();
+        } catch (const std::invalid_argument &e) {
+          set_error(std::string("ignis_program_decode: ") + e.what());
+          return -1;
+        }
+        const bool host_cut = options->host_cut_lanes != nullptr &&
+                              std::any_of(options->host_cut_lanes, options->host_cut_lanes + batch_size,
+                                          [](std::uint8_t cut) { return cut != 0; });
+        if (ignis::round_shape::runs_extended(named, batch_size, model->extended_shape->lanes, host_cut)) {
+          shape = model->extended_shape.get();
         }
       }
       const auto began = std::chrono::steady_clock::now();
@@ -3526,11 +3573,13 @@ extern "C" int32_t ignis_program_repair(struct ignis_model *model, struct ignis_
 namespace {
 
 // GitHub #686 (spec #684): one round shape's verify round, as
-// `ignis_program_stats` reports it.
-ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape) {
+// `ignis_program_stats` reports it. GitHub #687: `shared_with` the shape
+// whose buffers it holds too, none for a load's base shape.
+ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape, const IgnisVerifyRound *shared_with) {
   ignis_round_shape_stats out{};
   out.window = shape.window;
-  out.vram_bytes = shape.device_bytes();
+  out.lanes = shape.lanes;
+  out.vram_bytes = shape.device_bytes(shared_with);
   for (uint32_t width = 1; width <= IGNIS_DECODE_MAX_BATCH; ++width) {
     if (shape.graph_ready[width - 1]) {
       out.verify_graph_ready_mask |= 1u << (width - 1);
@@ -3542,6 +3591,8 @@ ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape) {
     }
   }
   out.verify_folds_in_flight = shape.folds_in_flight;
+  out.verify_rounds = shape.rounds;
+  out.eager_verify_rounds = shape.eager_rounds;
   return out;
 }
 
@@ -3587,7 +3638,8 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   }
   // P5-04 (GitHub #153): the verify substrate's own buffers, records and
   // accept scratch, present only under a draft window (its traversal scratch
-  // is `decode_graph_scratch` above, sized for it at load).
+  // is `decode_graph_scratch` above, sized for it at load). GitHub #687: a
+  // load's extended shape holds them too, and nothing of its own.
   if (model->base_shape != nullptr) {
     out_stats->vram_bytes += model->base_shape->device_bytes();
   }
@@ -3652,13 +3704,18 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   }
   // GitHub #681: the gating's home; Flash-Next's load never captures the 27B's rounds.
   out_stats->gdn_gating = static_cast<uint32_t>(model->gdn_gating_home);
-  // GitHub #686: each round shape's own, the base shape alone; a Flash-Next load has none.
+  // GitHub #686: each round shape's own, the base shape first, then (GitHub
+  // #687) the extended one where the load has it; a Flash-Next load has none.
   out_stats->round_shapes = 0;
   for (ignis_round_shape_stats &shape : out_stats->shapes) {
     shape = ignis_round_shape_stats{};
   }
   if (model->base_shape != nullptr) {
-    out_stats->shapes[out_stats->round_shapes++] = round_shape_stats(*model->base_shape);
+    out_stats->shapes[out_stats->round_shapes++] = round_shape_stats(*model->base_shape, nullptr);
+  }
+  if (model->extended_shape != nullptr) {
+    out_stats->shapes[out_stats->round_shapes++] =
+        round_shape_stats(*model->extended_shape, model->base_shape.get());
   }
   return 0;
 }

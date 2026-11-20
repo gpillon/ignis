@@ -826,8 +826,35 @@ ninfer::GdnReplayRecordSpec verify_record_spec(const ignis_topology &topology, u
 // allocating -- the VRAM plan's verify line. `IgnisVerifyRound::device_bytes`
 // reads the same total back off a built round, and the load checks the two
 // agree. GitHub #336: for the load's `decode_lanes`, IGNIS_DECODE_MAX_BATCH before.
-std::size_t verify_round_bytes(const ignis_topology &topology, uint32_t window, bool vision,
-                               uint32_t decode_lanes) {
+//
+// GitHub #687: by buffer, the buffers of one extent under one field, because
+// a load's two round shapes hold one set of buffers, each the larger of the
+// two shapes' (`larger_of`). At 8 lanes both shapes top out at 64 columns (8
+// x 8 and 4 x 16), so the set is the base shape's -- the line of a load at 7
+// drafts -- but for the drafts: 15 x 4 words against 7 x 8.
+struct VerifyRoundSizes {
+  // anchors, base_positions, extents, valid_columns, lengths,
+  // licensed_counts, accepted, selectors: I32 [B] each
+  std::size_t lane_words = 0;
+  std::size_t drafts = 0; // I32 [k, B]
+  // verify_ids, positions, target_tokens, licensed_tokens, and
+  // rope_positions with `vision`: I32 [k+1, B] each
+  std::size_t column_words = 0;
+  std::size_t logits = 0;          // BF16 [vocab, k+1, B]
+  std::size_t hidden = 0;          // BF16 [hidden, k+1, B]
+  std::size_t selected_hidden = 0; // BF16 [hidden, B]
+  std::size_t records = 0;         // the ReplaySSM records' backing
+  std::size_t accept = 0;          // the accept workspace
+  bool vision = false;
+
+  std::size_t total() const {
+    return 8 * lane_words + drafts + (vision ? 5 : 4) * column_words + logits + hidden + selected_hidden + records +
+           accept;
+  }
+};
+
+VerifyRoundSizes verify_round_sizes(const ignis_topology &topology, uint32_t window, bool vision,
+                                    uint32_t decode_lanes) {
   const auto k = static_cast<std::size_t>(window);
   const std::size_t columns = k + 1;
   const std::size_t lanes = decode_lanes;
@@ -836,24 +863,53 @@ std::size_t verify_round_bytes(const ignis_topology &topology, uint32_t window, 
   const std::size_t i32 = sizeof(int32_t);
   const std::size_t bf16 = sizeof(std::uint16_t);
 
-  std::size_t bytes = 0;
-  // anchors, base_positions, extents, valid_columns, lengths,
-  // licensed_counts, accepted, selectors
-  bytes += 8 * lanes * i32;
-  bytes += k * lanes * i32;                          // drafts
-  bytes += (vision ? 5 : 4) * columns * lanes * i32; // verify_ids, positions, target_tokens,
-                                                     // licensed_tokens, rope_positions
-  bytes += vocab * columns * lanes * bf16;           // logits
-  bytes += hidden * columns * lanes * bf16;          // hidden
-  bytes += hidden * lanes * bf16;                    // selected_hidden
+  VerifyRoundSizes sizes;
+  sizes.vision = vision;
+  sizes.lane_words = lanes * i32;
+  sizes.drafts = k * lanes * i32;
+  sizes.column_words = columns * lanes * i32;
+  sizes.logits = vocab * columns * lanes * bf16;
+  sizes.hidden = hidden * columns * lanes * bf16;
+  sizes.selected_hidden = hidden * lanes * bf16;
   ninfer::LayoutBuilder builder;
   (void)ninfer::plan_gdn_replay_records(builder, verify_record_spec(topology, window, decode_lanes));
-  bytes += builder.finish(kArenaAlign, "GDN replay records");
-  bytes += std::max<std::size_t>(ninfer::ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                                     static_cast<std::int32_t>(vocab), static_cast<std::int32_t>(k),
-                                     static_cast<std::int32_t>(k), 1, static_cast<std::int32_t>(lanes)),
-                                 kArenaAlign);
-  return bytes;
+  sizes.records = builder.finish(kArenaAlign, "GDN replay records");
+  sizes.accept = std::max<std::size_t>(ninfer::ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                           static_cast<std::int32_t>(vocab), static_cast<std::int32_t>(k),
+                                           static_cast<std::int32_t>(k), 1, static_cast<std::int32_t>(lanes)),
+                                       kArenaAlign);
+  return sizes;
+}
+
+// GitHub #687: each buffer at the larger of two round shapes'.
+VerifyRoundSizes larger_of(const VerifyRoundSizes &a, const VerifyRoundSizes &b) {
+  VerifyRoundSizes sizes;
+  sizes.lane_words = std::max(a.lane_words, b.lane_words);
+  sizes.drafts = std::max(a.drafts, b.drafts);
+  sizes.column_words = std::max(a.column_words, b.column_words);
+  sizes.logits = std::max(a.logits, b.logits);
+  sizes.hidden = std::max(a.hidden, b.hidden);
+  sizes.selected_hidden = std::max(a.selected_hidden, b.selected_hidden);
+  sizes.records = std::max(a.records, b.records);
+  sizes.accept = std::max(a.accept, b.accept);
+  sizes.vision = a.vision || b.vision;
+  return sizes;
+}
+
+// The ReplaySSM records of `verify`'s window across its lanes, laid out by
+// the vendored planner over its backing. GitHub #687: a backing two round
+// shapes share is the larger layout's, so each shape binds its own planes
+// over as many of its bytes as its layout takes.
+void bind_verify_records(IgnisVerifyRound &verify, const ignis_topology &topology) {
+  ninfer::LayoutBuilder builder;
+  verify.records_layout =
+      ninfer::plan_gdn_replay_records(builder, verify_record_spec(topology, verify.window, verify.lanes));
+  const std::size_t record_bytes = builder.finish(kArenaAlign, "GDN replay records");
+  if (record_bytes > verify.records_backing->bytes) {
+    throw std::runtime_error("the verify round's records outgrow their backing");
+  }
+  verify.records =
+      ninfer::GdnReplayRecords(ninfer::DeviceSpan{verify.records_backing->p, record_bytes}, verify.records_layout);
 }
 
 // P5-04 (GitHub #153): the verify round's substrate (model_internal.h's
@@ -865,45 +921,40 @@ std::size_t verify_round_bytes(const ignis_topology &topology, uint32_t window, 
 // the fold only admits its registered all-layer geometries, so a wrong
 // count here fails at the first round, by name, not silently.
 //
-// GitHub #195: `vision` adds the round's rope-position staging, so a
-// multimodal sequence's verify columns rotate at `position + rope_delta` the
-// way its decode rounds do. A load without vision allocates nothing for it
-// and every round rotates at `positions` itself, exactly as before.
-std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topology,
-                                                     uint32_t window, bool vision,
-                                                     uint32_t decode_lanes) {
+// GitHub #195: a vision load's `sizes` add the round's rope-position staging,
+// so a multimodal sequence's verify columns rotate at `position + rope_delta`
+// the way its decode rounds do. A load without vision allocates nothing for
+// it and every round rotates at `positions` itself, exactly as before.
+//
+// GitHub #687: every buffer is allocated at `sizes`, the round's own
+// (`verify_round_sizes` at this window and these lanes) or, on a load of two
+// round shapes, the larger of the two shapes'.
+std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topology, uint32_t window,
+                                                     uint32_t decode_lanes, const VerifyRoundSizes &sizes) {
   auto verify = std::make_unique<IgnisVerifyRound>();
   verify->window = window;
-  const auto k = static_cast<std::int32_t>(window);
-  const std::int32_t columns = k + 1;
+  verify->lanes = decode_lanes;
   const auto lanes = static_cast<std::int32_t>(decode_lanes);
-  const auto hidden = static_cast<std::size_t>(topology.hidden);
-  const auto vocab = static_cast<std::int32_t>(topology.vocab);
 
-  const auto i32 = [](std::int64_t n) {
-    return std::make_unique<ninfer::DeviceBuffer>(static_cast<std::size_t>(n) * sizeof(int32_t));
-  };
-  const auto bf16 = [](std::size_t n) {
-    return std::make_unique<ninfer::DeviceBuffer>(n * sizeof(std::uint16_t));
-  };
-  verify->anchors = i32(lanes);
-  verify->drafts = i32(static_cast<std::int64_t>(k) * lanes);
-  verify->base_positions = i32(lanes);
-  verify->extents = i32(lanes);
-  verify->valid_columns = i32(lanes);
-  verify->lengths = i32(lanes);
-  verify->verify_ids = i32(static_cast<std::int64_t>(columns) * lanes);
-  verify->positions = i32(static_cast<std::int64_t>(columns) * lanes);
-  verify->target_tokens = i32(static_cast<std::int64_t>(columns) * lanes);
-  verify->logits = bf16(static_cast<std::size_t>(vocab) * columns * lanes);
-  verify->hidden = bf16(hidden * columns * lanes);
-  verify->licensed_tokens = i32(static_cast<std::int64_t>(columns) * lanes);
-  verify->licensed_counts = i32(lanes);
-  verify->accepted = i32(lanes);
-  verify->selectors = i32(lanes);
-  verify->selected_hidden = bf16(hidden * lanes);
-  if (vision) {
-    verify->rope_positions = i32(static_cast<std::int64_t>(columns) * lanes);
+  const auto device = [](std::size_t bytes) { return std::make_shared<ninfer::DeviceBuffer>(bytes); };
+  verify->anchors = device(sizes.lane_words);
+  verify->drafts = device(sizes.drafts);
+  verify->base_positions = device(sizes.lane_words);
+  verify->extents = device(sizes.lane_words);
+  verify->valid_columns = device(sizes.lane_words);
+  verify->lengths = device(sizes.lane_words);
+  verify->verify_ids = device(sizes.column_words);
+  verify->positions = device(sizes.column_words);
+  verify->target_tokens = device(sizes.column_words);
+  verify->logits = device(sizes.logits);
+  verify->hidden = device(sizes.hidden);
+  verify->licensed_tokens = device(sizes.column_words);
+  verify->licensed_counts = device(sizes.lane_words);
+  verify->accepted = device(sizes.lane_words);
+  verify->selectors = device(sizes.lane_words);
+  verify->selected_hidden = device(sizes.selected_hidden);
+  if (sizes.vision) {
+    verify->rope_positions = device(sizes.column_words);
   }
   // The staging a capture reads before any round refreshed it must still be
   // a legal input (a valid extent, a real slot): zero is one. A lane's
@@ -919,19 +970,59 @@ std::unique_ptr<IgnisVerifyRound> build_verify_round(const ignis_topology &topol
   const std::vector<std::int32_t> anchor_only(static_cast<std::size_t>(lanes), 1);
   verify->valid_columns->copy_from_host(anchor_only.data(), anchor_only.size() * sizeof(std::int32_t));
 
-  ninfer::LayoutBuilder builder;
-  verify->records_layout =
-      ninfer::plan_gdn_replay_records(builder, verify_record_spec(topology, window, decode_lanes));
-  const std::size_t record_bytes = builder.finish(kArenaAlign, "GDN replay records");
-  verify->records_backing = std::make_unique<ninfer::DeviceBuffer>(record_bytes);
-  verify->records = ninfer::GdnReplayRecords(
-      ninfer::DeviceSpan{verify->records_backing->p, verify->records_backing->bytes},
-      verify->records_layout);
+  verify->records_backing = device(sizes.records);
+  bind_verify_records(*verify, topology);
 
-  const std::size_t accept_bytes = ninfer::ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-      vocab, k, k, 1, lanes);
-  verify->accept_workspace =
-      std::make_unique<ninfer::DeviceArena>(std::max<std::size_t>(accept_bytes, kArenaAlign));
+  verify->accept_workspace = std::make_shared<ninfer::DeviceArena>(sizes.accept);
+  return verify;
+}
+
+// GitHub #687: a load's extended round shape at window `window` across
+// `lanes`, over `base`'s device memory: every buffer and arena is the base
+// shape's own, which the load sized for the larger of the two shapes
+// (`plan_load_sizes`), the drafter's included, and the ReplaySSM records take
+// the extended shape's layout over the same backing. Nothing here is
+// allocated on the device; the host-mapped staging and the graphs are the
+// shape's own.
+std::unique_ptr<IgnisVerifyRound> build_extended_shape(const ignis_topology &topology, uint32_t window,
+                                                       uint32_t lanes, const IgnisVerifyRound &base) {
+  auto verify = std::make_unique<IgnisVerifyRound>();
+  verify->window = window;
+  verify->lanes = lanes;
+  verify->anchors = base.anchors;
+  verify->drafts = base.drafts;
+  verify->base_positions = base.base_positions;
+  verify->extents = base.extents;
+  verify->valid_columns = base.valid_columns;
+  verify->lengths = base.lengths;
+  verify->rope_positions = base.rope_positions;
+  verify->verify_ids = base.verify_ids;
+  verify->positions = base.positions;
+  verify->target_tokens = base.target_tokens;
+  verify->logits = base.logits;
+  verify->hidden = base.hidden;
+  verify->licensed_tokens = base.licensed_tokens;
+  verify->licensed_counts = base.licensed_counts;
+  verify->accepted = base.accepted;
+  verify->selectors = base.selectors;
+  verify->selected_hidden = base.selected_hidden;
+  verify->records_backing = base.records_backing;
+  verify->accept_workspace = base.accept_workspace;
+  verify->features = base.features;
+  verify->append_counts = base.append_counts;
+  verify->drafter_scratch = base.drafter_scratch;
+  verify->draft_candidates = base.draft_candidates;
+  verify->draft_q = base.draft_q;
+  bind_verify_records(*verify, topology);
+  verify->sampled_draft = base.sampled_draft;
+  verify->drafter_temperature_factor = base.drafter_temperature_factor;
+  verify->drafter_top_p = base.drafter_top_p;
+  if (verify->sampled_draft &&
+      ignis_sampled_accept_workspace_bytes(static_cast<std::int32_t>(topology.vocab), static_cast<std::int32_t>(window),
+                                           static_cast<std::int32_t>(lanes)) > verify->accept_workspace->capacity()) {
+    throw std::runtime_error("the sampled draft's accept at the extended shape outgrows the accept workspace");
+  }
+  verify->staging = std::make_unique<VerifyStaging>();
   return verify;
 }
 
@@ -978,8 +1069,21 @@ constexpr std::size_t kDflash2RoundWorkspaceBytes = 32 * 1024 * 1024;
 // it allocates them: its forward -- both blocks of a layer counted together,
 // so the sum is conservative -- or the round's context append, whichever is
 // larger.
-std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::int32_t window,
-                                           uint32_t lanes) {
+//
+// GitHub #687: the forward in its two phases, for the extended round shape's
+// bound (`dflash2_extended_round_scratch_bytes`): the query block's ids,
+// positions and residual with one layer's blocks, then the draft columns'
+// head, top-k and selector, which the forward allocates once every layer's
+// blocks are released (their scopes close first, dflash2_drafter.cu).
+struct Dflash2RoundActivations {
+  std::size_t query = 0;  // ids, positions, residual: live through the forward
+  std::size_t layers = 0; // one layer's attention and MLP blocks together
+  std::size_t head = 0;   // packed .. scores
+  std::size_t append = 0; // the round's context append
+};
+
+Dflash2RoundActivations dflash2_round_activations(const ignis_topology &topology, std::int32_t window,
+                                                  uint32_t lanes) {
   const auto hidden = static_cast<int64_t>(topology.hidden);
   const auto vocab = static_cast<int64_t>(topology.vocab);
   const auto intermediate = static_cast<int64_t>(topology.ffn_intermediate);
@@ -991,6 +1095,7 @@ std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::
   std::size_t forward = 0;
   forward += i32_bytes(columns) * 2;                                // ids, positions
   forward += bf16_bytes(hidden * columns);                          // residual
+  const std::size_t query = forward;
   forward += bf16_bytes(hidden * columns) * 2;                      // attention: normed, conv
   forward += bf16_bytes(kDflash2ConvProjRows * columns);            // dynamic
   forward += bf16_bytes((kDflash2QuerySize + 2 * kv_width) * columns); // query_key_value
@@ -1001,6 +1106,7 @@ std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::
   forward += bf16_bytes(kDflash2ConvProjRows * columns);            // dynamic
   forward += bf16_bytes(intermediate * columns);                    // intermediate
   forward += bf16_bytes(hidden * columns) * 2;                      // projected, conv_projected
+  const std::size_t layers = forward - query;
   forward += bf16_bytes(hidden * drafts) * 2;                       // packed, proposal_hidden
   forward += bf16_bytes(vocab * drafts);                            // logits
   forward += i32_bytes(top_k * drafts) + bf16_bytes(top_k * drafts); // candidate ids, values
@@ -1022,7 +1128,29 @@ std::size_t dflash2_round_activation_bytes(const ignis_topology &topology, std::
   append += bf16_bytes(hidden * columns) * 2;                       // projected, context
   append += bf16_bytes((kDflash2QuerySize + 2 * kv_width) * columns); // query_key_value
   append += bf16_bytes(kv_width * columns) * 3;                     // key_raw, key, value
-  return std::max(forward, append);
+  return Dflash2RoundActivations{query, layers, forward - query - layers, append};
+}
+
+// P5-05 (GitHub #155): the drafter's round scratch at window `k` across
+// `lanes`: the forward's activations summed, or the append's, with the
+// allowance for the vendored workspaces (kDflash2RoundWorkspaceBytes).
+std::size_t dflash2_round_scratch_bytes(const ignis_topology &topology, std::int32_t window, uint32_t lanes) {
+  const Dflash2RoundActivations bytes = dflash2_round_activations(topology, window, lanes);
+  return std::max(bytes.query + bytes.layers + bytes.head, bytes.append) + kDflash2RoundWorkspaceBytes;
+}
+
+// GitHub #687: what an extended round asks of the scratch the two round
+// shapes share, by the forward's phases: while a layer runs, the query block,
+// its blocks and the vendored workspaces; after the last one, the query block
+// and the head's buffers, where the layers' were. The extended forward's head
+// is larger than the base one's at 8 lanes (4 x 15 draft columns against 8 x
+// 7), yet it fits what the base shape's sum reserves, so the shared scratch
+// stays the base shape's at every lane count and window.
+std::size_t dflash2_extended_round_scratch_bytes(const ignis_topology &topology, std::int32_t window,
+                                                 uint32_t lanes) {
+  const Dflash2RoundActivations bytes = dflash2_round_activations(topology, window, lanes);
+  return std::max(bytes.query + std::max(bytes.layers + kDflash2RoundWorkspaceBytes, bytes.head),
+                  bytes.append + kDflash2RoundWorkspaceBytes);
 }
 
 // GitHub #576: what the sampled draft keeps of the drafter's q from the draw
@@ -1910,7 +2038,9 @@ struct LoadSizes {
   bool vision = false;
   std::size_t sampling_workspace = 0;
   std::size_t decode_graph_scratch = 0;
-  std::size_t verify_round = 0;
+  // The verify round's buffers; all zero without a draft window. GitHub #687:
+  // on a load of two round shapes, each the larger of the two shapes'.
+  VerifyRoundSizes verify_round;
   std::size_t drafter_features = 0;
   // One count per lane: the columns its committed run appends to its window.
   std::size_t drafter_append_counts = 0;
@@ -1918,6 +2048,13 @@ struct LoadSizes {
   // GitHub #576: under the sampled draft, the drafter's q kept from the draw
   // to the accept -- its candidates' ids and probabilities (0 otherwise).
   std::size_t drafter_draws = 0;
+  // GitHub #687: the load's base shape's window, and its extended shape's
+  // window and lanes (0 on a load with one shape). Its rounds run in the base
+  // shape's buffers, so `verify_round` and the drafter's lines above are each
+  // buffer at the larger of the two shapes'.
+  uint32_t base_window = 0;
+  uint32_t extended_window = 0;
+  uint32_t extended_lanes = 0;
   std::size_t sampling_logits = 0;
   // GitHub #339: the trellis body's one workspace (0 on the NVFP4 body).
   std::size_t trellis_workspace = 0;
@@ -1954,7 +2091,7 @@ struct LoadSizes {
     // with vision.
     out.decode_graph_bytes =
         decode_graph_scratch + (vision ? 3 : 2) * sizeof(int32_t) * lanes;
-    out.verify_round_bytes = verify_round;
+    out.verify_round_bytes = verify_round.total();
     // The load's drafter's round buffers, as `plan_load_sizes` chose them
     // (GitHub #619): 0 without a drafter that has any.
     out.drafter_round_bytes = drafter_features + drafter_append_counts + drafter_draws + drafter_scratch;
@@ -1983,7 +2120,8 @@ struct LoadSizes {
 //
 // The head is asked on the decode route alone, which holds only while its
 // widest call fits that route: a verify round's `lanes x (k + 1)` is at most
-// 8 x 8 = 64 by the load's own limits, and a span-logits block 32. Both are
+// 8 x 8 = 64 by the load's own limits (GitHub #687: an extended round's 4 x 16
+// at most too), and a span-logits block 32. Both are
 // pinned below at compile time, and a load whose head would still be wider is
 // refused here, naming why, rather than its first such round failing mid-
 // decode on a workspace sized for a narrower call.
@@ -1992,8 +2130,16 @@ struct LoadSizes {
 // decode route reaches the fused op, so the prefill width asks the dense op
 // instead: the INT8 activations of each shared input's matrices together
 // (`ignis_dense_prefill_workspace_bytes`), past the fused op's counters.
-static_assert(IGNIS_DECODE_MAX_BATCH * (kIgnisWidestDraftTokens + 1) <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
+// GitHub #687: a round at the base shape runs every lane count, at most the
+// base shape's window (the MTP head's and the verify substrate's caps among
+// it); one at the extended shape its fewer lanes, at most DFlash2's cap.
+static_assert(IGNIS_MTP_MAX_DRAFT_TOKENS <= IGNIS_BASE_SHAPE_DRAFT_TOKENS &&
+                  IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS <= IGNIS_BASE_SHAPE_DRAFT_TOKENS,
+              "a backend without an extended shape drafts no more than the base shape at every lane count");
+static_assert(IGNIS_DECODE_MAX_BATCH * (IGNIS_BASE_SHAPE_DRAFT_TOKENS + 1) <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
               "a verify round's head columns (lanes x (k + 1)) must stay on the trellis op's decode route");
+static_assert(IGNIS_EXTENDED_SHAPE_MAX_LANES * (IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1) <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
+              "an extended verify round's head columns (lanes x (k + 1)) must stay on the trellis op's decode route");
 static_assert(kSpanLogitsBlockColumns <= IGNIS_TRELLIS_DECODE_MAX_TOKENS,
               "a span-logits block's head columns must stay on the trellis op's decode route");
 std::size_t trellis_workspace_bytes(const ignis_model &model, uint32_t prefill_chunk_tokens,
@@ -2230,17 +2376,45 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   sizes.sampling_workspace = std::max<std::size_t>(
       ninfer::ops::sampling_workspace_capacity_bytes(vocab, 1, static_cast<std::int32_t>(lanes)), kArenaAlign);
 
+  // GitHub #687: past the base shape's window a DFlash2 load runs two round
+  // shapes out of one set of buffers: its base shape (the load's round below,
+  // at IGNIS_BASE_SHAPE_DRAFT_TOKENS and every lane count) and its extended
+  // shape (the load's window, at no more than IGNIS_EXTENDED_SHAPE_MAX_LANES).
+  const bool two_shapes =
+      model.drafter == IgnisDrafter::kDflash2 && options.draft_tokens > IGNIS_BASE_SHAPE_DRAFT_TOKENS;
+  sizes.base_window = two_shapes ? IGNIS_BASE_SHAPE_DRAFT_TOKENS : options.draft_tokens;
+  if (two_shapes) {
+    sizes.extended_window = options.draft_tokens;
+    sizes.extended_lanes = std::min<uint32_t>(lanes, IGNIS_EXTENDED_SHAPE_MAX_LANES);
+  }
+  const bool vision = options.vision_max_tokens > 0;
+
   // P3-05 (GitHub #102) / P5-04 (GitHub #153): the round scratch, one column
   // per lane, or `k+1` with a draft window.
   const bool windowed = options.draft_tokens > 0;
-  const auto round_columns = static_cast<std::int32_t>(windowed ? options.draft_tokens + 1 : 1);
+  const auto round_columns = static_cast<std::int32_t>(windowed ? sizes.base_window + 1 : 1);
   sizes.decode_graph_scratch = compute_program_scratch_bytes(
       model, topology, /*chunk=*/round_columns, max_context_tokens, options.cache_dtype,
       /*batch=*/static_cast<std::int32_t>(lanes), /*head_every_column=*/windowed, LayerRoutes{});
+  if (two_shapes) {
+    // GitHub #687: and the extended round's, asked at two lanes or more: one
+    // lane's attention runs in chunks of the small-T tile (kernel/src/gqa_layer.cu,
+    // kernel/src/round_shape.h), which a two-lane query bounds, where a
+    // one-lane query would size the prompt route's planes for the context.
+    const auto extended_batch = static_cast<std::int32_t>(std::max<uint32_t>(2, sizes.extended_lanes));
+    sizes.decode_graph_scratch =
+        std::max(sizes.decode_graph_scratch,
+                 compute_program_scratch_bytes(model, topology, static_cast<std::int32_t>(sizes.extended_window + 1),
+                                               max_context_tokens, options.cache_dtype, extended_batch,
+                                               /*head_every_column=*/true, LayerRoutes{}));
+  }
 
   if (windowed) {
-    sizes.verify_round =
-        verify_round_bytes(topology, options.draft_tokens, options.vision_max_tokens > 0, lanes);
+    sizes.verify_round = verify_round_sizes(topology, sizes.base_window, vision, lanes);
+  }
+  if (two_shapes) {
+    sizes.verify_round = larger_of(
+        sizes.verify_round, verify_round_sizes(topology, sizes.extended_window, vision, sizes.extended_lanes));
   }
 
   // GitHub #619: the load's drafter's lines, chosen here once -- what its
@@ -2252,16 +2426,32 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     sizes.prefill_scratch +=
         dflash2_prefill_scratch_bytes(topology, static_cast<std::int32_t>(prefill_chunk_tokens));
     // P5-05 (GitHub #155): the drafter's round buffers.
-    check_dflash2_round_workspace(model, g, max_context_tokens, options.draft_tokens, lanes);
-    const auto block = static_cast<std::size_t>(options.draft_tokens + 1);
+    check_dflash2_round_workspace(model, g, max_context_tokens, sizes.base_window, lanes);
+    const auto block = static_cast<std::size_t>(sizes.base_window + 1);
     sizes.drafter_features = kDflash2TapLayers.size() * static_cast<std::size_t>(g.hidden) * block *
                              lanes * sizeof(std::uint16_t);
     sizes.drafter_append_counts = sizeof(std::int32_t) * lanes;
     sizes.drafter_scratch =
-        dflash2_round_activation_bytes(topology, static_cast<std::int32_t>(options.draft_tokens), lanes) +
-        kDflash2RoundWorkspaceBytes;
+        dflash2_round_scratch_bytes(topology, static_cast<std::int32_t>(sizes.base_window), lanes);
     if (options.draft_rule == IGNIS_DRAFT_RULE_SAMPLED) {
-      sizes.drafter_draws = dflash2_draw_bytes(options.draft_tokens, lanes);
+      sizes.drafter_draws = dflash2_draw_bytes(sizes.base_window, lanes);
+    }
+    // GitHub #687: the extended shape drafts out of the same buffers, each the
+    // larger of the two shapes' (its lanes are never more than the base
+    // shape's, so the append counts are the base shape's).
+    if (two_shapes) {
+      check_dflash2_round_workspace(model, g, max_context_tokens, sizes.extended_window, sizes.extended_lanes);
+      sizes.drafter_features =
+          std::max(sizes.drafter_features, kDflash2TapLayers.size() * static_cast<std::size_t>(g.hidden) *
+                                               (sizes.extended_window + 1) * sizes.extended_lanes *
+                                               sizeof(std::uint16_t));
+      sizes.drafter_scratch = std::max(
+          sizes.drafter_scratch, dflash2_extended_round_scratch_bytes(
+                                     topology, static_cast<std::int32_t>(sizes.extended_window), sizes.extended_lanes));
+      if (options.draft_rule == IGNIS_DRAFT_RULE_SAMPLED) {
+        sizes.drafter_draws =
+            std::max(sizes.drafter_draws, dflash2_draw_bytes(sizes.extended_window, sizes.extended_lanes));
+      }
     }
     break;
   }
@@ -2286,7 +2476,9 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   // GitHub #339: the trellis body's workspace, whose head runs at most a
   // round's columns across the load's lanes or one span-logits block.
   if (model.is_trellis_body) {
-    const uint32_t round_head_columns = lanes * static_cast<uint32_t>(round_columns);
+    // GitHub #687: an extended round's, at its fewer lanes, too.
+    const uint32_t round_head_columns =
+        std::max(lanes * static_cast<uint32_t>(round_columns), sizes.extended_lanes * (sizes.extended_window + 1));
     const bool dense = options.prefill_linear == IGNIS_PREFILL_LINEAR_DENSE;
     sizes.trellis_workspace = trellis_workspace_bytes(
         model, prefill_chunk_tokens,
@@ -2303,12 +2495,10 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
 // buffers -- the other half of `LoadSizes::reservations`, which the caller
 // compares against its plan.
 ignis_model_reservations reserved_of(const ignis_model &model) {
-  const auto bytes = [](const std::unique_ptr<ninfer::DeviceBuffer> &buffer) -> uint64_t {
-    return buffer != nullptr ? buffer->bytes : 0;
-  };
-  const auto capacity = [](const std::unique_ptr<ninfer::DeviceArena> &arena) -> uint64_t {
-    return arena != nullptr ? arena->capacity() : 0;
-  };
+  // Of a unique or a shared pointer (GitHub #687: the round shapes' buffers
+  // are shared).
+  const auto bytes = [](const auto &buffer) -> uint64_t { return buffer != nullptr ? buffer->bytes : 0; };
+  const auto capacity = [](const auto &arena) -> uint64_t { return arena != nullptr ? arena->capacity() : 0; };
   ignis_model_reservations out{};
   out.workspace_bytes = capacity(model.scratch);
   // GitHub #415: a host-mapped pool holds no VRAM.
@@ -2326,6 +2516,8 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.trellis_workspace_bytes = bytes(model.trellis_workspace_buffer);
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   out.tma_descriptor_bytes = model.tma_descriptors != nullptr ? model.tma_descriptors->bytes() : 0;
+  // GitHub #687: a load's extended shape holds the base shape's buffers and
+  // none of its own, so the base shape's are every byte of both.
   if (model.base_shape != nullptr) {
     out.drafter_round_bytes = bytes(model.base_shape->features) + bytes(model.base_shape->append_counts) +
                               bytes(model.base_shape->draft_candidates) + bytes(model.base_shape->draft_q) +
@@ -2840,10 +3032,12 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
   }
 
   // P5-04 (GitHub #153): the verify round's substrate, for either windowed
-  // backend: GitHub #686, the load's base shape.
+  // backend: GitHub #686, the load's base shape. GitHub #687: in buffers sized
+  // for both of a load's shapes (`sizes.verify_round`); the extended shape's
+  // view of them is made below, once the drafter's exist.
   if (draft_tokens > 0) {
     try {
-      model->base_shape = build_verify_round(*topology, draft_tokens, vision_max_tokens > 0, load.decode_lanes);
+      model->base_shape = build_verify_round(*topology, sizes.base_window, load.decode_lanes, sizes.verify_round);
       // GitHub #576 (ADR 0090): the round's draft rule. The sampled draft's
       // accept takes the same workspace the vendored one does.
       model->base_shape->sampled_draft = load.draft_rule == IGNIS_DRAFT_RULE_SAMPLED;
@@ -2851,7 +3045,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       model->base_shape->drafter_top_p = load.drafter_top_p;
       if (model->base_shape->sampled_draft &&
           ignis_sampled_accept_workspace_bytes(static_cast<std::int32_t>(topology->vocab),
-                                               static_cast<std::int32_t>(draft_tokens),
+                                               static_cast<std::int32_t>(sizes.base_window),
                                                static_cast<std::int32_t>(load.decode_lanes)) >
               model->base_shape->accept_workspace->capacity()) {
         throw std::runtime_error("the sampled draft's accept outgrows the accept workspace");
@@ -2882,6 +3076,13 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       // GitHub #676: the host-mapped staging its verify rounds take, page-locked
       // here rather than while serving.
       model->base_shape->staging = std::make_unique<VerifyStaging>();
+      // GitHub #687: the extended shape, a view of every buffer above with
+      // host-mapped staging of its own (two 16 KiB slots and a ticket, no
+      // device memory).
+      if (sizes.extended_window != 0) {
+        model->extended_shape =
+            build_extended_shape(*topology, sizes.extended_window, sizes.extended_lanes, *model->base_shape);
+      }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
       cudaStreamDestroy(model->stream);
@@ -2985,15 +3186,19 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
         exec = nullptr;
       }
     }
-    if (model->base_shape != nullptr) {
-      for (auto &exec : model->base_shape->graph_exec) {
+    // GitHub #687: each of a load's round shapes.
+    for (IgnisVerifyRound *shape : {model->base_shape.get(), model->extended_shape.get()}) {
+      if (shape == nullptr) {
+        continue;
+      }
+      for (auto &exec : shape->graph_exec) {
         if (exec != nullptr) {
           cudaGraphExecDestroy(exec);
           exec = nullptr;
         }
       }
       // GitHub #676: and the drafter's append graphs.
-      for (auto &exec : model->base_shape->append_exec) {
+      for (auto &exec : shape->append_exec) {
         if (exec != nullptr) {
           cudaGraphExecDestroy(exec);
           exec = nullptr;

@@ -10,12 +10,32 @@
 //! purpose: the GPU load test compares the leaf's reported VRAM against this
 //! arithmetic, so the two cannot drift silently.
 
-/// The widest draft window DFlash2 accepts (the reference's `--spec-draft-tokens`
-/// range for the 27B DFlash2 module, spec 05: `1..7`). The leaf's own is
+/// The widest draft window DFlash2 accepts: GitHub #687 (spec #684), 15, two
+/// round shapes past [`BASE_SHAPE_DRAFT_TOKENS`] ([`Speculation::round_shapes`]),
+/// where the reference's `--spec-draft-tokens` range for the 27B DFlash2
+/// module (spec 05) was `1..7`. The leaf's own is
 /// `IGNIS_DFLASH2_MAX_DRAFT_TOKENS` (`kernel/include/ignis_model.h`), which a
 /// build-time check holds inside the vendored ops' domains
-/// (`kernel/src/draft_window.h`).
-pub const DFLASH2_MAX_DRAFT_TOKENS: u32 = 7;
+/// (`kernel/src/draft_window.h`): 15 is their edge.
+pub const DFLASH2_MAX_DRAFT_TOKENS: u32 = 15;
+
+/// GitHub #687: the base shape's draft window, 8 columns a lane at every lane
+/// count: a DFlash2 load's past it, and the one shape of every load at it or
+/// fewer (`IGNIS_BASE_SHAPE_DRAFT_TOKENS`, `kernel/include/ignis_model.h`).
+pub const BASE_SHAPE_DRAFT_TOKENS: u32 = 7;
+
+/// GitHub #687: the most lanes a round at the extended shape runs, so that
+/// `lanes x (window + 1)` stays within the 64 columns of 8 lanes of 8
+/// (`IGNIS_EXTENDED_SHAPE_MAX_LANES`).
+pub const EXTENDED_SHAPE_MAX_LANES: u32 = 4;
+
+/// A verify round's shape (GitHub #687): its draft window, a round at it
+/// `window + 1` columns a lane, and the most lanes a round at it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundShape {
+    pub window: u32,
+    pub lanes: u32,
+}
 
 /// The widest draft window of a model's MTP head, the 27B's and
 /// Flash-Next's (`IGNIS_MTP_MAX_DRAFT_TOKENS`).
@@ -537,6 +557,24 @@ impl Speculation {
         draft_positions(self.draft_tokens)
     }
 
+    /// The round shapes a load of `decode_lanes` lanes holds (GitHub #687,
+    /// `plan_load_sizes`, `kernel/src/model.cu`): its base shape, and its
+    /// extended shape where it has one. Up to [`BASE_SHAPE_DRAFT_TOKENS`], and
+    /// under every backend but DFlash2, one shape: the load's window at its
+    /// lanes. Past it a DFlash2 load's base shape is
+    /// [`BASE_SHAPE_DRAFT_TOKENS`] at its lanes, and its extended shape the
+    /// load's window at no more than [`EXTENDED_SHAPE_MAX_LANES`]. The two
+    /// hold one set of device buffers, each the larger of the two shapes', so
+    /// the plan's lines take each buffer once.
+    pub fn round_shapes(&self, decode_lanes: u32) -> (RoundShape, Option<RoundShape>) {
+        if self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens > BASE_SHAPE_DRAFT_TOKENS {
+            let extended = RoundShape { window: self.draft_tokens, lanes: decode_lanes.min(EXTENDED_SHAPE_MAX_LANES) };
+            (RoundShape { window: BASE_SHAPE_DRAFT_TOKENS, lanes: decode_lanes }, Some(extended))
+        } else {
+            (RoundShape { window: self.draft_tokens, lanes: decode_lanes }, None)
+        }
+    }
+
     /// The device bytes the load's drafter keeps per sequence in a pool of
     /// `slot_count` slots (GitHub #619: a lane's share of the plan's
     /// `lane_state` line). The state lives in the sequence pool (P5-03,
@@ -646,6 +684,15 @@ impl Speculation {
     /// [`DraftRule::Sampled`], also the drafter's distribution kept from the
     /// draw to the accept: each draft column's candidate ids and their
     /// probabilities (GitHub #576, `dflash2_draw_bytes`).
+    ///
+    /// GitHub #687: with two round shapes ([`Self::round_shapes`]) each
+    /// buffer is the larger of the two shapes', and the extended shape asks
+    /// the scratch by its forward's phases
+    /// (`dflash2_extended_round_scratch_bytes`): while a layer runs, the
+    /// query block, the layer's blocks and the allowance; after the last one,
+    /// the query block and the head's buffers where the layers' were. That is
+    /// under the base shape's sum at every lane count, so the scratch stays
+    /// the base shape's.
     pub fn round_scratch_bytes(&self, decode_lanes: u32) -> u64 {
         match self.backend {
             // The fake drafter proposes from the host: nothing to reserve. The
@@ -654,51 +701,89 @@ impl Speculation {
             // own (spec flash-next/07).
             SpeculativeBackend::VerifyOnly | SpeculativeBackend::Mtp => 0,
             SpeculativeBackend::Dflash2 => {
-                use crate::arena::{bf16, words as wide};
-                let lanes = u64::from(decode_lanes);
-                let columns = u64::from(self.draft_tokens + 1) * lanes;
-                let drafts = u64::from(self.draft_tokens) * lanes;
-                let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
-                let hidden_columns = bf16(HIDDEN * columns);
-                // Added unrounded, as the leaf adds it (GitHub #259: this
-                // term was missing since the top-k was replaced, 5dcfade).
-                let topk_splits = VOCAB.div_ceil(DFLASH2_TOPK_ROWS_PER_SPLIT).min(DFLASH2_TOPK_MAX_SPLITS);
-                let topk_partials =
-                    topk_splits * drafts * DFLASH2_SELECTOR_TOP_K * DFLASH2_TOPK_ENTRY_BYTES;
-
-                let forward = 2 * wide(columns)
-                    + hidden_columns
-                    + 2 * hidden_columns
-                    + bf16(DFLASH2_CONV_PROJ_ROWS * columns)
-                    + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
-                    + 3 * bf16(DFLASH2_QUERY_SIZE * columns)
-                    + 3 * bf16(kv_width * columns)
-                    + 2 * hidden_columns
-                    + 2 * hidden_columns
-                    + bf16(DFLASH2_CONV_PROJ_ROWS * columns)
-                    + bf16(FFN_INTERMEDIATE * columns)
-                    + 2 * hidden_columns
-                    + 2 * bf16(HIDDEN * drafts)
-                    + bf16(VOCAB * drafts)
-                    + wide(DFLASH2_SELECTOR_TOP_K * drafts)
-                    + bf16(DFLASH2_SELECTOR_TOP_K * drafts)
-                    + topk_partials
-                    + 2 * wide(DFLASH2_SELECTOR_TOP_K * drafts)
-                    + bf16(DFLASH2_SELECTOR_RANK * drafts)
-                    + wide(DFLASH2_SELECTOR_RANK * drafts)
-                    + wide(DFLASH2_SELECTOR_TOP_K * DFLASH2_SELECTOR_TOP_K * drafts);
-                let append = 2 * hidden_columns
-                    + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
-                    + 3 * bf16(kv_width * columns);
-
-                let features = DFLASH2_FEATURE_TAPS * HIDDEN * columns * 2;
-                let append_counts = lanes * 4;
-                let draws = match self.draft_rule {
-                    DraftRule::Fixed => 0,
-                    DraftRule::Sampled => 2 * DFLASH2_SELECTOR_TOP_K * drafts * 4,
-                };
-                features + append_counts + draws + forward.max(append) + DFLASH2_ROUND_WORKSPACE_BYTES
+                let (base, extended) = self.round_shapes(decode_lanes);
+                let at = Dflash2RoundBuffers::at(base, self.draft_rule);
+                let scratch = (at.query + at.layers + at.head).max(at.append) + DFLASH2_ROUND_WORKSPACE_BYTES;
+                let mut lines = [at.features, at.append_counts, at.draws, scratch];
+                if let Some(extended) = extended {
+                    let at = Dflash2RoundBuffers::at(extended, self.draft_rule);
+                    let scratch = (at.query + (at.layers + DFLASH2_ROUND_WORKSPACE_BYTES).max(at.head))
+                        .max(at.append + DFLASH2_ROUND_WORKSPACE_BYTES);
+                    for (line, extended) in lines.iter_mut().zip([at.features, at.append_counts, at.draws, scratch]) {
+                        *line = (*line).max(extended);
+                    }
+                }
+                lines.iter().sum()
             }
+        }
+    }
+}
+
+/// The DFlash2 drafter's round buffers at one round shape, in bytes
+/// (`plan_load_sizes`, `dflash2_round_activations`, `kernel/src/model.cu`):
+/// the feature taps, the append counts and the sampled draft's draws, and
+/// what the drafter's round allocates from its scratch -- the forward's query
+/// block (ids, positions, residual), one layer's attention and MLP blocks
+/// counted together, the draft columns' head, top-k and selector, and the
+/// round's context append.
+struct Dflash2RoundBuffers {
+    features: u64,
+    append_counts: u64,
+    draws: u64,
+    query: u64,
+    layers: u64,
+    head: u64,
+    append: u64,
+}
+
+impl Dflash2RoundBuffers {
+    fn at(shape: RoundShape, draft_rule: DraftRule) -> Self {
+        use crate::arena::{bf16, words as wide};
+        let lanes = u64::from(shape.lanes);
+        let columns = u64::from(shape.window + 1) * lanes;
+        let drafts = u64::from(shape.window) * lanes;
+        let kv_width = DFLASH2_KV_HEADS * DFLASH2_HEAD_DIM;
+        let hidden_columns = bf16(HIDDEN * columns);
+        // Added unrounded, as the leaf adds it (GitHub #259: this
+        // term was missing since the top-k was replaced, 5dcfade).
+        let topk_splits = VOCAB.div_ceil(DFLASH2_TOPK_ROWS_PER_SPLIT).min(DFLASH2_TOPK_MAX_SPLITS);
+        let topk_partials = topk_splits * drafts * DFLASH2_SELECTOR_TOP_K * DFLASH2_TOPK_ENTRY_BYTES;
+
+        let query = 2 * wide(columns) + hidden_columns;
+        let layers = 2 * hidden_columns
+            + bf16(DFLASH2_CONV_PROJ_ROWS * columns)
+            + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
+            + 3 * bf16(DFLASH2_QUERY_SIZE * columns)
+            + 3 * bf16(kv_width * columns)
+            + 2 * hidden_columns
+            + 2 * hidden_columns
+            + bf16(DFLASH2_CONV_PROJ_ROWS * columns)
+            + bf16(FFN_INTERMEDIATE * columns)
+            + 2 * hidden_columns;
+        let head = 2 * bf16(HIDDEN * drafts)
+            + bf16(VOCAB * drafts)
+            + wide(DFLASH2_SELECTOR_TOP_K * drafts)
+            + bf16(DFLASH2_SELECTOR_TOP_K * drafts)
+            + topk_partials
+            + 2 * wide(DFLASH2_SELECTOR_TOP_K * drafts)
+            + bf16(DFLASH2_SELECTOR_RANK * drafts)
+            + wide(DFLASH2_SELECTOR_RANK * drafts)
+            + wide(DFLASH2_SELECTOR_TOP_K * DFLASH2_SELECTOR_TOP_K * drafts);
+        let append = 2 * hidden_columns
+            + bf16((DFLASH2_QUERY_SIZE + 2 * kv_width) * columns)
+            + 3 * bf16(kv_width * columns);
+
+        Self {
+            features: DFLASH2_FEATURE_TAPS * HIDDEN * columns * 2,
+            append_counts: lanes * 4,
+            draws: match draft_rule {
+                DraftRule::Fixed => 0,
+                DraftRule::Sampled => 2 * DFLASH2_SELECTOR_TOP_K * drafts * 4,
+            },
+            query,
+            layers,
+            head,
+            append,
         }
     }
 }
@@ -726,10 +811,10 @@ mod tests {
     }
 
     /// GitHub #685: the widest window is the drafter's own. Each of DFlash2,
-    /// the MTP head and the verify substrate alone holds its cap, all three
-    /// still 7.
+    /// the MTP head and the verify substrate alone holds its cap: GitHub #687,
+    /// DFlash2 drafts up to 15, the other two keep 7.
     const WINDOW_RANGES: [(SpeculativeBackend, u32, &str); 3] = [
-        (SpeculativeBackend::Dflash2, 7, "1..7"),
+        (SpeculativeBackend::Dflash2, 15, "1..15"),
         (SpeculativeBackend::Mtp, 7, "1..7"),
         (SpeculativeBackend::VerifyOnly, 7, "1..7"),
     ];
@@ -748,7 +833,7 @@ mod tests {
     #[test]
     fn a_window_outside_the_range_is_refused_naming_the_range() {
         for (backend, widest, range) in WINDOW_RANGES {
-            for n in [0, 8, 15, 16, u32::MAX] {
+            for n in [0, 8, 15, 16, 17, u32::MAX] {
                 if (1..=widest).contains(&n) {
                     continue;
                 }
@@ -769,13 +854,14 @@ mod tests {
     /// load's own window, never fewer than the seven every load reported
     /// while one cap bounded every drafter: so every load a drafter at 7
     /// takes, DFlash2's, the 27B's MTP head's, the verify substrate's and
-    /// Flash-Next's, reports the seven it reported then, whatever its window.
+    /// Flash-Next's, reports the seven it reported then, whatever its window;
+    /// GitHub #687: a DFlash2 load past 7 drafts reports its own window.
     #[test]
     fn every_load_reports_the_seven_draft_positions_it_reported_before_the_cap_split() {
         for (backend, widest, _) in WINDOW_RANGES {
             for n in 1..=widest {
                 let positions = Speculation::new(backend, n).unwrap().draft_positions();
-                assert_eq!(positions, 7, "{} at {n}", backend.as_str());
+                assert_eq!(positions, n.max(7), "{} at {n}", backend.as_str());
                 assert!(positions as usize <= crate::types::DRAFT_POSITIONS, "the counters hold every position a load reports");
             }
         }
@@ -1013,6 +1099,71 @@ mod tests {
             assert!((5_559_300 - 1024..=5_559_300).contains(&step), "lane {lanes} adds {step}");
         }
         assert_eq!(spec.round_scratch_bytes(crate::N_DECODE_LANES as u32), 78_027_552);
+    }
+
+    /// GitHub #687: the round shapes a load holds. One, the option's own window
+    /// at the load's lanes, up to a window of 7 and under every backend but
+    /// DFlash2; past 7 DFlash2's two: the base shape at 7 and the load's lanes,
+    /// the extended one at the window and at most four lanes, so that neither
+    /// passes 64 columns. The two draft out of one set of buffers, each the
+    /// larger of the two shapes': at eight lanes both top out at 64 columns, so
+    /// the drafter's line is the 7-draft load's -- the scratch to the byte (the
+    /// extended forward's larger head, 60 draft columns against 56, lands where
+    /// its layers' blocks were), and under the sampled draft 512 bytes more of
+    /// draws (16 candidates' ids and probabilities of 4 more draft columns).
+    /// Below eight lanes the extended shape has the more columns, and its taps
+    /// size the line.
+    #[test]
+    fn a_dflash2_load_past_seven_drafts_holds_a_base_and_an_extended_shape_on_one_set_of_buffers() {
+        assert_eq!((BASE_SHAPE_DRAFT_TOKENS, EXTENDED_SHAPE_MAX_LANES), (7, 4));
+        for lanes in 1..=8u32 {
+            for window in 1..=7 {
+                for (backend, _, _) in WINDOW_RANGES {
+                    let spec = Speculation::new(backend, window).unwrap();
+                    assert_eq!(spec.round_shapes(lanes), (RoundShape { window, lanes }, None), "{} at {window}", backend.as_str());
+                }
+            }
+            for window in 8..=DFLASH2_MAX_DRAFT_TOKENS {
+                let (base, extended) = Speculation::new(SpeculativeBackend::Dflash2, window).unwrap().round_shapes(lanes);
+                assert_eq!(base, RoundShape { window: 7, lanes }, "window {window}");
+                let extended = extended.unwrap_or_else(|| panic!("window {window}: an extended shape"));
+                assert_eq!(extended, RoundShape { window, lanes: lanes.min(4) }, "window {window}, {lanes} lanes");
+                assert!(base.lanes * 8 <= 64 && extended.lanes * (window + 1) <= 64, "window {window}, {lanes} lanes");
+            }
+        }
+
+        let at = |window| Speculation::new(SpeculativeBackend::Dflash2, window).unwrap();
+        let sampled = |window| at(window).with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
+        assert_eq!(at(15).round_scratch_bytes(8), at(7).round_scratch_bytes(8));
+        assert_eq!(at(15).round_scratch_bytes(8), 78_027_552);
+        assert_eq!(sampled(15).round_scratch_bytes(8), sampled(7).round_scratch_bytes(8) + 512);
+        // A window between the two: 4 x 10 columns and 36 draft columns, under
+        // the base shape's 64 and 56 on every buffer.
+        assert_eq!(sampled(9).round_scratch_bytes(8), sampled(7).round_scratch_bytes(8));
+        // Four lanes: the extended shape's 64 columns against the base shape's
+        // 32 double the taps (1,638,400 more); the scratch is still the base
+        // shape's sum.
+        assert_eq!(at(15).round_scratch_bytes(4), at(7).round_scratch_bytes(4) + 1_638_400);
+        // The extended forward by its phases at 4 lanes of 16 columns: the query
+        // block 655,872 with the layers' blocks 10,551,296 and the allowance
+        // 33,554,432, against the query block with the head's 32,131,328; the
+        // base forward's head at 8 lanes of 8 is 29,989,120.
+        let extended = Dflash2RoundBuffers::at(RoundShape { window: 15, lanes: 4 }, DraftRule::Fixed);
+        assert_eq!((extended.query, extended.layers, extended.head, extended.append), (655_872, 10_551_296, 32_131_328, 2_490_368));
+        let base = Dflash2RoundBuffers::at(RoundShape { window: 7, lanes: 8 }, DraftRule::Fixed);
+        assert_eq!((base.query, base.layers, base.head), (extended.query, extended.layers, 29_989_120));
+        // At every lane count and window the extended forward by its phases fits
+        // the base shape's sum, so the shared scratch is the base shape's.
+        for lanes in 1..=8 {
+            for window in 8..=DFLASH2_MAX_DRAFT_TOKENS {
+                let (base, extended) = at(window).round_shapes(lanes);
+                let base = Dflash2RoundBuffers::at(base, DraftRule::Fixed);
+                let extended = Dflash2RoundBuffers::at(extended.unwrap(), DraftRule::Fixed);
+                let base_scratch = base.query + base.layers + base.head + DFLASH2_ROUND_WORKSPACE_BYTES;
+                let extended_scratch = extended.query + (extended.layers + DFLASH2_ROUND_WORKSPACE_BYTES).max(extended.head);
+                assert!(extended_scratch < base_scratch, "window {window} at {lanes} lanes: {extended_scratch} against {base_scratch}");
+            }
+        }
     }
 
     /// GitHub #576 (ADR 0090): the fixed draft is a speculation's rule until

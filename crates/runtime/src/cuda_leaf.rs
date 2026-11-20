@@ -429,6 +429,22 @@ fn capture_complete(ready: u32, lanes: u32) -> bool {
     ready >= lanes
 }
 
+/// GitHub #687: the round shapes a capture left without a verify graph at a
+/// width they serve, each as its draft window and those widths. A round of
+/// such a shape at such a width runs eagerly: the same tokens, without the
+/// graph's gain (never a refusal of service, ADR 0019), which the load says
+/// in a structured event rather than leave to a silent fallback.
+fn round_shapes_without_graphs(stats: &step::ProgramStats) -> Vec<(u32, Vec<u32>)> {
+    stats
+        .shapes()
+        .iter()
+        .filter_map(|shape| {
+            let widths = shape.widths_without_a_graph();
+            (!widths.is_empty()).then_some((shape.window, widths))
+        })
+        .collect()
+}
+
 /// Log `message` (with `context`) and collapse it to the generic leaf
 /// error code `StepLeaf` expects — `ignis_core`'s step/seq/model_load
 /// wrappers already discarded the raw C return code in favor of a
@@ -813,14 +829,29 @@ impl StepLeaf for CudaLeaf {
         // exactly once per model load (never per-token/decode-round), same
         // frequency class as `ignis.process.started`.
         // hotpath-lint-allow: model-load-time only (`load_model`, runs once per process start), not per-token/decode-round (GitHub #80/#102).
+        // GitHub #687: and each round shape's window, lanes and verify graph
+        // nodes, the base shape first (its nodes are `verify_nodes`).
+        let round_shapes: Vec<(u32, u32, [u32; 8])> =
+            graphs.shapes().iter().map(|shape| (shape.window, shape.lanes, shape.verify_graph_nodes)).collect();
         tracing::info!(
             name: "ignis.runtime.decode_graph_capture",
             ready = capture.ready_count(),
             capture_micros = capture.capture_micros,
             decode_nodes = ?graphs.decode_graph_nodes,
             verify_nodes = ?graphs.verify_graph_nodes,
+            round_shapes = ?round_shapes,
             "decode graph capture"
         );
+        for (window, widths) in round_shapes_without_graphs(&graphs) {
+            // hotpath-lint-allow: same model-load-time call as above.
+            tracing::warn!(
+                name: "ignis.runtime.verify_graph_capture_incomplete",
+                window,
+                widths = ?widths,
+                error = %step::last_decode_graph_error(),
+                "verify graph capture: these widths of the round shape run their verify rounds eagerly"
+            );
+        }
         if !capture_complete(capture.ready_count(), self.config.slot_count) {
             // hotpath-lint-allow: same model-load-time call as above, one line down.
             tracing::warn!(
@@ -1324,6 +1355,39 @@ mod tests {
         assert!(!capture_complete(1, 2));
         assert!(!capture_complete(7, 8));
         assert!(!capture_complete(0, 1));
+    }
+
+    /// GitHub #687: a capture that left a round shape without a verify graph
+    /// at a width it serves is named, shape by shape and width by width, and
+    /// one that reached every width of every shape names nothing: an extended
+    /// shape of 4 lanes is complete at widths 1..=4, a base shape of 2 lanes
+    /// at 1..=2.
+    #[test]
+    fn the_capture_names_each_round_shapes_widths_without_a_graph() {
+        let shape = |window, lanes, ready| step::RoundShapeStats {
+            window,
+            lanes,
+            verify_graph_ready_mask: ready,
+            ..step::RoundShapeStats::default()
+        };
+        let stats = |shapes: &[step::RoundShapeStats]| {
+            let mut stats = step::ProgramStats { round_shape_count: shapes.len() as u32, ..step::ProgramStats::default() };
+            stats.round_shapes[..shapes.len()].copy_from_slice(shapes);
+            stats
+        };
+        assert!(round_shapes_without_graphs(&stats(&[])).is_empty(), "a load with no window");
+        assert!(round_shapes_without_graphs(&stats(&[shape(7, 8, 0xff), shape(15, 4, 0x0f)])).is_empty());
+        assert!(round_shapes_without_graphs(&stats(&[shape(7, 2, 0x03), shape(15, 2, 0x03)])).is_empty());
+        assert_eq!(
+            round_shapes_without_graphs(&stats(&[shape(7, 8, 0xff), shape(15, 4, 0b1011)])),
+            vec![(15, vec![3])],
+            "the extended shape's width 3"
+        );
+        assert_eq!(
+            round_shapes_without_graphs(&stats(&[shape(7, 8, 0x7f), shape(12, 4, 0)])),
+            vec![(7, vec![8]), (12, vec![1, 2, 3, 4])],
+            "the base shape's width 8, and every width of the extended shape"
+        );
     }
 
     #[test]

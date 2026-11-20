@@ -15,10 +15,12 @@
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "prefill_swiglu.h"
+#include "round_shape.h"
 #include "trellis_body.h"
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ops/launcher/gqa_attention.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/position.h"
@@ -412,11 +414,15 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 // appends and attends exactly a lane's valid prefix and writes zero for the
 // padded tail -- the masked form of A1's own contract. The decode round is
 // the `lane_tokens == 1` case with the dense (empty) mask, unchanged.
+//
+// GitHub #687: `extended_round` when the round runs at a load's extended
+// shape (kernel/src/round_shape.h), whose one lane's attention runs in chunks
+// of the small-T tile below; every other round's is exactly as before.
 int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                             uint32_t width, std::int32_t lane_tokens, const void *positions_ptr,
                             const void *rope_positions_ptr,
                             const void *valid_columns_ptr, void *in_residual, void *out_residual,
-                            uint32_t gqa_layer, LinearPolicyMode mode, const char *op) {
+                            uint32_t gqa_layer, LinearPolicyMode mode, bool extended_round, const char *op) {
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
@@ -547,8 +553,21 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // format and the query has to be asked the same way (GitHub #123). At
     // the verify width the resolver's own chunking decides the route -- one
     // hq width-8 tile, or BF16's two passes of six -- not this layer.
-    const std::size_t attention_workspace_bytes = ninfer::ops::gqa_attention_workspace_capacity_bytes(
-        kQHeads, batch_cache.dtype, envelope, batch, lane_tokens, lane_tokens);
+    //
+    // GitHub #687: but for an extended round's one lane, whose 9..16 columns
+    // the resolver would send to its prompt route, with planes sized for the
+    // whole context that a decode load does not reserve: it runs in chunks of
+    // the tile (below), as the vendored chunked small-T route runs two lanes
+    // or more, and its workspace is one chunk's, asked at the tile's widths.
+    const std::int32_t small_t_tile = ninfer::ops::detail::gqa_small_t_chunk_tokens(batch_cache.dtype);
+    const bool one_lane_in_chunks =
+        ignis::round_shape::one_lane_in_chunks(extended_round, batch, lane_tokens, small_t_tile);
+    const std::size_t attention_workspace_bytes =
+        one_lane_in_chunks
+            ? ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, 1, 1,
+                                                                  small_t_tile)
+            : ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, batch,
+                                                                  lane_tokens, lane_tokens);
     const ninfer::DeviceSpan attention_workspace_storage =
         model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
     // Graph-safe (ADR 0019): the predicate is the pool's KV format, fixed for
@@ -577,6 +596,24 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
           rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
           kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
           attention_heads, stream);
+    } else if (one_lane_in_chunks) {
+      // GitHub #687: the vendored chunked small-T route's loop
+      // (kernel/vendor/src/ops/wrapper/gqa_attention.cpp `launch_chunked_small_t`)
+      // at one lane, which its resolver does not give the 27B's 24 heads:
+      // each chunk of the tile appends its columns' K/V and attends from its
+      // first column of the lane's, its partials in a scope of their own.
+      for (std::int32_t begin = 0; begin < lane_tokens; begin += small_t_tile) {
+        const std::int32_t count = std::min(small_t_tile, lane_tokens - begin);
+        auto chunk_scope = attention_workspace.scope();
+        const std::int32_t splits =
+            ninfer::ops::detail::gqa_attention_split_capacity(kQHeads, count, batch_cache.dtype, envelope);
+        ninfer::Tensor acc = attention_workspace.alloc(ninfer::DType::BF16, {kHeadDim, kQHeads, count, splits});
+        ninfer::Tensor m = attention_workspace.alloc(ninfer::DType::FP32, {kQHeads, count, splits});
+        ninfer::Tensor l = attention_workspace.alloc(ninfer::DType::FP32, {kQHeads, count, splits});
+        ninfer::ops::detail::gqa_attention_small_t_launch(
+            rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns, kv_table_rows,
+            gate_heads, attention_scale, batch_cache, envelope, begin, count, acc, m, l, attention_heads, stream);
+      }
     } else {
       ninfer::ops::gqa_attention(
           rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
@@ -619,7 +656,8 @@ int32_t run_gqa_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                                  ? model->decode_rope_positions->p
                                  : model->sampling_decode_positions->p,
                              /*valid_columns_ptr=*/nullptr,
-                             in_residual, out_residual, gqa_layer, mode, "ignis_gqa_layer_graph");
+                             in_residual, out_residual, gqa_layer, mode, /*extended_round=*/false,
+                             "ignis_gqa_layer_graph");
 }
 
 // P4-05 (GitHub #123): both formats serve, and which routes a layer takes is
@@ -790,7 +828,7 @@ int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
       verify.rope_positions != nullptr ? verify.rope_positions->p : verify.positions->p;
   return run_gqa_layer_batch(model, pool, layer, width, static_cast<std::int32_t>(verify.window + 1),
                              verify.positions->p, rotation, verify.valid_columns->p,
-                             const_cast<void *>(in_residual), out_residual, gqa_layer, mode,
+                             const_cast<void *>(in_residual), out_residual, gqa_layer, mode, verify.extended(),
                              "ignis_gqa_layer_verify");
 }
 

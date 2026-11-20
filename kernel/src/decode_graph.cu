@@ -185,9 +185,12 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     set_error("ignis_verify_graph: null argument");
     return -1;
   }
-  if (width == 0 || width > model->decode_lanes) {
+  // GitHub #687: the shape's own lanes, the load's decode lanes at its base
+  // shape and no more than IGNIS_EXTENDED_SHAPE_MAX_LANES at an extended one.
+  if (width == 0 || width > verify.lanes) {
     set_error("ignis_verify_graph: width " + std::to_string(width) + " is not in 1.." +
-              std::to_string(model->decode_lanes) + ", the load's decode lanes");
+              std::to_string(verify.lanes) + ", the lanes of the round shape at " + std::to_string(verify.window) +
+              " drafts");
     return -1;
   }
   const auto k = static_cast<std::int32_t>(verify.window);
@@ -649,13 +652,19 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   if (!read_round_timing(model) || !read_decode_graph_copies(model) || !read_gdn_gating(model)) {
     return -1;
   }
-  // GitHub #686: the shape whose verify and append graphs this capture makes,
-  // the load's base shape; none on a load with no window.
+  // GitHub #686: the shapes whose verify and append graphs this capture
+  // makes, the load's base shape and (GitHub #687) its extended shape where
+  // it has one; none on a load with no window.
+  IgnisVerifyRound *const shapes[] = {model->base_shape.get(), model->extended_shape.get()};
   IgnisVerifyRound *const shape = model->base_shape.get();
   // GitHub #676: IGNIS_DEFER_VERIFY, read at each capture like the round
-  // timing; a load with no window has no verify round to defer.
+  // timing; a load with no window has no verify round to defer. Both of a
+  // load's shapes defer alike.
   if (shape != nullptr && !capture_switch(ignis::deferred_verify::read_switch, shape->defer)) {
     return -1;
+  }
+  if (model->extended_shape != nullptr) {
+    model->extended_shape->defer = shape->defer;
   }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
@@ -672,14 +681,16 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     release_graph(model->decode_graph_exec[width - 1], model->decode_graph_ready[width - 1],
                   model->decode_graph_nodes[width - 1]);
     model->decode_graph_copy_nodes[width - 1] = 0;
-    if (shape != nullptr) {
-      release_graph(shape->graph_exec[width - 1], shape->graph_ready[width - 1],
-                    shape->graph_nodes[width - 1]);
-      shape->graph_copy_nodes[width - 1] = 0;
+    for (IgnisVerifyRound *const held : shapes) {
+      if (held == nullptr) {
+        continue;
+      }
+      release_graph(held->graph_exec[width - 1], held->graph_ready[width - 1], held->graph_nodes[width - 1]);
+      held->graph_copy_nodes[width - 1] = 0;
       // GitHub #676: and the drafter's append graph.
-      if (shape->append_exec[width - 1] != nullptr) {
-        cudaGraphExecDestroy(shape->append_exec[width - 1]);
-        shape->append_exec[width - 1] = nullptr;
+      if (held->append_exec[width - 1] != nullptr) {
+        cudaGraphExecDestroy(held->append_exec[width - 1]);
+        held->append_exec[width - 1] = nullptr;
       }
     }
   }
@@ -705,30 +716,38 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   // P5-04 (GitHub #153): the verify graphs, one per exact width at the
   // load's window, under the same never-refuse-service rule -- a width whose
   // verify capture failed runs the verify traversal eagerly. On an MTP load
-  // the head's chain is in them (GitHub #621).
-  if (shape != nullptr) {
-    for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
+  // the head's chain is in them (GitHub #621). GitHub #687: each of the
+  // load's round shapes at its own widths, 1..its lanes; a failed width is in
+  // the shape's stats (`ignis_program_stats`), which the runtime reports.
+  for (IgnisVerifyRound *const held : shapes) {
+    if (held == nullptr) {
+      continue;
+    }
+    for (uint32_t width = 1; width <= held->lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
-      if (capture_verify_graph_width(model, pool, *shape, width, &exec, &shape->graph_nodes[width - 1],
-                                     &shape->graph_copy_nodes[width - 1]) == 0) {
-        shape->graph_exec[width - 1] = exec;
-        shape->graph_ready[width - 1] = true;
+      if (capture_verify_graph_width(model, pool, *held, width, &exec, &held->graph_nodes[width - 1],
+                                     &held->graph_copy_nodes[width - 1]) == 0) {
+        held->graph_exec[width - 1] = exec;
+        held->graph_ready[width - 1] = true;
       } else {
-        shape->graph_exec[width - 1] = nullptr;
-        shape->graph_ready[width - 1] = false;
+        held->graph_exec[width - 1] = nullptr;
+        held->graph_ready[width - 1] = false;
       }
     }
   }
   // GitHub #676: the DFlash2 drafter's append after a deferring round's
   // commit, one graph per width, under the same never-refuse-service rule: a
-  // width whose capture failed appends eagerly.
-  if (shape != nullptr && shape->defer && shape->staging != nullptr) {
-    for (uint32_t width = 1; width <= model->decode_lanes; ++width) {
+  // width whose capture failed appends eagerly. GitHub #687: each shape's.
+  for (IgnisVerifyRound *const held : shapes) {
+    if (held == nullptr || !held->defer || held->staging == nullptr) {
+      continue;
+    }
+    for (uint32_t width = 1; width <= held->lanes; ++width) {
       std::string error;
-      if (ignis::deferred_verify::capture_append(model, pool, *shape, width, &shape->append_exec[width - 1],
+      if (ignis::deferred_verify::capture_append(model, pool, *held, width, &held->append_exec[width - 1],
                                                  &error) != 0) {
-        set_error("ignis_decode_graph_capture: the drafter's append at width " + std::to_string(width) +
-                  ": " + error);
+        set_error("ignis_decode_graph_capture: the drafter's append at " + std::to_string(held->window) +
+                  " drafts, width " + std::to_string(width) + ": " + error);
       }
     }
   }

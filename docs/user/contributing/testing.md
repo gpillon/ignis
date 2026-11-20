@@ -231,6 +231,20 @@ the other. They are no configuration fields: `GET /v1/config` and
   counts. An RTX 30 or RTX 40 card keeps `chain` whatever the variable says,
   and Flash-Next's rounds are its own. Any other value refuses the load,
   naming the variable.
+- `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) picks, at each verify round
+  of a DFlash2 load of the 27B past 7 draft tokens, the round's shape. `base`,
+  or unset: every round at the base shape, 8 columns a lane, the round of a
+  load at 7 drafts token for token. `extended`: every round of 1 to 4 lanes at
+  the extended shape, the window + 1 columns a lane, and a round of 5 to 8
+  lanes, or one with a lane held to a grammar, at the base shape still. Both
+  shapes' verify and drafter-append graphs are captured at every load, so
+  the switch flips between rounds of one load with no capture. A load at 7
+  drafts or fewer, an MTP load and Flash-Next never read it. Any other value
+  refuses the round, naming the variable. Each shape's graphs, node counts
+  and rounds, and how many of them ran eagerly, are in the program's stats;
+  `ignis.runtime.decode_graph_capture` lists the shapes (`round_shapes`), and
+  `ignis.runtime.verify_graph_capture_incomplete` names a shape's widths whose
+  verify graph could not be captured, whose rounds run eagerly.
 
 ### The round identity test
 

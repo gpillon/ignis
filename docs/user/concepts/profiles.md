@@ -59,6 +59,10 @@ loads is the table of
 No profile here carries a speed for an RTX 30 or RTX 40 card: those come
 from the reports of people who have one, collected on
 [issue #643](https://github.com/gpillon/ignis/issues/643).
+Every profile drafts 7 tokens a round. From 0.11.0 a DFlash2 load may name
+up to 15 on any card (`--spec-draft-tokens`), unmeasured for speed, at the
+VRAM [the configuration reference](../configuration/context-and-speculation.md)
+states for the profile's lanes.
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` and `rtx-12gb` are

@@ -110,8 +110,9 @@ pub(crate) mod ffi {
     pub const IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY: i32 = 1;
 
     /// `IGNIS_ROUND_SHAPES_MAX` (`kernel/include/ignis_step.h`): the most
-    /// round shapes a load builds (GitHub #686).
-    pub const IGNIS_ROUND_SHAPES_MAX: usize = 1;
+    /// round shapes a load builds (GitHub #686): GitHub #687, a DFlash2
+    /// load's base and extended shapes.
+    pub const IGNIS_ROUND_SHAPES_MAX: usize = 2;
 
     /// 1:1 with `struct ignis_round_shape_stats` (GitHub #686): one round
     /// shape's verify round.
@@ -124,7 +125,12 @@ pub(crate) mod ffi {
         pub verify_graph_nodes: [u32; 8],
         pub verify_graph_copy_nodes: [u32; 8],
         pub drafter_append_graph_ready_mask: u32,
+        /// GitHub #687.
+        pub lanes: u32,
         pub verify_folds_in_flight: u64,
+        /// GitHub #687.
+        pub verify_rounds: u64,
+        pub eager_verify_rounds: u64,
     }
 
     #[repr(C)]
@@ -523,7 +529,9 @@ pub struct ProgramStats {
     pub gdn_gating: u32,
     /// GitHub #686 (spec #684): how many of [`ProgramStats::round_shapes`]
     /// the load built: 1 on a 27B load with a draft window (its base shape),
-    /// 0 on one without and on Flash-Next, which keeps its own verify round.
+    /// GitHub #687 2 on a DFlash2 load past 7 drafts (and its extended
+    /// shape), 0 on one without and on Flash-Next, which keeps its own verify
+    /// round.
     pub round_shape_count: u32,
     /// Each round shape's verify round, the base shape first; the entries
     /// past [`ProgramStats::round_shape_count`] are zero. See
@@ -549,7 +557,8 @@ pub struct RoundShapeStats {
     /// captured and replayable.
     pub verify_graph_ready_mask: u32,
     /// The shape's own device buffers: its verify substrate and its drafter
-    /// round buffers.
+    /// round buffers. GitHub #687: an extended shape holds the base shape's
+    /// and none of its own, so 0.
     pub vram_bytes: u64,
     /// Entry `w - 1`: the node count of the shape's verify graph for width
     /// `w`, and how many of them are copies; 0 for a width with no graph.
@@ -560,6 +569,24 @@ pub struct RoundShapeStats {
     pub drafter_append_graph_ready_mask: u32,
     /// The rounds at the shape that returned with their fold in flight.
     pub verify_folds_in_flight: u64,
+    /// GitHub #687: the most lanes a round at the shape runs, the widths its
+    /// graphs are captured at (`1..=lanes`; a clear bit of
+    /// [`RoundShapeStats::verify_graph_ready_mask`] among them is a width
+    /// whose capture failed, whose rounds run eagerly).
+    pub lanes: u32,
+    /// GitHub #687: the verify rounds run at the shape, and how many of them
+    /// ran eagerly, with no graph.
+    pub verify_rounds: u64,
+    pub eager_verify_rounds: u64,
+}
+
+impl RoundShapeStats {
+    /// GitHub #687: the widths `1..=lanes` the shape serves whose verify graph
+    /// was not captured, so whose rounds run eagerly: none on a capture that
+    /// reached every width.
+    pub fn widths_without_a_graph(&self) -> Vec<u32> {
+        (1..=self.lanes.min(8)).filter(|&width| self.verify_graph_ready_mask & (1 << (width - 1)) == 0).collect()
+    }
 }
 
 /// The result of [`capture_decode_graphs`]: how long capture took and which
@@ -2503,6 +2530,9 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
             verify_graph_copy_nodes: shape.verify_graph_copy_nodes,
             drafter_append_graph_ready_mask: shape.drafter_append_graph_ready_mask,
             verify_folds_in_flight: shape.verify_folds_in_flight,
+            lanes: shape.lanes,
+            verify_rounds: shape.verify_rounds,
+            eager_verify_rounds: shape.eager_verify_rounds,
         }),
     })
 }

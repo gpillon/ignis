@@ -454,16 +454,33 @@ struct VerifyStaging {
 // (`run_verify_round`, `ignis_verify_graph_run_batch`), and everything they
 // call takes it as an argument: nothing inside them reads a shape from the
 // model (`ignis_model::base_shape`).
+//
+// GitHub #687: a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS holds two
+// shapes (`ignis_model::extended_shape`) on one set of device buffers: every
+// buffer and arena below is held by both, allocated once at the larger of the
+// two shapes' sizes (kernel/src/model.cu `plan_load_sizes`), and each shape
+// lays its own window and lanes over them -- its strides, its ReplaySSM
+// records' layout -- with host-mapped staging and graphs of its own. One round
+// runs at a time on the model's one stream and each stages or writes every
+// buffer before it reads it, so a round of one shape never reads what a round
+// of the other left, but for the kept scores (`kept_epoch`).
 struct IgnisVerifyRound {
   uint32_t window = 0; // k
+  // GitHub #687: the most lanes a round at this shape runs, and the widths its
+  // graphs are captured at: the load's decode lanes for its base shape, at most
+  // IGNIS_EXTENDED_SHAPE_MAX_LANES for an extended one.
+  uint32_t lanes = 0;
+  // Whether this is a load's extended shape: more than the base shape's 8
+  // columns a lane.
+  bool extended() const { return window > IGNIS_BASE_SHAPE_DRAFT_TOKENS; }
 
   // Host-refreshed per round.
-  std::unique_ptr<ninfer::DeviceBuffer> anchors;        // I32 [B]: each lane's pending token
-  std::unique_ptr<ninfer::DeviceBuffer> drafts;         // I32 [k, B]: the proposals
-  std::unique_ptr<ninfer::DeviceBuffer> base_positions; // I32 [B]: each lane's frontier
-  std::unique_ptr<ninfer::DeviceBuffer> extents;        // I32 [B]: draft columns this round
-  std::unique_ptr<ninfer::DeviceBuffer> valid_columns;  // I32 [B]: extent + 1
-  std::unique_ptr<ninfer::DeviceBuffer> lengths;        // I32 [B]: the accept RNG's position base
+  std::shared_ptr<ninfer::DeviceBuffer> anchors;        // I32 [B]: each lane's pending token
+  std::shared_ptr<ninfer::DeviceBuffer> drafts;         // I32 [k, B]: the proposals
+  std::shared_ptr<ninfer::DeviceBuffer> base_positions; // I32 [B]: each lane's frontier
+  std::shared_ptr<ninfer::DeviceBuffer> extents;        // I32 [B]: draft columns this round
+  std::shared_ptr<ninfer::DeviceBuffer> valid_columns;  // I32 [B]: extent + 1
+  std::shared_ptr<ninfer::DeviceBuffer> lengths;        // I32 [B]: the accept RNG's position base
   // GitHub #195: a vision load's verify columns rotate at `position +
   // rope_delta`, the way its decode rounds do (`decode_rope_positions`).
   // Present only on a load with vision; null everywhere else, where the
@@ -471,30 +488,30 @@ struct IgnisVerifyRound {
   // round -- `base + min(j, extent) + rope_delta` per lane -- rather than
   // derived on the device, because the delta is per lane and the vendored
   // `offset_i32_positions` takes one scalar for the whole matrix.
-  std::unique_ptr<ninfer::DeviceBuffer> rope_positions;
+  std::shared_ptr<ninfer::DeviceBuffer> rope_positions;
 
   // Written by the traversal (device-only).
-  std::unique_ptr<ninfer::DeviceBuffer> verify_ids;      // I32 [k+1, B]
-  std::unique_ptr<ninfer::DeviceBuffer> positions;       // I32 [k+1, B]: base + min(j, extent)
-  std::unique_ptr<ninfer::DeviceBuffer> target_tokens;   // I32 [k+1, B]: argmax per column
-  std::unique_ptr<ninfer::DeviceBuffer> logits;          // BF16 [vocab, k+1, B]
-  std::unique_ptr<ninfer::DeviceBuffer> hidden;          // BF16 [hidden, k+1, B]: final residual
-  std::unique_ptr<ninfer::DeviceBuffer> licensed_tokens; // I32 [k+1, B]: accept output
-  std::unique_ptr<ninfer::DeviceBuffer> licensed_counts; // I32 [B]
-  std::unique_ptr<ninfer::DeviceBuffer> accepted;        // I32 [B]
-  std::unique_ptr<ninfer::DeviceBuffer> selectors;       // I32 [B]: committed - 1
-  std::unique_ptr<ninfer::DeviceBuffer> selected_hidden; // BF16 [hidden, B]: for the drafter
+  std::shared_ptr<ninfer::DeviceBuffer> verify_ids;      // I32 [k+1, B]
+  std::shared_ptr<ninfer::DeviceBuffer> positions;       // I32 [k+1, B]: base + min(j, extent)
+  std::shared_ptr<ninfer::DeviceBuffer> target_tokens;   // I32 [k+1, B]: argmax per column
+  std::shared_ptr<ninfer::DeviceBuffer> logits;          // BF16 [vocab, k+1, B]
+  std::shared_ptr<ninfer::DeviceBuffer> hidden;          // BF16 [hidden, k+1, B]: final residual
+  std::shared_ptr<ninfer::DeviceBuffer> licensed_tokens; // I32 [k+1, B]: accept output
+  std::shared_ptr<ninfer::DeviceBuffer> licensed_counts; // I32 [B]
+  std::shared_ptr<ninfer::DeviceBuffer> accepted;        // I32 [B]
+  std::shared_ptr<ninfer::DeviceBuffer> selectors;       // I32 [B]: committed - 1
+  std::shared_ptr<ninfer::DeviceBuffer> selected_hidden; // BF16 [hidden, B]: for the drafter
 
   // The ReplaySSM records every GDN layer writes for every lane's `k+1`
   // columns (conv input, key, value, {g, beta}), folded into each lane's
   // slot after accept. Record row b is lane b.
-  std::unique_ptr<ninfer::DeviceBuffer> records_backing;
+  std::shared_ptr<ninfer::DeviceBuffer> records_backing;
   ninfer::GdnReplayRecordLayout records_layout;
   ninfer::GdnReplayRecords records;
 
   // The accept kernel's own transient scratch (its partial-top-k route at
   // temperature > 0), sized once for `k` drafts across `B` lanes.
-  std::unique_ptr<ninfer::DeviceArena> accept_workspace;
+  std::shared_ptr<ninfer::DeviceArena> accept_workspace;
 
   // P5-05 (GitHub #155): the DFlash2 drafter's round buffers, present only on
   // a load with the drafter (null under VERIFY_ONLY, whose drafts come per
@@ -506,9 +523,9 @@ struct IgnisVerifyRound {
   // `drafter_scratch` backs the drafter's forward (inside the verify graph)
   // and that append (after it); a graph bakes the forward's addresses, so it
   // is reserved once here and every call walks it from the same base.
-  std::unique_ptr<ninfer::DeviceBuffer> features;      // BF16 [5 * hidden, (k+1) * B]
-  std::unique_ptr<ninfer::DeviceBuffer> append_counts; // I32 [B]
-  std::unique_ptr<ninfer::DeviceArena> drafter_scratch;
+  std::shared_ptr<ninfer::DeviceBuffer> features;      // BF16 [5 * hidden, (k+1) * B]
+  std::shared_ptr<ninfer::DeviceBuffer> append_counts; // I32 [B]
+  std::shared_ptr<ninfer::DeviceArena> drafter_scratch;
 
   // GitHub #576 (spec #574, ADR 0090): the load's draft rule. Under the
   // sampled draft a sampling lane draws its drafts from the drafter's
@@ -527,8 +544,8 @@ struct IgnisVerifyRound {
   bool sampled_draft = false;
   float drafter_temperature_factor = 0.0f;
   float drafter_top_p = 1.0f;
-  std::unique_ptr<ninfer::DeviceBuffer> draft_candidates; // I32 [16, k, B]
-  std::unique_ptr<ninfer::DeviceBuffer> draft_q;          // F32 [16, k, B]
+  std::shared_ptr<ninfer::DeviceBuffer> draft_candidates; // I32 [16, k, B]
+  std::shared_ptr<ninfer::DeviceBuffer> draft_q;          // F32 [16, k, B]
 
   // GitHub #577 (test-only): during a teacher-forced round under the sampled
   // draft, the device copy of its recorded tokens (I32 [k + 1, B]), which the
@@ -542,10 +559,13 @@ struct IgnisVerifyRound {
   // scores of a lane whose commit the host cut (`ignis_kept_scores`, source
   // kVerifyLogits). Every round writes the whole buffer, so each round stamps
   // it once, from the model's `kept_epoch` counter, and a repair refuses a
-  // kept record whose stamp is no longer this one.
+  // kept record whose stamp is no longer this one. GitHub #687: on a load of
+  // two shapes the buffer is both shapes', and a record is current only while
+  // no round of either has written it since (kernel/src/step.cu
+  // `kept_scores_current`): one stamp across both, read at the repair.
   std::uint64_t kept_epoch = 0;
 
-  // One verify graph per exact width 1..decode_lanes, captured by
+  // One verify graph per exact width 1..lanes, captured by
   // `ignis_decode_graph_capture` after the decode graphs; the tables stay
   // the most a round serves wide (GitHub #336).
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> graph_exec{};
@@ -568,23 +588,46 @@ struct IgnisVerifyRound {
   std::unique_ptr<VerifyStaging> staging;
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> append_exec{};
   std::uint64_t folds_in_flight = 0;
+  // GitHub #687: the verify rounds run at this shape, and how many of them ran
+  // eagerly, with no graph (`ignis_program_stats`'s round shapes).
+  std::uint64_t rounds = 0;
+  std::uint64_t eager_rounds = 0;
 
-  std::size_t device_bytes() const {
+  // The device bytes this shape holds; GitHub #687: with `shared_with`, only
+  // the buffers it does not hold too, so a load's two shapes count their one
+  // set of buffers once.
+  std::size_t device_bytes(const IgnisVerifyRound *shared_with = nullptr) const {
+    const auto buffers = [](const IgnisVerifyRound &shape) {
+      return std::array<const ninfer::DeviceBuffer *, 22>{
+          shape.anchors.get(),         shape.drafts.get(),          shape.base_positions.get(),
+          shape.extents.get(),         shape.valid_columns.get(),   shape.lengths.get(),
+          shape.rope_positions.get(),  shape.verify_ids.get(),      shape.positions.get(),
+          shape.target_tokens.get(),   shape.logits.get(),          shape.hidden.get(),
+          shape.licensed_tokens.get(), shape.licensed_counts.get(), shape.accepted.get(),
+          shape.selectors.get(),       shape.selected_hidden.get(), shape.records_backing.get(),
+          shape.features.get(),        shape.append_counts.get(),   shape.draft_candidates.get(),
+          shape.draft_q.get()};
+    };
+    const auto arenas = [](const IgnisVerifyRound &shape) {
+      return std::array<const ninfer::DeviceArena *, 2>{shape.accept_workspace.get(), shape.drafter_scratch.get()};
+    };
+    const auto own = buffers(*this);
+    const auto own_arenas = arenas(*this);
+    std::array<const ninfer::DeviceBuffer *, 22> other{};
+    std::array<const ninfer::DeviceArena *, 2> other_arenas{};
+    if (shared_with != nullptr) {
+      other = buffers(*shared_with);
+      other_arenas = arenas(*shared_with);
+    }
     std::size_t bytes = 0;
-    for (const auto *buffer :
-         {anchors.get(), drafts.get(), base_positions.get(), extents.get(), valid_columns.get(),
-          lengths.get(), rope_positions.get(), verify_ids.get(), positions.get(),
-          target_tokens.get(), logits.get(), hidden.get(), licensed_tokens.get(),
-          licensed_counts.get(), accepted.get(), selectors.get(), selected_hidden.get(),
-          records_backing.get(), features.get(), append_counts.get(), draft_candidates.get(),
-          draft_q.get()}) {
-      if (buffer != nullptr) {
-        bytes += buffer->bytes;
+    for (std::size_t i = 0; i < own.size(); ++i) {
+      if (own[i] != nullptr && own[i] != other[i]) {
+        bytes += own[i]->bytes;
       }
     }
-    for (const auto *arena : {accept_workspace.get(), drafter_scratch.get()}) {
-      if (arena != nullptr) {
-        bytes += arena->capacity();
+    for (std::size_t i = 0; i < own_arenas.size(); ++i) {
+      if (own_arenas[i] != nullptr && own_arenas[i] != other_arenas[i]) {
+        bytes += own_arenas[i]->capacity();
       }
     }
     return bytes;
@@ -914,6 +957,12 @@ struct ignis_model {
   // reservations and teardown, the stats, the readouts, a repair's kept
   // scores).
   std::unique_ptr<IgnisVerifyRound> base_shape;
+  // GitHub #687: on a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS drafts,
+  // its extended shape -- the load's window at up to
+  // IGNIS_EXTENDED_SHAPE_MAX_LANES lanes, over `base_shape`'s buffers, whose
+  // window is then IGNIS_BASE_SHAPE_DRAFT_TOKENS -- and null on every other
+  // load. Read where `base_shape` is.
+  std::unique_ptr<IgnisVerifyRound> extended_shape;
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;

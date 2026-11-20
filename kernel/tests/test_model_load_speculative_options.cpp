@@ -183,7 +183,8 @@ int main() {
   }
   // The draft window, by backend (GitHub #685): DFLASH2, the verify substrate
   // alone (P5-04, GitHub #153: its verify graphs are captured at it) and the
-  // MTP head each hold their own cap, all three 7. A window outside its
+  // MTP head each hold their own cap: GitHub #687, DFLASH2 drafts up to 15,
+  // two round shapes past 7, and the other two keep 7. A window outside its
   // backend's range is refused naming the option, that range, the value and
   // the backend; one inside it gets past the check, whatever stops the load
   // after it.
@@ -195,13 +196,20 @@ int main() {
       const char *range;
     };
     const std::vector<WindowRule> rules = {
-        {IGNIS_SPECULATIVE_DFLASH2, "DFLASH2", IGNIS_DFLASH2_MAX_DRAFT_TOKENS, "1..7"},
+        {IGNIS_SPECULATIVE_DFLASH2, "DFLASH2", IGNIS_DFLASH2_MAX_DRAFT_TOKENS, "1..15"},
         {IGNIS_SPECULATIVE_VERIFY_ONLY, "VERIFY_ONLY", IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS, "1..7"},
         {IGNIS_SPECULATIVE_MTP, "MTP", IGNIS_MTP_MAX_DRAFT_TOKENS, "1..7"},
     };
+    check(IGNIS_DFLASH2_MAX_DRAFT_TOKENS == 15 && IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS == 7 &&
+              IGNIS_MTP_MAX_DRAFT_TOKENS == 7 && IGNIS_BASE_SHAPE_DRAFT_TOKENS == 7,
+          "DFlash2's widest window is 15, the other backends' and the base shape's 7");
+    // An extended round's most lanes at the widest window are the 64 columns
+    // of a base round's eight lanes.
+    check(IGNIS_EXTENDED_SHAPE_MAX_LANES * (IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1) == 64 &&
+              8 * (IGNIS_BASE_SHAPE_DRAFT_TOKENS + 1) == 64,
+          "4 lanes of 16 columns and 8 lanes of 8 are both a round of 64 columns");
     for (const WindowRule &rule : rules) {
-      check(rule.widest == 7, std::string(rule.name) + "'s widest window is 7");
-      for (const uint32_t window : {0u, 1u, 7u, 8u, 15u, 16u, 255u}) {
+      for (const uint32_t window : {0u, 1u, 7u, 8u, 15u, 16u, 17u, 255u}) {
         ignis_model_load_options options = dflash2(window);
         options.speculative_backend = rule.backend;
         const std::string m = load_error({}, &options);
@@ -305,6 +313,17 @@ int main() {
     const std::string m = load_error({}, &ok);
     check(contains(m, "text/token_embedding"),
           "window " + std::to_string(window) + " reaches the binding: " + m);
+  }
+  // GitHub #687: the sampled draft builds the target's distribution over a
+  // round's columns, 16 at DFlash2's widest window: the load takes it there too.
+  for (const uint32_t window : {8u, 15u}) {
+    ignis_model_load_options sampled = dflash2(window);
+    sampled.draft_rule = IGNIS_DRAFT_RULE_SAMPLED;
+    sampled.drafter_temperature_factor = 0.9f;
+    sampled.drafter_top_p = 0.95f;
+    const std::string m = load_error({}, &sampled);
+    check(contains(m, "text/token_embedding"),
+          "the sampled draft at a window of " + std::to_string(window) + " reaches the binding: " + m);
   }
 
   // --- 2. the drafter schema ------------------------------------------------

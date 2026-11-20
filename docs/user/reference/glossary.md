@@ -33,6 +33,11 @@ is short. See *Lane tag*.
 and chat template in one file, checked against its sidecar. See
 [models and artifacts](../concepts/models-and-artifacts.md).
 
+**Base shape.** The 27B's verify round at 8 columns a lane, the anchor and 7
+drafts, at every lane count: the one round shape of a load at 7 drafts or fewer,
+and from 0.11.0, beside the *extended shape*, the base shape of a DFlash2 load
+past 7. See [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
+
 **Body format.** How an artifact stores its transformer layers (NVFP4 or
 trellis). It is read from the artifact, never configured. See
 [models and artifacts](../concepts/models-and-artifacts.md).
@@ -96,15 +101,17 @@ prefills (`--model-decode-share`, 25 percent by default). See
 [how ignis serves a request](../concepts/how-ignis-serves.md).
 
 **DFlash2.** The 27B's default speculative-decoding drafter, grafted into its
-artifact: a five-layer, sliding-window model that proposes 1 to 7 tokens per
-round. See [speculative decoding](../concepts/speculative-decoding.md).
+artifact: a five-layer, sliding-window model that proposes 1 to 15 tokens per
+round (1 to 7 before 0.11.0). See [speculative decoding](../concepts/speculative-decoding.md).
 
 **Draft.** A token a drafter proposes ahead of the model, to be verified in the same
 pass. See [speculative decoding](../concepts/speculative-decoding.md).
 
 **Draft tokens.** The most tokens a lane drafts per round
-(`--spec-draft-tokens`), the draft window: 1 to 7, and 0 to 7 for the 27B's
-MTP head, where 0 loads no speculation. See
+(`--spec-draft-tokens`), the draft window: 1 to 15 for DFlash2 (from 0.11.0,
+1 to 7 before; past 7 the load holds a *base shape* and an *extended shape*), 1
+to 7 for Flash-Next's MTP head, and 0 to 7 for the 27B's MTP head, where 0
+loads no speculation. See
 [speculative decoding](../concepts/speculative-decoding.md).
 
 **Drafter.** Whatever proposes the drafts, one per load: DFlash2 or its own MTP
@@ -116,6 +123,11 @@ in use, replaced least-recently-used. It takes what the KV pool leaves and is
 refused below 12 GiB. See
 [models and artifacts](../concepts/models-and-artifacts.md) and
 [the VRAM plan](../concepts/vram-plan.md).
+
+**Extended shape.** From 0.11.0, the 27B's verify round at the window + 1 columns
+a lane (9 to 16), at up to 4 lanes: the second round shape of a DFlash2 load
+past 7 drafts, on the *base shape*'s buffers. See
+[speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Family.** The architecture an artifact runs as (Qwen3.8-27B, Qwen3.8-Flash-Next,
 Qwen-Image-2.1), read from the artifact's header. Several artifacts can share one
@@ -273,6 +285,11 @@ needs, first to go when room is needed. See
 **Rewind.** The loop guard's action: cancel the request and continue it from the
 text before the loop, with a nudge. See
 [reasoning and the loop guard](../concepts/reasoning.md).
+
+**Round shape.** The columns a lane and the most lanes of a 27B verify round:
+the *base shape*, or from 0.11.0 on a DFlash2 load past 7 drafts the *extended
+shape*, one for all of a round's lanes. See
+[speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Row budget.** The most rows one Flash-Next MTP verify round may take across all
 lanes (`--spec-draft-rows`, 8 by default). See

@@ -194,8 +194,18 @@ void distribution_arm() {
 // --- the round fixture ---------------------------------------------------------
 
 constexpr int kVocab = 40000; // 79 partial tiles, four merge groups
-constexpr int kWindow = 3;
+// The round's window: 3, or the one the build names. kernel/tests/CMakeLists.txt
+// builds this test a second time at 15 (GitHub #687): DFlash2's widest window,
+// whose 16 columns a lane are exactly the vendored sampler's column cap
+// (kSamplerMaxColumns), so every arm below runs at the last width the
+// multi-block route serves.
+#ifndef IGNIS_SAMPLED_DRAFT_TEST_WINDOW
+#define IGNIS_SAMPLED_DRAFT_TEST_WINDOW 3
+#endif
+constexpr int kWindow = IGNIS_SAMPLED_DRAFT_TEST_WINDOW;
 constexpr int kCols = kWindow + 1;
+static_assert(kWindow >= 3 && kCols <= ninfer::ops::kSamplerMaxColumns,
+              "the test's lanes need a window of 3 or more, and the sampler's multi-block route stops at 16 columns");
 constexpr int kLanes = 6;
 
 std::uint16_t to_bf16(float x) {
@@ -267,7 +277,8 @@ Round make_round() {
   }
   r.drafts[1 * kWindow + 1] = 7; // lane 1: greedy, disagrees at its second draft
   r.drafts[5 * kWindow + 0] = 11; // lane 5: a draft the target hardly gives anything
-  r.extents = {3, 2, 0, 3, 2, 3};
+  // At the window, one short of it, and none.
+  r.extents = {kWindow, kWindow - 1, 0, kWindow, kWindow - 1, kWindow};
   r.lengths = {10, 40, 7, 99, 1000, 5};
   // Lanes 0 and 1 greedy; 2 samples at extent 0; 3 samples with penalties; 4
   // at top-k 5 and top-p 0.8; 5 a cold one with a wide support.
@@ -457,7 +468,8 @@ void target_arm(const Round &round, const Outputs &ours) {
       ++columns;
     }
   }
-  check(columns == 1 + 4 + 3 + 4, "every sampling column was compared"); // lanes 2..5: extents 0, 3, 2, 3
+  // Lanes 2..5: extents 0, the window, one short of it, the window.
+  check(columns == 1 + kCols + kWindow + kCols, "every sampling column was compared");
   // Lane 4's top-k of 5 and top-p of 0.8 cut its support.
   for (const auto &column : ours.p_ids[4]) {
     check(!column.empty() && column.size() <= 5, "a top-k of 5 holds at most five tokens");
@@ -770,7 +782,7 @@ void forced_accept_arm(const Round &round, const std::vector<std::int32_t> &q_id
     forced[b * kCols + kWindow] = 321 + b;
   }
   forced[2 * kCols + 0] = 123;
-  forced[3 * kCols + 3] = -1;
+  forced[3 * kCols + kWindow] = -1;
   forced[4 * kCols + 1] = 999;
   const Outputs plain = run_accept(round, Accept::Ours, q_ids, q_probs);
   const Outputs ours = run_accept(round, Accept::Ours, q_ids, q_probs, forced);
@@ -840,7 +852,7 @@ int main() {
           where + ": the counts, the anchor or the frontier is not the vendored accept's");
     check(ours.penalty[b] == vendored.penalty[b], where + ": the penalty row is not the vendored accept's");
   }
-  check(vendored.accepted[0] == 3 && vendored.accepted[1] == 1,
+  check(vendored.accepted[0] == kWindow && vendored.accepted[1] == 1,
         "the greedy lanes took their agreeing drafts (the fixture's own check)");
 
   // Arm 4: the verdicts, with q one-hot and with an explicit q.

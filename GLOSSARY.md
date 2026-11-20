@@ -1084,17 +1084,19 @@ hq-e8-2b: eight lanes at a 40,960-token context are ~20 GiB of BF16 KV against
 
 **DFlash2**:
 The 5-layer sliding-window (2048) speculative-decoding drafter (hidden 5120,
-draft tokens 1..7, native acceptance 3.4–3.7 tokens/round). Selected at load
+draft tokens 1..15, native acceptance 3.4–3.7 tokens/round at 7). Selected at load
 (`--spec-backend dflash2 --spec-draft-tokens N`); without it none of the 66
 `dflash2/*` objects is bound.
 
 **Draft window**:
-The number of tokens the drafter proposes per round (`--spec-draft-tokens`),
-fixed for the life of a load: 1..7 under **DFlash2** (required) and Flash-Next's
-**MTP head** (default 2); 0..7 under the 27B's MTP head (default 7, provisional
-until spec #618's measurement sets it), where 0 is a load with no speculation,
-the load `off` makes, nothing of the head bound (#623). Not to be confused with
-the drafter's own 2048-token sliding **drafter window**.
+The most tokens the drafter proposes per round (`--spec-draft-tokens`), fixed
+for the life of a load: 1..15 under **DFlash2** (required; #687), 1..7 under
+Flash-Next's **MTP head** (default 2) and the verify substrate alone; 0..7
+under the 27B's MTP head (default 7), where 0 is a load with no speculation,
+the load `off` makes, nothing of the head bound (#623). Past 7 it is the
+load's widest window, its **extended shape**'s, and a round at its **base
+shape** drafts 7: the window a round drafts is its round shape's. Not to be
+confused with the drafter's own 2048-token sliding **drafter window**.
 
 **Drafter window**:
 A sequence's DFlash2 context: every drafter layer's BF16 K and V for the last
@@ -1130,14 +1132,36 @@ The speculative form of the **decode round** (P5-04): each lane contributes
 tail padded with the anchor — and the 64 layers traverse the batch's columns
 once, the GQA layers appending every valid column and the GDN layers recording
 instead of advancing. Selected per call through the decode options at the
-load's draft window, never padded to it; window 0 is today's round.
+load's draft window, never padded to it; window 0 is today's round. `k` is the
+window of the round's **round shape** (#687).
 
 **Round shape**:
 How wide a round's batch is per lane: one column in a **decode round**,
 `k+1` in a **verify round**. A wider shape takes other activation routes
 (ADR 0016), so the two shapes can rank two near-equal tokens differently: a
 speculative and a plain decode of the same prompt are not byte-identical,
-by design.
+by design. Of a verify round (#686, #687): its window and the most lanes it
+runs, the **base shape** or the **extended shape**, one for all its lanes,
+chosen before the round launches and handed to it; each shape has its own
+verify and drafter-append graphs per lane count.
+
+**Base shape**:
+The 27B's verify round at 8 columns a lane (7 drafts) at every lane count up
+to the load's lanes: the one **round shape** of a load at a **draft window**
+of 7 or fewer, and on a DFlash2 load past 7 the shape every round takes unless
+it is extended (#687). Its buffers are the load's: allocated once, each at the
+larger of the two shapes' sizes.
+
+**Extended shape**:
+On a DFlash2 load whose **draft window** is 8..15, the 27B's verify round at
+the window + 1 columns a lane, at 1..4 lanes, so that a round never carries
+more than 64 columns (#687). It runs on the **base shape**'s buffers (a load
+plans what a 7-draft load plans, plus the wider drafts, at 8 lanes) with its
+own layout over them, its own host-mapped staging and its own graphs; a kept
+record of either shape is current only while no later round of either has
+written the logits they share. Its one-lane attention runs the vendored
+chunked small-T loop, never the prompt route. Not "wide" or "narrow": those
+are the **Near-tie**'s computations.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify
