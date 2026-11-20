@@ -1437,6 +1437,9 @@ pub fn qwen27b_load(
         .map_err(|e| e.to_string())?
         .page_count;
 
+    // GitHub #687: the extended round shape the leaf builds, whose state the
+    // process keeps once the load is torn down.
+    let extended_shape = leaf_config.speculation.and_then(|s| s.round_shapes(leaf_config.slot_count).1);
     // GitHub #213: the whole KV-RAM tier, pinned once here and held for the
     // life of the load — the same figure the scheduler's host tier budgets in
     // bytes, so the ledger and the arena describe one region. A size the host
@@ -1445,7 +1448,7 @@ pub fn qwen27b_load(
     let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config)
         .with_kv_ram_arena(shape.host_pool_bytes)?;
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
-    ignis_runtime::note_qwen27b_loaded();
+    ignis_runtime::note_qwen27b_loaded(extended_shape);
 
     // GitHub #98 (P3-02): do not just trust that formula — ask the leaf
     // what it actually built (`ignis_seq_pool_stats`, surfaced through
@@ -3555,7 +3558,7 @@ mod tests {
         const COLD_FREE: u64 = 31_104_512_000;
         const HEADROOM: u64 = 1_258_291_200;
         let mode = ignis_core::VramMode::Derived { headroom_bytes: HEADROOM };
-        let cold_start = held_before_load(Qwen38_27b, None, false, None);
+        let cold_start = held_before_load(Qwen38_27b, None, 0, None);
         assert_eq!(cold_start, ProcessHeld { bytes: 0, source: HeldSource::Nothing }, "a first load reads before its context exists");
         // The context measured below `CUDA_CONTEXT_BYTES`, at it, and at what
         // one took under WSL; the plan keeps it for the process's life.
@@ -3568,14 +3571,14 @@ mod tests {
             // `vram_reload_gpu`'s shape.
             for holds in [charged_again, charged_again - (2 << 20)] {
                 let nvml_free = COLD_FREE - holds;
-                let held = held_before_load(Qwen38_27b, measured, true, Some(holds));
+                let held = held_before_load(Qwen38_27b, measured, QWEN27B_PROCESS_STATE_BYTES, Some(holds));
                 let reload = plan_at(mode, nvml_free + held.bytes, context);
                 assert_eq!(
                     (reload.kv_page_count, reload.budget_bytes),
                     (cold.kv_page_count, cold.budget_bytes),
                     "a per-process figure: context {context}, the process holding {holds}"
                 );
-                let held = held_before_load(Qwen38_27b, measured, true, None);
+                let held = held_before_load(Qwen38_27b, measured, QWEN27B_PROCESS_STATE_BYTES, None);
                 let reload = plan_at(mode, nvml_free + held.bytes, context);
                 assert_eq!(
                     reload.budget_bytes,
