@@ -20,7 +20,13 @@
 //! `--model-exception-weights` converts it). A copy here would be a second
 //! implementation of the vendored route tables, wrong the first time one of
 //! them moves; the GPU test pins the line at 1, 2 and 8 lanes instead, where
-//! it is exactly affine in them.
+//! it is exactly affine in them. A load of two round shapes (GitHub #687)
+//! sizes it for the larger of the base traversal and the extended one, the
+//! latter at no fewer than 2 lanes, whose bytes a column are the body's
+//! routes' too (about 160 kB on the NVFP4 artifact, 166 kB on the trellis
+//! one): the GPU test holds a one-lane load's line to the two-lane load's,
+//! which sizes the same traversal, and pins the trellis load's at the 16 GB
+//! profile's 2 lanes.
 
 // The leaf's arena alignment (`kArenaAlign`, `kernel/src/model.cu`), which
 // the vendored layouts below align every tensor and their total to.

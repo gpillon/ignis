@@ -652,9 +652,13 @@ fn the_sampled_draft_keeps_its_draws_on_the_drafters_line() {
 /// not move. Against the plan of the same load at seven drafts, no line moves
 /// but those two and the decode round's scratch, which holds the extended
 /// round's traversal, and at eight lanes, where both shapes are 64 columns,
-/// not that one either. Each delta is printed: the configuration reference
-/// quotes them. Asked of the leaf's plan only, so nothing here touches the
-/// device.
+/// not that one either. The decode round's line has no CPU mirror (its
+/// routes are the body's, `ignis_core::lane_lines`'s header), so it is held
+/// where the leaf's sizing makes it exact without one: a one-lane load sizes
+/// the extended traversal at two lanes, as a two-lane load does, so the two
+/// loads' lines differ by one lane's token staging alone. Each delta is
+/// printed: the configuration reference quotes them. Asked of the leaf's
+/// plan only, so nothing here touches the device.
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
@@ -687,8 +691,10 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
     };
     for window in [8, 12, 15] {
         let wide = at_window(window);
+        let mut decode_round = std::collections::BTreeMap::new();
         for lanes in [1, 2, 4, 5, N_DECODE_LANES as u32] {
             let (at, base) = (planned(wide, lanes), planned(seven, lanes));
+            decode_round.insert(lanes, at.decode_graph);
             let lines = lane_lines(&topology, KvFormat::HqE8_2b, Some(wide), false, lanes, 2);
             let what = format!("{window} drafts at {lanes} lanes");
             assert_eq!(at.verify_round, lines.verify_round, "{what}: the leaf's verify line is the CPU's");
@@ -714,8 +720,18 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
                 at.decode_graph - base.decode_graph
             );
         }
+        assert_eq!(
+            decode_round[&2] - decode_round[&1],
+            DECODE_TOKEN_STAGING_WORDS * 4,
+            "{window} drafts: one lane's decode round holds the two-lane extended traversal, a two-lane load's, and one lane's token ids and slot"
+        );
     }
 }
+
+/// A decode round's token staging a lane (`decode_graph_token_ids` and
+/// `decode_graph_slots`, `kernel/src/model.cu`), in 4-byte words: a load with
+/// vision stages each lane's rope position too.
+const DECODE_TOKEN_STAGING_WORDS: u64 = 2;
 
 /// GitHub #695: the trellis body the 16 GB and 24 GB profiles load.
 const TRELLIS_ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_trellis_sc30-v2.ninfer";
@@ -730,10 +746,18 @@ const TRELLIS_ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_trellis_sc3
 /// load at seven drafts, no line moves but those two and the decode round's
 /// scratch: the trellis workspace does not, whose head's widest call is the
 /// span-logits block's 32 columns at 2 lanes and 64 columns at 8 at either
-/// window. Each delta prints in bytes and in the KV pages it takes from a
-/// pool the budget sizes (at most, rounded up): the configuration reference
-/// and the profiles page quote them. Asked of the leaf's plan only, so
-/// nothing here touches the device but the trellis op's own queries.
+/// window. The decode round's scratch has no CPU mirror (the body's routes
+/// size it, `ignis_core::lane_lines`'s header): at `rtx-16gb`'s 2 lanes,
+/// where the extended traversal is the larger, its delta is pinned to the
+/// leaf's measured figures, 165,888 B a column of the traversal past the base
+/// one's 16 (2,654,208 B at 15 drafts, as #695 measured, and at 8 and 12 what
+/// that load's measured totals leave past the CPU's verify and drafter
+/// lines), and a one-lane load's line to the two-lane load's, which sizes the
+/// same traversal, less one lane's token staging. Each delta prints in bytes
+/// and in the KV pages it takes from a pool the budget sizes (at most,
+/// rounded up) before it is held: the configuration reference and the
+/// profiles page quote them. Asked of the leaf's plan only, so nothing here
+/// touches the device but the trellis op's own queries.
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
@@ -781,11 +805,11 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
     for profile in &profiles {
         let scope = model_load::model_scope(Some(seven), Some(profile.vision), ExceptionWeights::Bf16);
         let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
-        let planned = |speculation: Speculation| {
+        let planned_at = |speculation: Speculation, lanes: u32| {
             let config = CudaLeafConfig {
                 max_context_tokens: profile.max_context_tokens,
                 kv_format: KvFormat::HqE8_2b,
-                slot_count: profile.lanes,
+                slot_count: lanes,
                 prefill_chunk_tokens: profile.prefill_chunk_tokens,
                 speculation: Some(speculation),
                 vision: Some(profile.vision),
@@ -797,9 +821,10 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
                 .unwrap_or_else(|e| panic!("{}: plan at {} drafts: {e}", profile.label, speculation.draft_tokens()))
                 .reserved
         };
+        let planned = |speculation: Speculation| planned_at(speculation, profile.lanes);
         let base = planned(seven);
         assert!(base.trellis_workspace > 0, "{}: a trellis body plans its workspace", profile.label);
-        for window in [8, 12, 15] {
+        for (window, two_lane_decode_round) in [(8, 331_776), (12, 1_658_880), (15, 2_654_208)] {
             let wide = at_window(window);
             let at = planned(wide);
             let lines = lane_lines(&topology, KvFormat::HqE8_2b, Some(wide), true, profile.lanes, profile.retained_device_slots);
@@ -830,6 +855,14 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
                 delta.div_ceil(page_bytes),
                 at.trellis_workspace
             );
+            if profile.lanes == 2 {
+                assert_eq!(at.decode_graph - base.decode_graph, two_lane_decode_round, "{what}: the decode round's scratch past the seven-draft load's");
+                assert_eq!(
+                    at.decode_graph - planned_at(wide, 1).decode_graph,
+                    (DECODE_TOKEN_STAGING_WORDS + 1) * 4,
+                    "{what}: one lane's decode round holds the two-lane extended traversal, and one lane's token ids, slot and rope position"
+                );
+            }
         }
     }
 }
