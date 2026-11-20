@@ -1,10 +1,12 @@
 // ignis kernel leaf: launches of ours of the vendored NVFP4 A16 small-T kernel for the DFlash2
-// drafter (GitHub #694, spec #684) -- OURS, leaf-internal. The kernel is the vendored template
-// (ops/linear/nvfp4/nvfp4_small_t.cuh), instantiated here and not changed, on the vendored
-// production schedule for the call's width with one field of its own: 4 warps a CTA, the
-// schedule's own choice past 16 columns. What is ours is the launch: how many warps a CTA holds,
-// and which rows of the weight it computes. A row's sum is one warp's, in an order that depends on
-// neither, so each launch writes the bytes `ninfer::ops::linear` writes for the same rows.
+// drafter (GitHub #694, spec #684) -- an ADAPTED op (ADR 0051 tier 2), leaf-internal: the launch
+// restates the vendored launcher's (kernel/src/dflash2_small_t.cu names its upstream, as
+// kernel/NOTICE does). The kernel is the vendored template (ops/linear/nvfp4/nvfp4_small_t.cuh),
+// instantiated here and not changed, on the vendored production schedule for the call's width with
+// one field of its own: 4 warps a CTA, the schedule's own choice past 16 columns. What is ours is
+// how many warps a CTA holds and which rows of the weight it computes. A row's sum is one warp's,
+// in an order that depends on neither, so each launch writes the bytes `ninfer::ops::linear` writes
+// for the same rows.
 //
 // Two levers, each behind a measurement switch read at each call, so a graph keeps what its
 // capture read, and once at load (kernel/src/model.cu), so a value it does not know refuses the

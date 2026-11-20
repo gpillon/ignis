@@ -1,5 +1,24 @@
 // ignis kernel leaf: the DFlash2 drafter's launches of the vendored NVFP4 A16 small-T kernel
-// (GitHub #694) -- see kernel/src/dflash2_small_t.h.
+// (GitHub #694; kernel/src/dflash2_small_t.h) -- an ADAPTED op (ADR 0051 tier 2): the launch is
+// restated from the vendored launcher, the levers are ours.
+//
+// Upstream: the reference, gpillon/ninfer, commit a00648cb828457986cf5b4b4f712b4cbcd7af0d1 (the
+// commit kernel/vendor/manifest.json pins, ADR 0010), Apache-2.0 (kernel/vendor/LICENSE), restated:
+// src/ops/linear/nvfp4/nvfp4_small_t.cu `launch_exact` (the kernel's launch at a width: its
+// schedule, its grid of the weight's rows over the schedule's rows a CTA, the contiguous output,
+// the inverse weight divisor and the identity epilogue, then the launch's error check), as `launch`;
+// `make_launchers` and `launchers` (the table of those launches by width from the first, indexed
+// by the call's columns), as `make_launches` and `launch_at`. Called and not copied: the kernel
+// nvfp4_small_t_kernel (ops/linear/nvfp4/nvfp4_small_t.cuh), the schedules
+// Nvfp4LinearSmallTProductionSchedule and Nvfp4SmallTSchedule and kNvfp4LastSmallT
+// (ops/linear/nvfp4/nvfp4_config.h), the output and epilogue (ops/linear/nvfp4/nvfp4_output.cuh)
+// and validate_nvfp4_weight (ops/linear/nvfp4/nvfp4_format.h). Changed here: 4 warps a CTA in
+// place of the production schedule's (`FourWarps`); one token tile a launch, every column in one
+// CTA; a range of the weight's rows (the drafter's key and value rows, from row 4,096 of its code
+// and scale planes) launched as a weight of their own; widths 5..16 and 5..32 only; a failed
+// launch throws naming the op, and each launch is counted (`launches`). `require_operands`
+// restates ignis's own operand checks of `ninfer::ops::linear` (kernel/src/linear.cu
+// `validate_linear_semantics`), not upstream code (kernel/NOTICE).
 
 #include "dflash2_small_t.h"
 
