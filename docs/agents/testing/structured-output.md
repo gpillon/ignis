@@ -190,11 +190,19 @@ repaired from the verify pass's scores, as a plain round's draw is.
   run is cut inside). The free lanes verify and commit what they do beside a
   free lane, every round replays its verify graph, each repair after a cut
   is the masked argmax of the verify column that drew it, and a run was cut
-  inside:
+  inside. Its second test (#691) runs the same at the extended shape, a
+  DFlash2 load at 15 drafts under `IGNIS_ROUND_SHAPE=extended` (16 columns a
+  lane, the column read at that stride), then holds a repair to its own
+  round's scores: a cut at one shape, a round of the other over the free lanes,
+  and the repair after it refused, both ways. The two tests load the 27B each,
+  so they run one at a time:
 
   ```sh
-  cargo test -p ignis-core --features cuda --test verify_cut_gpu -- --ignored --nocapture
+  cargo test -p ignis-core --features cuda --test verify_cut_gpu -- --ignored --nocapture --test-threads=1
   ```
+
+  A cut round's shape under the shape rule, which reads what the target
+  accepted and not what the cut kept, is part 4 of `dflash2_round_shape_gpu`.
 
 ## Held tools (GitHub #611, spec #582, ADR 0094)
 
