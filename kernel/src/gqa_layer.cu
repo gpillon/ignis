@@ -5,6 +5,7 @@
 // KV append -> attention + sigmoid output gate -> output residual -> MLP tail.
 
 #include "attention_readout.h"
+#include "extended_attention.h"
 #include "hq_decode_attention.h"
 #include "ignis_attn_tap.h"
 #include "ignis_gqa_layer.h"
@@ -15,7 +16,6 @@
 #include "layer_internal.h"
 #include "model_internal.h"
 #include "prefill_swiglu.h"
-#include "round_shape.h"
 #include "trellis_body.h"
 
 #include "ninfer/ops/attn_input_proj.h"
@@ -416,8 +416,9 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 // the `lane_tokens == 1` case with the dense (empty) mask, unchanged.
 //
 // GitHub #687: `extended_round` when the round runs at a load's extended
-// shape (kernel/src/round_shape.h), whose one lane's attention runs in chunks
-// of the small-T tile below; every other round's is exactly as before.
+// shape (kernel/src/round_shape.h), whose attention runs in chunks of the
+// small-T tile below (GitHub #688, kernel/src/extended_attention.h); every
+// other round's is exactly as before.
 int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                             uint32_t width, std::int32_t lane_tokens, const void *positions_ptr,
                             const void *rope_positions_ptr,
@@ -554,16 +555,16 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // the verify width the resolver's own chunking decides the route -- one
     // hq width-8 tile, or BF16's two passes of six -- not this layer.
     //
-    // GitHub #687: but for an extended round's one lane, whose 9..16 columns
-    // the resolver would send to its prompt route, with planes sized for the
-    // whole context that a decode load does not reserve: it runs in chunks of
-    // the tile (below), as the vendored chunked small-T route runs two lanes
-    // or more, and its workspace is one chunk's, asked at the tile's widths.
+    // GitHub #687, #688: but an extended round's 9..16 columns a lane run in
+    // chunks of the tile (below), as the vendored chunked small-T route runs
+    // two lanes or more. Its one lane's workspace is one chunk's, asked at the
+    // tile's widths: the resolver would send that lane to its prompt route,
+    // with planes sized for the whole context that a decode load does not
+    // reserve. At two lanes or more the query is the vendored chunked route's.
     const std::int32_t small_t_tile = ninfer::ops::detail::gqa_small_t_chunk_tokens(batch_cache.dtype);
-    const bool one_lane_in_chunks =
-        ignis::round_shape::one_lane_in_chunks(extended_round, batch, lane_tokens, small_t_tile);
+    const bool in_chunks = ignis::extended_attention::in_chunks(extended_round, lane_tokens, small_t_tile);
     const std::size_t attention_workspace_bytes =
-        one_lane_in_chunks
+        in_chunks && batch == 1
             ? ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, 1, 1,
                                                                   small_t_tile)
             : ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, batch,
@@ -596,27 +597,20 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
           rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
           kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
           attention_heads, stream);
-    } else if (one_lane_in_chunks) {
-      // GitHub #687: the vendored chunked small-T route's loop at one lane,
-      // which its resolver does not give the 27B's 24 heads: each chunk of the
-      // tile appends its columns' K/V and attends from its first column of the
-      // lane's, its partials in a scope of their own. Restated, not changed,
-      // from the reference, gpillon/ninfer, commit
-      // a00648cb828457986cf5b4b4f712b4cbcd7af0d1 (kernel/vendor/manifest.json),
-      // Apache-2.0: src/ops/wrapper/gqa_attention.cpp `launch_chunked_small_t`
-      // (kernel/NOTICE); the launcher is the vendored one, called.
-      for (std::int32_t begin = 0; begin < lane_tokens; begin += small_t_tile) {
-        const std::int32_t count = std::min(small_t_tile, lane_tokens - begin);
-        auto chunk_scope = attention_workspace.scope();
-        const std::int32_t splits =
-            ninfer::ops::detail::gqa_attention_split_capacity(kQHeads, count, batch_cache.dtype, envelope);
-        ninfer::Tensor acc = attention_workspace.alloc(ninfer::DType::BF16, {kHeadDim, kQHeads, count, splits});
-        ninfer::Tensor m = attention_workspace.alloc(ninfer::DType::FP32, {kQHeads, count, splits});
-        ninfer::Tensor l = attention_workspace.alloc(ninfer::DType::FP32, {kQHeads, count, splits});
-        ninfer::ops::detail::gqa_attention_small_t_launch(
-            rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns, kv_table_rows,
-            gate_heads, attention_scale, batch_cache, envelope, begin, count, acc, m, l, attention_heads, stream);
-      }
+    } else if (in_chunks) {
+      // GitHub #688: an extended round's call, at 1..4 lanes (past the tile, so never the call
+      // above), runs the one chunk loop (kernel/src/extended_attention.h): its chunks on ignis's
+      // route where the load takes that route for its base rounds, on the vendored chunks elsewhere
+      // and under IGNIS_EXTENDED_ATTENTION=vendored as the latest capture read it (the unset switch
+      // before a load's first). Fixed until the next capture, so a replay runs the nodes its
+      // capture recorded.
+      const ignis::extended_attention::Route route = ignis::extended_attention::route_of(
+          model->hq_decode_attention_ours, model->extended_attention,
+          ignis::hq_decode_attention::serves_chunked(kQHeads, lane_tokens, batch_cache.dtype));
+      ignis::extended_attention::attend(
+          route, rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
+          kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
+          attention_heads, stream);
     } else {
       ninfer::ops::gqa_attention(
           rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,

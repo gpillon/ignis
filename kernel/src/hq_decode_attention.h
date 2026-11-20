@@ -19,6 +19,11 @@
 // from the vendored call's arguments, its split capacity, its workspace and its partial layout, and
 // the vendored reducer runs after it unchanged; so the VRAM plan and a round's node count are the
 // vendored route's too.
+//
+// GitHub #688 (spec #684): a round at a load's extended shape, 9..16 columns a lane, past the
+// small-T tile, takes the route one chunk of the tile at a time (`attend_chunk`), in the chunk loop
+// of kernel/src/extended_attention.h; the vendored chunked small-T route is its oracle, byte for
+// byte (kernel/tests/test_hq_verify_chunked_exact.cu).
 #pragma once
 
 #include "process_environment.h"
@@ -65,9 +70,15 @@ constexpr bool takes_ours(Switch named, bool hq_kv, int compute_capability_major
 bool image_here();
 
 // Whether a call is one the route serves: the 27B's 24 query heads over an hq-e8-2b cache, on the
-// vendored small-T route (1..8 columns a lane), which is every call of the batch body.
+// vendored small-T route (1..8 columns a lane), which is every call of the batch body but an
+// extended round's (`serves_chunked`).
 bool serves(std::int32_t q_heads, std::int32_t width, std::int32_t batch, ninfer::DType cache_dtype,
             ninfer::ops::GqaExecutionEnvelope envelope);
+
+// GitHub #688: whether the route serves a call of `width` columns a lane in chunks of the small-T
+// tile: the 27B's 24 query heads over an hq-e8-2b cache, past the tile and within two of it (9..16
+// columns a lane, a second chunk of 1..8), which is every call of an extended round.
+bool serves_chunked(std::int32_t q_heads, std::int32_t width, ninfer::DType cache_dtype);
 
 // `ninfer::ops::gqa_attention`'s small-T route over a call `serves` admits, with its arguments:
 // the partials on the route, then the vendored reducer, each a programmatic dependent of the
@@ -78,6 +89,21 @@ void attend(const ninfer::Tensor &q, const ninfer::Tensor &k, const ninfer::Tens
             const ninfer::Tensor &kv_table_rows, const ninfer::Tensor &gate, float scale,
             const ninfer::PagedKVBatchLayerView &cache, ninfer::ops::GqaExecutionEnvelope envelope,
             ninfer::WorkspaceArena &workspace, ninfer::Tensor &out, cudaStream_t stream);
+
+// GitHub #688: one chunk of a call `serves_chunked` admits, the vendored chunked small-T route's
+// chunk with its arguments (`ninfer::ops::detail::gqa_attention_small_t_launch`): the `count`
+// columns from `column_begin` of every lane, each appending its own K/V, attended on the route into
+// the chunk's partials (`acc`, `m`, `l`: BF16 [256, 24, count, S * B] and FP32 [24, count, S * B],
+// S the chunk's split capacity), then the vendored reducer at the chunk's offset in `out`, each a
+// programmatic dependent of the launch before it. Throws std::invalid_argument on a call
+// `serves_chunked` refuses, a chunk outside the call or a tensor of the wrong shape; enqueues on
+// `stream` and does not synchronize.
+void attend_chunk(const ninfer::Tensor &q, const ninfer::Tensor &k, const ninfer::Tensor &v,
+                  const ninfer::Tensor &positions, const ninfer::Tensor &valid_columns,
+                  const ninfer::Tensor &kv_table_rows, const ninfer::Tensor &gate, float scale,
+                  const ninfer::PagedKVBatchLayerView &cache, ninfer::ops::GqaExecutionEnvelope envelope,
+                  std::int32_t column_begin, std::int32_t count, ninfer::Tensor &acc, ninfer::Tensor &m,
+                  ninfer::Tensor &l, ninfer::Tensor &out, cudaStream_t stream);
 
 // The route's partial kernel's arguments, the vendored hq route's
 // (kernel/vendor/src/ops/launcher/gqa_attention_decode_hq_routes.cuh), in their order.

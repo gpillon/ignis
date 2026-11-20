@@ -328,6 +328,25 @@ enum ignis_hq_decode_attention {
   IGNIS_HQ_DECODE_ATTENTION_OURS = 1,
 };
 
+/* GitHub #688 (spec #684): the route of a 27B extended round's attention,
+ * 9..16 columns a lane in chunks of the small-T tile, which no load option
+ * names: decided at each decode graph capture from the load's route above and
+ * the measurement switch IGNIS_EXTENDED_ATTENTION (`ours` or `vendored`)
+ * (kernel/src/extended_attention.h). `ignis_model_extended_attention` reports
+ * it. */
+enum ignis_extended_attention {
+  /* A load without an extended round shape: at 7 drafts or fewer, an MTP
+   * load, Flash-Next. */
+  IGNIS_EXTENDED_ATTENTION_NONE = 0,
+  /* The vendored chunked small-T route: every card and load whose rounds run
+   * the vendored route above, and what IGNIS_EXTENDED_ATTENTION=vendored
+   * names. */
+  IGNIS_EXTENDED_ATTENTION_VENDORED = 1,
+  /* ignis's route above, one chunk of the tile at a time: wherever the load
+   * takes it, unless the switch names the other. */
+  IGNIS_EXTENDED_ATTENTION_OURS = 2,
+};
+
 /* GitHub #627 (spec #618): the route of the 27B MTP head's five W8G32
  * matrices, which no load option names: decided once per MTP load from the
  * card (ours below compute capability 12), unless the measurement switch
@@ -784,6 +803,14 @@ uint32_t ignis_model_gdn_prefill(const struct ignis_model *model);
  * decode and verify graph captured on it holds. IGNIS_HQ_DECODE_ATTENTION_VENDORED
  * for NULL and for Flash-Next, whose attention is its own. */
 uint32_t ignis_model_hq_decode_attention(const struct ignis_model *model);
+
+/* The route a loaded 27B's extended rounds attend on (enum
+ * ignis_extended_attention; GitHub #688): what the latest decode graph
+ * capture decided, which every extended round runs from then on, replayed or
+ * eager; before a load's first capture, what the switch unset decides.
+ * IGNIS_EXTENDED_ATTENTION_NONE for NULL and for a load without an extended
+ * round shape. */
+uint32_t ignis_model_extended_attention(const struct ignis_model *model);
 
 /* The route a loaded 27B's MTP head runs its matrices on (enum
  * ignis_mtp_head_linear; GitHub #627): what the load decided, which every

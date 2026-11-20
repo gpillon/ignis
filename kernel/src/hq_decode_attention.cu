@@ -21,6 +21,12 @@
 // here for the specializations the vendored launcher instantiates too, from the same header and for
 // the same architectures. Changed here: the partials come from ignis's route
 // (kernel/src/hq_decode_attention_ws.cu), not the vendored kernel.
+//
+// GitHub #688 (spec #684): `attend_chunk` restates, from the same commit, one chunk of the
+// vendored chunked small-T route: gqa_attention_small_t_launch at a chunk's first column
+// (ops/launcher/gqa_attention_decode.cu: the invocation's `full_width` the call's columns a lane,
+// its `column_begin` the chunk's) and the launcher's reducer profile at that offset (`Offset` when
+// the chunk starts past column 0). The loop over the chunks is kernel/src/extended_attention.cu.
 #include "hq_decode_attention.h"
 
 #include "process_environment.h"
@@ -55,22 +61,49 @@ bool shaped(const Tensor &t, DType dtype, std::int32_t n0, std::int32_t n1, std:
 }
 
 // The vendored launcher's reducer launch for the 27B geometry over hq-e8-2b: kDChunk 64, no INT8
-// scales, no column offset (the batch body's calls are one pass from column 0).
-template <bool MultiBatch, bool Masked>
+// scales, no column offset (the batch body's calls are one pass from column 0). GitHub #688: or a
+// chunk of `width` columns of a call `full_width` columns a lane, from its `column_begin`
+// (`Offset` past column 0), as the vendored launcher launches a chunk; a call from column 0 passes
+// neither and launches as before.
+template <bool MultiBatch, bool Masked, bool Offset = false>
 cudaError_t reduce(const Tensor &acc, const Tensor &m, const Tensor &l, const Tensor &positions,
                    const std::int32_t *valid_columns, const Tensor &gate, std::int32_t width,
-                   std::int32_t batch, std::int32_t splits, Tensor &out, cudaStream_t stream) {
+                   std::int32_t batch, std::int32_t splits, Tensor &out, cudaStream_t stream,
+                   std::int32_t full_width = 0, std::int32_t column_begin = 0) {
   constexpr int kReduceBlock = 256;
   constexpr int kDChunk = 64;
   const dim3 grid(Gqa27Geometry::QHeads, (kGqaHeadDim + kDChunk - 1) / kDChunk, width * batch);
   return ninfer::pdl::launch_dependent(
       {grid, dim3(kReduceBlock), 0, stream},
       ninfer::ops::gqa_attention_small_t_reduce_output_kernel<Gqa27Geometry, kDChunk, false, MultiBatch,
-                                                              Masked, false>,
+                                                              Masked, Offset>,
       static_cast<const __nv_bfloat16 *>(acc.data), static_cast<const float *>(m.data),
       static_cast<const float *>(l.data), static_cast<const std::int32_t *>(positions.data),
-      valid_columns, static_cast<const __nv_bfloat16 *>(gate.data), width, width,
-      std::int32_t{0}, batch, splits, static_cast<__nv_bfloat16 *>(out.data));
+      valid_columns, static_cast<const __nv_bfloat16 *>(gate.data), width,
+      full_width == 0 ? width : full_width, column_begin, batch, splits, static_cast<__nv_bfloat16 *>(out.data));
+}
+
+// GitHub #688: the vendored launcher's reducer profile for a chunk at `column_begin` of a call
+// `full_width` columns a lane: one lane or many, the dense mask or a lane's valid prefix.
+template <bool Offset>
+cudaError_t reduce_chunk(const Tensor &acc, const Tensor &m, const Tensor &l, const Tensor &positions,
+                         const std::int32_t *masked, const Tensor &gate, std::int32_t count, std::int32_t batch,
+                         std::int32_t splits, Tensor &out, cudaStream_t stream, std::int32_t full_width,
+                         std::int32_t column_begin) {
+  if (batch == 1 && masked == nullptr) {
+    return reduce<false, false, Offset>(acc, m, l, positions, masked, gate, count, batch, splits, out, stream,
+                                        full_width, column_begin);
+  }
+  if (batch == 1) {
+    return reduce<false, true, Offset>(acc, m, l, positions, masked, gate, count, batch, splits, out, stream,
+                                       full_width, column_begin);
+  }
+  if (masked == nullptr) {
+    return reduce<true, false, Offset>(acc, m, l, positions, masked, gate, count, batch, splits, out, stream,
+                                       full_width, column_begin);
+  }
+  return reduce<true, true, Offset>(acc, m, l, positions, masked, gate, count, batch, splits, out, stream,
+                                    full_width, column_begin);
 }
 
 }  // namespace
@@ -82,6 +115,11 @@ bool serves(std::int32_t q_heads, std::int32_t width, std::int32_t batch, DType 
   return q_heads == Gqa27Geometry::QHeads && cache_dtype == DType::U8 &&
          ninfer::ops::detail::gqa_attention_resolve_route(q_heads, width, batch, cache_dtype, envelope) ==
              ninfer::ops::detail::GqaAttentionRoute::SmallT;
+}
+
+bool serves_chunked(std::int32_t q_heads, std::int32_t width, DType cache_dtype) {
+  const std::int32_t tile = ninfer::ops::detail::gqa_small_t_chunk_tokens(cache_dtype);
+  return q_heads == Gqa27Geometry::QHeads && cache_dtype == DType::U8 && width > tile && width <= 2 * tile;
 }
 
 void attend(const Tensor &q, const Tensor &k, const Tensor &v, const Tensor &positions,
@@ -155,6 +193,78 @@ void attend(const Tensor &q, const Tensor &k, const Tensor &v, const Tensor &pos
   if (err != cudaSuccess) {
     (void)cudaGetLastError();
     throw std::runtime_error(std::string("hq_decode_attention: the reducer's launch: ") +
+                             cudaGetErrorString(err));
+  }
+}
+
+void attend_chunk(const Tensor &q, const Tensor &k, const Tensor &v, const Tensor &positions,
+                  const Tensor &valid_columns, const Tensor &kv_table_rows, const Tensor &gate, float scale,
+                  const ninfer::PagedKVBatchLayerView &cache, ninfer::ops::GqaExecutionEnvelope envelope,
+                  std::int32_t column_begin, std::int32_t count, Tensor &acc, Tensor &m, Tensor &l, Tensor &out,
+                  cudaStream_t stream) {
+  constexpr std::int32_t kQHeads = Gqa27Geometry::QHeads;
+  constexpr std::int32_t kKvHeads = Gqa27Geometry::KVHeads;
+  const std::int32_t width = q.ne[2];
+  const std::int32_t batch = q.ne[3];
+  require(serves_chunked(q.ne[1], width, cache.dtype),
+          "a call of the 27B's 24 query heads over hq-e8-2b at 9..16 columns a lane");
+  require(column_begin >= 0 && count >= 1 &&
+              count <= ninfer::ops::detail::gqa_small_t_chunk_tokens(cache.dtype) && column_begin + count <= width,
+          "a chunk of at most the small-T tile's columns inside the call");
+  require(shaped(q, DType::BF16, kGqaHeadDim, kQHeads, width, batch), "q is BF16 [256, 24, W, B]");
+  require(shaped(k, DType::BF16, kGqaHeadDim, kKvHeads, width, batch), "k is BF16 [256, 4, W, B]");
+  require(shaped(v, DType::BF16, kGqaHeadDim, kKvHeads, width, batch), "v is BF16 [256, 4, W, B]");
+  require(shaped(out, DType::BF16, kGqaHeadDim, kQHeads, width, batch), "out is BF16 [256, 24, W, B]");
+  require(shaped(gate, DType::BF16, kGqaHeadDim, kQHeads, width, batch), "gate is BF16 [256, 24, W, B]");
+  require(shaped(positions, DType::I32, width, batch, 1, 1), "positions are I32 [W, B]");
+  require(shaped(kv_table_rows, DType::I32, batch, 1, 1, 1), "the table rows are I32 [B]");
+  require(valid_columns.data == nullptr || shaped(valid_columns, DType::I32, batch, 1, 1, 1),
+          "the valid columns are empty or I32 [B]");
+  require(cache.block_tables.data != nullptr && cache.block_tables.dtype == DType::I32,
+          "the cache's block tables are I32");
+  const std::int32_t splits =
+      ninfer::ops::detail::gqa_attention_split_capacity(kQHeads, count, cache.dtype, envelope);
+  require(shaped(acc, DType::BF16, kGqaHeadDim, kQHeads, count, splits * batch) &&
+              shaped(m, DType::FP32, kQHeads, count, splits * batch, 1) &&
+              shaped(l, DType::FP32, kQHeads, count, splits * batch, 1),
+          "the chunk's partials are BF16 [256, 24, C, S * B] and FP32 [24, C, S * B] at its split capacity");
+
+  const auto *masked = static_cast<const std::int32_t *>(valid_columns.data);
+  PartialLaunch launch;
+  launch.grid = dim3(kKvHeads, splits, batch);
+  launch.q = static_cast<const __nv_bfloat16 *>(q.data);
+  launch.k = static_cast<const __nv_bfloat16 *>(k.data);
+  launch.v = static_cast<const __nv_bfloat16 *>(v.data);
+  launch.positions = static_cast<const std::int32_t *>(positions.data);
+  launch.codes_k = static_cast<std::uint8_t *>(cache.k_pages.data);
+  launch.codes_v = static_cast<std::uint8_t *>(cache.v_pages.data);
+  launch.meta_k = static_cast<std::uint8_t *>(cache.k_scale_pages.data);
+  launch.meta_v = static_cast<std::uint8_t *>(cache.v_scale_pages.data);
+  launch.residual_k = static_cast<__nv_bfloat16 *>(cache.residual_k.data);
+  launch.residual_v = static_cast<__nv_bfloat16 *>(cache.residual_v.data);
+  launch.ring_valid = static_cast<std::uint32_t *>(cache.ring_valid.data);
+  launch.block_tables = static_cast<const std::int32_t *>(cache.block_tables.data);
+  launch.valid_columns = masked;
+  launch.table_rows = static_cast<const std::int32_t *>(kv_table_rows.data);
+  launch.table_stride = cache.block_tables.ne[0];
+  launch.tokens = count;
+  launch.full_width = width;
+  launch.column_begin = column_begin;
+  launch.logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
+  launch.scale = scale;
+  launch.partial_acc = static_cast<__nv_bfloat16 *>(acc.data);
+  launch.partial_m = static_cast<float *>(m.data);
+  launch.partial_l = static_cast<float *>(l.data);
+  launch_partials(launch, stream);
+
+  const cudaError_t err =
+      column_begin == 0
+          ? reduce_chunk<false>(acc, m, l, positions, masked, gate, count, batch, splits, out, stream, width, 0)
+          : reduce_chunk<true>(acc, m, l, positions, masked, gate, count, batch, splits, out, stream, width,
+                               column_begin);
+  if (err != cudaSuccess) {
+    (void)cudaGetLastError();
+    throw std::runtime_error(std::string("hq_decode_attention: the chunk's reducer launch: ") +
                              cudaGetErrorString(err));
   }
 }
