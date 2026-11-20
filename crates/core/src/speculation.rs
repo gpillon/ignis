@@ -58,13 +58,13 @@ pub const WIDEST_DRAFT_TOKENS: u32 =
 /// The fewest draft positions a load reports: the seven every load
 /// reported while one cap of 7 bounded every drafter, so that a load at a
 /// window of 7 or fewer reports what it did then (a Flash-Next load at 2
-/// drafts still prints positions 1 to 7 on `/metrics`). Past it a load
+/// drafts still prints positions 1 to 7 on the server). Past it a load
 /// reports its own window ([`draft_positions`]).
 pub const MIN_DRAFT_POSITIONS: u32 = 7;
 
 /// The draft positions a load at a window of `draft_tokens` reports (GitHub
 /// #685): its rounds' per-position counters ([`crate::types::SpecCounters`])
-/// and the `ignis_speculative_position_*` series `/metrics` prints, the
+/// and the `ignis_speculative_position_*` series the server prints, the
 /// window but never fewer than [`MIN_DRAFT_POSITIONS`].
 pub const fn draft_positions(draft_tokens: u32) -> u32 {
     wider(draft_tokens, MIN_DRAFT_POSITIONS)
@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     /// GitHub #685: the draft positions a load reports (its rounds'
-    /// counters, the request log's profile, `/metrics`) are sized by the
+    /// counters, the request log's profile, what the server prints) are sized by the
     /// load's own window, never fewer than the seven every load reported
     /// while one cap bounded every drafter: so every load a drafter at 7
     /// takes, DFlash2's, the 27B's MTP head's, the verify substrate's and
