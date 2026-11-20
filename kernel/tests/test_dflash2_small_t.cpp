@@ -1,14 +1,17 @@
 // The DFlash2 drafter's launches of ours of the vendored NVFP4 small-T kernel (GitHub #694,
 // kernel/src/dflash2_small_t.h) -- OURS. Each lever held bit for bit to today's path at the
 // drafter's real shapes, its outputs and today's poisoned apart first, on activations spread over
-// 2^-12..2^12 so that the sums round:
+// 2^-12..2^12 so that the sums round, and on weights whose codes and scales are drawn at random
+// (the vendored harness's pattern repeats every 16 rows, so another row tile's weights would read
+// the same):
 //
 //   key_value  the append's key and value rows alone, [2048, T] from the q | k | v weight
 //              [6144, 5120] (`key_value_linear`), against rows 4096..6143 of today's whole product
 //              (`ignis_linear_a16`, a verify round's call) at every width the lever takes, 5 to 32
 //              columns: the base block, 8 columns a lane, at 1 to 4 lanes, and the extended block,
 //              16, at 1 and 2 among them. A wrong offset into the code or the scale plane reads
-//              another row's weights and fails here.
+//              another row's weights and fails here: rows 0..2047 and 2048..4095 of the product
+//              must differ from them, or the comparison could not tell.
 //   fill       `forward_linear` on the conv projection [1280, 5120] and the q | k | v weight against
 //              `ops::linear` at every width it takes on 4 warps a CTA, 5 to 16 columns: the base
 //              block at 1 and 2 lanes, the extended at 1, a window of 10's 11 among them, one launch
@@ -31,6 +34,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -96,7 +100,8 @@ void set_environment(const char *name, const char *value) {
 #endif
 }
 
-// A drafter weight of `n` x 5120 on the device, from the vendored harness's generator.
+// A drafter weight of `n` x 5120 on the device: the vendored harness's layout, every code and every
+// group scale drawn at random (an E4M3 scale between 2^-3 and 1.875).
 struct DeviceWeight {
   test::quantized_weight::PackedWeight host;
   DeviceBytes bytes;
@@ -104,6 +109,14 @@ struct DeviceWeight {
   DeviceWeight(std::int32_t n, std::uint32_t seed)
       : host(test::linear::make_nvfp4_weight(n, kHidden, seed)), bytes(host.payload.size()),
         weight(host.device_weight(bytes.p)) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> code(0, 255), scale(0x20, 0x3f);
+    for (std::uint64_t i = 0; i < host.code_plane_bytes; ++i) {
+      host.payload[i] = static_cast<std::uint8_t>(code(rng));
+    }
+    for (std::uint64_t i = 0; i < host.scale_plane_bytes; ++i) {
+      host.payload[host.scale_plane_offset + i] = static_cast<std::uint8_t>(scale(rng));
+    }
     cuda_ok(cudaMemcpy(bytes.p, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice), "copy weight");
   }
 };
@@ -155,19 +168,28 @@ void key_value_bits(const DeviceWeight &qkv) {
     const std::uint64_t launches = small_t::launches() - before;
     const std::vector<std::uint16_t> today = whole.read();
     const std::vector<std::uint16_t> ours = kv.read();
-    std::size_t differing = 0;
-    for (std::int32_t token = 0; token < tokens; ++token) {
-      for (std::int32_t row = 0; row < kKeyValueRows; ++row) {
-        const std::size_t at = static_cast<std::size_t>(token) * kKeyValueRows + row;
-        const std::size_t from = static_cast<std::size_t>(token) * kQkvRows + kQueryRows + row;
-        differing += ours[at] != today[from] ? 1 : 0;
+    // How many of the key and value rows differ from the product's rows from `first_row` on.
+    const auto differing = [&](std::int32_t first_row) {
+      std::size_t count = 0;
+      for (std::int32_t token = 0; token < tokens; ++token) {
+        for (std::int32_t row = 0; row < kKeyValueRows; ++row) {
+          const std::size_t at = static_cast<std::size_t>(token) * kKeyValueRows + row;
+          const std::size_t from = static_cast<std::size_t>(token) * kQkvRows + first_row + row;
+          count += ours[at] != today[from] ? 1 : 0;
+        }
       }
-    }
+      return count;
+    };
+    const std::size_t moved = differing(kQueryRows);
+    const std::size_t apart = std::min(differing(0), differing(kKeyValueRows));
     const std::string what = "key_value [2048, 5120] x " + std::to_string(tokens) + " columns";
-    std::printf("  %s: %s rows 4096..6143 of the whole product (%zu differ), %llu launch(es)\n", what.c_str(),
-                differing == 0 ? "bit-identical to" : "DIFFERS from", differing,
+    std::printf("  %s: %s rows 4096..6143 of the whole product (%zu differ; %zu or more differ from rows 0 or "
+                "2048 on), %llu launch(es)\n",
+                what.c_str(), moved == 0 ? "bit-identical to" : "DIFFERS from", moved, apart,
                 static_cast<unsigned long long>(launches));
-    check(differing == 0, what + ": the whole product's key and value rows");
+    check(moved == 0, what + ": the whole product's key and value rows");
+    check(apart > 0, what + ": the query rows' outputs differ from the key and value rows', so the comparison "
+                            "tells the rows apart");
     check(launches == 1, what + ": one launch of ours");
   }
 }
