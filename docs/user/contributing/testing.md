@@ -6,9 +6,12 @@ sidebar:
 ---
 
 Every change ships with a test, and a task is not complete until the test
-suite is green. The full runbook — fixtures, the GPU profile's script, the
-measurement instruments — is [`docs/agents/testing.md`](../../agents/testing.md)
-and the per-area files it links; this page is the map.
+suite is green. While a change is worked on only its own tests run; the whole
+suite runs once, at the end, on CI, with the branch pushed as `ci/<n>`, and
+the task is done when that run is green on Linux and on Windows. The full
+runbook — fixtures, the GPU profile's script, the measurement instruments — is
+[`docs/agents/testing.md`](../../agents/testing.md) and the per-area files it
+links; this page is the map.
 
 ## The default suite: `cargo test`
 
@@ -249,11 +252,13 @@ the 16 GB and 12 GB classes' trellis artifacts, each under the exception
 weights it has. Each arm is held to the graphs' replay with every switch
 unset; a change behind a switch of its own adds that switch as an arm, as the
 file says. The whole run materializes eight loads in turn, so a narrow one is
-the usual run:
+the usual run, from 0.11.0 through the GPU profile's single-test mode, under
+the GPU lock (`--test <name>` on Linux; 0.10.0 runs it as `cargo test -p
+ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture`):
 
 ```sh
 IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 \
-  cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture
+  make gpu-profile GPU_PROFILE_ARGS='-Test every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
 ```
 
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the

@@ -162,10 +162,11 @@ The measured figures are in
   are the same bit for bit whichever round it falls in, but they part from
   both prefill routes' by more than a near-tie, so a speculative answer is
   never held to the prefill routes past the point where it parts from the
-  answer with speculation off. Ignored outside the GPU profile:
+  answer with speculation off. Ignored outside the GPU profile, whose
+  single-test mode runs it under the GPU lock (`--test <name>` on Linux):
 
   ```sh
-  cargo test -p ignis-server --features cuda --test structured_output_gpu -- --ignored --nocapture
+  make gpu-profile GPU_PROFILE_ARGS='-Test constrained_answers_equal_the_per_token_masked_argmax_with_dflash2_off_and_on'
   ```
 
 ## Speculation stays on (GitHub #590)
@@ -193,7 +194,7 @@ repaired from the verify pass's scores, as a plain round's draw is.
   inside:
 
   ```sh
-  cargo test -p ignis-core --features cuda --test verify_cut_gpu -- --ignored --nocapture
+  make gpu-profile GPU_PROFILE_ARGS='-Test a_held_lane_keeps_speculation_and_its_neighbours_keep_their_drafts_and_the_graph'
   ```
 
 ## Held tools (GitHub #611, spec #582, ADR 0094)
@@ -294,10 +295,11 @@ repaired from the verify pass's scores, as a plain round's draw is.
   both deliveries with the twin's faults and what the held call wrote there,
   the cost on held traffic beside free, and the one-call-per-turn
   conversations; each test goes through every case before it fails. The two
-  tests load the 27B under one card lock; run them one at a time:
+  tests load the 27B under one lock of the test binary's; the single-test mode
+  runs each alone:
 
   ```sh
-  cargo test -p ignis-server --features cuda --test held_tools_gpu -- --ignored --nocapture --test-threads=1
+  make gpu-profile GPU_PROFILE_ARGS='-Test strict_tools_on_the_27b_with_dflash2_return_valid_calls_their_repairs_counted_and_drafts_kept,with_parallel_tool_calls_false_the_27b_makes_one_call_per_turn'
   ```
 
   `flash_next_parallel_tool_calls_gpu` holds the same conversations to one
@@ -306,5 +308,5 @@ repaired from the verify pass's scores, as a plain round's draw is.
   RAM, and runs under the GPU profile:
 
   ```sh
-  cargo test -p ignis-server --features cuda --test flash_next_parallel_tool_calls_gpu -- --ignored --nocapture
+  make gpu-profile GPU_PROFILE_ARGS='-Test with_parallel_tool_calls_false_flash_next_makes_one_call_per_turn'
   ```

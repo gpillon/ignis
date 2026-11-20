@@ -14,7 +14,9 @@ them.
 ## The ground rules
 
 - **Every code change ships with a test**, and the work is not done until
-  `cargo test` passes workspace-wide ([Testing](testing.md)).
+  `cargo test` passes workspace-wide on CI. While working, only the change's
+  own tests run; the whole suite runs once, at the end, with the branch pushed
+  as `ci/<n>` ([Testing](testing.md)).
 - **Every user-visible change updates this guide in the same commit**: a
   flag, a default, a route, a field of a response, a Playground screen, a
   metric ([`docs/agents/user-docs.md`](../../agents/user-docs.md)).

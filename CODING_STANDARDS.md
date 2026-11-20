@@ -111,6 +111,8 @@ The smell baseline does not apply to:
 Tooling already enforces the kernel's vendored tree against its manifest and
 the generated pages against the code (both in `cargo test`), the guide's
 links (`make docs-build`), and the commit messages' conventions
-(`.githooks/commit-msg`). The guardrails are `make ci`, run by hand before a
-merge, and the release workflow's `cargo test` on Linux and Windows on every
-code push to `main`.
+(`.githooks/commit-msg`). The guardrails are the change's own tests while it is
+worked on, then the whole suite once, at the end, on CI: the branch pushed as
+`ci/<n>` without asking runs the release workflow's `cargo test` on Linux and
+Windows, which runs again on every code push to `main` (`AGENTS.md`, Testing;
+`docs/agents/testing.md`, "The gate").
