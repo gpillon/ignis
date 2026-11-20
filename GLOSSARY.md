@@ -1271,7 +1271,11 @@ replay walks are distributed as live rounds under the rule are. On a 27B load
 built for the **MTP head** (GitHub #626) the head's chain proposes in the pass
 as in a live round; the head drafts under the fixed draft only, so only greedy
 lanes are forced, and fed the text its own rounds committed a forced round is
-those rounds bit for bit.
+those rounds bit for bit. On a DFlash2 load of two **round shapes** (#692) a
+forced round may name its shape, which it then runs at whatever would choose
+one, and the drafts it verifies in place of its drafter's: offered the recording
+itself, every column holds the recorded text and the round commits its whole
+shape, the rows the extended round's numerical class is held by (ADR 0104).
 
 **Proposal readout**:
 The drafter's proposals at a sequence's frontier, read without running a round

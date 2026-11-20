@@ -125,9 +125,27 @@ int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis_seq_pool *
  * drafter or verify-only), on either 27B body (GitHub #339: the round's head
  * is the trellis one on a trellis body); `lanes` at most the load's decode
  * lanes (GitHub #336), which the round's logits are sized for. Synchronous.
- * Returns 0, or -1 with `ignis_dflash2_readout_last_error()` set. */
+ * Returns 0, or -1 with `ignis_dflash2_readout_last_error()` set.
+ *
+ * GitHub #692 (spec #684): `window` names the round shape read. On a DFlash2
+ * load of two shapes it is the load's draft window, the extended shape's
+ * (`lanes` at most the IGNIS_EXTENDED_SHAPE_MAX_LANES it runs), or the base
+ * shape's IGNIS_BASE_SHAPE_DRAFT_TOKENS; the two shapes write one buffer,
+ * each at its own stride, so the read is refused unless the most recent
+ * verify round ran the shape named. `ignis_dflash2_readout`'s `window` names
+ * the shape whose forward it runs the same way. */
 int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32_t lanes, uint32_t window,
                                     uint16_t *out_logits);
+
+/* GitHub #692 (spec #684, test-only): the most recent plain round's logits,
+ * BF16 `[lanes][vocab]` for its first `lanes` lanes -- lane `i`'s
+ * distribution of its successor, as the round's draw read it (a lane held to
+ * a short permitted set reads its masked row). Speculation off's rows, which
+ * the numerical class of the verify round's shapes is measured against. Valid
+ * until the next round or prefill draw on this model; the 27B's decode
+ * logits, `lanes` at most the load's decode lanes. Synchronous. Returns 0, or
+ * -1 with `ignis_dflash2_readout_last_error()` set. */
+int32_t ignis_decode_readout_logits(struct ignis_model *model, uint32_t lanes, uint16_t *out_logits);
 
 const char *ignis_dflash2_readout_last_error(void);
 

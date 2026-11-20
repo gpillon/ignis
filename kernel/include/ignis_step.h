@@ -826,6 +826,28 @@ struct ignis_decode_options {
   const uint8_t *host_cut_lanes; /* [batch_size], or NULL */
   int32_t (*host_cut)(void *context, uint64_t lane, const int32_t *run, int32_t run_count);
   void *host_cut_context;
+  /* GitHub #692 (spec #684) -- test-only, the numerical-class test of the
+   * round shapes; no serving caller sets them. Both ride a teacher-forced
+   * round (`forced_tokens`), which they need, on the 27B.
+   *
+   * `forced_shape_window`: the window of the round shape the round runs at
+   * -- the load's draft window, or on a DFlash2 load of two shapes its base
+   * shape's IGNIS_BASE_SHAPE_DRAFT_TOKENS -- whatever IGNIS_ROUND_SHAPE or a
+   * rule would choose, so one load runs either shape on request; a window
+   * that is no shape's, or a round of more lanes than that shape runs, is
+   * refused. 0: the round's shape is chosen as any round's.
+   *
+   * `forced_drafts`: host `[batch_size][speculative_window]`, lane i's from
+   * i * speculative_window, of which a round at a shape of window `k` reads
+   * each lane's first `k`: the drafts the round verifies in place of its
+   * drafter's, written over the proposal after the drafter's forward, so the
+   * round's columns hold them and the forced tokens' verdict takes their
+   * leading agreement with the recording (every one, where they are the
+   * recording's). On a DFlash2 load, every lane greedy; such a round runs
+   * eagerly (the verify graphs were captured without them, and a capture
+   * refuses them). NULL: the drafter's proposals, as always. */
+  const int32_t *forced_drafts; /* [batch_size][speculative_window], or NULL */
+  uint32_t forced_shape_window; /* 0, or the window of the shape a teacher-forced round runs at */
   /* GitHub #689 (spec #684): receives the verify round's shape, one for all
    * its lanes: 0 the base shape -- every round of a load of one shape -- or 1
    * the extended shape of a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS
@@ -837,14 +859,17 @@ struct ignis_decode_options {
 /* Beside the `size` check, both sides pin the layout (here, and
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #267 appended
  * `forced_tokens` after every field the serving path sets, GitHub #590 the
- * host cut after it, and GitHub #689 the round's shape after that. */
-static_assert(sizeof(struct ignis_decode_options) == 120 &&
+ * host cut after it, GitHub #692 the forced drafts and shape after that,
+ * and GitHub #689 the round's shape after them. */
+static_assert(sizeof(struct ignis_decode_options) == 136 &&
                   offsetof(struct ignis_decode_options, out_logits) == 72 &&
                   offsetof(struct ignis_decode_options, forced_tokens) == 80 &&
                   offsetof(struct ignis_decode_options, host_cut_lanes) == 88 &&
                   offsetof(struct ignis_decode_options, host_cut) == 96 &&
                   offsetof(struct ignis_decode_options, host_cut_context) == 104 &&
-                  offsetof(struct ignis_decode_options, out_round_shape) == 112,
+                  offsetof(struct ignis_decode_options, forced_drafts) == 112 &&
+                  offsetof(struct ignis_decode_options, forced_shape_window) == 120 &&
+                  offsetof(struct ignis_decode_options, out_round_shape) == 128,
               "ignis_decode_options drifted from crates/core/src/step_abi.rs IgnisDecodeOptions");
 #endif
 

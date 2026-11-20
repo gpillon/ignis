@@ -557,6 +557,14 @@ struct IgnisVerifyRound {
   // captured, so no graph carries it.
   const std::int32_t *forced_tokens = nullptr;
 
+  // GitHub #692 (test-only): during a teacher-forced round that names its
+  // drafts (`ignis_decode_options::forced_drafts`), their host copy at this
+  // shape's stride (I32 [k, B]), which the pass writes over the drafter's
+  // proposal (kernel/src/decode_graph.cu). Set by that round alone, which
+  // runs eagerly and clears it before it returns; null in every serving round
+  // and while the verify graphs are captured, so no graph carries it.
+  const std::int32_t *forced_drafts = nullptr;
+
   // GitHub #590 (spec #287): `logits` is also where a repair reads the
   // scores of a lane whose commit the host cut (`ignis_kept_scores`, source
   // kVerifyLogits). Every round writes the whole buffer, so each round stamps
@@ -980,6 +988,34 @@ struct ignis_model {
   // none of the 27B's fields above it is bound.
   std::unique_ptr<ignis::flash_next::FlashNextModel, ignis::flash_next::FlashNextModelDeleter> flash_next;
 };
+
+// GitHub #692 (spec #684): the load's round shape at a draft window of `window` -- its base shape, or
+// on a DFlash2 load of two its extended shape -- or null where no shape of the load has that window.
+// The shape a test seam is asked for by its window: a teacher-forced round's `forced_shape_window`,
+// the readouts' `window` (kernel/include/ignis_dflash2_readout.h).
+inline IgnisVerifyRound *ignis_round_shape_at(const ignis_model &model, uint32_t window) {
+  if (model.base_shape != nullptr && model.base_shape->window == window) {
+    return model.base_shape.get();
+  }
+  if (model.extended_shape != nullptr && model.extended_shape->window == window) {
+    return model.extended_shape.get();
+  }
+  return nullptr;
+}
+
+// GitHub #692: the round shape whose verify round wrote the logits the load's shapes share last, or
+// null before its first verify round. Each round stamps its shape from the model's one counter
+// (`IgnisVerifyRound::kept_epoch`), so the later stamp is the later round's.
+inline const IgnisVerifyRound *ignis_latest_verify_shape(const ignis_model &model) {
+  const IgnisVerifyRound *latest = model.base_shape.get();
+  if (latest == nullptr) {
+    return nullptr;
+  }
+  if (model.extended_shape != nullptr && model.extended_shape->kept_epoch > latest->kept_epoch) {
+    latest = model.extended_shape.get();
+  }
+  return latest->kept_epoch == 0 ? nullptr : latest;
+}
 
 // GitHub #178: a media embedding -- the `[hidden, columns]` BF16 encoder
 // output, live until released. GitHub #243: its columns sit in the pages

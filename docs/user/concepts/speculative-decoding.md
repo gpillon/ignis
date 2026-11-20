@@ -193,11 +193,9 @@ for it, so no request pays the wider round for another; a round of 5 to 8
 lanes, or one with a lane held to a grammar, runs at the base shape. Text the
 drafter predicts far ahead (a JSON answer, a long tool call's arguments) goes
 extended and stays there; free text rarely takes all 7, so it stays at the
-base shape and decodes as at 7 drafts. Either shape commits the model's own
-text: like a speculative and a plain decode, the two shapes can rank two
-near-equal tokens differently, so a greedy answer can differ at a near tie
-when a round changes shape. A request evicted and restored keeps what it
-asked. `/metrics` counts the rounds at each shape
+base shape and decodes as at 7 drafts (a greedy answer can differ at a
+near-tie where the shape changes, below). A request evicted and restored
+keeps what it asked. `/metrics` counts the rounds at each shape
 (`ignis_speculative_shape_rounds_total`) and, per position up to the window,
 the drafts proposed and taken.
 
@@ -208,6 +206,13 @@ outside it. The measurement switch `IGNIS_ROUND_SHAPE=base|extended`
 ([Testing](../contributing/testing.md)) forces every round to one shape over
 the rule. A load at 7 drafts or fewer has the one shape it had. The MTP head
 keeps 0 to 7.
+
+The two shapes compute a column's logits up to rounding, not bit for bit:
+past 8 columns a lane the round takes other routes, and the extended round is
+held to the base round's numerical class, not to its bytes
+([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)).
+So a greedy answer can differ at a near-tie where a round of one shape runs in
+place of the other, as it can between speculation on and off.
 
 ## MTP, for the 27B
 

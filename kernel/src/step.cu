@@ -2250,6 +2250,30 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       forced_on_device = forced_on_device || samples(i);
     }
   }
+  // GitHub #692 (test-only): a teacher-forced round that names its drafts
+  // verifies them in place of the drafter's -- written over the proposal
+  // inside the pass, at the round's stride, each lane's first `k` of the
+  // caller's row -- and its verdict takes their leading agreement with the
+  // recording. A DFlash2 load's, every lane greedy (a sampling lane's drafts
+  // are its draws, which another set of drafts would leave without their q);
+  // the round runs eagerly, the copy at `verify.forced_drafts` while it runs.
+  std::vector<std::int32_t> forced_draft_rows;
+  if (options.forced_drafts != nullptr) {
+    if (!dflash2) {
+      set_error("ignis_program_decode: forced_drafts replace the DFlash2 drafter's proposals; this model was "
+                "loaded with " + std::string(ignis_drafter_name(model->drafter)));
+      return -1;
+    }
+    forced_draft_rows.resize(static_cast<std::size_t>(k) * batch_size);
+    for (uint64_t i = 0; i < batch_size; ++i) {
+      if (samples(i)) {
+        set_error("ignis_program_decode: forced_drafts ride greedy lanes; lane " + std::to_string(i) +
+                  " samples at temperature > 0");
+        return -1;
+      }
+      std::copy_n(options.forced_drafts + i * caller_k, k, forced_draft_rows.data() + i * k);
+    }
+  }
 
   std::vector<std::int32_t> anchors(batch_size, 0);
   std::vector<std::int32_t> drafts(static_cast<std::size_t>(k) * batch_size, 0);
@@ -2450,8 +2474,24 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       clear_forced_tokens.verify = &verify;
     }
 
+    // GitHub #692 (test-only): the forced drafts, for this round only, read
+    // by the eager pass below.
+    struct ClearForcedDrafts {
+      IgnisVerifyRound *verify = nullptr;
+      ~ClearForcedDrafts() {
+        if (verify != nullptr) {
+          verify->forced_drafts = nullptr;
+        }
+      }
+    } clear_forced_drafts;
+    if (!forced_draft_rows.empty()) {
+      verify.forced_drafts = forced_draft_rows.data();
+      clear_forced_drafts.verify = &verify;
+    }
+
     UncommittedRingColumns uncommitted{pool, model->stream, &base_positions, &extents, &slots};
-    const bool use_graph = !forced_on_device && verify.graph_ready[batch_size - 1];
+    const bool use_graph =
+        !forced_on_device && verify.forced_drafts == nullptr && verify.graph_ready[batch_size - 1];
     // GitHub #590: the pass writes the verify logits, which a repair reads for
     // a lane whose commit the host cuts. Stamped before the work is enqueued,
     // so a round that fails part way leaves no earlier record believing them
@@ -2948,6 +2988,13 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       set_error("ignis_program_decode: forced_tokens is the 27B verify round's; a Flash-Next load has none");
       return -1;
     }
+    // GitHub #692: and so are the forced drafts and the forced shape.
+    if (options != nullptr && options->size == sizeof(struct ignis_decode_options) &&
+        (options->forced_drafts != nullptr || options->forced_shape_window != 0)) {
+      set_error("ignis_program_decode: forced_drafts and forced_shape_window are the 27B verify round's; a "
+                "Flash-Next load has none");
+      return -1;
+    }
     // GitHub #590: so is a host cut -- Flash-Next keeps no scores a repair
     // reads (#581), so a cut there would leave a miss nobody can repair.
     if (options != nullptr && options->size == sizeof(struct ignis_decode_options) &&
@@ -3016,6 +3063,14 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       set_error("ignis_program_decode: a teacher-forced round commits its recording; it takes no host cut");
       return -1;
     }
+    // GitHub #692 (test-only): the forced drafts and the forced shape name a
+    // teacher-forced round's drafts and shape, so they ride one.
+    if ((options->forced_drafts != nullptr || options->forced_shape_window != 0) &&
+        options->forced_tokens == nullptr) {
+      set_error("ignis_program_decode: forced_drafts and forced_shape_window ride a teacher-forced round "
+                "(forced_tokens)");
+      return -1;
+    }
     if (options->speculative_window != 0) {
       // GitHub #686: the round's shape, chosen here and handed to the round.
       // GitHub #687: the load's window is its widest, its extended shape's on
@@ -3044,13 +3099,31 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           return -1;
         }
       }
+      // GitHub #692 (test-only): a teacher-forced round that names its shape
+      // runs at it, and nothing below chooses one for it.
       // GitHub #687, #689: on a load of two round shapes, the round runs at the
       // extended shape when every lane in it asks (the shape rule's asks and
       // the shape policy `all`), it has no more lanes than that shape runs and
       // no lane whose commit the host cuts (kernel/src/round_shape.h);
       // IGNIS_ROUND_SHAPE, read here at each round, forces either shape over
       // the rule.
-      if (model->extended_shape != nullptr) {
+      if (options->forced_shape_window != 0) {
+        shape = ignis_round_shape_at(*model, options->forced_shape_window);
+        if (shape == nullptr) {
+          set_error("ignis_program_decode: forced_shape_window " + std::to_string(options->forced_shape_window) +
+                    " is no round shape of this load (its windows: " + std::to_string(model->base_shape->window) +
+                    (model->extended_shape != nullptr ? " and " + std::to_string(model->extended_shape->window)
+                                                      : std::string()) +
+                    ")");
+          return -1;
+        }
+        if (batch_size > shape->lanes) {
+          set_error("ignis_program_decode: a round of " + std::to_string(batch_size) +
+                    " lanes at the round shape of " + std::to_string(shape->window) + " drafts, which runs " +
+                    std::to_string(shape->lanes) + " at most");
+          return -1;
+        }
+      } else if (model->extended_shape != nullptr) {
         ignis::round_shape::Named named = ignis::round_shape::Named::kRule;
         try {
           named = ignis::round_shape::read_switch();

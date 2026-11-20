@@ -143,6 +143,7 @@ mod ffi {
             readout: *const IgnisDflash2Readout,
         ) -> i32;
         pub fn ignis_verify_readout_logits(model: *mut IgnisModel, lanes: u32, window: u32, out_logits: *mut u16) -> i32;
+        pub fn ignis_decode_readout_logits(model: *mut IgnisModel, lanes: u32, out_logits: *mut u16) -> i32;
         pub fn ignis_dflash2_readout_last_error() -> *const c_char;
     }
 }
@@ -158,7 +159,10 @@ fn last_error() -> String {
 /// the proposals that round verifies.
 ///
 /// `window` is the load's draft window ([`crate::Speculation::draft_tokens`]),
-/// which sizes the outputs; the leaf refuses any other. `extent` is at most
+/// which sizes the outputs; the leaf refuses any other. GitHub #692: on a
+/// DFlash2 load past [`crate::speculation::BASE_SHAPE_DRAFT_TOKENS`] drafts it names
+/// the round shape read: the load's window, its extended shape, or the base
+/// shape's window, the forward its base rounds run. `extent` is at most
 /// that. With `with_logits`, the proposal head's whole logits come back too
 /// (4 MB a readout at window 7). Nothing the sequence or any other one reads
 /// is written; the leaf refuses a sequence whose window does not stand at its
@@ -247,11 +251,33 @@ fn read(
 /// distribution after its column `j` (its anchor, then its drafts), as the
 /// round's accept read it. Valid until the model's next verify round.
 /// `window` sizes the copy and must be the load's: the leaf refuses another.
+///
+/// GitHub #692: `window` names the round shape read. On a DFlash2 load past
+/// [`crate::speculation::BASE_SHAPE_DRAFT_TOKENS`] drafts it is the load's window, the
+/// extended shape's (at most its lanes), or the base shape's; the two shapes
+/// write one buffer at their own strides, so the leaf refuses the read unless
+/// the latest verify round ran the shape named.
 #[cfg(feature = "cuda")]
 pub fn verify_logits(model: &crate::model_load::Model, lanes: u32, window: u32) -> Result<Vec<u16>, String> {
     let vocab = crate::compute::ModelConfig::qwen38_27b().vocab as usize;
     let mut logits = vec![0u16; lanes as usize * (window as usize + 1) * vocab];
     let rc = unsafe { ffi::ignis_verify_readout_logits(model.handle(), lanes, window, logits.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    Ok(logits)
+}
+
+/// GitHub #692 (test-only): the most recent plain round's logits for its first
+/// `lanes` lanes, BF16 `[lanes][vocab]`: lane `i`'s distribution of its
+/// successor, as the round's draw read it -- speculation off's rows, which the
+/// verify round's numerical class is measured against. Valid until the
+/// model's next round or prefill draw; `lanes` at most the load's decode lanes.
+#[cfg(feature = "cuda")]
+pub fn plain_round_logits(model: &crate::model_load::Model, lanes: u32) -> Result<Vec<u16>, String> {
+    let vocab = crate::compute::ModelConfig::qwen38_27b().vocab as usize;
+    let mut logits = vec![0u16; lanes as usize * vocab];
+    let rc = unsafe { ffi::ignis_decode_readout_logits(model.handle(), lanes, logits.as_mut_ptr()) };
     if rc != 0 {
         return Err(last_error());
     }

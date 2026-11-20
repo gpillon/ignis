@@ -152,7 +152,7 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
         config.slot_count,
     )
     .map_err(|e| format!("model load: {e}"))?;
-    ignis_runtime::note_qwen27b_loaded();
+    ignis_runtime::note_qwen27b_loaded(config.speculation.and_then(|s| s.round_shapes(config.slot_count).1));
     let pool = SeqPool::create_with_speculation(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
