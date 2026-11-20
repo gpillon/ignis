@@ -127,8 +127,8 @@
 //! at 2 and 8 lanes. `trellis-16gb-w15-rule` and `trellis-24gb-w15-rule` are
 //! it at 15 drafts under the shape rule at those lanes, so its rounds cross
 //! the shapes as the NVFP4 body's do: at 2 lanes the extended shape, 32
-//! columns against the base shape's 16, sizes the buffers both shapes share
-//! and the trellis head's widest call, and at 8 both shapes are 64 columns
+//! columns against the base shape's 16, sizes the buffers both shapes share,
+//! and at 8 both shapes are 64 columns
 //! ([`ROUND_COLUMNS`], held of each shape the load reports). Both are held to
 //! a 7-draft load of the same lanes by the second test, and
 //! `trellis-16gb-w8` runs every arm under `extended` at the smallest window
@@ -478,7 +478,7 @@ const LOADS: &[Load] = &[
     // The trellis body the 16 GB and 24 GB profiles load (the `sc30` artifact) with DFlash2 at 15
     // drafts under the shape rule, every arm with the switch unset, at each profile's lanes: at the
     // 16 GB profile's 2 the extended shape (2 x 16 columns) is the larger and sizes the shared
-    // buffers and the trellis head's widest call; at the 24 GB profile's 8 both shapes are 64.
+    // buffers; at the 24 GB profile's 8 both shapes are 64.
     Load {
         name: "trellis-16gb-w15-rule",
         artifact: TRELLIS_16GB,
