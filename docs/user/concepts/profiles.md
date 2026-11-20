@@ -60,9 +60,12 @@ No profile here carries a speed for an RTX 30 or RTX 40 card: those come
 from the reports of people who have one, collected on
 [issue #643](https://github.com/gpillon/ignis/issues/643).
 Every profile drafts 7 tokens a round. From 0.11.0 a DFlash2 load may name
-up to 15 on any card (`--spec-draft-tokens`), unmeasured for speed, at the
+up to 15 on any card (`--spec-draft-tokens`), at the
 VRAM [the configuration reference](../configuration/context-and-speculation.md)
-states for the profile's lanes.
+states for the profile's lanes. Its rounds are held correct on the RTX 5090
+on both 27B artifacts, the trellis one at the 16 and 24 GB profiles' lanes;
+its speed is unmeasured off the RTX 5090, so no other profile's default
+moves.
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` and `rtx-12gb` are
@@ -205,6 +208,16 @@ Why each:
   `--vision-max-tokens` sets your own envelope. The pinned host RAM it needs is
   [host RAM for the 27B](../configuration/host-ram.md#host-ram-for-the-27b).
 - **Two lanes.** Eight would leave no room for the context.
+- **DFlash2 at 7 drafts.** Up to 15 is yours to name
+  (`--spec-draft-tokens`): the load then holds the
+  [extended round shape](speculative-decoding.md#past-seven-drafts-two-round-shapes)
+  beside the base one, and at these two lanes the extended shape is the
+  larger, so it plans 41.5 MB more at 15 drafts, at most 71 KV pages (4,544
+  tokens) of the pool, 25.9 MB at 12 and 5.2 MB at 8 (planned on the RTX 5090
+  at this profile's shape). Its rounds are held to a 7-draft load's tokens and
+  numerical class on the RTX 5090; whether it is faster on a 16 GB card is not
+  measured, so the default stays 7. Off compute capability 12.0 the extended
+  round attends on the vendored chunked route.
 - **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
   2,048 would cost about 0.4 GB of KV pool. The solo width is pinned to it for
   the same reason: on an RTX 40 card in a 16 GiB budget less 1 GiB, `auto`
@@ -342,6 +355,14 @@ Why each:
 - **The 5090's values for the 27B.** The headroom, the 2,048-token chunk,
   DFlash2 at 7 drafts and vision in host RAM are what `rtx5090` gives the
   27B; the lanes and the drafter's head stay at their defaults.
+- **Past 7 drafts, the same pages.** At eight lanes both
+  [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes)
+  are 64 columns, so `--spec-draft-tokens 15` plans 528 bytes more than 7, and
+  8 or 12 nothing, the KV pool's pages unchanged (planned on the RTX 5090 at
+  this profile's shape). Its rounds are held to a 7-draft load's tokens and
+  numerical class on the RTX 5090; whether it is faster on a 24 GB card is not
+  measured, so the default stays 7, and off compute capability 12.0 the
+  extended round attends on the vendored chunked route.
 - **A million tokens of context.** Measured as the 16 GB numbers were: the
   16 GB entry on the RTX 5090 held to a 24 GiB budget, on the routes a card
   below compute capability 12.0 runs (the dense prefill with its 89 MB buffer,
