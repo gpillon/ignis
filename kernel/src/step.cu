@@ -336,22 +336,19 @@ std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
 // was made from -- a decode-logits column no later round or prefill draw has
 // written, or the verify logits of the last verify round, the one that cut
 // the lane's commit. GitHub #687: a load's two round shapes write one logits
-// buffer, so the last verify round is the latest of either shape's, whose
-// stamps both come from the model's one counter; a record's column is the
-// buffer's own, at the stride of the round that wrote it.
+// buffer (the base shape's, which the extended one holds too), so the last
+// verify round is the latest of either shape's (`ignis_latest_verify_shape`);
+// a record's column is the buffer's own, at the stride of the round that
+// wrote it. A verify round's record carries its round's stamp, never 0.
 bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept) {
   if (kept.source == IgnisKeptSource::kVerifyLogits) {
-    const IgnisVerifyRound *verify = model->base_shape.get();
-    if (verify == nullptr) {
+    const IgnisVerifyRound *latest = ignis_latest_verify_shape(*model);
+    if (latest == nullptr) {
       return false;
     }
-    std::uint64_t latest = verify->kept_epoch;
-    if (model->extended_shape != nullptr) {
-      latest = std::max(latest, model->extended_shape->kept_epoch);
-    }
     const std::uint64_t columns =
-        verify->logits->bytes / (static_cast<std::uint64_t>(model->vocab) * sizeof(std::uint16_t));
-    return static_cast<std::uint64_t>(kept.column) < columns && latest == kept.epoch;
+        latest->logits->bytes / (static_cast<std::uint64_t>(model->vocab) * sizeof(std::uint16_t));
+    return static_cast<std::uint64_t>(kept.column) < columns && latest->kept_epoch == kept.epoch;
   }
   return static_cast<std::uint32_t>(kept.column) < model->decode_lanes &&
          model->kept_column_epochs[static_cast<std::size_t>(kept.column)] == kept.epoch;
