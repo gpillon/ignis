@@ -406,7 +406,7 @@ def test_a_local_quant_whose_pins_trace_or_recipe_do_not_hold_is_refused_naming_
 @pytest.mark.parametrize("local,argv,message", [
     (True, ("--recipe", "ig28a", "--quant-pins", "{pins}"), "a quant converted locally .--quant-pins. takes --trace"),
     (True, ("--recipe", "ig28a", "--trace", "{trace}"), "--trace is a quant converted locally's, with --quant-pins"),
-    # without its pins a local quant is refused as a quant with no download record
+    # without its pins and at the default recipe, a local quant is refused by its configuration first
     (True, ("--recipe", "sc30",), "bits = 2.79, not 3.0"),
     (False, ("--recipe", "ig28a"), "a downloaded quant is named turboderp/Qwen3.8-27B-exl3 SC_3.00bpw_H4, the recipe "
                                    "sc30's: the recipe ig28a is replayed from a quant converted locally"),

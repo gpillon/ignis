@@ -631,7 +631,7 @@ def test_an_override_todays_replay_wrote_converts_and_verifies_as_it_did(tmp_pat
     record = _run(src, work, override=override_mod.Override(out, src["abliterated"]), errors_fn=_ov_errors,
                   weights_id=VARIANT)
     # the conversion record's override section is today's, key for key and value for value
-    assert record["override"] == frozen("converter-override.json")
+    assert json.dumps(record["override"]) == json.dumps(frozen("converter-override.json"))
     assert record["override"]["matrices"] == REPLAYED
     ok, report = _pack_and_verify(src, work, override_mod.Override(out))
     assert ok, report["problems"]
