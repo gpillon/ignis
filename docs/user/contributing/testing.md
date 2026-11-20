@@ -287,8 +287,9 @@ the other. They are no configuration fields: `GET /v1/config` and
   naming the variable.
 - `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) forces, at each verify
   round of a DFlash2 load of the 27B past 7 draft tokens, the round's shape
-  over the shape rule. Unset: the shape rule and its policy, a round of 1 to 4
-  lanes at the extended shape when every lane in it asks for it. `base`: every
+  over the shape rule. Unset: the shape rule and the shape policy
+  (`--spec-shape-policy`, `aggregate` by default) give each round its shape.
+  `base`: every
   round at the base shape, 8 columns a lane, the round of a load at 7 drafts
   token for token. `extended`: every round of 1 to 4 lanes at the extended
   shape, the window + 1 columns a lane. Under all three a round of 5 to 8
@@ -316,10 +317,11 @@ the 16 GB and 12 GB classes' trellis artifacts, each under the exception
 weights it has. From 0.11.0 it also loads DFlash2 at 15 and 10 draft tokens
 and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
 extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
-under the shape rule (`nvfp4-dflash2-w15-rule`), every round's shape held to
-what its lanes asked and the same lanes taken from the base shape to the
-extended one and back on live, host-cut and teacher-forced rounds at 1 to 4
-lanes; a
+under the shape rule and the default shape policy `aggregate`
+(`nvfp4-dflash2-w15-rule`), every round's shape held to what its lanes asked
+and their recent rounds give, and the same lanes taken from the base shape to
+the extended one and back on live, host-cut and teacher-forced rounds at 1 to
+4 lanes; a
 second test holds a 15-draft load's base rounds to a 7-draft load's tokens;
 and a third holds a prefill whose last chunk is 9 to 16 tokens to the same
 logits, bit for bit, under `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is

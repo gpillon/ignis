@@ -2950,6 +2950,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
         ignis_seq &seq = *sequences[i];
         seq.asks_extended_shape = ignis::round_shape::asks_extended(model->shape_rule, seq.asks_extended_shape,
                                                                     extended, extents[i], accepted[i]);
+        // GitHub #690: and the round, for the shape policy's estimate of the lane.
+        ignis::round_shape::record_round(seq.shape_rounds, seq.shape_rounds_recorded, extended, extents[i],
+                                         accepted[i]);
       }
     }
     if (options.out_round_shape != nullptr) {
@@ -3101,12 +3104,12 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       }
       // GitHub #692 (test-only): a teacher-forced round that names its shape
       // runs at it, and nothing below chooses one for it.
-      // GitHub #687, #689: on a load of two round shapes, the round runs at the
-      // extended shape when every lane in it asks (the shape rule's asks and
-      // the shape policy `all`), it has no more lanes than that shape runs and
-      // no lane whose commit the host cuts (kernel/src/round_shape.h);
+      // GitHub #687, #689, #690, #691: on a load of two round shapes, the
+      // round runs at the extended shape when the shape policy gives it from
+      // its lanes' asks and recent rounds, a lane the host cuts among them,
+      // and it has no more lanes than that shape runs (kernel/src/round_shape.h);
       // IGNIS_ROUND_SHAPE, read here at each round, forces either shape over
-      // the rule.
+      // the rule and the policy.
       if (options->forced_shape_window != 0) {
         shape = ignis_round_shape_at(*model, options->forced_shape_window);
         if (shape == nullptr) {
@@ -3132,10 +3135,17 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           return -1;
         }
         std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> asks{};
+        // GitHub #690: and what each lane's recent rounds say, which `aggregate` reads.
+        std::array<ignis::round_shape::LaneEstimate, IGNIS_DECODE_MAX_BATCH> estimates{};
         for (uint64_t i = 0; i < batch_size; ++i) {
           asks[i] = sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
+          if (sequences[i] != nullptr) {
+            estimates[i] = ignis::round_shape::estimate_of(sequences[i]->shape_rounds, sequences[i]->shape_rounds_recorded,
+                                                           model->shape_policy.estimate_rounds);
+          }
         }
-        if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes)) {
+        if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes,
+                                              model->shape_policy, estimates.data())) {
           shape = model->extended_shape.get();
         }
       }

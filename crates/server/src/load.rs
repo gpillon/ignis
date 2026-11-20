@@ -773,6 +773,9 @@ impl LoadSpeculation {
 /// measured names; `off` without one. GitHub #623: the 27B's MTP load names
 /// its drafter and window alone, none of DFlash2's settings being its own,
 /// and its window of 0 is `off` saying so; Flash-Next's line is what it was.
+/// GitHub #690: a load of two round shapes then names the shape rule's
+/// thresholds and the shape policy with its window and its period ratios,
+/// which no other load reads.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String {
     let speculation = match speculation {
@@ -786,7 +789,7 @@ fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String
         || "off".to_owned(),
         |s| {
             let drafter = s.drafter_sampling();
-            format!(
+            let line = format!(
                 "{} draft_tokens={} draft_head={} draft_rule={} drafter_temperature_factor={} drafter_top_p={}",
                 s.backend().as_str(),
                 s.draft_tokens(),
@@ -794,6 +797,18 @@ fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String
                 s.draft_rule().as_str(),
                 crate::config::decimal_text(drafter.temperature_factor_milli),
                 crate::config::decimal_text(drafter.top_p_milli)
+            );
+            if s.round_shapes(1).1.is_none() {
+                return line;
+            }
+            let (rule, estimate) = (s.shape_rule(), s.shape_estimate());
+            format!(
+                "{line} shape_enter_accepted={} shape_stay_accepted={} shape_policy={} shape_estimate_rounds={} shape_period_ratios={}",
+                rule.enter_accepted(),
+                rule.stay_accepted(),
+                s.shape_policy().as_str(),
+                estimate.rounds(),
+                crate::config::ratios_text(estimate.period_ratios_milli())
             )
         },
     )
@@ -1086,6 +1101,40 @@ mod tests {
             "dflash2 draft_tokens=7 draft_head=full draft_rule=sampled drafter_temperature_factor=1 drafter_top_p=0.875"
         );
         assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None)), "off");
+    }
+
+    /// GitHub #690 (spec #684, user story 25): a load of two round shapes
+    /// names after them the shape rule's thresholds and the shape policy it
+    /// resolved, with the policy's window and period ratios; a load at 7
+    /// drafts or fewer reads none of them, and its line is what it was.
+    #[test]
+    fn the_load_log_names_a_two_shape_loads_shape_rule_and_shape_policy() {
+        use ignis_core::{ShapeEstimate, ShapePolicy, ShapeRule, Speculation, SpeculativeBackend};
+        let the_27b = ModelFamily::Qwen38_27b;
+        let wide = Speculation::new(SpeculativeBackend::Dflash2, 15).unwrap();
+        assert_eq!(
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide))),
+            "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
+             shape_enter_accepted=7 shape_stay_accepted=6 shape_policy=aggregate shape_estimate_rounds=16 \
+             shape_period_ratios=1.15,1.23,1.27,1.31"
+        );
+        let all = wide
+            .with_shape_rule(ShapeRule::new(5, 12).unwrap())
+            .unwrap()
+            .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, [1000, 1200, 1250, 2000]).unwrap());
+        assert_eq!(
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(all))),
+            "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
+             shape_enter_accepted=5 shape_stay_accepted=12 shape_policy=all shape_estimate_rounds=8 \
+             shape_period_ratios=1,1.2,1.25,2"
+        );
+        let seven = Speculation::new(SpeculativeBackend::Dflash2, 7)
+            .unwrap()
+            .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, [1000, 1200, 1250, 2000]).unwrap());
+        assert_eq!(
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven))),
+            "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
+        );
     }
 
     /// GitHub #623: the 27B's MTP load names its drafter and its window, and
