@@ -97,10 +97,11 @@
 //! The base shape of such a load is the round of a load at [`BASE_WINDOW`]
 //! drafts, token for token: the second test here
 //! ([`a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens`])
-//! runs the session on `nvfp4-dflash2-w15` under [`ROUND_SHAPE`]`=base` and on
-//! a load at [`BASE_WINDOW`] that reserves its context ([`Load::sized_for`]),
-//! and compares the two, greedy lanes and sampled ones, at every width; then a
-//! verify round under a value the switch does not know is refused, naming it.
+//! runs the session on each load of [`TWO_SHAPE_LOADS`] under
+//! [`ROUND_SHAPE`]`=base` and on a load at [`BASE_WINDOW`] of the same body
+//! and lanes that reserves its context ([`Load::sized_for`]), and compares
+//! the two, greedy lanes and sampled ones, at every width; then a verify
+//! round under a value the switch does not know is refused, naming it.
 //!
 //! # The shape rule (#689)
 //!
@@ -120,6 +121,21 @@
 //! round at a time ([`CROSSING`]), and gives the rule the round after: a fold
 //! in flight, a forced round and each arm's switch all cross the change.
 //!
+//! # The trellis body's two shapes (#695)
+//!
+//! The 16 GB and 24 GB profiles load the trellis body (the `sc30` artifact)
+//! at 2 and 8 lanes. `trellis-16gb-w15-rule` and `trellis-24gb-w15-rule` are
+//! it at 15 drafts under the shape rule at those lanes, so its rounds cross
+//! the shapes as the NVFP4 body's do: at 2 lanes the extended shape, 32
+//! columns against the base shape's 16, sizes the buffers both shapes share
+//! and the trellis head's widest call, and at 8 both shapes are 64 columns
+//! ([`ROUND_COLUMNS`], held of each shape the load reports). Both are held to
+//! a 7-draft load of the same lanes by the second test, and
+//! `trellis-16gb-w8` runs every arm under `extended` at the smallest window
+//! past the base shape's, 9 columns a lane. On the RTX 5090 the extended
+//! round attends on ignis's chunks there too; the arm on the vendored chunks
+//! holds the route a card without ignis's route takes.
+//!
 //! # Loads and weights
 //!
 //! [`LOADS`]: the NVFP4 body with DFlash2 at 7, with its MTP head at the
@@ -128,7 +144,8 @@
 //! the 16 GB class (the `sc30` artifact, DFlash2 at 7) and of the 12 GB class
 //! (`ig28`, MTP at 7). Each drafts by the server's default rule for its
 //! drafter, over hq-e8-2b KV, at 8 lanes: past the 16 and 12 GB profiles' 2
-//! and 1, which an operator can raise, so that widths 1-8 run on both bodies.
+//! and 1, which an operator can raise, so that widths 1-8 run on both bodies
+//! (#695's two-shape trellis loads at their profiles' lanes, above).
 //! Every load names its exception weights. The NVFP4 body runs under `bf16`
 //! and under `fp8`, which needs compute capability 12.0 (on another card, set
 //! `IGNIS_ROUND_IDENTITY_WEIGHTS=bf16`). The trellis body holds no BF16
@@ -156,7 +173,9 @@
 //! `IGNIS_ROUND_IDENTITY_ARMS` (a comma list of arm names) and
 //! `IGNIS_ROUND_IDENTITY_WEIGHTS` (`bf16`, `fp8`, or both) narrow the run;
 //! each, unset, is everything. A name the test does not know fails it, naming
-//! the ones it knows, and so does a run that compares nothing.
+//! the ones it knows, and so does a run that compares nothing. The second
+//! test runs the loads of [`TWO_SHAPE_LOADS`] the loads filter selects, and
+//! nothing where it selects none of them.
 //!
 //! ```text
 //! IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture
@@ -254,8 +273,12 @@ const ARMS: &[Arm] = &[
 const ROUND_SHAPE: &str = "IGNIS_ROUND_SHAPE";
 const BASE_WINDOW: u32 = 7;
 const EXTENDED_LANES: usize = 4;
-/// The load whose base shape the second test holds to a 7-draft load's.
-const TWO_SHAPE_LOAD: &str = "nvfp4-dflash2-w15";
+/// The most columns a round of either shape carries: 8 lanes of 8, 4 of 16.
+const ROUND_COLUMNS: u32 = 64;
+/// The loads whose base shape the second test holds to a 7-draft load's:
+/// the NVFP4 body's, and (#695) the trellis body's at each of its profiles'
+/// lanes.
+const TWO_SHAPE_LOADS: [&str; 3] = ["nvfp4-dflash2-w15", "trellis-16gb-w15-rule", "trellis-24gb-w15-rule"];
 /// #689: the shapes [`ROUND_SHAPE`] names, one round each, after which a
 /// rule load's lanes cross at each width the extended shape runs: from the
 /// base shape to the extended one and back, then the rule's own.
@@ -439,6 +462,48 @@ const LOADS: &[Load] = &[
     // #694's loads, below this line.
 
     // #695's loads, below this line.
+    // The trellis body the 16 GB and 24 GB profiles load (the `sc30` artifact) with DFlash2 at 15
+    // drafts under the shape rule, every arm with the switch unset, at each profile's lanes: at the
+    // 16 GB profile's 2 the extended shape (2 x 16 columns) is the larger and sizes the shared
+    // buffers and the trellis head's widest call; at the 24 GB profile's 8 both shapes are 64.
+    Load {
+        name: "trellis-16gb-w15-rule",
+        artifact: TRELLIS_16GB,
+        backend: SpeculativeBackend::Dflash2,
+        window: 15,
+        draft_rule: DraftRule::Sampled,
+        lanes: 2,
+        vision: false,
+        exceptions: false,
+        sized_for: None,
+        round_shape: None,
+    },
+    Load {
+        name: "trellis-24gb-w15-rule",
+        artifact: TRELLIS_16GB,
+        backend: SpeculativeBackend::Dflash2,
+        window: 15,
+        draft_rule: DraftRule::Sampled,
+        lanes: 8,
+        vision: false,
+        exceptions: false,
+        sized_for: None,
+        round_shape: None,
+    },
+    // The same body at the smallest window past the base shape's, every arm under `extended`
+    // at the 16 GB profile's 2 lanes: 9 columns a lane, a second attention chunk of one.
+    Load {
+        name: "trellis-16gb-w8",
+        artifact: TRELLIS_16GB,
+        backend: SpeculativeBackend::Dflash2,
+        window: 8,
+        draft_rule: DraftRule::Sampled,
+        lanes: 2,
+        vision: false,
+        exceptions: false,
+        sized_for: None,
+        round_shape: Some("extended"),
+    },
 
     Load {
         name: "trellis-16gb",
@@ -789,6 +854,10 @@ fn round_shape_stats(model: &Model, pool: &SeqPool, load: &Load, label: &str) {
     );
     let reserved = model.stats().reserved;
     assert_eq!(base.vram_bytes, reserved.verify_round_bytes + reserved.drafter_round_bytes, "{label}: the base shape's VRAM");
+    // #695: neither shape's widest round carries more than [`ROUND_COLUMNS`].
+    for shape in shapes {
+        assert!(shape.lanes * (shape.window + 1) <= ROUND_COLUMNS, "{label}: {} lanes of {} columns", shape.lanes, shape.window + 1);
+    }
     if let [_, extended] = shapes {
         let lanes = load.lanes.min(EXTENDED_LANES as u32);
         assert_eq!(
@@ -1215,21 +1284,30 @@ fn every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_wi
 
 /// #687: a 15-draft load's rounds at the base shape commit what a load at
 /// [`BASE_WINDOW`] drafts commits, token for token, at every width, with
-/// greedy lanes and with sampled ones, under each exception setting: the load
-/// [`TWO_SHAPE_LOAD`] with [`ROUND_SHAPE`] unset against a load at
-/// [`BASE_WINDOW`] that reserves its context (the context is the envelope the
-/// round's attention splits by, so a load at another context is another
-/// summation order, not another round). Then, on the 15-draft load, a verify
-/// round under a value the switch does not know is refused, naming it: the
-/// proof that a round reads it, which every two-shape load's `extended` rests
-/// on.
+/// greedy lanes and with sampled ones, under each exception setting the body
+/// has: each load of [`TWO_SHAPE_LOADS`] the `IGNIS_ROUND_IDENTITY_LOADS`
+/// filter selects, under [`ROUND_SHAPE`]`=base`, against a load at
+/// [`BASE_WINDOW`] of the same body and lanes that reserves its context (the
+/// context is the envelope the round's attention splits by, so a load at
+/// another context is another summation order, not another round). Then, on
+/// the 15-draft load, a verify round under a value the switch does not know
+/// is refused, naming it: the proof that a round reads it, which every
+/// two-shape load's `extended` rests on. #695: the trellis body's loads at 2
+/// lanes, where the extended shape sizes the buffers the base round reads,
+/// and at 8; it holds no BF16 exception tensor, so it runs once, as `bf16`.
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens() {
-    let wide = LOADS.iter().find(|load| load.name == TWO_SHAPE_LOAD).expect("the two-shape load is in LOADS");
-    let base = Load { round_shape: Some("base"), ..*wide };
-    let seven = Load { name: "nvfp4-dflash2-w7-at-the-w15-context", window: BASE_WINDOW, sized_for: Some(wide.window), round_shape: None, ..*wide };
-    assert_eq!(seven.context(), base.context(), "both loads reserve one context");
+    let loads = selected("IGNIS_ROUND_IDENTITY_LOADS", &LOADS.iter().map(|load| load.name).collect::<Vec<_>>());
+    let wides: Vec<&Load> = TWO_SHAPE_LOADS
+        .iter()
+        .map(|&name| LOADS.iter().find(|load| load.name == name).expect("a two-shape load in LOADS"))
+        .filter(|load| loads.contains(&load.name))
+        .collect();
+    if wides.is_empty() {
+        println!("round_identity_gpu: the IGNIS_ROUND_IDENTITY_LOADS filter leaves out every one of {TWO_SHAPE_LOADS:?}");
+        return;
+    }
     let weights = selected("IGNIS_ROUND_IDENTITY_WEIGHTS", &ExceptionWeights::NAMES);
     let mut device = match CudaDevice::create(0) {
         Ok(device) => device,
@@ -1240,60 +1318,72 @@ fn a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    let path = Path::new(base.artifact);
-    if !path.exists() && gpu_profile::skip_or_fail(&format!("{}: artifact absent: {}", base.name, base.artifact)) {
-        return;
-    }
-    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", base.artifact));
-    let script = script(&reader);
     let (mut compared, mut skipped) = (0, false);
-    for exceptions in [ExceptionWeights::Bf16, ExceptionWeights::Fp8] {
-        if !weights.contains(&exceptions.as_str()) {
+    for wide in wides {
+        assert!(wide.two_shapes() && wide.window == 15, "{}: a load of two shapes at 15 drafts", wide.name);
+        let base = Load { round_shape: Some("base"), ..*wide };
+        let name: &'static str = Box::leak(format!("{}-w7-at-the-w15-context", wide.name).into_boxed_str());
+        let seven = Load { name, window: BASE_WINDOW, sized_for: Some(wide.window), round_shape: None, ..*wide };
+        assert_eq!(seven.context(), base.context(), "{}: both loads reserve one context", wide.name);
+        let path = Path::new(base.artifact);
+        if !path.exists() && gpu_profile::skip_or_fail(&format!("{}: artifact absent: {}", base.name, base.artifact)) {
+            skipped = true;
             continue;
         }
-        // The load at seven drafts first, released before the 15-draft one.
-        let Some(want) = with_load(&mut device, &reader, &seven, exceptions, |model, pool, label| {
-            run(model, pool, &seven, &script, &REFERENCE, label)
-        }) else {
-            skipped = true;
-            continue;
-        };
-        let Some(got) = with_load(&mut device, &reader, &base, exceptions, |model, pool, label| {
-            let sessions = run(model, pool, &base, &script, &REFERENCE, label);
-            apply(&REFERENCE, Some("no-such-value"));
-            let mut seq = pool.alloc(base.context()).unwrap_or_else(|e| panic!("{label}: alloc: {e}"));
-            prefill(model, pool, &mut seq, &script.prompts[0], greedy(0), false, label);
-            let mut refs = vec![&mut seq];
-            let lanes = [VerifyLane::greedy(&[])];
-            let Err(refused) = decode_program_verify_runs(model, pool, &mut refs, &lanes, base.window) else {
-                panic!("{label}: a verify round under {ROUND_SHAPE}=no-such-value was not refused");
-            };
-            assert!(refused.contains(ROUND_SHAPE), "{label}: the round's refusal names the variable: {refused}");
-            apply(&REFERENCE, None);
-            sessions
-        }) else {
-            skipped = true;
-            continue;
-        };
-        for (((kind, _), want), got) in KINDS.iter().zip(&want).zip(&got) {
-            if let Some((lane, at)) = first_difference(want, got) {
-                let from = at.saturating_sub(4);
-                panic!(
-                    "{} {exceptions}: at the base shape, {kind} lanes: lane {lane} leaves the load at {BASE_WINDOW} \
-                     drafts at token {at}: that load {:?}, the base shape {:?}",
-                    base.name,
-                    &want[lane][from..want[lane].len().min(at + 8)],
-                    &got[lane][from..got[lane].len().min(at + 8)]
-                );
+        let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", base.artifact));
+        let script = script(&reader);
+        for exceptions in [ExceptionWeights::Bf16, ExceptionWeights::Fp8] {
+            if !weights.contains(&exceptions.as_str()) {
+                continue;
             }
+            if exceptions.is_fp8() && !base.exceptions {
+                println!("round_identity_gpu {}: no BF16 exception tensor, so fp8 is its bf16 load: run once, as bf16", base.name);
+                continue;
+            }
+            // The load at seven drafts first, released before the 15-draft one.
+            let Some(want) = with_load(&mut device, &reader, &seven, exceptions, |model, pool, label| {
+                run(model, pool, &seven, &script, &REFERENCE, label)
+            }) else {
+                skipped = true;
+                continue;
+            };
+            let Some(got) = with_load(&mut device, &reader, &base, exceptions, |model, pool, label| {
+                let sessions = run(model, pool, &base, &script, &REFERENCE, label);
+                apply(&REFERENCE, Some("no-such-value"));
+                let mut seq = pool.alloc(base.context()).unwrap_or_else(|e| panic!("{label}: alloc: {e}"));
+                prefill(model, pool, &mut seq, &script.prompts[0], greedy(0), false, label);
+                let mut refs = vec![&mut seq];
+                let lanes = [VerifyLane::greedy(&[])];
+                let Err(refused) = decode_program_verify_runs(model, pool, &mut refs, &lanes, base.window) else {
+                    panic!("{label}: a verify round under {ROUND_SHAPE}=no-such-value was not refused");
+                };
+                assert!(refused.contains(ROUND_SHAPE), "{label}: the round's refusal names the variable: {refused}");
+                apply(&REFERENCE, None);
+                sessions
+            }) else {
+                skipped = true;
+                continue;
+            };
+            for (((kind, _), want), got) in KINDS.iter().zip(&want).zip(&got) {
+                if let Some((lane, at)) = first_difference(want, got) {
+                    let from = at.saturating_sub(4);
+                    panic!(
+                        "{} {exceptions}: at the base shape, {kind} lanes: lane {lane} leaves the load at {BASE_WINDOW} \
+                         drafts at token {at}: that load {:?}, the base shape {:?}",
+                        base.name,
+                        &want[lane][from..want[lane].len().min(at + 8)],
+                        &got[lane][from..got[lane].len().min(at + 8)]
+                    );
+                }
+            }
+            let tokens: usize = got.iter().flatten().flatten().filter(|&&t| t >= 0).count();
+            println!(
+                "round_identity_gpu {} {exceptions}: the base shape commits the {tokens} tokens of the load at \
+                 {BASE_WINDOW} drafts, widths 1..={}, greedy and sampled lanes",
+                base.name, base.lanes
+            );
+            compared += 1;
         }
-        let tokens: usize = got.iter().flatten().flatten().filter(|&&t| t >= 0).count();
-        println!(
-            "round_identity_gpu {} {exceptions}: the base shape commits the {tokens} tokens of the load at \
-             {BASE_WINDOW} drafts, widths 1..={}, greedy and sampled lanes",
-            base.name, base.lanes
-        );
-        compared += 1;
     }
     assert!(compared > 0 || skipped, "no exception setting was compared: check IGNIS_ROUND_IDENTITY_WEIGHTS");
 }

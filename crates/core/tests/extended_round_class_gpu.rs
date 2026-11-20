@@ -16,7 +16,9 @@
 //! # The rows
 //!
 //! On one load (the NVFP4 body, DFlash2 at 15 under the sampled draft,
-//! hq-e8-2b, FP8 exception weights, the served lanes and context), per prompt:
+//! hq-e8-2b, FP8 exception weights, the served lanes and context; #695: and,
+//! in a test of its own, the trellis body the 16 GB and 24 GB profiles load,
+//! under its own exception weights, `bf16`), per prompt:
 //!
 //! - **spec-off**: plain greedy rounds of one lane, one token each, to the
 //!   turn's end or [`MAX_TOKENS`]: speculation off's own text `T`, and the row
@@ -125,13 +127,19 @@ use logit_drift::{row_drift, within, RowDrift};
 // array (7,312) and a code module (5,184) -- and over this test's first three
 // prompts (672 rows). "This test": its own run of 2026-11-20 (NVFP4 body,
 // FP8 exception weights, hq-e8-2b), forced rounds over 3,360 rows and graph
-// rounds over 3,205, at 1 to 4 lanes.
+// rounds over 3,205, at 1 to 4 lanes. "The trellis body" (#695): its own
+// test's run of 2026-11-20 (the `sc30` artifact, BF16, hq-e8-2b), forced
+// rounds over 3,360 rows and graph rounds over 3,255, at 1 to 4 lanes; its
+// rows sit about 1 ulp from speculation off's where the NVFP4 body's sit 14
+// to 18, so it is far inside every bound below.
 
 /// The extended row against the base row after the same tokens: no logit
 /// further than this, in BF16 ulps at the base row's largest magnitude.
 /// Measured widest: prototype 91.1, 113.8, 127.0, 138.9, 168.0, 96.9 by cell;
 /// this test, forced rounds 96.9 at one lane, 0.0 at two and 1.0 at three
-/// and four, graph rounds 114.1 at one lane and 115.2 at two to four; 256 is
+/// and four, graph rounds 114.1 at one lane and 115.2 at two to four; the
+/// trellis body, forced rounds 66.6, 43.9 and 0.0 at one, two and three or
+/// four lanes, graph rounds 64.0, 88.7, 41.1 and 39.8 at one to four; 256 is
 /// the next power of two above, ADR 0056's rule for its own tolerance.
 const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 
@@ -140,7 +148,8 @@ const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 /// prompts); this test, forced rounds 14.0 to 16.1 at one lane and 0.0 to 0.5
 /// at two to four, graph rounds 13.6 to 16.0 at one lane and 11.8 to 14.2 at
 /// two to four but for the code prompt's 0.0 there (neither split is
-/// explained); 32 is the next power of two above.
+/// explained); the trellis body, 1.0 but for forced rounds' 0.0 at three and
+/// four lanes; 32 is the next power of two above.
 const EXTENDED_VS_BASE_TYPICAL_ULPS: f32 = 32.0;
 
 /// ADR 0056's near tie, in the reference row's ulps: the floor of the class's
@@ -152,17 +161,21 @@ const PICK_GAP_ULPS: f32 = logit_drift::PICK_GAP_ULPS;
 /// The class, median: the extended rows' median distance from speculation
 /// off's rows over the base rows'. Measured ratios: prototype 0.96, 1.01,
 /// 1.01, 1.00, 1.01, 1.01; this test, forced rounds 1.00 (0.99 to 1.00 by lane
-/// count), graph rounds 1.02 (0.99 to 1.03). Held at each lane count too.
+/// count), graph rounds 1.02 (0.99 to 1.03); the trellis body, 1.00 for both
+/// kinds at every lane count. Held at each lane count too.
 const CLASS_MEDIAN_MARGIN: f32 = 1.25;
 
 /// The class, 90th percentile. Measured ratios: prototype 0.86, 1.03, 1.02,
 /// 1.00, 1.02, 0.87; this test, forced rounds 1.00 (0.98 to 1.01), graph
-/// rounds 0.99 (0.94 to 1.02).
+/// rounds 0.99 (0.94 to 1.02); the trellis body, forced rounds 0.95 (0.75 to
+/// 1.08), graph rounds 1.01 (1.00 to 1.04).
 const CLASS_P90_MARGIN: f32 = 1.25;
 
 /// The class, widest row: one tail logit each, so the loosest of the three.
 /// Measured ratios: prototype 1.02, 1.20, 0.97, 1.07, 1.25, 1.02; this test,
-/// forced rounds 1.00 (1.00 to 1.02), graph rounds 1.03 (1.03 to 1.06).
+/// forced rounds 1.00 (1.00 to 1.02), graph rounds 1.03 (1.03 to 1.06); the
+/// trellis body, forced rounds 0.69 (0.59 to 1.00), graph rounds 0.49 (0.42 to
+/// 0.53).
 const CLASS_WIDEST_MARGIN: f32 = 1.5;
 
 /// The class, moved picks: the extended rows may move this many times the
@@ -172,7 +185,9 @@ const CLASS_WIDEST_MARGIN: f32 = 1.5;
 /// 5, 0 and 0, 155 and 176, 58 and 63, 15 and 14; this test, forced rounds 90
 /// and 89 (25 and 24, 25 and 25, 15 and 15, 25 and 25 at 1 to 4 lanes), graph
 /// rounds 76 and 73 (19 and 20, 19 and 21, 12 and 11, 26 and 21: 26 against a
-/// bound of 28 at 4 lanes).
+/// bound of 28 at 4 lanes); the trellis body, forced rounds 8 and 8 (2 and 2 at
+/// each lane count), graph rounds 11 and 12 (3 and 2, 3 and 3, 2 and 3, 3 and
+/// 4).
 const CLASS_MOVED_PICKS_MARGIN: f32 = 1.25;
 const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 
@@ -192,14 +207,17 @@ const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 /// test's length, 82.5 on the long answers; this test, forced rounds 8.0,
 /// graph rounds 17.0 (one lane, over a base widest of 12.0 there), where ADR
 /// 0056's 16 alone, the bound between the shapes before this one, failed the
-/// test's first run.
+/// test's first run. The trellis body: from spec-off 1.0 over 1.0 for both
+/// kinds, so its near tie is ADR 0056's 16; between the shapes none moved on
+/// forced rounds, 1.0 on graph rounds.
 const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 
 /// A lane's mean log-probability of the text under the extended rows against
 /// the base rows', in nats a token, either way. Measured apart by: prototype
 /// 0.0074, 0.0031, 0.0001, 0.0040, 0.0001, and 0.0089 at the furthest of the
 /// three prompts; this test, forced rounds at most 0.0089, graph rounds at
-/// most 0.0124; 0.02 is ADR 0056's bound for its own pair.
+/// most 0.0124; the trellis body, forced rounds at most 0.0025, graph rounds
+/// at most 0.0016; 0.02 is ADR 0056's bound for its own pair.
 const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 
 /// The control's median, one index off, over the right rows' median and over
@@ -207,11 +225,26 @@ const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 /// 166.5 ulps from speculation off's over the prototype's three prompts
 /// (145.5 to 182.2 by prompt), the right rows' 11.6, 14 times apart; this
 /// test, forced rounds 166.0 (14.0 times the right rows', 5.2 times the
-/// typical bound), graph rounds 165.0 (13.8, 5.2); 2 is far inside both and
-/// far outside a right pair's margins above.
+/// typical bound), graph rounds 165.0 (13.8, 5.2); the trellis body, forced
+/// rounds 167.5 (167.5 times the right rows' 1.0, 5.2 times the typical
+/// bound), graph rounds 168.1 (168.1, 5.3); 2 is far inside both and far
+/// outside a right pair's margins above.
 const CONTROL_MARGIN: f32 = 2.0;
 
-const NVFP4: &str = "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer";
+/// One body the class is held on: its artifact and the exception weights it
+/// loads under.
+struct Cell {
+    name: &'static str,
+    artifact: &'static str,
+    exceptions: ExceptionWeights,
+}
+
+/// The NVFP4 body the RTX 5090 profile serves, under FP8 exception weights.
+const NVFP4: Cell = Cell { name: "nvfp4", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer", exceptions: ExceptionWeights::Fp8 };
+/// #695: the trellis body the 16 GB and 24 GB profiles load (the `sc30`
+/// artifact), which holds no BF16 exception tensor: `bf16` is its own.
+const TRELLIS: Cell = Cell { name: "trellis", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer", exceptions: ExceptionWeights::Bf16 };
+
 /// The load: the widest DFlash2 window, at the served lanes, prefill chunk and
 /// context. The context is the envelope the rounds' attention splits by, so it
 /// is the served cell's, not the session's need; the pool below is small.
@@ -571,8 +604,22 @@ impl Class {
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn an_extended_rounds_rows_are_the_base_rounds_class() {
-    let path = Path::new(NVFP4);
-    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {NVFP4}")) {
+    hold_the_class(&NVFP4);
+}
+
+/// #695: the same on the trellis body, at the same lanes, chunk and context
+/// (the 16 GB profile's context and chunk; 8 lanes, the 24 GB profile's, so
+/// that the extended shape runs its 4).
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn on_the_trellis_body_an_extended_rounds_rows_are_the_base_rounds_class() {
+    hold_the_class(&TRELLIS);
+}
+
+fn hold_the_class(cell: &Cell) {
+    let file = cell.artifact;
+    let path = Path::new(file);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("{}: artifact absent: {file}", cell.name)) {
         return;
     }
     let mut device = match CudaDevice::create(0) {
@@ -584,19 +631,20 @@ fn an_extended_rounds_rows_are_the_base_rounds_class() {
             unreachable!("skip_or_fail panics under the profile");
         }
     };
-    // The extended round, its FP8 exception weights and its figures are the
-    // RTX 5090's: another generation has no such cell to hold.
+    // The figures the bounds rest on are the RTX 5090's, and the NVFP4 body's
+    // FP8 exception weights need it: another generation has no such cell to
+    // hold (#695: the trellis body's included, measured there alone).
     let (_, (major, minor)) = CudaDevice::identity(0).unwrap_or_else(|e| panic!("device identity: {e}"));
     if major != 12 && gpu_profile::skip_or_fail(&format!("compute capability {major}.{minor}: the extended round's cell is measured on 12.0 alone")) {
         return;
     }
-    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {NVFP4}: {e}"));
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {file}: {e}"));
     let frontend = FrontendSet::from_reader(&reader).unwrap_or_else(|e| panic!("frontend: {e}"));
     let spec = Speculation::new(SpeculativeBackend::Dflash2, WINDOW)
         .unwrap_or_else(|e| panic!("speculation: {e}"))
         .with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
     let (plan, handles) =
-        bind_model_scope_27b_with(&reader, model_scope(Some(spec), None, ExceptionWeights::Fp8)).unwrap_or_else(|e| panic!("bind: {e}"));
+        bind_model_scope_27b_with(&reader, model_scope(Some(spec), None, cell.exceptions)).unwrap_or_else(|e| panic!("bind: {e}"));
     let mut artifact = match materialize(&reader, &plan, &mut device, None) {
         Ok(artifact) => artifact,
         Err(e) => {
@@ -770,5 +818,5 @@ fn an_extended_rounds_rows_are_the_base_rounds_class() {
         }
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
-    assert!(failures.is_empty(), "{} excesses, the first of them:\n{}", failures.len(), failures.iter().take(24).cloned().collect::<Vec<_>>().join("\n"));
+    assert!(failures.is_empty(), "{}: {} excesses, the first of them:\n{}", cell.name, failures.len(),failures.iter().take(24).cloned().collect::<Vec<_>>().join("\n"));
 }
