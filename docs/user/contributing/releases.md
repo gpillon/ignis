@@ -106,9 +106,9 @@ row of the scorer's table, follow from them:
 # CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu.
 export IGNIS_CUDA_ARCHITECTURES='86;120a'
 ignis-server model download qwen3.8-27b-16g      # into ./models
-IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours \
-    cargo run --release -p ignis-core --features cuda --example span_logits -- \
-    models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024
+# The dump under the GPU lock (make gpu-run), the switches reaching it from the environment.
+IGNIS_MODEL_PREFILL_LINEAR=int8 IGNIS_MODEL_PREFILL_ATTENTION=int8 IGNIS_GDN_PREFILL=ours make gpu-run \
+    CMD='cargo run --release -p ignis-core --features cuda --example span_logits -- models/qwen3_8_27b_trellis_sc30-v2.ninfer hq-e8-2b ref27b-top64/windows.json dump-sm86 1024'
 python3 tools/kld-gate/score_top64.py ref27b-top64 dump-sm86 --json gate-sm86.json
 ```
 
