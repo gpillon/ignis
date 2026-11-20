@@ -24,8 +24,9 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make test` / `test-all` / `ci` | `cargo test` / plus web typecheck, vitest and the connector skill's script tests / what a CI job runs. |
 | `make test-connector` | From 0.11.0: the connector skill's script tests, `node --test` in `connector/`; Node alone, no `npm`. |
 | `make grammar-venv` | From 0.11.0: the Python venv at `.scratch/grammar-venv` with the independent JSON Schema validator the structured-output tests check every served answer with. Without it those checks are skipped, saying so; CI installs it, and there a missing one fails them. |
-| `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card / refuse when it is held / the explicit GPU test profile. |
-| `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch). |
+| `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card, the GPU lock's holder among it / refuse when it is held / the explicit GPU test profile, whole or (from 0.11.0) only the tests it is given. |
+| `make gpu-run CMD="…"` | From 0.11.0: one sh line under the GPU lock, for GPU work no other target runs (an example run in process, a server started by hand for a bench): waits for the lock up to `GPU_LOCK_WAIT` seconds, runs the guard, then the command as written (`$HOME` reaches sh, not make). |
+| `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch); from 0.11.0 `CUDA=1` runs it under the GPU lock. |
 | `make clean` / `distclean` | This profile's binary / everything. |
 
 Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
@@ -75,6 +76,21 @@ verbatim.
 A CUDA `run` or `start` first runs a GPU guard (the preflight plus a check for
 other Ignis GPU work), skippable with `GPU_CHECK=0`.
 
+From 0.11.0 the card also has a GPU lock: one per card, a record that names its
+holder (pid, worktree, command, since when), in `%ProgramData%\ignis\gpu-lock\`
+on Windows and `/tmp/ignis-gpu-lock/` on Linux (`IGNIS_GPU_LOCK_DIR` moves it).
+A CUDA `start`, `run` or `run-ui` takes it before the server starts and hands it
+to the server, which holds it until it exits; `stop` frees it, and so does a
+start that fails. `make watch CUDA=1` holds it for cargo-watch, which restarts
+the server, until it exits. A lock someone else holds refuses the start at
+once, naming the holder, and `GPU_CHECK=0` does not skip it; the guard refuses
+for it too. On Windows the guard of a start runs once the start holds the lock.
+`make kernel-test`, `make gpu-run` and the GPU profile wait for the lock
+instead, up to `GPU_LOCK_WAIT` seconds (900), then fail naming the holder.
+A holder that has exited, or whose pid now names another process, holds
+nothing. `make gpu-status` names the holder, and `make gpu-lock-selftest`
+tests the lock and the scripts around it on stand-ins, with no card.
+
 `start`, like `run`, launches the last build and refuses a stale one, naming
 the files changed since: `make build` is the fix. It rewrites
 `ignis-server.log` and its `.err` in `.scratch/serve/`, so before restarting a
@@ -101,7 +117,11 @@ the server gets SIGTERM, its graceful shutdown, and is killed if it still runs
 the same three stages, the same marker, the same exit codes. Its switches go
 in `GPU_PROFILE_ARGS`: `-SkipKernelBuild`, `-SkipCargoTests` and
 `-ThresholdMiB 4096` on Windows, `--skip-kernel-build`, `--skip-cargo-tests`
-and `--threshold-mib 4096` on Linux. The Linux script has had no run on a real
+and `--threshold-mib 4096` on Linux. From 0.11.0, `-Test a_test,b_test` on
+Windows and `--test a_test --test b_test` on Linux run only those `#[ignore]`d
+tests, each alone, under the lock, the preflight and the marker
+(`make gpu-profile GPU_PROFILE_ARGS='-Test a_test,b_test'`); a name that is no
+ignored test fails the run before any test runs. The Linux script has had no run on a real
 card yet, only its selftest on stand-ins (`mk/linux/gpu-profile-selftest.sh`).
 
 A change to the `Makefile` starts from

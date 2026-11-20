@@ -13,8 +13,9 @@ In short:
 - Report a bug or ask for a feature in a [GitHub issue](https://github.com/gpillon/ignis/issues):
   the command you ran (or `make config`'s output), what you expected, what
   happened, and the server's log lines around it.
-- Every code change ships with a test; the work is done when `cargo test`
-  passes workspace-wide.
+- Every code change ships with a test; while working, run only the change's
+  own tests, and the work is done when `cargo test` passes workspace-wide on
+  CI, with the branch pushed as `ci/<n>`.
 - Every user-visible change updates the user guide, `docs/user/`, in the same
   commit ([`docs/agents/user-docs.md`](docs/agents/user-docs.md)).
 - One run at a time on the GPU: `make gpu-status` before any of them.

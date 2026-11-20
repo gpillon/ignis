@@ -9,6 +9,16 @@
 #   IGNIS_MK_URL            base URL probed for readiness (/v1/models)
 #   IGNIS_MK_READY_TIMEOUT  seconds to wait for readiness
 #   IGNIS_MK_FORCE          "1": stop also kills an ignis-server make did not start
+#   IGNIS_MK_GPU_LOCK       "1" (CUDA=1): the server takes the GPU lock
+#                           (gpulock.ps1) before it starts, refused at once,
+#                           and holds it until it stops
+#   IGNIS_MK_GPU_GUARD      "1" (CUDA=1 and GPU_CHECK=1): the GPU guard runs
+#                           once the lock is held, before the server starts:
+#                           its preflight then never clears the marker of a
+#                           GPU profile, which takes the lock before its own
+#   IGNIS_MK_GPU_THRESHOLD_MIB  the guard's VRAM threshold (8192)
+#
+# The server's process is named after its executable (ignis-server).
 
 $ErrorActionPreference = 'Stop'
 
@@ -19,6 +29,12 @@ $LogFile = $env:IGNIS_MK_LOG
 $Url = $env:IGNIS_MK_URL
 $Timeout = if ($env:IGNIS_MK_READY_TIMEOUT) { [int]$env:IGNIS_MK_READY_TIMEOUT } else { 600 }
 $Force = $env:IGNIS_MK_FORCE -eq '1'
+$GpuLock = $env:IGNIS_MK_GPU_LOCK -eq '1'
+$GpuGuard = $env:IGNIS_MK_GPU_GUARD -eq '1'
+$GpuThresholdMiB = if ($env:IGNIS_MK_GPU_THRESHOLD_MIB) { [int]$env:IGNIS_MK_GPU_THRESHOLD_MIB } else { 8192 }
+$GpuScript = Join-Path $PSScriptRoot 'gpu.ps1'
+$ServerName = if ($Bin) { [IO.Path]::GetFileNameWithoutExtension($Bin) } else { 'ignis-server' }
+. (Join-Path $PSScriptRoot 'gpulock.ps1')
 
 # The server make started, if its pid file still names a live ignis-server.
 function Get-ManagedServer {
@@ -26,7 +42,7 @@ function Get-ManagedServer {
     $id = 0
     if (-not [int]::TryParse((Get-Content $PidFile -Raw).Trim(), [ref]$id)) { return $null }
     $p = Get-Process -Id $id -ErrorAction SilentlyContinue
-    if ($p -and $p.ProcessName -eq 'ignis-server') { return $p }
+    if ($p -and $p.ProcessName -eq $ServerName) { return $p }
     return $null
 }
 
@@ -76,7 +92,7 @@ function Assert-NoServer {
         Write-Host "error: ignis-server is already running (pid $($managed.Id)). make stop, or make restart"
         exit 1
     }
-    $stray = @(Get-Process -Name 'ignis-server' -ErrorAction SilentlyContinue)
+    $stray = @(Get-Process -Name $ServerName -ErrorAction SilentlyContinue)
     if ($stray.Count -gt 0) {
         $ids = ($stray | ForEach-Object { $_.Id }) -join ', '
         Write-Host "error: an ignis-server make did not start is running (pid $ids). make stop FORCE=1 stops it"
@@ -85,6 +101,65 @@ function Assert-NoServer {
     if (-not (Test-Path $Bin)) {
         Write-Host "error: $Bin not found (make build)"
         exit 1
+    }
+}
+
+# With IGNIS_MK_GPU_LOCK=1, the GPU lock for this script before the server
+# starts, refused at once naming its holder (exit 1), then with
+# IGNIS_MK_GPU_GUARD=1 the guard under it (exit 1, the lock freed, when it
+# refuses); $null without the lock.
+function Lock-GpuForServer([string]$What) {
+    if (-not $GpuLock) { return $null }
+    try {
+        $hold = Lock-Gpu -Command "$What`: $Bin $ServerArgs" -WaitSeconds 0
+    } catch {
+        Write-Host "error: $($_.Exception.Message)"
+        exit 1
+    }
+    if ($GpuGuard -and -not (Test-GpuGuard $GpuThresholdMiB)) {
+        Unlock-Gpu $hold
+        exit 1
+    }
+    return $hold
+}
+
+# The guard (gpu.ps1 -Action guard) in a PowerShell of its own, its lines on
+# this console, a hold of this process no refusal: whether it passed. Run it
+# with the lock held: its preflight writes and clears the marker a GPU profile
+# reads, and the profile takes the lock before its own preflight.
+function Test-GpuGuard([int]$ThresholdMiB) {
+    & (Get-Process -Id $PID).Path -NoProfile -ExecutionPolicy Bypass -File $GpuScript -Action guard -ThresholdMiB $ThresholdMiB -Holder $PID | Out-Host
+    return $LASTEXITCODE -eq 0
+}
+
+# Hand the hold to the started server: the identity that holds the lock now,
+# the server's, or $Hold itself when the server is already gone; $null
+# without a hold.
+function Move-GpuLockToServer($Hold, $Process) {
+    if (-not $Hold) { return $null }
+    $to = Get-GpuLockIdentity $Process.Id
+    if ($to -and (Move-GpuLock $Hold $to)) { return $to }
+    return $Hold
+}
+
+# Start-Process @StartArgs on this console, wait for the child to exit and
+# return its exit code; -Job adds the child to a kill-on-close job, -HandOver
+# hands it the GPU lock $Hold holds. However this ends (the child's exit, a
+# Ctrl+C that reached the child too, a throw), the child is given 20s for its
+# own shutdown, then killed, and the lock freed.
+function Invoke-Foreground([hashtable]$StartArgs, [string]$Name, $Hold, $Job = $null, [switch]$HandOver) {
+    $child = $null
+    try {
+        $child = Start-Process @StartArgs -NoNewWindow -PassThru
+        # Touching the handle keeps ExitCode readable after the process exits.
+        $null = $child.Handle
+        if ($Job) { Add-ProcessToJob $Job $child }
+        if ($HandOver) { $Hold = Move-GpuLockToServer $Hold $child }
+        while (-not $child.HasExited) { Start-Sleep -Milliseconds 250 }
+        return $child.ExitCode
+    } finally {
+        Stop-Gently $child 20 $Name
+        Unlock-Gpu $Hold
     }
 }
 

@@ -1918,6 +1918,13 @@ rate.
 The explicit test profile for GPU work: it requires the 5090 free and
 **fails**, never skips, when the GPU is busy or a kernel errors.
 
+**GPU lock**:
+The one claim on a card, naming the run that holds it, its worktree and its
+command: whatever goes onto the card (a **GPU profile**, a server, a GPU
+command run by hand) holds it for as long as it runs, and it is free once that
+run has ended. It stands beside the profile's preflight pass, not in its place.
+_Avoid_: card lock, GPU mutex
+
 **Generated token**:
 A token the engine decoded, on **either** channel: the answer
 (`delta.content`) or the thinking trace (`delta.reasoning_content`, on by

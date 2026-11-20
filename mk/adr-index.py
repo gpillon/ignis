@@ -43,7 +43,9 @@ tree is compared, so an edit is refused before it is committed. A typo fix
 passes when every commit since the base that changes the ADR's text names it in
 its message, `[typo ADR-0032]` (or `[typo ADR-0032, ADR-0045]`), and nothing on
 top of them is left uncommitted; the release notes then do not call it amended. An
-ADR that existed at the base is never deleted.
+edit in place the owner decided passes the same way, each commit that changes the
+text naming it `[edit ADR-0006]` (or a list), and the release notes call it
+amended. An ADR that existed at the base is never deleted.
 `--since auto` is the merge base with origin/main, which `make records-check`
 uses, and is skipped with a note in a clone with no origin/main or no git; the
 records workflow passes the push's or the pull request's base.
@@ -68,8 +70,9 @@ BARE_TITLE_FROM = 70
 NUMBERED = re.compile(r"ADR[ -]?\d{4}\b")
 # "ADR 0001 — title" in the long form; the index shows the title alone.
 NUMBER_PREFIX = re.compile(r"ADR[ -]?\d{4}\s*(?:—|–|-|:)\s*")
-# --since: the commit message's mark of a typo fix, and a frontmatter's status.
-TYPO = re.compile(r"\[typo (ADR-\d{4}(?:, ADR-\d{4})*)\]")
+# --since: the commit message's mark of a typo fix or of an edit in place, and a
+# frontmatter's status.
+MARK = re.compile(r"\[(typo|edit) (ADR-\d{4}(?:, ADR-\d{4})*)\]")
 FRONT_STATUS = re.compile(r"^status: (\S+)", re.MULTILINE)
 
 INDEX = "README.md"
@@ -91,7 +94,8 @@ memory of why ignis is built the way it is.
   supersedes the old one, whose text then stays as it was: only its
   frontmatter changes (`amended-by`, or a status of `superseded by`).
   `make records-check` refuses any other change to an ADR that is no longer
-  `proposed`, a typo fix aside when its commit message says `[typo ADR-NNNN]`.
+  `proposed`, a typo fix aside when its commit message says `[typo ADR-NNNN]`,
+  and an edit in place the owner decided when it says `[edit ADR-NNNN]`.
 - **This file is generated** from the frontmatter by `mk/adr-index.py`
   (`make records`), and `make records-check` fails when it is out of date:
   never edit it by hand.
@@ -274,8 +278,13 @@ def decision_text(text):
 
 
 def marked(message):
-    """The ADRs a commit message names as typo fixes, as ADR-NNNN."""
-    return {item for match in TYPO.finditer(message) for item in match.group(1).split(", ")}
+    """The ADRs a commit message names as typo fixes or edits, as ADR-NNNN, each
+    with the marks that name it ("typo", "edit")."""
+    marks = {}
+    for match in MARK.finditer(message):
+        for item in match.group(2).split(", "):
+            marks.setdefault(item, set()).add(match.group(1))
+    return marks
 
 
 def git(root, *args, data=None):
@@ -317,29 +326,29 @@ def frozen(adr_dir, adrs, since):
             texts[path] = out[at:at + size].decode("utf-8", "replace")
             at += size + 1
 
-    def typo_fix(number):
-        """Whether every commit since the base that changes ADR `number`'s text
-        names it as a typo fix: a commit that changes its frontmatter alone needs
-        no mark, one marked commit does not cover another's rewrite, and an edit
-        not committed yet is no fix."""
+    def covering_marks(number):
+        """The marks ("typo", "edit") of the commits since the base that change ADR
+        `number`'s text when every one of them names it, else none: a commit that
+        changes its frontmatter alone needs no mark, one marked commit does not
+        cover another's rewrite, and an edit not committed yet is no fix."""
         pathspec = f":(glob){folder}/{number}-*.md"
         if git(root, "diff", "--quiet", "HEAD", "--", pathspec).returncode:
-            return False
+            return set()
         log = git(root, "log", "--format=%x1e%H%x1f%B%x1f", "--name-only",
                   f"{base}..HEAD", "--", pathspec).stdout.decode("utf-8", "replace")
         def text_at(rev, name):
             blob = git(root, "show", f"{rev}:{name}").stdout
             return decision_text(blob.decode("utf-8", "replace"))
 
-        fixed = False
+        marks = set()
         for entry in log.split("\x1e")[1:]:
             sha, message, names = entry.split("\x1f", 2)
             if all(text_at(f"{sha}^", name) == text_at(sha, name) for name in names.split()):
                 continue
             if ref(number) not in marked(message):
-                return False
-            fixed = True
-        return fixed
+                return set()
+            marks |= marked(message)[ref(number)]
+        return marks
 
     problems, notes = [], []
     for path, was in texts.items():
@@ -353,15 +362,18 @@ def frozen(adr_dir, adrs, since):
             problems.append(f"{path}: ADR {number} existed at {base[:8]} and is gone: an ADR "
                             "is never deleted, a later one supersedes it (ADR 0081)")
         elif decision_text(was) != decision_text(adr.path.read_text(encoding="utf-8")):
-            if typo_fix(number):
+            marks = covering_marks(number)
+            if marks:
                 notes.append(f"adr-index: ADR {number}'s text changed since {base[:8]}, "
-                             "as a typo fix its commit names")
+                             + ("as an edit its commit names" if "edit" in marks
+                                else "as a typo fix its commit names"))
             else:
                 problems.append(
                     f"docs/adr/{adr.name}: its text changed since {base[:8]}, but an ADR "
                     "changes only in its frontmatter: a decision that changes is a new ADR "
                     "that amends or supersedes it (ADR 0081). A typo fix names it in its "
-                    f"commit message, [typo ADR-{number}]")
+                    f"commit message, [typo ADR-{number}], and an edit in place the owner "
+                    f"decided, [edit ADR-{number}]")
     return problems, notes
 
 
@@ -541,6 +553,20 @@ SINCE_CASES = [
     ("a typo fix with an edit on top not committed yet",
      [{"0003-the-third.md": CHANGED}, {"0003-the-third.md": CHANGED.replace("Now", "Then")}],
      ["A typo, fixed [typo ADR-0003] (#1)", None], False, "its text changed since"),
+    ("an edit in place its commit names", {"0003-the-third.md": CHANGED},
+     "The third, edited in place [edit ADR-0003] (#1)", True, "as an edit its commit names"),
+    ("an edit named in a list", {"0003-the-third.md": CHANGED},
+     "Two decisions, edited [edit ADR-0002, ADR-0003] (#1)", True, "as an edit its commit names"),
+    ("an edit mark that names another ADR", {"0003-the-third.md": CHANGED},
+     "An edit [edit ADR-0002] (#1)", False, "its text changed since"),
+    ("a typo fix, then an edit, each marked",
+     [{"0003-the-third.md": CHANGED}, {"0003-the-third.md": CHANGED.replace("Now", "Then")}],
+     ["A typo, fixed [typo ADR-0003] (#1)", "The third, edited [edit ADR-0003] (#1)"], True,
+     "as an edit its commit names"),
+    ("an edit with a rewrite on top not marked",
+     [{"0003-the-third.md": CHANGED}, {"0003-the-third.md": CHANGED.replace("Now", "Then")}],
+     ["The third, edited [edit ADR-0003] (#1)", "The third, rewritten (#1)"], False,
+     "its text changed since"),
     ("a typo fix beside a commit that changes the frontmatter alone",
      [{"0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md").replace(
          "accepted\n", "deprecated\namended-by: [ADR-0071]\n"),

@@ -18,6 +18,8 @@ set of decisions, `docs/adr/`, listed in its generated index
 - An ADR changes through a new ADR that amends it (ADR 0081): once it is no
   longer `proposed`, its text stays as written and only its frontmatter
   changes. `make records-check` and the records workflow refuse anything else;
-  a typo fix says `[typo ADR-NNNN]` in its commit message.
+  a typo fix says `[typo ADR-NNNN]` in its commit message, and an edit in place
+  the owner decides says `[edit ADR-NNNN]`, the ADR's Status naming the edit,
+  its date and its issue.
 - Where a skill's convention and the repo's disagree, ADR 0070 lists where the
   repo differs.

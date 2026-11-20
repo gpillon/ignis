@@ -137,7 +137,12 @@ Needs the GPU exclusively (ADR 0006,
 [who holds the card](../testing.md#who-holds-the-card)) and `ninfer-serve`
 stopped for the ignis legs. Four runs, ~4 minutes each. Launch the legs with the explicit commands
 below: `make start` brings up the G5 configuration (262144 context, DFlash2),
-a different engine from these legs.
+a different engine from these legs. Each engine started by hand runs under
+`make gpu-run` (GitHub #707): it waits for the GPU lock, runs the guard, and
+the server holds the lock until it exits. `CMD` is one sh line, so the paths
+take forward slashes and the artifact's path sits in single quotes.
+`ignis-bench` is an HTTP client and takes no lock: the server it measures holds
+it, and so does one `make start` started.
 
 ```powershell
 $Artifact = "F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer"
@@ -152,10 +157,10 @@ nvidia-smi --format=csv,noheader -l 1 `
 
 # ignis, hq-e8-2b / BF16 (--model-kv-format bf16 --vram-kv-pool-bytes 4G: 65,536 BF16
 # tokens; with no --vram-kv-pool-bytes the pool is the rest of the VRAM budget)
-.\target\x86_64-pc-windows-msvc\release\ignis-server.exe --model-artifact $Artifact `
-  --server-bind 127.0.0.1:8000 --model-kv-format hq-e8-2b --model-max-context 40960 `
-  --vram-kv-pool-bytes 576M --model-prefill-chunk 1024 --server-request-timeout 900 `
-  --model-idle-unload 0 --model-loop-guard off
+$Flags = "--server-bind 127.0.0.1:8000 --model-kv-format hq-e8-2b --model-max-context 40960 " +
+  "--vram-kv-pool-bytes 576M --model-prefill-chunk 1024 --server-request-timeout 900 " +
+  "--model-idle-unload 0 --model-loop-guard off"
+make gpu-run CMD="./target/x86_64-pc-windows-msvc/release/ignis-server.exe --model-artifact '$Artifact' $Flags"
 
 # the reference, same two formats
 F:\ai\q38\ninfer\build-ninja\apps\ninfer-serve.exe $Artifact `

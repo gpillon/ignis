@@ -276,6 +276,9 @@ ARGS ?=
 # 1 = run the GPU guard before starting a CUDA server.
 GPU_CHECK ?= 1
 GPU_THRESHOLD_MIB ?= 8192
+# Seconds a GPU test (kernel-test, the profile) or gpu-run waits for the GPU
+# lock before it fails naming the holder; make start refuses at once.
+GPU_LOCK_WAIT ?= 900
 # Forwarded to the GPU profile script: -SkipKernelBuild, -SkipCargoTests, ...
 GPU_PROFILE_ARGS ?=
 

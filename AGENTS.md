@@ -49,7 +49,8 @@ Recording, amending, numbering or citing a decision: the index
 ### Testing
 
 Every code change ships with a test, and the task is done only when
-`cargo test` passes workspace-wide. Before writing a test or reporting a code
+`cargo test` passes workspace-wide on CI (`ci/<n>`); while working, run only
+the change's own tests. Before writing a test or reporting a code
 change done: `docs/agents/testing.md`.
 
 One run fits the card at a time, and the loser dies with no diagnostic. Before

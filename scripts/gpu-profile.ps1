@@ -23,6 +23,21 @@
 #   ... -ThresholdMiB 4096       # forwarded to gpu-preflight.ps1
 #   ... -SkipKernelBuild         # skip kernel/build.ps1 -Test (Rust tests only)
 #   ... -SkipCargoTests          # skip both cargo stages (kernel leaf only)
+#   ... -Test a_test,b_test      # only these #[ignore]d tests, in place of the stages
+#   ... -WaitSeconds 900         # how long to wait for the GPU lock (default 900)
+#
+# The GPU lock (mk/windows/gpulock.ps1, GitHub #707) is taken first and held
+# for the whole run: while another process holds it the script waits up to
+# -WaitSeconds, then fails naming the holder, before the preflight, so a
+# marker another run owns is never touched. The preflight and the marker are
+# then as without the lock.
+#
+# -Test: the single-test mode, for a ticket's own GPU tests. Each name is an
+# #[ignore]d test's full name as `cargo test -- --list --ignored` prints it,
+# the names separated by commas (one string through -File, as make passes
+# it); one listing checks that every name resolves (a name that matches
+# nothing would otherwise pass with no test run), then each runs alone, as
+# stage 3 runs, its wall time reported like a stage's.
 #
 # Three stages, each timed and reported at the end (GitHub #135):
 #   1. kernel/build.ps1 -Test          the leaf's own op tests (CTest)
@@ -31,14 +46,18 @@
 # Stage 2 touches no GPU, so it does not belong inside stage 3's serialization;
 # stage 3 skips it by name.
 #
-# Exit codes: 1 if the preflight refuses (its own message says why); otherwise
+# Exit codes: 1 if the lock stays held past the wait, the preflight refuses
+# (its own message says why) or a -Test name does not resolve; otherwise
 # the exit code of the first stage that fails, or 0 if all pass.
-# IGNIS_GPU_PROFILE is always cleared before this script exits, pass or fail.
+# IGNIS_GPU_PROFILE is always cleared before this script exits, pass or fail,
+# and the lock freed.
 
 param(
     [int]$ThresholdMiB = 8192,
     [switch]$SkipKernelBuild,
-    [switch]$SkipCargoTests
+    [switch]$SkipCargoTests,
+    [string[]]$Test = @(),
+    [int]$WaitSeconds = 900
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,15 +88,23 @@ $NotGpuLegs = @(
     "a_long_monologue_keeps_its_live_text_with_speakers_on"
 )
 
+# Stage 3's cargo flags, which -Test shares (each is explained at stage 3
+# below): the build's, which -Test's listing takes too so that nothing is
+# built twice, and the run's.
+$SweepBuild = @("--workspace", "--exclude", "ignis-speech", "--features", "cuda")
+$SweepRun = @("--test-threads=1", "--nocapture")
+
 # Per-stage wall time (GitHub #135): the profile's cost is the point of this
 # script, so it reports where the time went instead of leaving the reader to
 # add up per-test output.
 $Timings = [ordered]@{}
 
 # A GPU-gated step that failed: report it and leave with its own exit code
-# (not a flattened 1 -- the caller wants to know which code came back).
+# (not a flattened 1 -- the caller wants to know which code came back). The
+# error is not terminating: under "Stop" it would end the script, exit 1,
+# before the exit below.
 function FailWithCode([string]$What, [int]$Code) {
-    Write-Error "GPU profile: $What failed (exit $Code)."
+    Write-Error "GPU profile: $What failed (exit $Code)." -ErrorAction Continue
     exit $Code
 }
 
@@ -106,8 +133,24 @@ function Write-StageSummary {
     Write-Host ("  {0,10:N1}s  total" -f $total)
 }
 
-& (Join-Path $ScriptDir "gpu-preflight.ps1") -ThresholdMiB $ThresholdMiB
+# The lock, before anything else: a wait that runs out leaves before the
+# preflight. Held from here to the finally block below.
+. (Join-Path $Repository "mk\windows\gpulock.ps1")
+$Test = @($Test | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$What = if ($Test.Count -gt 0) { "gpu-profile -Test $($Test -join ',')" } else { "gpu-profile" }
+try {
+    $Hold = Lock-Gpu -Command $What -WaitSeconds $WaitSeconds
+} catch {
+    Write-Host $_.Exception.Message
+    Write-Error "GPU profile: the GPU lock is held (see above) -- not running the GPU profile."
+    exit 1
+}
+
+# A refusal is a terminating error of the preflight's own: the lock is freed
+# before it ends this script.
+try { & (Join-Path $ScriptDir "gpu-preflight.ps1") -ThresholdMiB $ThresholdMiB } catch { Unlock-Gpu $Hold; throw }
 if ($LASTEXITCODE -ne 0) {
+    Unlock-Gpu $Hold
     Write-Error "GPU profile: preflight refused (see above) -- not running the GPU profile."
     exit 1
 }
@@ -116,6 +159,28 @@ Push-Location $Repository
 try {
     $env:IGNIS_GPU_PROFILE = "1"
     Write-Host "GPU profile: preflight passed -- running the profile."
+
+    if ($Test.Count -gt 0) {
+        # The sweep's build and flags, narrowed to the named tests: one
+        # listing that each name resolves, then each test alone.
+        $listed = & cargo test @SweepBuild -- --list --ignored --exact @Test
+        if ($LASTEXITCODE -ne 0) { FailWithCode "listing the named tests" $LASTEXITCODE }
+        foreach ($GpuTest in $Test) {
+            if (@($listed) -notcontains "${GpuTest}: test") {
+                Write-Host "GPU profile: no #[ignore]d test is named '$GpuTest' (cargo test -- --list --ignored --exact): not running the named tests."
+                exit 1
+            }
+        }
+        # $GpuTest, not $Name: the block runs inside Invoke-Stage, whose $Name
+        # is the stage's.
+        foreach ($GpuTest in $Test) {
+            Invoke-Stage "gpu test $GpuTest" {
+                & cargo test @SweepBuild --no-fail-fast -- --ignored --exact @SweepRun $GpuTest
+            }
+        }
+        Write-Host "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."
+        exit 0
+    }
 
     if (-not $SkipKernelBuild) {
         Invoke-Stage "kernel/build.ps1 -Test" {
@@ -173,7 +238,7 @@ try {
         $Skips = @("--skip", $CpuOracleTest)
         foreach ($Leg in $NotGpuLegs) { $Skips += @("--skip", $Leg) }
         Invoke-Stage "gpu tests (serialized)" {
-            & cargo test --workspace --exclude ignis-speech --features cuda --no-fail-fast -- --ignored --test-threads=1 --nocapture @Skips
+            & cargo test @SweepBuild --no-fail-fast -- --ignored @SweepRun @Skips
         }
     }
 
@@ -185,5 +250,6 @@ try {
     Write-StageSummary
     Remove-Item Env:\IGNIS_GPU_PROFILE -ErrorAction SilentlyContinue
     Remove-Item $MarkerPath -ErrorAction SilentlyContinue
+    Unlock-Gpu $Hold
     Pop-Location
 }

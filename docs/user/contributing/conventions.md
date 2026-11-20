@@ -81,10 +81,15 @@ pages under `docs/user/reference/` are generated: change the code, then run
 ## Branches, worktrees and commits
 
 - Work happens on a branch per issue, merged into `main` with a merge commit
-  that names the issue.
+  that names the issue. While working only the change's own tests run; the
+  whole suite runs once, at the end, on CI: the branch is pushed as `ci/<n>`,
+  which needs no OK, and the work is done when that run is green on both hosts
+  ([Testing](testing.md)).
 - A spec whose tickets agents build in parallel goes through an integration
-  branch the owner merges into `main` locally, with no pull request; the
-  coordinating session runs the GPU legs one at a time
+  branch, with no pull request: each implementer runs its own ticket's tests,
+  the GPU ones under the GPU lock, the coordinating session keeps the full GPU
+  profile, the benches and the gate legs, and fast-forwards `main` to the
+  branch once CI is green on `ci/<spec>`
   ([`docs/agents/orchestrated-builds.md`](../../agents/orchestrated-builds.md)).
 - A commit message says what the change does and why, in full sentences, and
   ends with the issue it belongs to, `(#347)`.

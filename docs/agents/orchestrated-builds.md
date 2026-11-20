@@ -6,45 +6,53 @@ the skill leaves open.
 
 ## Worktrees
 
-The integration branch and each implementer's branch get their own worktree,
-one per ticket, every implementer branch starting from the integration branch.
+The integration branch has its own worktree too.
 Each worktree builds into its own target directory: two worktrees on one
 `CARGO_TARGET_DIR` link each other's workspace crates, with no error unless a
 signature happens to break.
 
 ## Agents
 
-Each ticket gets a fresh implementer whose brief points at the spec, the
-ticket and any shared notes, which live in the coordinator's `.scratch/`. An
-implementer is stopped once it reports; follow-up work goes to a new agent with
-a short handoff in the scratchpad, never back to the finished one. At most
-three agents run at once, reviews included.
+The notes the implementers share live in the coordinator's `.scratch/`.
 
 ## Checks
 
-Implementers run the CPU-side suites only: `make ci`, or the narrower targets
-their brief names. The coordinator runs every GPU leg (the profile, a bench
-run, a gate leg) itself, under the GPU rule in `AGENTS.md`, Testing
-(`docs/agents/testing.md`, the GPU test profile).
+Implementers run their own ticket's tests only: the Rust ones through
+`cargo test`'s filter, the GPU ones through the profile script's single-test
+mode (`-Test` / `--test`), which takes the GPU lock. The workspace suite runs
+on `ci/<spec>` at the end of the build (below); the coordinator keeps the full
+profile, the bench runs and the gate legs. Both run
+on the card under the GPU rule in `AGENTS.md`, Testing
+(`docs/agents/testing.md`, the GPU test profile): an agent whose own model is
+served from the card hands every GPU step to the user.
 
 The local checks run on one host, so code behind the other host's `cfg`
-compiles nowhere before `main`. Before the owner merges the integration
-branch, the coordinator pushes its tip as `ci/<spec>`, with the owner's OK
-since it is a push: the release workflow runs its Linux and Windows test jobs
-on `ci/**` without touching `main`. The coordinator reports both results with
-the branch and deletes `ci/<spec>` once the owner has merged.
+compiles nowhere before `main`: the run on `ci/<spec>` at the end of a build
+is where it compiles first.
 
 ## The end of a build
 
-There is no pull request. Each implementer's branch merges into the
-integration branch, the coordinator reports that branch, and the owner merges
-it into `main` locally; nothing is pushed until the owner says so. Tickets
-close as `docs/agents/issue-tracker.md` says under "Closing work".
+There is no pull request. Once every ticket is merged and the review's fixes
+are in, the coordinator lands the integration branch on `main` itself, without
+asking:
 
-An implementer merges the integration branch into its own before it reports,
-with a message its brief gives it, such as `Merge 374-integration into the T2
-branch before the report (#377)`: the commit-message hook refuses git's
-default one.
+1. It merges `main` into the integration branch and pushes the tip as
+   `ci/<spec>`: the release workflow runs its Linux and Windows test jobs on
+   `ci/**` and publishes nothing.
+2. A red job is fixed on the integration branch, within the spec, and pushed
+   again; a fix outside the spec goes to the owner first. A test that fails and
+   then passes on a rerun of the same commit (`gh run rerun --failed`) is
+   flaky: the coordinator opens an issue labelled `bug` and `needs-triage`
+   that names the test, the job and its failing lines, and the green rerun
+   counts. A test that fails its rerun too is a real failure.
+3. With every job of the run green, `main` moves to that commit by fast-forward and is
+   pushed by its SHA, which publishes the `develop` image and prerelease. If
+   `main` moved meanwhile, step 1 runs again.
+4. `ci/<spec>` is deleted, with its Actions caches.
+
+An implementer's merge of the integration branch into its own takes a message
+its brief gives it, such as `Merge 374-integration into the T2 branch before
+the report (#377)`: the commit-message hook refuses git's default one.
 
 ## Cleanup
 

@@ -74,10 +74,11 @@ $PY tools/flash-next-vision/convert.py fetch --source H:/fn-vision-556/source
 $PY tools/flash-next-vision/tower_check.py fetch-27b --source $W/27b-visual
 $PY -I tools/vision-known-answers/fetch.py --root $W/known --tower $W/tower-images
 
-# 1. The served tower (GPU, the card exclusively; Flash-Next's load needs ~40 GB
-#    of free RAM, one load at a time; ~10 minutes). Writes $W/tower-dump/<family>/.
-IGNIS_TOWER_IMAGES=$W/tower-images IGNIS_TOWER_OUT=$W/tower-dump \
-  cargo test -p ignis-server --features cuda --test vision_tower_dump_gpu -- --ignored --nocapture --test-threads=1
+# 1. The served tower (GPU, the card exclusively, under the GPU lock: make gpu-run;
+#    Flash-Next's load needs ~40 GB of free RAM, one load at a time; ~10 minutes).
+#    Writes $W/tower-dump/<family>/.
+IGNIS_TOWER_IMAGES=$W/tower-images IGNIS_TOWER_OUT=$W/tower-dump make gpu-run \
+  CMD='cargo test -p ignis-server --features cuda --test vision_tower_dump_gpu -- --ignored --nocapture --test-threads=1'
 
 # 2. The BF16 towers on the same patches and the record (CPU, ~4 GB of RAM, a few
 #    minutes per family: run it with no Flash-Next load on the host).

@@ -75,8 +75,9 @@ The download route tests waited for `on_disk` complete, then asserted
 
 ## After a merge or a rebase
 
-The checks are `make ci`, whose `check` step compiles the code behind the
-`cuda` feature unless it runs with `CUDA=0`; `cargo test` never does. The rest
+The checks are `make check`, which compiles the code behind the `cuda` feature
+unless it runs with `CUDA=0` (`cargo test` never does), and the suite's run on
+`ci/<n>`. The rest
 of what a change needs, a kernel change's GPU legs among it, is
 `docs/agents/testing.md`'s "Done means". Resolving a conflict reformats
 nothing.
@@ -110,6 +111,8 @@ The smell baseline does not apply to:
 Tooling already enforces the kernel's vendored tree against its manifest and
 the generated pages against the code (both in `cargo test`), the guide's
 links (`make docs-build`), and the commit messages' conventions
-(`.githooks/commit-msg`). The guardrails are `make ci`, run by hand before a
-merge, and the release workflow's `cargo test` on Linux and Windows on every
-code push to `main`.
+(`.githooks/commit-msg`). The guardrails are the change's own tests while it is
+worked on, then the whole suite once, at the end, on CI: the branch pushed as
+`ci/<n>` without asking runs the release workflow's `cargo test` on Linux and
+Windows, which runs again on every code push to `main` (`AGENTS.md`, Testing;
+`docs/agents/testing.md`, "The gate").

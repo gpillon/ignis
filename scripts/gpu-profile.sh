@@ -13,6 +13,8 @@
 #     ignis_core::gpu_profile reads, at ${TMPDIR:-/tmp}/ignis-gpu-preflight.ok
 #     (std::env::temp_dir()). It is deleted when the run ends, pass or fail,
 #     so one preflight authorizes exactly one run.
+#   - The GPU lock is mk/linux/gpulock.py, called with this script's pid; the
+#     Windows script dot-sources mk/windows/gpulock.ps1.
 #   - Every cargo call passes --target: .cargo/config.toml pins the MSVC
 #     triple. TARGET_TRIPLE in the environment overrides the default; the
 #     Makefile's hook (mk/os/linux.mk) passes its own.
@@ -24,17 +26,32 @@
 #   ... --threshold-mib 4096     # the guard's VRAM threshold (default 8192)
 #   ... --skip-kernel-build      # skip kernel/build.sh build --test (Rust tests only)
 #   ... --skip-cargo-tests       # skip both cargo stages (kernel leaf only)
+#   ... --test <name> [--test <name> ...]
+#                                # only these #[ignore]d tests, in place of the stages
+#   ... --wait-seconds 900       # how long to wait for the GPU lock (default 900)
+#
+# The GPU lock (GitHub #707) is taken first and held for the whole run: while
+# another process holds it the script waits up to --wait-seconds, then fails
+# naming the holder, before the preflight, so a marker another run owns is
+# never touched. The preflight and the marker are then as without the lock.
+#
+# --test: the single-test mode, for a ticket's own GPU tests. Each name is an
+# #[ignore]d test's full name as `cargo test -- --list --ignored` prints it;
+# one listing checks that every name resolves (a name that matches nothing
+# would otherwise pass with no test run), then each runs alone, as stage 3
+# runs, its wall time reported like a stage's.
 #
 # Stages, each timed and reported at the end (GitHub #135):
 #   1. kernel/build.sh build --test    the leaf's own op tests (CTest)
 #   2. cpu f64 layer oracle            CPU-only, full libtest parallelism
 #   3. gpu tests (serialized)          --ignored, --test-threads=1 (ADR 0006)
 #
-# Exit codes: 1 if the preflight refuses (its own message says why) or the CPU
-# oracle's name no longer resolves; 2 for a bad flag; otherwise the exit code
+# Exit codes: 1 if the lock stays held past the wait, the preflight refuses
+# (its own message says why), or the CPU oracle's name or a --test name no
+# longer resolves; 2 for a bad flag; otherwise the exit code
 # of the first stage that fails, or 0 if all pass. IGNIS_GPU_PROFILE is only
-# ever set inside this process, so nothing outlives the run but the marker,
-# which the EXIT trap removes.
+# ever set inside this process, so nothing outlives the run but the marker
+# and the lock, which the EXIT trap removes.
 
 set -uo pipefail
 
@@ -42,12 +59,20 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 threshold=8192
 skip_kernel=0
 skip_cargo=0
+wait_seconds=900
+tests=()
+usage() {
+    echo "usage: gpu-profile.sh [--threshold-mib N] [--skip-kernel-build] [--skip-cargo-tests] [--test NAME ...] [--wait-seconds N]" >&2
+    exit 2
+}
 while [ $# -gt 0 ]; do
     case "$1" in
         --threshold-mib) threshold="${2:?--threshold-mib needs a number}"; shift ;;
         --skip-kernel-build) skip_kernel=1 ;;
         --skip-cargo-tests) skip_cargo=1 ;;
-        *) echo "usage: gpu-profile.sh [--threshold-mib N] [--skip-kernel-build] [--skip-cargo-tests]" >&2; exit 2 ;;
+        --test) [ $# -ge 2 ] || usage; tests+=("$2"); shift ;;
+        --wait-seconds) [ $# -ge 2 ] || usage; wait_seconds="$2"; shift ;;
+        *) usage ;;
     esac
     shift
 done
@@ -55,6 +80,7 @@ done
 cargo="${CARGO:-cargo}"
 target="${TARGET_TRIPLE:-x86_64-unknown-linux-gnu}"
 marker="${TMPDIR:-/tmp}/ignis-gpu-preflight.ok"
+lockctl() { "${PYTHON:-python3}" "$repo/mk/linux/gpulock.py" "$@"; }
 
 # The CPU-only f64 layer oracle (GitHub #56): it runs as its own stage at
 # libtest's default parallelism, and the serialized sweep skips it by name
@@ -72,6 +98,12 @@ not_gpu_legs=(
     every_item_of_the_conversations_sends_its_text_whole_at_its_end
     a_long_monologue_keeps_its_live_text_with_speakers_on
 )
+
+# Stage 3's cargo flags, which --test shares (each is explained at stage 3
+# below): the build's, which --test's listing takes too so that nothing is
+# built twice, and the run's.
+sweep_build=(--workspace --exclude ignis-speech --features cuda --target "$target")
+sweep_run=(--test-threads=1 --nocapture)
 
 stage_names=()
 stage_secs=()
@@ -91,13 +123,14 @@ write_summary() {
 }
 
 # In an EXIT trap, so a run that failed a stage still reports where its time
-# went, and the marker never outlives the run.
+# went, and neither the marker nor the lock outlives the run.
 finish() {
     local code=$?
     trap - EXIT
     write_summary
     unset IGNIS_GPU_PROFILE
     rm -f "$marker"
+    lockctl release --pid $$
     exit "$code"
 }
 
@@ -123,19 +156,48 @@ invoke_stage() { # <name> <command ...>
     if [ "$code" -ne 0 ]; then fail_with_code "$name" "$code"; fi
 }
 
+# The lock, before anything else: a wait that runs out leaves before the
+# preflight. Held from here to the EXIT trap.
+what="gpu-profile${tests[*]:+ --test ${tests[*]}}"
+if ! lockctl acquire --pid $$ --wait "$wait_seconds" --command "$what"; then
+    echo "GPU profile: the GPU lock is held (see above) -- not running the GPU profile." >&2
+    exit 1
+fi
+trap finish EXIT
+
 # The preflight: any earlier pass is cleared first, so a refusal never leaves
-# an older one standing; the guard refuses a held card; a pass is recorded.
+# an older one standing; the guard refuses a held card (the lock this run
+# holds aside); a pass is recorded.
 rm -f "$marker"
-if ! bash "$repo/mk/linux/gpu.sh" guard "$threshold"; then
+if ! bash "$repo/mk/linux/gpu.sh" guard "$threshold" $$; then
     echo "GPU profile: preflight refused (see above) -- not running the GPU profile." >&2
     exit 1
 fi
 date -u +%Y-%m-%dT%H:%M:%SZ > "$marker"
-trap finish EXIT
 
 cd "$repo" || exit 1
 export IGNIS_GPU_PROFILE=1
 echo "GPU profile: preflight passed -- running the profile."
+
+if [ "${#tests[@]}" -gt 0 ]; then
+    # The sweep's build and flags, narrowed to the named tests: one listing
+    # that each name resolves, then each test alone.
+    listed="$("$cargo" test "${sweep_build[@]}" -- --list --ignored --exact "${tests[@]}")"
+    code=$?
+    if [ "$code" -ne 0 ]; then fail_with_code "listing the named tests" "$code"; fi
+    for name in "${tests[@]}"; do
+        if ! grep -qxF -- "$name: test" <<< "$listed"; then
+            echo "GPU profile: no #[ignore]d test is named '$name' (cargo test -- --list --ignored --exact): not running the named tests." >&2
+            exit 1
+        fi
+    done
+    for name in "${tests[@]}"; do
+        invoke_stage "gpu test $name" \
+            "$cargo" test "${sweep_build[@]}" --no-fail-fast -- --ignored --exact "${sweep_run[@]}" "$name"
+    done
+    echo "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."
+    exit 0
+fi
 
 if [ "$skip_kernel" = 0 ]; then
     invoke_stage "kernel/build.sh build --test" bash kernel/build.sh build --test
@@ -169,7 +231,7 @@ if [ "$skip_cargo" = 0 ]; then
     skips=(--skip "$cpu_oracle_test")
     for leg in "${not_gpu_legs[@]}"; do skips+=(--skip "$leg"); done
     invoke_stage "gpu tests (serialized)" \
-        "$cargo" test --workspace --exclude ignis-speech --features cuda --target "$target" --no-fail-fast -- --ignored --test-threads=1 --nocapture "${skips[@]}"
+        "$cargo" test "${sweep_build[@]}" --no-fail-fast -- --ignored "${sweep_run[@]}" "${skips[@]}"
 fi
 
 echo "GPU profile: done. If you stopped the engine that serves your agent, restart it now (runbook step 3, docs/agents/testing.md)."

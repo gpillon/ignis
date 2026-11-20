@@ -278,6 +278,19 @@ jobs:
         shell: bash
         run: bash mk/linux/gpu-profile-selftest.sh
 
+      # The GPU lock (GitHub #707) and the scripts around it -- the guard,
+      # make start / stop / run / run-ui, gpu-run, the profile -- on stand-ins
+      # under a temp directory, once per host: no card is needed.
+      - name: Linux GPU lock selftest
+        if: matrix.host == 'linux' && matrix.shard == 1
+        shell: bash
+        run: bash mk/linux/gpu-lock-selftest.sh
+
+      - name: Windows GPU lock selftest
+        if: matrix.host == 'windows' && matrix.shard == 1
+        shell: bash
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File mk/windows/gpu-lock-selftest.ps1
+
       # The Playground's logic is pure TypeScript with no host in it, so one
       # run answers for both (ADR 0026, docs/agents/testing.md). Linux is the
       # cheaper runner.
