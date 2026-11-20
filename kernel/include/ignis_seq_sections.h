@@ -67,8 +67,12 @@
  * one was ever written, and a blob of one pool kind restored into the other
  * is refused by name ("the MTP head's state") before its geometry is read.
  * Keeping the number lets the blob identity name the drafter, the field that
- * differs, rather than the layout version. */
-inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 5;
+ * differs, rather than the layout version.
+ * 6 (GitHub #689): the progress image ends with the sequence's ask of the
+ * shape rule and a reserved word. A version-5 progress image is 8 bytes
+ * shorter and says nothing of the ask, so it is refused rather than restored
+ * at the base shape the request may not have been at. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 6;
 
 /* GitHub #303 (spec flash-next/05): a Flash-Next pool's blobs number their
  * own layout, per model family -- family 1 in the high byte, its version in
@@ -77,8 +81,9 @@ inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersion = 5;
  * its tail and the n-gram conv state. The Flash-Next leaf (Rust,
  * flash_next_leaf.rs) puts its n-gram hashing context in a 256-byte block
  * before these bytes and names this version in its blob identity: changing
- * that block bumps it. */
-inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersionFlashNext = 0x101;
+ * that block bumps it. 2 (GitHub #689): the progress image the two families
+ * share grew by the 27B's ask of the shape rule, always 0 here. */
+inline constexpr std::uint32_t kIgnisSeqSnapshotFormatVersionFlashNext = 0x102;
 
 /* 'IGNISSNP' little-endian: the first thing a restore checks, so a foreign
  * buffer is refused before any of its fields are believed. */
@@ -237,9 +242,14 @@ struct ignis_seq_progress_image {
   std::uint64_t dflash2_position;
   std::uint32_t gqa_positions[kIgnisGqaLayerCount];
   std::uint32_t gdn_positions[kIgnisGdnLayerCount];
+  /* GitHub #689: the sequence's ask of the shape rule
+   * (`ignis_seq::asks_extended_shape`), 1 for the extended shape; 0 on a
+   * pool whose load has one round shape, and in a clone's capture. */
+  std::uint32_t asks_extended_shape;
+  std::uint32_t reserved;
 };
 static_assert(sizeof(ignis_seq_progress_image) ==
-                  24 + 4 * (kIgnisGqaLayerCount + kIgnisGdnLayerCount),
+                  32 + 4 * (kIgnisGqaLayerCount + kIgnisGdnLayerCount),
               "ignis_seq_progress_image has gained padding; bump "
               "kIgnisSeqSnapshotFormatVersion and restate the size");
 
@@ -439,6 +449,7 @@ inline ignis_seq_progress_image ignis_seq_progress_of(const ignis_seq &seq) {
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
     image.gdn_positions[i] = seq.gdn_positions[i];
   }
+  image.asks_extended_shape = seq.asks_extended_shape ? 1 : 0;
   return image;
 }
 
@@ -460,6 +471,8 @@ inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_im
   for (std::size_t i = 0; i < static_cast<std::size_t>(kIgnisGdnLayerCount); ++i) {
     seq.gdn_positions[i] = image.gdn_positions[i];
   }
+  // GitHub #689: the image's ask, never the handle's own from a previous life.
+  seq.asks_extended_shape = image.asks_extended_shape != 0;
 }
 
 /* The physical KV pages a snapshot of `seq` captures: the pages its written

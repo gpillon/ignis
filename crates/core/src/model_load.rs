@@ -129,6 +129,11 @@ pub(crate) mod ffi {
         /// factor of the lane's, and its top-p.
         pub drafter_temperature_factor: f32,
         pub drafter_top_p: f32,
+        /// GitHub #689: the shape rule's thresholds, read on a DFlash2 load
+        /// past 7 drafts alone ([`crate::speculation::ShapeRule`]); 0 is the
+        /// rule's default.
+        pub shape_enter_accepted: u32,
+        pub shape_stay_accepted: u32,
     }
 
     /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
@@ -528,6 +533,8 @@ fn load_options(
             draft_rule: speculation.map_or(0, |s| s.draft_rule().abi_code()),
             drafter_temperature_factor: speculation.map_or(0.0, |s| s.drafter_sampling().temperature_factor()),
             drafter_top_p: speculation.map_or(1.0, |s| s.drafter_sampling().top_p()),
+            shape_enter_accepted: speculation.map_or(0, |s| s.shape_rule().enter_accepted()),
+            shape_stay_accepted: speculation.map_or(0, |s| s.shape_rule().stay_accepted()),
         }
     })
 }
@@ -1161,6 +1168,9 @@ fn flash_next_options(
         draft_rule: 0,
         drafter_temperature_factor: 0.0,
         drafter_top_p: 1.0,
+        // GitHub #689: no round shapes of its own.
+        shape_enter_accepted: 0,
+        shape_stay_accepted: 0,
     }
 }
 
@@ -1740,6 +1750,15 @@ mod tests {
             .expect("options");
         assert_eq!((options.draft_rule, options.drafter_temperature_factor, options.drafter_top_p), (1, 1.25, 0.8));
         assert_eq!(options.speculative_backend, 1);
+        // GitHub #689: and the shape rule's thresholds, the defaults unless named.
+        assert_eq!((options.shape_enter_accepted, options.shape_stay_accepted), (7, 6));
+        let wide = Speculation::new(SpeculativeBackend::Dflash2, 15)
+            .unwrap()
+            .with_shape_rule(crate::speculation::ShapeRule::new(5, 12).unwrap())
+            .unwrap();
+        let options = load_options(Some(wide), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+            .expect("options");
+        assert_eq!((options.draft_tokens, options.shape_enter_accepted, options.shape_stay_accepted), (15, 5, 12));
     }
 
     #[test]
@@ -1824,7 +1843,10 @@ mod tests {
         // padded to the pointer's alignment.
         // GitHub #576: then the uint32 draft rule, in that padding, and the
         // drafter's two float settings, appended at the end.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 104);
+        // GitHub #689: then the shape rule's two uint32 thresholds.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 112);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_enter_accepted), 104);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_stay_accepted), 108);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, prefill_linear), 88);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, draft_rule), 92);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, drafter_temperature_factor), 96);

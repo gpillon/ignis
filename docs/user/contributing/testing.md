@@ -164,10 +164,12 @@ the other. They are no configuration fields: `GET /v1/config` and
   graph and one just after it. Every 256 rounds of a kind, the server's
   standard error (`.scratch/serve/ignis-server.log.err` under `make start`)
   gets one line, `ignis leaf: round timing plain n 256: period median … us
-  mean …, span median …, gap median …` (`verify` for the verify rounds): the
-  period from one round's start to the next one's, the graph's span, and the
-  gap from its end to the next round's start, two rounds that begin 50 ms or
-  more apart left out (a request or a prefill between them). This is where a
+  mean …, span median …, gap median …` (`verify` for the verify rounds, and
+  `verify extended` for those at the extended round shape of a load past 7
+  drafts): the period from one round's start to the next one's, the graph's
+  span, and the gap from its end to the next round's start, each the round's
+  own whatever shape the next round is, two rounds that begin 50 ms or more
+  apart left out (a request or a prefill between them). This is where a
   change to the round is read: under Nsight Systems each graph launch costs
   ~400 us more on the RTX 5090's host, so a launch read off a trace is the
   tracer's. It is read at each capture of the decode graphs, once per load;
@@ -231,12 +233,15 @@ the other. They are no configuration fields: `GET /v1/config` and
   counts. An RTX 30 or RTX 40 card keeps `chain` whatever the variable says,
   and Flash-Next's rounds are its own. Any other value refuses the load,
   naming the variable.
-- `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) picks, at each verify round
-  of a DFlash2 load of the 27B past 7 draft tokens, the round's shape. `base`,
-  or unset: every round at the base shape, 8 columns a lane, the round of a
-  load at 7 drafts token for token. `extended`: every round of 1 to 4 lanes at
-  the extended shape, the window + 1 columns a lane, and a round of 5 to 8
-  lanes, or one with a lane held to a grammar, at the base shape still. Both
+- `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) forces, at each verify
+  round of a DFlash2 load of the 27B past 7 draft tokens, the round's shape
+  over the shape rule. Unset: the shape rule and its policy, a round of 1 to 4
+  lanes at the extended shape when every lane in it asks for it. `base`: every
+  round at the base shape, 8 columns a lane, the round of a load at 7 drafts
+  token for token. `extended`: every round of 1 to 4 lanes at the extended
+  shape, the window + 1 columns a lane. Under all three a round of 5 to 8
+  lanes, or one with a lane held to a grammar, runs at the base shape, and
+  each round's outcome still moves its lanes' asks. Both
   shapes' verify and drafter-append graphs are captured at every load, so
   the switch flips between rounds of one load with no capture. A load at 7
   drafts or fewer, an MTP load and Flash-Next never read it. Any other value
@@ -257,8 +262,11 @@ after a verify round, on the NVFP4 artifact with DFlash2, with its MTP head and 
 the 16 GB and 12 GB classes' trellis artifacts, each under the exception
 weights it has. From 0.11.0 it also loads DFlash2 at 15 and 10 draft tokens
 and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
-extended round at 1 to 4 lanes and the base round past them, and a second test
-holds a 15-draft load's base rounds to a 7-draft load's tokens. Each arm is
+extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
+under the shape rule (`nvfp4-dflash2-w15-rule`), every round's shape held to
+what its lanes asked and the same lanes taken from the base shape to the
+extended one and back on live and teacher-forced rounds at 1 to 4 lanes; and a
+second test holds a 15-draft load's base rounds to a 7-draft load's tokens. Each arm is
 held to the graphs' replay with every switch unset; a change behind a switch
 of its own adds that switch as an arm, as the file says. The whole run
 materializes fourteen loads in turn, so a narrow one is

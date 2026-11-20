@@ -558,6 +558,16 @@ struct ignis_seq {
   // such a sequence: extent 0 is a request's last round.
   bool dflash2_pending = false;
   std::vector<std::uint8_t> dflash2_pending_features;
+  // GitHub #689 (spec #684): on a load of two round shapes, what the shape
+  // rule says this sequence asks of its next verify round
+  // (kernel/src/round_shape.h `asks_extended`): the extended shape, or the
+  // base one. False with no history; only a verify round of such a load moves
+  // it. A progress scalar: snapshot and restore carry it, so a request
+  // evicted and restored, onto its own handle or a fresh one, continues at
+  // the shape it asked -- a different shape is a different text at a near
+  // tie. A prefix or checkpoint claim starts without it, as a cold request
+  // does (`ignis_seq_capture_state`).
+  bool asks_extended_shape = false;
   // The shared prefix this sequence claims (P4-10, GitHub #126), or null.
   // One reference is held for as long as this handle lives; `shared_pages`
   // restates its page count so every capacity question here can be answered

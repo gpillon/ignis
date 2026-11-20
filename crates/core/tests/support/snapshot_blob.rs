@@ -1,7 +1,7 @@
-//! The version-5 snapshot blob layout (`kernel/include/ignis_seq_sections.h`),
+//! The version-6 snapshot blob layout (`kernel/include/ignis_seq_sections.h`),
 //! for the GPU tests that read what a snapshot carries (P5-03, GitHub #152;
-//! P5-05, GitHub #155; GitHub #194; GitHub #257). The layout is leaf internal
-//! (ADR 0024): a test asserts `snapshot_format_version() == 5` before trusting
+//! P5-05, GitHub #155; GitHub #194; GitHub #257; GitHub #689). The layout is leaf internal
+//! (ADR 0024): a test asserts `snapshot_format_version() == 6` before trusting
 //! these offsets, so a format change fails that assertion rather than
 //! misreading bytes.
 
@@ -24,6 +24,11 @@ pub const PROGRESS_ROPE_DELTA: usize = 12;
 
 /// The progress image's offset of the drafter window's frontier.
 pub const PROGRESS_DRAFTER_FRONTIER: usize = 16;
+
+/// The progress image's offset of the sequence's ask of the shape rule
+/// (GitHub #689, format 6): after the position, the pending token, the rope
+/// delta, the drafter frontier and the 16 GQA and 48 GDN layers' positions.
+pub const PROGRESS_ASKS_EXTENDED_SHAPE: usize = 24 + 4 * (16 + 48);
 
 pub fn read_u32(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())

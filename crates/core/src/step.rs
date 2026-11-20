@@ -1430,6 +1430,7 @@ fn program_round(
         host_cut_context: std::ptr::null_mut(),
         forced_drafts: std::ptr::null(),
         forced_shape_window: 0,
+        out_round_shape: std::ptr::null_mut(),
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -1725,6 +1726,10 @@ pub struct LaneVerifyRun {
     /// `reasoning_close` in place of a stop id -- the next round emits it
     /// first.
     pub redirected: bool,
+    /// GitHub #689: the round ran at its load's extended round shape (one
+    /// shape for every lane of it); false at the base shape, the only one of
+    /// a load at 7 drafts or fewer.
+    pub extended: bool,
 }
 
 /// [`decode_program_verify`], reporting each lane's extent with its run.
@@ -2052,6 +2057,7 @@ fn verify_round(
     let mut extents = vec![0u32; handles.len()];
     let mut next_drafts = vec![-1i32; handles.len() * width];
     let mut redirected = vec![0i32; handles.len()];
+    let mut round_shape = 0u32;
     // No proposal on any lane is a null seam: every lane at extent 0 under a
     // caller-fed load, the drafter's own proposals under DFlash2.
     let proposes = lanes.iter().any(|lane| !lane.drafts.is_empty());
@@ -2078,6 +2084,7 @@ fn verify_round(
         }),
         forced_drafts: forced.drafts,
         forced_shape_window: forced.shape_window,
+        out_round_shape: &mut round_shape,
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -2105,6 +2112,7 @@ fn verify_round(
                 extent,
                 next_drafts: if drafts.iter().all(|&d| d >= 0) { drafts.to_vec() } else { Vec::new() },
                 redirected: redirected[index] == 1,
+                extended: round_shape == 1,
             }
         })
         .collect())

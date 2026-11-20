@@ -1707,6 +1707,9 @@ fn derive_speculation(
         ("draft_rule", Some(s.draft_rule.as_str().to_owned())),
         ("drafter_temperature_factor", Some(decimal_text(s.drafter_temperature_factor))),
         ("drafter_top_p", Some(decimal_text(s.drafter_top_p))),
+        // GitHub #689: the shape rule's thresholds.
+        ("shape_enter_accepted", Some(s.shape_enter_accepted.to_string())),
+        ("shape_stay_accepted", Some(s.shape_stay_accepted.to_string())),
     ]
     .map(|(name, value)| (name, value.filter(|_| named(name))));
     let backend = match s.backend {
@@ -1807,6 +1810,20 @@ fn derive_speculation(
     // its scope before this ran (Flash-Next), or is refused by name where the
     // family is fitted (the 27B, GitHub #623).
     let rule = if backend == SpeculativeBackend::Mtp { DraftRule::Fixed } else { s.draft_rule };
+    // GitHub #689: the shape rule's thresholds, each in its field's range. On
+    // a load of two round shapes a stay threshold past the window could never
+    // keep a lane at the extended shape, refused naming the field and the
+    // window; every other load never reads them.
+    let shape_rule = ignis_core::ShapeRule::new(s.shape_enter_accepted, s.shape_stay_accepted).map_err(ConfigError)?;
+    let speculation = speculation.with_shape_rule(shape_rule).map_err(|_| {
+        ConfigError(format!(
+            "`{} {}`: an extended round of `{} {tokens}` takes at most {tokens} drafts, so no lane would stay at the \
+             extended shape (1..={tokens})",
+            spelled("spec", "shape_stay_accepted"),
+            s.shape_stay_accepted,
+            spelled("spec", "draft_tokens"),
+        ))
+    })?;
     Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
 }
 
@@ -1838,6 +1855,9 @@ fn refuse_dflash2s_settings_under_mtp(resolution: &Resolution, spelled: &impl Fn
         ("draft_rule", (s.draft_rule == DraftRule::Sampled && named("draft_rule")).then(|| s.draft_rule.as_str().to_owned()), "the sampled draft"),
         ("drafter_temperature_factor", named("drafter_temperature_factor").then(|| decimal_text(s.drafter_temperature_factor)), "the drafter temperature factor"),
         ("drafter_top_p", named("drafter_top_p").then(|| decimal_text(s.drafter_top_p)), "the drafter top-p"),
+        // GitHub #689: the shape rule chooses between DFlash2's round shapes.
+        ("shape_enter_accepted", named("shape_enter_accepted").then(|| s.shape_enter_accepted.to_string()), "the shape rule"),
+        ("shape_stay_accepted", named("shape_stay_accepted").then(|| s.shape_stay_accepted.to_string()), "the shape rule"),
     ];
     for (name, value, what) in refused {
         if let Some(value) = value {
@@ -2056,7 +2076,15 @@ fn fit_family(
         }
         *fitted.speculation = None;
         fitted.dropped.push(schema::field("spec", "backend").expect("declared").flag());
-        for name in ["draft_tokens", "draft_head", "draft_rule", "drafter_temperature_factor", "drafter_top_p"] {
+        for name in [
+            "draft_tokens",
+            "draft_head",
+            "draft_rule",
+            "drafter_temperature_factor",
+            "drafter_top_p",
+            "shape_enter_accepted",
+            "shape_stay_accepted",
+        ] {
             if resolution.explicit("spec", name) {
                 fitted.dropped.push(schema::field("spec", name).expect("declared").flag());
             }

@@ -767,6 +767,8 @@ pub struct Metrics {
     /// rounds, drafts verified and drafts committed, and per draft position
     /// how many rounds proposed it and committed it.
     spec_rounds: AtomicU64,
+    /// GitHub #689: of `spec_rounds`, those at the extended round shape.
+    spec_extended_rounds: AtomicU64,
     spec_drafted: AtomicU64,
     spec_accepted: AtomicU64,
     spec_drafted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
@@ -966,6 +968,7 @@ impl Metrics {
             loop_guard_rewound_tokens: AtomicU64::new(0),
             loop_guard_min_ratio: Ratio::new(&LOOP_GUARD_MIN_RATIO_BOUNDS),
             spec_rounds: AtomicU64::new(0),
+            spec_extended_rounds: AtomicU64::new(0),
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_drafted_at: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1063,6 +1066,7 @@ impl Metrics {
     /// (GitHub #307), the request log's `spec.*` summed across requests.
     pub(crate) fn record_speculation(&self, spec: &ignis_core::types::SpecCounters) {
         self.spec_rounds.fetch_add(u64::from(spec.rounds), Ordering::Relaxed);
+        self.spec_extended_rounds.fetch_add(u64::from(spec.extended_rounds), Ordering::Relaxed);
         self.spec_drafted.fetch_add(u64::from(spec.drafted), Ordering::Relaxed);
         self.spec_accepted.fetch_add(u64::from(spec.accepted), Ordering::Relaxed);
         for (series, &n) in self.spec_drafted_at.iter().zip(&spec.drafted_at) {
@@ -1866,6 +1870,14 @@ impl Metrics {
                 declare(&mut out, name, "counter", help);
                 let _ = writeln!(out, "{name} {}", read(series));
             }
+            // GitHub #689: the rounds by round shape. The base shape is a load
+            // of one shape's only one (an MTP or a Flash-Next load, DFlash2 at
+            // 7 drafts or fewer), whose extended series stays at 0.
+            let name = "ignis_speculative_shape_rounds_total";
+            declare(&mut out, name, "counter", "Verify rounds run, by round shape: base or extended.");
+            let extended = read(&self.spec_extended_rounds);
+            let _ = writeln!(out, "{name}{{shape=\"base\"}} {}", rounds.saturating_sub(extended));
+            let _ = writeln!(out, "{name}{{shape=\"extended\"}} {extended}");
             for (name, help, family) in [
                 (
                     "ignis_speculative_position_drafted_total",
@@ -2278,6 +2290,36 @@ mod tests {
         assert_eq!(value(&text, "ignis_speculative_position_accepted_total", "position=\"1\""), "2");
         assert_eq!(value(&text, "ignis_speculative_position_accepted_total", "position=\"2\""), "1");
         assert_eq!(value(&text, "ignis_speculative_position_drafted_total", "position=\"3\""), "2");
+        // GitHub #689: every round at the base shape here.
+        declared_once(&text, &[("ignis_speculative_shape_rounds_total", "counter")]);
+        assert_eq!(value(&text, "ignis_speculative_shape_rounds_total", "shape=\"base\""), "3");
+        assert_eq!(value(&text, "ignis_speculative_shape_rounds_total", "shape=\"extended\""), "0");
+    }
+
+    /// GitHub #689: a load of two round shapes counts its rounds per shape,
+    /// and drafted and accepted tokens per position up to its window: two
+    /// requests, one of an extended round that took 12 of 15 drafts and a
+    /// base round that took all 7, one of a base round that took 2.
+    #[test]
+    fn a_two_shape_loads_rounds_count_by_shape_and_its_drafts_by_position_to_its_window() {
+        use ignis_core::types::SpecCounters;
+        use ignis_core::{Speculation, SpeculativeBackend};
+        let metrics = Metrics::new();
+        let draft_positions = Speculation::new(SpeculativeBackend::Dflash2, 15).unwrap().draft_positions();
+        metrics.set_load_reservations(LoadReservations { draft_positions, ..LoadReservations::none() });
+        metrics.record_speculation(&(SpecCounters::round(15, 12).at_shape(true) + SpecCounters::round(7, 7).at_shape(false)));
+        metrics.record_speculation(&SpecCounters::round(7, 2).at_shape(false));
+        let text = metrics.render();
+        assert_eq!(value(&text, "ignis_speculative_rounds_total", ""), "3");
+        assert_eq!(value(&text, "ignis_speculative_shape_rounds_total", "shape=\"base\""), "2");
+        assert_eq!(value(&text, "ignis_speculative_shape_rounds_total", "shape=\"extended\""), "1");
+        let at = |family: &str, position: u32| value(&text, family, &format!("position=\"{position}\""));
+        let drafted = "ignis_speculative_position_drafted_total";
+        let accepted = "ignis_speculative_position_accepted_total";
+        for (position, want_drafted, want_accepted) in [(1, "3", "3"), (3, "3", "2"), (7, "3", "2"), (8, "1", "1"), (12, "1", "1"), (13, "1", "0"), (15, "1", "0")] {
+            assert_eq!((at(drafted, position), at(accepted, position)), (want_drafted.to_owned(), want_accepted.to_owned()), "position {position}");
+        }
+        assert_eq!(text.lines().filter(|line| line.starts_with("ignis_speculative_position_drafted_total{")).count(), 15);
     }
 
     /// GitHub #685: the per-position families print the draft positions the

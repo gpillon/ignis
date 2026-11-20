@@ -215,6 +215,9 @@ inline void ignis_seq_capture_state(ignis_seq_pool &pool, const ignis_seq &seq,
   // could set its own. A multimodal claimant always prefills a tail (ADR
   // 0029), and that span sets the delta.
   progress.rope_delta = 0;
+  // GitHub #689: nor the publisher's ask of the shape rule, which its own
+  // rounds made: a claimant starts at the base shape, as a cold request does.
+  progress.asks_extended_shape = 0;
 }
 
 /* The reverse: retained slot `retained_slot`'s state and `progress` become
