@@ -30,7 +30,7 @@ it. Python never writes the container.
 | `override.py` | An override directory: EXL3 records that replace the quant's, checked like for like, pinned by the replay's provenance and its partial BF16 reference. |
 | `overlay.py` | A BF16 checkpoint with a `replay.py fetch` directory laid over it: which file holds each tensor, the overlay's checked like for like and pinned by `fetch.json`. The KLD reference of the abliterated BF16 reads through it (GitHub #422). |
 | `reconstruction.py` | The conversion's GPU step and its only exllamav3 user: each trellis matrix's relative reconstruction error against the BF16 checkpoint. |
-| `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
+| `replay.py` | The abliterated variant's 70 matrices re-quantized by replaying exllamav3's conversion, from the downloaded quant or one converted locally at a named recipe: the plan (no torch), `fetch` of huihui's changed tensors by HTTP range, `run` (the GPU step). |
 | `recipe.py` | A named recipe (GitHub #631): `load` reads and checks `recipes/<name>.json`; the text scope's bytes and the bits per weight; a local conversion's per-tensor recipe (`job`) and exllamav3's YAML. |
 | `recipes/` | The recipes, one JSON file each, named by its stem: `sc30.json` is the 16 GB artifact's and the default; `tandem25.json` is the public 2.5-bit quant's (`0xBakeer/TandemLLM-Qwen3.8-27B-EXL3-2.5`, a measurement artifact that does not ship); `ig28a.json` is the 12 GB artifact's (GitHub #633), from exllamav3's allocation optimizer, its `about` says how, published as weights id `trellis-ig28` ("The 12 GB artifact" below); `ig28b.json` the second candidate (GitHub #634), from a public GGUF file's allocation (`gguf_recipe.py`), not admitted. |
 | `gguf_recipe.py` | A recipe translated from a public GGUF file's per-tensor allocation (GitHub #634): `header` reads the file's header by HTTP ranges (no weights), `recipe` translates its types to integer K under a ceiling. |
@@ -163,11 +163,17 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify .
 ```
 
 - **The provenance is `replay.json`.** The override's source repository and revision come from it
-  (`sources.abliterated`), with the quant revision it was made against and each record's sha256. `run`
+  (`sources.abliterated`), with the quant it was made against and each record's sha256. The quant is
+  named by its revision (`sources.quant.revision`) when it was downloaded, and by its pins file
+  (`sources.quant.pins`: name, bytes, sha256) when it was converted locally ("The abliterated replay"
+  below; GitHub #703); a record written before #703 names a downloaded quant and is taken as it is. `run`
   refuses (exit 2), naming what is missing, an override with no `replay.json` or one that is not
-  `complete` or lacks those fields, an override made against another quant revision, and a record whose
-  sha256 is not the replay's. The override's own files (shards, index, config, `replay.json`) are pinned by
-  bytes and sha256 computed at conversion time; there is no download record to read.
+  `complete` or lacks those fields, one naming its quant by neither a revision nor pins or by both, and a
+  record whose sha256 is not the replay's. It refuses an override made against another quant: another
+  revision for a downloaded quant; another pins file (name, bytes or sha256) than `--quant-pins` for a local
+  one; and one made against a local quant converting a downloaded one, or the reverse. The override's own
+  files (shards, index, config, `replay.json`) are pinned by bytes and sha256 computed at conversion time;
+  there is no download record to read.
 - **A swap is like for like.** `run` and `verify` refuse (exit 2 and VERIFY FAILED) an override record
   whose name is not one of the quant's text matrices, or whose K or shape differs from the quant's
   record, naming the record and what differs.
@@ -353,7 +359,8 @@ F:/ai/ngram-venv/Scripts/python.exe tools/27b-16gb-converter/convert.py verify \
 - `trellis`: per matrix its source key, `k2` (2·K), format, shape, bytes, sha256 and relative
   reconstruction error; the K histogram, the bound, the maximum and the mean.
 - `override` (only with an override): its repository and revision (the replay's), the quant revision it was made
-  against and every file read, by bytes and sha256; `matrices`, the object names it replaced (each also marked
+  against (`null` for a local quant, which `quant_pins` names by its pins file's name, bytes and sha256, as
+  `source.pins` does) and every file read, by bytes and sha256; `matrices`, the object names it replaced (each also marked
   `override: true` in `trellis.matrices`); its `reference` BF16, the repository, revision, the `fetch.json` and
   index files, the shards (LFS oid) and each override matrix's tensor by sha256 (the errors in
   `trellis.matrices` are measured against it; none in a dry run).
@@ -400,3 +407,45 @@ F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py run \
   abliterated BF16), each matrix's seed, K and proxy error, the sources' revisions, the calibration
   trace's sha256, the versions and the command, its paths by role. turboderp's quant was made with
   exllamav3 1.4.2, so its bytes are not reproduced bit for bit.
+- **`--check`** prints the plan's K by module and the sources it pinned, then `CHECK PASS`; it reads
+  no GPU and writes nothing.
+
+### From a quant converted locally
+
+The uncensored 12 GB artifact (spec #701, GitHub #703) replays the same 70 matrices on the 12 GB
+artifact's body, the local quant at the recipe `ig28a` ("The 12 GB artifact" above), each at the K
+`ig28a` gives it: `linear_attn.out_proj` K3 25 and K4 1, `mlp.down_proj` K2 1 and K3 34,
+`self_attn.o_proj` K3 5 and K4 4. The abliterated tensors are the same 70 (`fetch` above names them
+from either quant), here in `H:/abliterated-701`:
+
+```
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py run --check --recipe ig28a \
+    --quant Y:/models/Qwen3.8-27B-exl3-ig28a --quant-pins Y:/models/Qwen3.8-27B-exl3-ig28a.pins.json \
+    --trace Y:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --bf16 Y:/models/Qwen3.8-27B \
+    --abliterated H:/abliterated-701 --out H:/override-701
+F:/ai/ngram-venv/Scripts/python.exe -u tools/27b-16gb-converter/replay.py run --recipe ig28a \
+    --quant Y:/models/Qwen3.8-27B-exl3-ig28a --quant-pins Y:/models/Qwen3.8-27B-exl3-ig28a.pins.json \
+    --trace Y:/models/qwen38-27b-exl3-SC_3.00bpw_H4 --bf16 Y:/models/Qwen3.8-27B \
+    --abliterated H:/abliterated-701 --out H:/override-701
+```
+
+- **`--recipe`** names the recipe the quant is, as `convert.py run` takes it (`sc30` by default, the
+  16 GB route's): the quant's `quantization_config.json` must state the recipe's fields and every matrix
+  must be at the recipe's K, or `run` refuses (exit 2), naming the field or the matrix. A downloaded quant
+  is replayed at `sc30` only, since the record names it as `SC_3.00bpw_H4`.
+- **`--quant-pins`** is the pins file `local_quant.py run` wrote beside the quant, which stands for the
+  download record: every file the replay reads (the shards, the index, `quantization_config.json`,
+  `config.json`) must have its pin, of its bytes and sha256.
+- **`--trace`** is the directory holding the calibration trace the recipe pins (`ig28a` pins
+  `SC_3.00bpw_H4`'s, so the downloaded quant's directory serves): `cal_trace.safetensors` must be the
+  recipe's pin, bytes and sha256. A local quant takes both arguments, a downloaded one neither.
+- **Refused** (exit 2, before the GPU, writing nothing), naming the file: a quant file with no pin, of
+  another size or whose sha256 is not its pin's; a trace the recipe does not pin, missing, of another
+  size or whose sha256 is not the pin's. The quant's files are hashed last, after the cheaper checks.
+- **The record** names the quant by its recipe (name and file sha256) and its pins file (name, bytes,
+  sha256), with `revision` `null`, where a downloaded quant is named by its repository, branch and
+  revision; the calibration trace by the recipe that pins it, its bytes and sha256. Every other field is
+  as from a downloaded quant, and the command names `--quant-pins` and `--trace` by role. The conversion
+  takes the override with `--quant-pins` on that same quant ("The override" above).
+- With a downloaded quant nothing changes: the record is the one the replay wrote before #703, field for
+  field, and the conversion's `override` section with it.

@@ -1,0 +1,91 @@
+{
+ "repo": "someone/abliterated",
+ "revision": "fedcba9876543210fedcba9876543210fedcba98",
+ "files": {
+  "replay-layer-01.safetensors": {
+   "bytes": 22656,
+   "sha256": "1659ed64591cc3798bb3eb5ed8c0c257a96c873b0062c7d94c378e6f682e5037"
+  },
+  "replay-layer-02.safetensors": {
+   "bytes": 22656,
+   "sha256": "a40f36629108a2095ce185ea33a8749e1bd04ff8d5b52751a99ef41582858beb"
+  },
+  "replay-layer-03.safetensors": {
+   "bytes": 22640,
+   "sha256": "59d9068aa563ea546fdddac15ba0075d37d2835f72b610b9f7dec3839137f783"
+  },
+  "model.safetensors.index.json": {
+   "bytes": 2153,
+   "sha256": "2341f4e09342c54073f3cfb31ce40fcde0819457ef1f302f2ee7be2d210855b8"
+  },
+  "quantization_config.json": {
+   "bytes": 173,
+   "sha256": "f2050653a57af82a20529989c7c3a69526a8ed17f41f0a5426ec76c3374115e6"
+  },
+  "replay.json": {
+   "bytes": 5790,
+   "sha256": "e053aebb41ce4b5e4001f663d2734971e57665cacb7f7bbf11c34d3d26cc9467"
+  }
+ },
+ "matrices": [
+  "text/layers/1/gdn/output",
+  "text/layers/1/mlp/down",
+  "text/layers/2/gdn/output",
+  "text/layers/2/mlp/down",
+  "text/layers/3/attention/output",
+  "text/layers/3/mlp/down"
+ ],
+ "quant_revision": "86b95530f9d365d90dd24d01a997a8de0cdf6c55",
+ "reference": {
+  "repo": "someone/abliterated",
+  "revision": "fedcba9876543210fedcba9876543210fedcba98",
+  "index_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "files": {
+   "fetch.json": {
+    "bytes": 1746,
+    "sha256": "f011b833faa9e707e3e30e2c7ef1b49462ce7278bfa4a1b3b80e8727c1ffaf8d"
+   },
+   "model.safetensors.index.json": {
+    "bytes": 661,
+    "sha256": "48b3d169f6204b2e6be41696e263c8de764713b65399a6c8ee98029194f3037e"
+   }
+  },
+  "shards": {
+   "model-00006-of-00018.safetensors": {
+    "lfs_oid": "2222222222222222222222222222222222222222222222222222222222222222"
+   }
+  },
+  "tensors": {
+   "model.language_model.layers.1.linear_attn.out_proj.weight": {
+    "shard": "model-00006-of-00018.safetensors",
+    "bytes": 32768,
+    "sha256": "c4cf1711ec6a639a2403074109502a2e796392b6b7984cadc64a83c398e09044"
+   },
+   "model.language_model.layers.1.mlp.down_proj.weight": {
+    "shard": "model-00006-of-00018.safetensors",
+    "bytes": 65536,
+    "sha256": "1a67fb66c38c992a2843512ddcbe926e2c74c54f40c2b75f0a83502d5244241a"
+   },
+   "model.language_model.layers.2.linear_attn.out_proj.weight": {
+    "shard": "model-00006-of-00018.safetensors",
+    "bytes": 32768,
+    "sha256": "8cc5ed68ef456562e1088d1cf4cd3c610c616a88f417882b37d5bf4a8709e314"
+   },
+   "model.language_model.layers.2.mlp.down_proj.weight": {
+    "shard": "model-00006-of-00018.safetensors",
+    "bytes": 65536,
+    "sha256": "428c2663625f40e5b26db6f86bf3df20ea7aa28a6b776574e6e1ab2125865d88"
+   },
+   "model.language_model.layers.3.mlp.down_proj.weight": {
+    "shard": "model-00006-of-00018.safetensors",
+    "bytes": 65536,
+    "sha256": "49a198241840d531c0d9946759682c58d9a3004ed0b912ee7712372f8e8ec1be"
+   },
+   "model.language_model.layers.3.self_attn.o_proj.weight": {
+    "shard": "model-00006-of-00018.safetensors",
+    "bytes": 32768,
+    "sha256": "5b34d6bb99943b63be054e749d4383964b5217163951043dccf263e7b2e0020e"
+   }
+  }
+ }
+}

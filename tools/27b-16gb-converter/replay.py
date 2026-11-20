@@ -19,6 +19,13 @@ The output is a directory of EXL3 records for exactly those matrices, under the 
 the quant's layout (index, shards, `quantization_config.json`), which the converter's override
 reads. turboderp's quant was made with exllamav3 1.4.2, so its bytes are not reproduced bit for bit.
 
+The quant may also be one converted locally (GitHub #703: the 12 GB artifact's, at the recipe
+`ig28a`): the replay takes the recipe by name (`--recipe`), as the conversion does, and checks the
+quant against it; the quant's pins file (`--quant-pins`) stands for the download record, and the
+calibration trace is the one the recipe pins, read from a directory of its own (`--trace`). The
+record names such a quant by its recipe and its pins file where a downloaded one is named by its
+revision.
+
 `plan` is the pure step (no torch); `fetch` takes huihui's changed tensors by HTTP range; `run` is
 the GPU step and the only exllamav3 user.
 """
@@ -45,7 +52,8 @@ CAL_TRACE = "cal_trace.safetensors"
 # recipe): output scales always, the mul1 codebook, the output-side Hessian regularization.
 QUANT_ARGS = {"apply_out_scales": True, "codebook": "mul1", "hessians_reg": 0.025}
 # The paths a command names, recorded by their role: the record carries no local path.
-PATH_ARGS = {"--quant": "<quant>", "--bf16": "<bf16>", "--abliterated": "<abliterated>", "--out": "<out>"}
+PATH_ARGS = {"--quant": "<quant>", "--bf16": "<bf16>", "--abliterated": "<abliterated>", "--out": "<out>",
+             "--quant-pins": "<quant-pins>", "--trace": "<trace>"}
 FIRST_LAYER, LAST_LAYER = 17, 51
 # A layer's output projection, by layer type: the quant holds exactly one of them per layer.
 OUTPUTS = ("linear_attn.out_proj", "self_attn.o_proj")
@@ -222,6 +230,17 @@ def bits(m):
     return m.k2 // 2 if m.k2 % 2 == 0 else m.k2 / 2
 
 
+def k_by_module(planned):
+    """The plan's K by module, as `--check` prints it: `<module> K<k> x<count>, ...`, the modules by name."""
+    counts = {}
+    for m in planned:
+        module = m.key[len(plan_mod.QUANT_LAYER.format(m.layer)):]
+        counts.setdefault(module, {}).setdefault(bits(m), 0)
+        counts[module][bits(m)] += 1
+    return "; ".join(f"{module} " + ", ".join(f"K{k} x{n}" for k, n in sorted(ks.items()))
+                     for module, ks in sorted(counts.items()))
+
+
 def public_command(argv):
     """The command line `argv` with each path argument replaced by its role."""
     out, role = ["python", "tools/27b-16gb-converter/replay.py"], None
@@ -238,29 +257,57 @@ def public_command(argv):
     return " ".join(out)
 
 
-def prepare(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAST_LAYER):
-    """What the GPU step checks before it touches the GPU: an empty `out`, the quant's recipe, the
-    plan, the sources' revisions, the calibration trace against its LFS oid, the abliterated tensors
-    `fetch` wrote. Returns (quant, planned, pins, fetched); raises ValueError."""
+def prepare(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAST_LAYER, recipe=None,
+            quant_pins=None, trace=None):
+    """What the GPU step checks before it touches the GPU: an empty `out`; the quant against its recipe
+    (`recipe`, `recipe.load`'s, `sc30` by default), its configuration and every matrix at the recipe's K;
+    the plan; the base BF16's revision; the abliterated tensors `fetch` wrote; the quant and its
+    calibration trace. A downloaded quant is pinned by its revision and holds its trace, checked against
+    its LFS oid. A quant converted locally (GitHub #703) is pinned by `quant_pins`, the pins its
+    conversion wrote, which stand for the download record: every file the replay reads is its pin's bytes
+    and sha256; its trace is the one its recipe pins, read from the directory `trace` and checked against
+    that pin. Returns (quant, planned, pins, fetched), `pins` what the record says of the quant and the
+    trace; raises ValueError naming the file or the field that does not hold."""
     import convert
     import exl3
+    import recipe as recipe_mod
 
     if os.path.isdir(out) and os.listdir(out):
         raise ValueError(f"{out} is not empty: remove it to replay again")
+    local = quant_pins is not None
+    if local != (trace is not None):
+        raise ValueError("a quant converted locally (--quant-pins) takes --trace, the directory of the calibration "
+                         "trace its recipe pins" if local else "--trace is a quant converted locally's, with "
+                         "--quant-pins: a downloaded quant holds its own calibration trace")
     quant = exl3.Quant(quant_root)
     try:
-        convert.check_quant_config(quant.config)
+        named = recipe_mod.or_default(recipe)
+        if not local and named["name"] != recipe_mod.DEFAULT:
+            raise convert.Refused(f"a downloaded quant is named {convert.REPO} {convert.BRANCH}, the recipe "
+                                  f"{recipe_mod.DEFAULT}'s: the recipe {named['name']} is replayed from a quant "
+                                  f"converted locally (--quant-pins, --trace)")
+        convert.check_quant_config(quant.config, named["quantization_config"])
+        matrices, _ = convert.text_matrices(quant)
+        problems = recipe_mod.mismatches(named, {key: m.k2 / 2 for key, m in matrices.items()})
+        if problems:
+            raise convert.Refused(f"the quant is not the recipe {named['name']}'s:\n  " + "\n  ".join(problems))
         planned = plan(quant, first, last)
-        quant_revision = convert.revision_of(
-            quant_root, list(quant.shards) + list(convert.QUANT_META) + [CAL_TRACE], "the quant")
+        quant_files = list(quant.shards) + list(convert.QUANT_META)
+        if local:
+            pinned = convert.read_pins(quant_pins, quant_root, quant_files)
+            cal_pin = convert.pins_of(named["files"], f"the recipe {named['name']}", trace, [CAL_TRACE])[CAL_TRACE]
+        else:
+            quant_revision = convert.revision_of(quant_root, quant_files + [CAL_TRACE], "the quant")
         bf16_revision = convert.revision_of(bf16_root, convert.bf16_shards(bf16_root) + [INDEX], "the base BF16")
-        cal_oid = convert.download_record(quant_root, CAL_TRACE)[1]
+        if not local:
+            cal_oid = convert.download_record(quant_root, CAL_TRACE)[1]
     except convert.Refused as e:
         raise ValueError(str(e))
-    cal_path = os.path.join(quant_root, CAL_TRACE)
-    cal_sha256 = work.file_digest(cal_path)
-    if cal_sha256 != cal_oid:
-        raise ValueError(f"{CAL_TRACE} hashes to {cal_sha256}, its LFS oid is {cal_oid}")
+    cal_path = os.path.join(trace if local else quant_root, CAL_TRACE)
+    if not local:
+        cal_sha256 = work.file_digest(cal_path)
+        if cal_sha256 != cal_oid:
+            raise ValueError(f"{CAL_TRACE} hashes to {cal_sha256}, its LFS oid is {cal_oid}")
     fetch_path = os.path.join(abliterated, FETCH_RECORD)
     if not os.path.isfile(fetch_path):
         raise ValueError(f"{abliterated} has no {FETCH_RECORD}: fetch the abliterated tensors first")
@@ -268,24 +315,42 @@ def prepare(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAS
     missing = [m.key + ".weight" for m in planned if m.key + ".weight" not in fetched["tensors"]]
     if missing:
         raise ValueError(f"{abliterated} does not hold {missing[:5]}")
-    pins = {"quant_revision": quant_revision, "bf16_revision": bf16_revision, "cal_path": cal_path,
-            "cal_sha256": cal_sha256}
-    return quant, planned, pins, fetched
+    if not local:
+        return quant, planned, {
+            "quant": {"repo": convert.REPO, "branch": convert.BRANCH, "revision": quant_revision},
+            "calibration": {"file": CAL_TRACE, "repo": convert.REPO, "revision": quant_revision, "sha256": cal_sha256},
+            "bf16_revision": bf16_revision, "cal_path": cal_path}, fetched
+    # The hashes last: the 27B's quant is about 13 GB.
+    cal_sha256 = work.file_digest(cal_path)
+    if cal_sha256 != cal_pin["sha256"]:
+        raise ValueError(f"{CAL_TRACE} hashes to {cal_sha256}, the recipe {named['name']}'s pin is {cal_pin['sha256']}")
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        try:
+            convert.pin_against(quant_root, {name: pool.submit(work.file_digest, os.path.join(quant_root, name))
+                                             for name in quant_files}, pinned)
+        except convert.Refused as e:
+            raise ValueError(str(e))
+    return quant, planned, {
+        "quant": {"recipe": {"name": named["name"], "sha256": named["sha256"]}, "revision": None,
+                  "pins": convert.pins_file(quant_pins)},
+        "calibration": {"file": CAL_TRACE, "recipe": named["name"], "bytes": cal_pin["bytes"], "sha256": cal_sha256},
+        "bf16_revision": bf16_revision, "cal_path": cal_path}, fetched
 
 
 def run(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAST_LAYER, device_index=0, argv=(),
-        log=print):
+        log=print, recipe=None, quant_pins=None, trace=None):
     """The GPU step: re-quantizes the planned matrices by replaying exllamav3's conversion, writes
     their records into `out`, then measures each against the abliterated BF16 beside the quant's own
-    against the base BF16 (the control) and writes `replay.json`, the provenance, last."""
+    against the base BF16 (the control) and writes `replay.json`, the provenance, last. The quant is
+    `prepare`'s: downloaded, or converted locally (`quant_pins`, `trace`)."""
     import convert
     import exl3
     import reconstruction
 
     t0 = time.time()
-    quant, planned, pins, fetched = prepare(quant_root, bf16_root, abliterated, out, first, last)
-    quant_revision, bf16_revision = pins["quant_revision"], pins["bf16_revision"]
-    cal_path, cal_sha256 = pins["cal_path"], pins["cal_sha256"]
+    quant, planned, pins, fetched = prepare(quant_root, bf16_root, abliterated, out, first, last, recipe=recipe,
+                                            quant_pins=quant_pins, trace=trace)
+    bf16_revision, cal_path = pins["bf16_revision"], pins["cal_path"]
     by_layer = {}
     for m in planned:
         by_layer.setdefault(m.layer, []).append(m)
@@ -508,15 +573,17 @@ def run(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAST_LA
         "status": "complete" if (first, last) == (FIRST_LAYER, LAST_LAYER) else "partial",
         "layers": [first, last],
         "sources": {
-            "quant": {"repo": convert.REPO, "branch": convert.BRANCH, "revision": quant_revision,
-                      "made_with_exllamav3": quant.config.get("version")},
+            # A downloaded quant by its repository, branch and revision; a local one by its recipe and its
+            # pins file, with no revision.
+            "quant": dict(pins["quant"], made_with_exllamav3=quant.config.get("version")),
             "base": {"repo": convert.BF16_REPO, "revision": bf16_revision},
             "abliterated": {"repo": fetched["repo"], "revision": fetched["revision"],
                             "how": "the base BF16 with these tensors laid over it, taken by HTTP range",
                             "tensors": {n: t["sha256"] for n, t in fetched["tensors"].items()}},
         },
-        "calibration": {"file": CAL_TRACE, "repo": convert.REPO, "revision": quant_revision, "sha256": cal_sha256,
-                        "rows": calibration["rows"], "cols": calibration["cols"], "excluded_rows": sorted(bad_rows)},
+        # The downloaded quant's own trace at its revision, or the one a local quant's recipe pins.
+        "calibration": dict(pins["calibration"], rows=calibration["rows"], cols=calibration["cols"],
+                            excluded_rows=sorted(bad_rows)),
         "quantizer": {"exllamav3": version,
                       "call": "exllamav3.conversion.convert_model's make_quant_args, get_H_data and "
                               "Linear.convert_exl3, per matrix, on one device",
@@ -541,21 +608,32 @@ def run(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAST_LA
     return record
 
 
-def main(argv=None):
+def main(argv=None, recipes=None):
+    """The command line; `recipes` is where `--recipe` is looked up (default `recipe.RECIPES`), for the
+    tests."""
     import argparse
     import sys
 
+    import convert
     import exl3
+    import recipe as recipe_mod
 
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
     f = sub.add_parser("fetch", help="take the planned matrices' abliterated BF16 weights by HTTP range")
-    f.add_argument("--quant", required=True, help="the SC_3.00bpw_H4 download (the plan reads its headers)")
+    f.add_argument("--quant", required=True, help="the quant (the plan reads its headers)")
     f.add_argument("--out", required=True, help="the directory to write (absent or empty)")
     f.add_argument("--repo", default=HUIHUI_REPO)
     f.add_argument("--revision", default=HUIHUI_REVISION)
     r = sub.add_parser("run", help="the GPU step: replay the conversion of the planned matrices")
-    r.add_argument("--quant", required=True, help="the SC_3.00bpw_H4 download, with .cache/huggingface/download")
+    r.add_argument("--quant", required=True, help="the SC_3.00bpw_H4 download, with .cache/huggingface/download, "
+                                                  "or a quant converted locally (with --quant-pins and --trace)")
+    r.add_argument("--recipe", default=recipe_mod.DEFAULT, help="the recipe the quant is, by name: recipes/<name>.json "
+                                                                "(default %(default)s, the 16 GB artifact's)")
+    r.add_argument("--quant-pins", help="a locally converted quant's pins (`local_quant.py run`'s <out>.pins.json), "
+                                        "in place of its download record")
+    r.add_argument("--trace", help="with --quant-pins: the directory holding the calibration trace its recipe pins, "
+                                   f"{CAL_TRACE}")
     r.add_argument("--bf16", required=True, help="the base BF16 checkpoint, with .cache/huggingface/download")
     r.add_argument("--abliterated", required=True, help="the directory `fetch` wrote")
     r.add_argument("--out", required=True, help="the records directory to write (absent or empty)")
@@ -571,16 +649,24 @@ def main(argv=None):
             planned = plan(exl3.Quant(a.quant))
             log(f"plan: {len(planned)} matrices, layers {planned[0].layer}-{planned[-1].layer}")
             fetch(planned, a.out, repo=a.repo, revision=a.revision, log=log)
-        elif a.check:
-            _, planned, pins, fetched = prepare(a.quant, a.bf16, a.abliterated, a.out, a.first, a.last)
-            log(f"plan: {len(planned)} matrices, layers {a.first}-{a.last}; quant {pins['quant_revision']}, "
-                f"base {pins['bf16_revision']}, abliterated {fetched['repo']}@{fetched['revision']}, "
-                f"{CAL_TRACE} {pins['cal_sha256']}")
+            return 0
+        named = recipe_mod.load(a.recipe, recipes)
+        if a.check:
+            _, planned, pins, fetched = prepare(a.quant, a.bf16, a.abliterated, a.out, a.first, a.last, recipe=named,
+                                                quant_pins=a.quant_pins, trace=a.trace)
+            quant, trace = pins["quant"], pins["calibration"]
+            log(f"plan: {len(planned)} matrices, layers {a.first}-{a.last}: {k_by_module(planned)}")
+            log("sources: quant " + (quant["revision"] or f"converted locally at the recipe {quant['recipe']['name']}, "
+                                     f"pinned by {quant['pins']['file']} (sha256 {quant['pins']['sha256']})")
+                + f", base {pins['bf16_revision']}, abliterated {fetched['repo']}@{fetched['revision']}, "
+                f"{CAL_TRACE} {trace['sha256']} ("
+                + (f"the recipe {trace['recipe']}'s pin" if quant["revision"] is None else "its LFS oid") + ")")
             log("CHECK PASS")
         else:
             run(a.quant, a.bf16, a.abliterated, a.out, first=a.first, last=a.last, device_index=a.device,
-                argv=sys.argv if argv is None else ["replay.py"] + list(argv), log=log)
-    except ValueError as e:
+                argv=sys.argv if argv is None else ["replay.py"] + list(argv), log=log, recipe=named,
+                quant_pins=a.quant_pins, trace=a.trace)
+    except (ValueError, convert.Refused) as e:
         print(f"REFUSED: {e}", flush=True)
         return 2
     return 0

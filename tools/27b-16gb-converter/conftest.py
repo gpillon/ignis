@@ -5,7 +5,8 @@ quant with the real ones' names and structure: four layers (layer 3 GQA), hidden
 head, the NVFP4 planes with their divisors, the BF16 exception planes, an MTP plane that shares a
 body suffix, a vision tensor, a DFlash2 tensor and its graft sidecar; the quant's shards, index,
 configs and Hugging Face download records. Payloads are seeded random bytes: the converter copies
-bytes and never decodes them.
+bytes and never decodes them. `make_replay_sources` adds what the abliterated replay reads, and
+`ReplayExllamav3` runs the replay's GPU step on the CPU.
 """
 import hashlib
 import json
@@ -346,3 +347,315 @@ def make_local_quant(src):
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump({"files": files}, f)
     return path
+
+
+# --- the abliterated replay (#421, #703) ---
+
+CAL_TRACE = "cal_trace.safetensors"
+# The reduced model's abliterated layers, the replay's whole range, as layers 17-51 are the 27B's.
+REPLAY_LAYERS = (1, 3)
+# The calibration size the reduced quants state.
+CALIBRATION = {"rows": 4, "cols": 16}
+# What `quantization_config.json` states of a quant at the 12 GB recipe, `ig28a`, beside `sc30`'s.
+IG28A_CONFIG = {"quant_method": "exl3", "codebook": "mul1", "out_scales": "always", "bits": 2.79, "head_bits": 4}
+
+
+def replayed_keys(first, last):
+    """The matrices the replay takes in layers `first`..`last` of the reduced quant: each layer's output
+    projection (the attention's at every fourth layer, from layer 3), then its down projection."""
+    keys = []
+    for layer in range(first, last + 1):
+        out = "self_attn.o_proj" if (layer + 1) % 4 == 0 else "linear_attn.out_proj"
+        keys += [f"{PREFIX}{layer}.{out}", f"{PREFIX}{layer}.mlp.down_proj"]
+    return keys
+
+
+def write_fetched(root, quant, keys, seed=421):
+    """The directory `replay.py fetch` writes for the matrices `keys` of `quant` (an `exl3.Quant`): their
+    BF16 weights in one shard named after the base's, its index and `fetch.json`."""
+    rng = random.Random(seed)
+    weights = {}
+    for key in keys:
+        m = quant.matrix(key)
+        weights[key + ".weight"] = ("BF16", m.shape, _bytes(rng, 2 * m.rows * m.columns))
+    os.makedirs(root)
+    shard = "model-00006-of-00018.safetensors"
+    write_safetensors(os.path.join(root, shard), weights)
+    with open(os.path.join(root, "model.safetensors.index.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"metadata": {"source": f"{OVERRIDE_REPO}@{OVERRIDE_REVISION}"},
+                   "weight_map": {n: shard for n in sorted(weights)}}, f)
+    with open(os.path.join(root, "fetch.json"), "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"repo": OVERRIDE_REPO, "revision": OVERRIDE_REVISION, "index_sha256": "1" * 64,
+                   "shards": {shard: {"bytes": 1 << 20, "lfs_oid": "2" * 64}},
+                   "tensors": {n: {"shard": shard, "bytes": len(t[2]), "dtype": "BF16", "shape": t[1],
+                                   "sha256": hashlib.sha256(t[2]).hexdigest()} for n, t in sorted(weights.items())}}, f)
+    return root
+
+
+def make_replay_sources(root, local=False):
+    """The reduced sources of `make_sources` as the replay reads them: the quant states its calibration
+    size, its calibration trace is at hand, and `abliterated` is the directory `replay.py fetch` writes for
+    the replay's matrices of layers 1-3. A downloaded quant (the default) holds the trace, with its download
+    record, and is the recipe `sc30`'s. A local one (`local`, GitHub #703) is the same matrices converted on
+    this machine at `ig28a`'s 2.79 bits by exllamav3 1.5.3: no download record, its pins beside it
+    (`pins`), and the same trace in a directory of its own (`trace`), which its recipe `ig28a` pins."""
+    src = make_sources(root)
+    quant = src["quant"]
+    path = os.path.join(quant, "quantization_config.json")
+    with open(path, encoding="utf-8") as f:
+        config = json.load(f)
+    config["calibration"] = CALIBRATION
+    if local:
+        config.update(bits=IG28A_CONFIG["bits"], version="1.5.3")
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(config, f)
+    trace = os.path.join(root, "trace") if local else quant
+    os.makedirs(trace, exist_ok=True)
+    rows, cols = CALIBRATION["rows"], CALIBRATION["cols"]
+    write_safetensors(os.path.join(trace, CAL_TRACE),
+                      {"input_ids": ("I64", [rows, cols], bytes(i % 251 for i in range(8 * rows * cols)))})
+    out = dict(src, abliterated=write_fetched(os.path.join(root, "abliterated"), exl3.Quant(quant),
+                                              replayed_keys(*REPLAY_LAYERS)))
+    if local:
+        out.update(pins=make_local_quant(src), trace=trace, recipe="ig28a")
+        write_recipe(os.path.join(src["recipes"], "ig28a.json"), weights_id="trellis-ig28a",
+                     quantization_config=IG28A_CONFIG, files=pin_dir(trace))
+    else:
+        download_records(quant, ["quantization_config.json", CAL_TRACE], {CAL_TRACE}, REVISION)
+        write_recipe(os.path.join(src["recipes"], "sc30.json"), files=pin_dir(quant))
+        out.update(recipe="sc30")
+    return out
+
+
+class StubTensor:
+    """A tensor of the stub torch: a numpy array."""
+
+    def __init__(self, a):
+        self.a = a
+
+    @property
+    def shape(self):
+        return self.a.shape
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.a
+
+    def all(self):
+        return StubTensor(self.a.all())
+
+    def item(self):
+        return self.a.item()
+
+
+class ReplayExllamav3:
+    """The replay's GPU step (`replay.run`) on the CPU: torch, exllamav3 and safetensors' `safe_open` are
+    stubs, so nothing reaches a GPU. The stub model is `src`'s quant, its token embedding then one module per
+    layer holding a linear per matrix of the quant; its calibration is the trace's size in zeros; its
+    quantizer gives each matrix a record of its own at the K and seed it is asked for (the trellis filled
+    with a number its key gives, the scales one). It also stands in for the GPU's name and peaks and for the
+    reconstruction step (each matrix's error a number of its own), and fixes the converter's commit and the
+    versions, so a record is the same wherever it is made; the replay's whole range is layers 1-3."""
+
+    PEAKS = {"allocated": 3 << 30, "reserved": 4 << 30}
+
+    def __init__(self, src):
+        self.src, self.quant = src, exl3.Quant(src["quant"])
+        self.calibration, self.quantized = None, []
+
+    def same(self, a, b):
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+    def install(self, monkeypatch):
+        import contextlib
+        import types
+
+        import numpy as np
+        import safetensors.numpy
+
+        import convert
+        import reconstruction
+        import replay
+
+        stub = self
+        dtypes = {"I16": np.int16, "F16": np.float16, "I32": np.int32, "BF16": np.uint16, "I64": np.int64}
+
+        class Handle:
+            def __init__(self, path):
+                self.path, self.header = path, exl3.read_header(path)
+
+            def get_tensor(self, name):
+                t = self.header[name]
+                with open(self.path, "rb") as f:
+                    f.seek(t.offset)
+                    data = f.read(t.size)
+                return StubTensor(np.frombuffer(data, dtype=dtypes[t.dtype]).reshape(t.shape))
+
+        def safe_open(path, framework, device):
+            assert (framework, device) == ("pt", "cpu")
+            return Handle(path)
+
+        class LinearFP16:
+            def swap_cpu(self):
+                pass
+
+        class LinearEXL3:
+            def __init__(self, tensors):
+                self.tensors = tensors
+
+            def swap_cpu(self):
+                pass
+
+        class Linear:
+            def __init__(self, key):
+                self.key, self.inner = key, LinearFP16()
+
+            def convert_exl3(self, H_data, quant_args, verbose, save_reg, override_swap_device):
+                m, k2 = stub.quant.matrix(self.key), int(quant_args["K"] * 2)
+                fill = int(hashlib.sha256(self.key.encode()).hexdigest()[:4], 16) & 0x7FFF
+                self.inner = LinearEXL3({
+                    f"{self.key}.trellis": StubTensor(np.full((m.columns // 16, m.rows // 16, k2 * 8), fill, np.int16)),
+                    f"{self.key}.suh": StubTensor(np.ones(m.columns, np.float16)),
+                    f"{self.key}.svh": StubTensor(np.ones(m.rows, np.float16)),
+                    f"{self.key}.mul1": StubTensor(np.array(exl3.MUL1, dtype=np.uint32).view(np.int32))})
+                quant_args.update(g_scale=1.0 + fill / (1 << 16), q_fallback=False)
+                stub.quantized.append((self.key, quant_args["seed"], quant_args["K"]))
+                return fill / (1 << 20)
+
+            def get_tensors(self):
+                return dict(self.inner.tensors)
+
+        class Module:
+            def __init__(self, key, linears):
+                self.key, self.linears, self.num_slices, self.caps = key, linears, 1, {}
+
+            def __iter__(self):
+                return iter(self.linears)
+
+            def can_defer_load(self):
+                return False
+
+            def load(self, device, source=None, keep_source_weights=False):
+                pass
+
+            def unload(self):
+                pass
+
+            def prepare_for_device(self, x, params):
+                return x
+
+            def forward(self, x, params):
+                return x
+
+        layers = {}
+        for key in self.quant.keys():
+            if key.startswith(PREFIX):
+                layers.setdefault(int(key[len(PREFIX):].split(".")[0]), []).append(Linear(key))
+        modules = [Module("model.language_model.embed_tokens", [])]
+        modules += [Module(f"{PREFIX}{i}", layers[i]) for i in range(max(layers) + 1)]
+
+        class Collection:
+            def __init__(self):
+                self.tensor_file_map = {}
+
+            def add_tensor_files(self, root):
+                with open(os.path.join(root, "model.safetensors.index.json"), encoding="utf-8") as f:
+                    weight_map = json.load(f)["weight_map"]
+                self.tensor_file_map.update({n: os.path.join(root, s) for n, s in weight_map.items()})
+
+            def begin_deferred_load(self):
+                pass
+
+            end_deferred_load = close = begin_deferred_load
+
+            def set_new_tensors(self, tensors):
+                pass
+
+        def from_directory(root):
+            config = types.SimpleNamespace(stc=Collection())
+            config.stc.add_tensor_files(root)
+            return config
+
+        def get_file_calibration(args, tokenizer):
+            stub.calibration = dict(args)
+            return [StubTensor(np.zeros((1, args["cal_cols"]), np.int64)) for _ in range(args["cal_rows"])]
+
+        def make_quant_args(qargs, idx, bits, devices):
+            return {"seed": idx, "K": bits, "apply_out_scales": qargs["apply_out_scales"], "devices": devices}
+
+        ex = types.ModuleType("exllamav3")
+        ex.Config = types.SimpleNamespace(from_directory=from_directory)
+        ex.Model = types.SimpleNamespace(from_config=lambda config: types.SimpleNamespace(
+            modules=modules, calibration_all_experts=False))
+        ex.Tokenizer = types.SimpleNamespace(from_config=lambda config: None)
+        calibration = types.ModuleType("exllamav3.conversion.calibration_data")
+        calibration.get_file_calibration = get_file_calibration
+        cm = types.ModuleType("exllamav3.conversion.convert_model")
+        cm.check_bad_rows = lambda bad_rows, rows: None
+        cm.get_H_data = lambda qargs, linear, capture_H, state: (None, None)
+        cm.make_quant_args = make_quant_args
+        cm.num_ref_states = 2
+        mods = types.ModuleType("exllamav3.modules")
+        mods.Linear = Linear
+        quant = types.ModuleType("exllamav3.modules.quant")
+        quant.LinearEXL3, quant.LinearFP16 = LinearEXL3, LinearFP16
+        quantize = types.ModuleType("exllamav3.modules.quant.exl3_lib.quantize")
+        quantize.get_temp_buffers = types.SimpleNamespace(cache_clear=lambda: None)
+        memory = types.ModuleType("exllamav3.util.memory")
+        memory.free_mem = lambda: None
+        torch = types.ModuleType("torch")
+        torch.set_grad_enabled = lambda on: None
+        torch.device = lambda index: f"cuda:{index}"
+        torch.inference_mode = contextlib.nullcontext
+        torch.isfinite = lambda t: StubTensor(np.isfinite(t.a))
+        torch.cuda = types.SimpleNamespace(max_memory_allocated=lambda device: self.PEAKS["allocated"],
+                                           max_memory_reserved=lambda device: self.PEAKS["reserved"],
+                                           get_device_name=lambda device: "a test GPU")
+        st = types.ModuleType("safetensors")
+        st.safe_open, st.numpy = safe_open, safetensors.numpy
+        for name, module in {"torch": torch, "safetensors": st, "exllamav3": ex,
+                             "exllamav3.conversion": types.ModuleType("exllamav3.conversion"),
+                             "exllamav3.conversion.calibration_data": calibration,
+                             "exllamav3.conversion.convert_model": cm, "exllamav3.modules": mods,
+                             "exllamav3.modules.quant": quant,
+                             "exllamav3.modules.quant.exl3_lib": types.ModuleType("exllamav3.modules.quant.exl3_lib"),
+                             "exllamav3.modules.quant.exl3_lib.quantize": quantize,
+                             "exllamav3.util": types.ModuleType("exllamav3.util"),
+                             "exllamav3.util.memory": memory}.items():
+            monkeypatch.setitem(sys.modules, name, module)
+
+        def rel_errors(q, reference, objects, device="cuda", log=print, override=None):
+            source = "quant" if stub.same(q.root, stub.src["quant"]) else "replay"
+            against = "abliterated" if stub.same(reference, stub.src["abliterated"]) else "base"
+            offset = {("replay", "abliterated"): 0.3, ("quant", "base"): 0.2, ("quant", "abliterated"): 0.4}
+            return {p.name: round(offset[source, against] + i / 1000, 6) for i, p in enumerate(objects)}
+
+        monkeypatch.setattr(reconstruction, "rel_errors", rel_errors)
+        monkeypatch.setattr(convert, "versions", lambda: {"python": "3.11.9", "torch": "2.13.0", "exllamav3": "1.5.3",
+                                                          "safetensors": "0.6.2"})
+        monkeypatch.setattr(convert, "tool_commit", lambda: {"tool": "tools/27b-16gb-converter", "commit": "0" * 40,
+                                                             "dirty": False})
+        monkeypatch.setattr(replay, "FIRST_LAYER", REPLAY_LAYERS[0])
+        monkeypatch.setattr(replay, "LAST_LAYER", REPLAY_LAYERS[1])
+        return self
+
+
+# What the replay and the conversion wrote at 010f221d, before a local quant (#703), on the reduced
+# downloaded sources of `make_replay_sources` with `ReplayExllamav3`: the base commit's converter
+# (`git archive 010f221d tools/27b-16gb-converter`) with this conftest beside it, `replay.main` on
+# `replay_argv`, then `convert.convert` taking that override (weights id trellis-sc30-abliterated).
+# `replay.json` is the record; `converter-override.json` the conversion record's `override` section.
+FROZEN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "010f221d")
+
+
+def frozen(name):
+    with open(os.path.join(FROZEN, name), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def replay_argv(src, out, *extra):
+    """`replay.py run`'s arguments for the sources `src` of `make_replay_sources`, into `out`."""
+    return ["run", "--quant", src["quant"], "--bf16", src["bf16"], "--abliterated", src["abliterated"],
+            "--out", out, *extra]

@@ -4,7 +4,8 @@ the same name, so a variant made from another BF16 (the abliterated one) is buil
 The directory is what `replay.py run` writes: an EXL3 checkpoint in the quant's layout (index, shards,
 `quantization_config.json`) holding only the matrices it replaces, and `replay.json`, its
 provenance. The provenance gives the override's source repository and revision (the BF16 it was made
-from), the quant revision it was made against and each record's sha256; the override's files are
+from), the quant it was made against (a downloaded quant's revision, or a quant converted locally's
+pins file, GitHub #703) and each record's sha256; the override's files are
 pinned by their bytes and sha256 when the conversion runs. A record swaps like for like: its name
 must be one of the quant's text matrices, with the same K and the same shape. Its reconstruction
 error is measured against `reference_root`, the BF16 it was made from: the partial shards `replay.py
@@ -13,6 +14,7 @@ fetch` wrote (only the changed tensors) and its `fetch.json`, whose per-tensor s
 import hashlib
 import json
 import os
+import re
 import struct
 
 import exl3
@@ -57,16 +59,26 @@ def provenance(root):
     if record.get("status") != "complete":
         missing.append(f"status complete (it is {record.get('status')!r})")
     sources = record.get("sources") or {}
-    for part, fields in (("quant", ("revision",)), ("abliterated", ("repo", "revision", "tensors"))):
-        for field in fields:
-            if not (sources.get(part) or {}).get(field):
-                missing.append(f"sources.{part}.{field}")
+    # The quant it was made against: a downloaded one by its revision, a local one by its pins (#703).
+    quant = sources.get("quant") or {}
+    revision, pins = quant.get("revision"), quant.get("pins")
+    if not revision and not pins:
+        missing.append("sources.quant.revision or sources.quant.pins")
+    elif pins and not (isinstance(pins, dict) and isinstance(pins.get("file"), str) and pins["file"]
+                       and isinstance(pins.get("bytes"), int) and isinstance(pins.get("sha256"), str)
+                       and re.fullmatch("[0-9a-f]{64}", pins["sha256"])):
+        missing.append("sources.quant.pins (its file, bytes and sha256)")
+    for field in ("repo", "revision", "tensors"):
+        if not (sources.get("abliterated") or {}).get(field):
+            missing.append(f"sources.abliterated.{field}")
     if not record.get("matrices"):
         missing.append("matrices")
     elif not all((m or {}).get("record_sha256") for m in record["matrices"].values()):
         missing.append("matrices.*.record_sha256")
     if missing:
         raise ValueError(f"{path} lacks {', '.join(missing)}")
+    if revision and pins:
+        raise ValueError(f"{path} names the quant by a revision and by pins: a quant is downloaded or converted locally")
     return record
 
 
@@ -122,9 +134,33 @@ class Override:
         self.provenance = provenance(self.root)
         abliterated = self.provenance["sources"]["abliterated"]
         self.repo, self.revision = abliterated["repo"], abliterated["revision"]
-        self.quant_revision = self.provenance["sources"]["quant"]["revision"]
+        # The quant it was made against: downloaded at `quant_revision`, or converted locally and pinned
+        # by `quant_pins` (its pins file's name, bytes and sha256); the other is None.
+        quant = self.provenance["sources"]["quant"]
+        self.quant_revision, self.quant_pins = quant.get("revision"), quant.get("pins")
         self.quant = exl3.Quant(self.root)
         self.matrices = {key: self.quant.matrix(key) for key in self.quant.keys()}
+
+    def made_against(self, revision, pins):
+        """The line naming how the quant at hand, downloaded at `revision` or converted locally and pinned
+        by `pins` (`convert.pins_file`'s), is not the one this override was made against; None when it
+        is. A downloaded quant is compared by its revision, a local one by its pins file."""
+        def named(p):
+            return f"{p['file']} ({p['bytes']} bytes, sha256 {p['sha256']})"
+
+        if self.quant_pins is None and pins is None:
+            if self.quant_revision != revision:
+                return f"the override was made against the quant at {self.quant_revision}, this is {revision}"
+        elif self.quant_pins is None:
+            return (f"the override was made against the quant downloaded at {self.quant_revision}, this quant is "
+                    f"converted locally, pinned by {pins['file']} (sha256 {pins['sha256']})")
+        elif pins is None:
+            return (f"the override was made against a quant converted locally, pinned by {self.quant_pins['file']} "
+                    f"(sha256 {self.quant_pins['sha256']}), this quant is downloaded at {revision}")
+        elif any(self.quant_pins[k] != pins[k] for k in ("file", "bytes", "sha256")):
+            return (f"the override was made against the quant pinned by {named(self.quant_pins)}, this quant's pins "
+                    f"are {named(pins)}")
+        return None
 
     def problems(self, base):
         """What keeps this override from swapping into the quant's matrices `base` (key -> Matrix):

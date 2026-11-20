@@ -595,6 +595,127 @@ def test_the_verify_command_takes_a_baseline(tmp_path):
     assert _json(out)["baseline"]["differ"] == OV_NAMES
 
 
+# --- the override the replay writes, of a downloaded quant or a local one (#703) ---
+
+import replay  # noqa: E402
+import work as work_mod  # noqa: E402
+from conftest import ReplayExllamav3, frozen, make_replay_sources, pin_dir, replay_argv  # noqa: E402
+
+REPLAYED = ["text/layers/1/gdn/output", "text/layers/1/mlp/down", "text/layers/2/gdn/output", "text/layers/2/mlp/down",
+            "text/layers/3/attention/output", "text/layers/3/mlp/down"]
+
+
+def _replay(tmp_path, monkeypatch, local=False, name="src"):
+    """The replay's records of the reduced sources (`make_replay_sources`), written by `replay.py run` on
+    the CPU (`ReplayExllamav3`): (sources, the records directory)."""
+    src = make_replay_sources(str(tmp_path / name), local=local)
+    ReplayExllamav3(src).install(monkeypatch)
+    out = str(tmp_path / name / "override")
+    extra = ("--recipe", src["recipe"], "--quant-pins", src["pins"], "--trace", src["trace"]) if local else ()
+    assert replay.main(replay_argv(src, out, *extra), recipes=src["recipes"]) == 0
+    return src, out
+
+
+def _pack_and_verify(src, work, override, **kw):
+    artifact = work + ".ninfer"
+    pack(work, artifact, identity=convert.identity_of(VARIANT))
+    return convert.verify(artifact, src["served"], src["quant"], log=lambda _: None, override=override,
+                          weights_id=VARIANT, **kw)
+
+
+def test_an_override_todays_replay_wrote_converts_and_verifies_as_it_did(tmp_path, monkeypatch):
+    src, out = _replay(tmp_path, monkeypatch)
+    # the provenance is the record today's replay wrote, as it wrote it
+    work_mod.write_json_atomic(os.path.join(out, "replay.json"), frozen("replay.json"))
+    work = str(tmp_path / "work")
+    record = _run(src, work, override=override_mod.Override(out, src["abliterated"]), errors_fn=_ov_errors,
+                  weights_id=VARIANT)
+    # the conversion record's override section is today's, key for key and value for value
+    assert json.dumps(record["override"]) == json.dumps(frozen("converter-override.json"))
+    assert record["override"]["matrices"] == REPLAYED
+    ok, report = _pack_and_verify(src, work, override_mod.Override(out))
+    assert ok, report["problems"]
+
+
+def _run_local(src, work, ov, **kw):
+    """The conversion of the local quant of `make_replay_sources` at its recipe, with its pins and labels."""
+    return _run(src, work, override=ov, errors_fn=_ov_errors, weights_id=VARIANT, quant_pins=src["pins"],
+                labels=LABELS, recipe=recipe.load(src["recipe"], src["recipes"]), **kw)
+
+
+def test_an_override_made_against_a_local_quant_converts_and_verifies_on_that_quant(tmp_path, monkeypatch):
+    src, out = _replay(tmp_path, monkeypatch, local=True)
+    work = str(tmp_path / "work")
+    record = _run_local(src, work, override_mod.Override(out, src["abliterated"]))
+    o = record["override"]
+    # the quant it was made against is named by its pins, as the record's source names the quant
+    assert o["quant_revision"] is None
+    assert o["quant_pins"] == record["source"]["pins"] == {"file": "quant.pins.json", "bytes": os.path.getsize(src["pins"]),
+                                                          "sha256": _sha(src["pins"])}
+    assert sorted(o) == ["files", "matrices", "quant_pins", "quant_revision", "reference", "repo", "revision"]
+    assert o["matrices"] == REPLAYED
+    assert (o["repo"], o["revision"]) == (OVERRIDE_REPO, OVERRIDE_REVISION)
+    ok, report = _pack_and_verify(src, work, override_mod.Override(out))
+    assert ok, report["problems"]
+    assert report["checked"]["trellis"] == 26
+
+
+def _another_local_quant(src):
+    """`src`'s local quant with one byte changed, and its pins taken again: the same matrices, another quant."""
+    shard = os.path.join(src["quant"], "model-00002-of-00002.safetensors")
+    with open(shard, "r+b") as f:
+        f.seek(-1, os.SEEK_END)
+        last = f.read(1)
+        f.seek(-1, os.SEEK_END)
+        f.write(bytes([last[0] ^ 1]))
+    with open(src["pins"], "w", encoding="utf-8", newline="\n") as f:
+        json.dump({"files": pin_dir(src["quant"])}, f)
+
+
+def test_an_override_made_against_a_local_quant_is_refused_on_another(tmp_path, monkeypatch):
+    src, out = _replay(tmp_path, monkeypatch, local=True)
+    made = _sha(src["pins"])
+    _another_local_quant(src)
+    work = tmp_path / "work"
+    with pytest.raises(convert.Refused, match=(
+            rf"^the override was made against the quant pinned by quant\.pins\.json \(\d+ bytes, sha256 {made}\), "
+            rf"this quant's pins are quant\.pins\.json \(\d+ bytes, sha256 {_sha(src['pins'])}\)$")):
+        _run_local(src, str(work), override_mod.Override(out, src["abliterated"]))
+    assert not work.exists()
+
+
+def test_an_override_is_refused_on_a_quant_of_the_other_kind(tmp_path, monkeypatch):
+    local, local_out = _replay(tmp_path, monkeypatch, local=True, name="local")
+    down, down_out = _replay(tmp_path, monkeypatch, name="down")
+    work = tmp_path / "work"
+    # made against a local quant, on the downloaded one
+    with pytest.raises(convert.Refused, match=(
+            rf"^the override was made against a quant converted locally, pinned by quant\.pins\.json \(sha256 "
+            rf"{_sha(local['pins'])}\), this quant is downloaded at {QUANT_REVISION}$")):
+        _run(down, str(work), override=override_mod.Override(local_out, local["abliterated"]), errors_fn=_never,
+             weights_id=VARIANT)
+    # made against the downloaded quant, on a local one
+    with pytest.raises(convert.Refused, match=(
+            rf"^the override was made against the quant downloaded at {QUANT_REVISION}, this quant is converted "
+            rf"locally, pinned by quant\.pins\.json \(sha256 {_sha(local['pins'])}\)$")):
+        _run_local(local, str(work), override_mod.Override(down_out, down["abliterated"]))
+    assert not work.exists()
+
+
+@pytest.mark.parametrize("change,message", [
+    (lambda q: q.pop("pins"), r"lacks sources\.quant\.revision or sources\.quant\.pins$"),
+    (lambda q: q.update(revision=QUANT_REVISION), r"names the quant by a revision and by pins: a quant is downloaded "
+                                                  r"or converted locally$"),
+    (lambda q: q["pins"].pop("sha256"), r"lacks sources\.quant\.pins \(its file, bytes and sha256\)$"),
+])
+def test_a_record_naming_its_quant_by_neither_or_both_or_by_half_its_pins_is_refused(tmp_path, monkeypatch, change,
+                                                                                     message):
+    src, out = _replay(tmp_path, monkeypatch, local=True)
+    _edit_json(os.path.join(out, "replay.json"), lambda r: change(r["sources"]["quant"]))
+    with pytest.raises(ValueError, match=r"replay\.json " + message):
+        override_mod.Override(out, src["abliterated"])
+
+
 # --- a fine-tune's 16 GB artifact (#465) ---
 
 UNITS = ("frontend", "text", "mtp", "vision", "dflash2")
