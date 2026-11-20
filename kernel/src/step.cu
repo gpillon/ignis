@@ -3099,6 +3099,15 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           return -1;
         }
       }
+      // GitHub #690: how many of the round's lanes ask the extended shape going
+      // into it, before its outcome moves their asks.
+      if (options->out_shape_asks != nullptr) {
+        std::uint32_t asking = 0;
+        for (uint64_t i = 0; model->extended_shape != nullptr && i < batch_size; ++i) {
+          asking += sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
+        }
+        *options->out_shape_asks = asking;
+      }
       // GitHub #692 (test-only): a teacher-forced round that names its shape
       // runs at it, and nothing below chooses one for it.
       // GitHub #687, #689, #690, #691: on a load of two round shapes, the

@@ -1443,6 +1443,7 @@ fn program_round(
         forced_drafts: std::ptr::null(),
         forced_shape_window: 0,
         out_round_shape: std::ptr::null_mut(),
+        out_shape_asks: std::ptr::null_mut(),
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -1742,6 +1743,9 @@ pub struct LaneVerifyRun {
     /// shape for every lane of it); false at the base shape, the only one of
     /// a load at 7 drafts or fewer.
     pub extended: bool,
+    /// GitHub #690: the round split its lanes' asks of the extended shape
+    /// ([`crate::types::splits_shape_asks`]), the same for every lane of it.
+    pub split: bool,
 }
 
 /// [`decode_program_verify`], reporting each lane's extent with its run.
@@ -2070,6 +2074,7 @@ fn verify_round(
     let mut next_drafts = vec![-1i32; handles.len() * width];
     let mut redirected = vec![0i32; handles.len()];
     let mut round_shape = 0u32;
+    let mut shape_asks = 0u32;
     // No proposal on any lane is a null seam: every lane at extent 0 under a
     // caller-fed load, the drafter's own proposals under DFlash2.
     let proposes = lanes.iter().any(|lane| !lane.drafts.is_empty());
@@ -2097,6 +2102,7 @@ fn verify_round(
         forced_drafts: forced.drafts,
         forced_shape_window: forced.shape_window,
         out_round_shape: &mut round_shape,
+        out_shape_asks: &mut shape_asks,
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -2112,6 +2118,7 @@ fn verify_round(
     if rc != 0 {
         return Err(last_error());
     }
+    let split = crate::types::splits_shape_asks(handles.len(), shape_asks);
     Ok(committed
         .iter()
         .zip(&extents)
@@ -2125,6 +2132,7 @@ fn verify_round(
                 next_drafts: if drafts.iter().all(|&d| d >= 0) { drafts.to_vec() } else { Vec::new() },
                 redirected: redirected[index] == 1,
                 extended: round_shape == 1,
+                split,
             }
         })
         .collect())

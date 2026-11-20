@@ -153,6 +153,8 @@ export type Speculation = {
   positionAccepted: (number | null)[];
   /** Verify rounds a load ran at each round shape (#689); null where the family is not printed. */
   shapeRounds: { base: number | null; extended: number | null } | null;
+  /** Of the verify rounds, those of two lanes or more some but not all of whose lanes asked the extended shape (#690); null where not printed. */
+  splitRounds: number | null;
 };
 
 /** One expert-cache family: a count per K class and phase. */
@@ -394,6 +396,7 @@ const SPEC_FAMILIES = {
   positionDrafted: "ignis_speculative_position_drafted_total",
   positionAccepted: "ignis_speculative_position_accepted_total",
   shapeRounds: "ignis_speculative_shape_rounds_total",
+  splitRounds: "ignis_speculative_shape_split_rounds_total",
 } as const;
 
 /** The image families (GitHub #324). */
@@ -613,6 +616,7 @@ export function readSnapshot({ families }: Exposition): Snapshot {
       shapeRounds: families.has(SPEC_FAMILIES.shapeRounds)
         ? { base: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "base"]), extended: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "extended"]) }
         : null,
+      splitRounds: valueOf(SPEC_FAMILIES.splitRounds),
     };
   }
 
@@ -792,6 +796,7 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.speculation?.accepted ?? null,
     s.speculation?.shapeRounds?.base ?? null,
     s.speculation?.shapeRounds?.extended ?? null,
+    s.speculation?.splitRounds ?? null,
     ...IMAGE_OUTCOMES.map((outcome) => s.images?.jobs[outcome] ?? null),
     s.images?.images ?? null,
     ...IMAGE_PHASES.map((phase) => s.images?.phaseSeconds[phase] ?? null),

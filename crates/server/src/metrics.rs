@@ -769,6 +769,9 @@ pub struct Metrics {
     spec_rounds: AtomicU64,
     /// GitHub #689: of `spec_rounds`, those at the extended round shape.
     spec_extended_rounds: AtomicU64,
+    /// GitHub #690: of `spec_rounds`, those of two lanes or more some but not
+    /// all of whose lanes asked the extended shape.
+    spec_split_rounds: AtomicU64,
     spec_drafted: AtomicU64,
     spec_accepted: AtomicU64,
     spec_drafted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
@@ -969,6 +972,7 @@ impl Metrics {
             loop_guard_min_ratio: Ratio::new(&LOOP_GUARD_MIN_RATIO_BOUNDS),
             spec_rounds: AtomicU64::new(0),
             spec_extended_rounds: AtomicU64::new(0),
+            spec_split_rounds: AtomicU64::new(0),
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_drafted_at: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1067,6 +1071,7 @@ impl Metrics {
     pub(crate) fn record_speculation(&self, spec: &ignis_core::types::SpecCounters) {
         self.spec_rounds.fetch_add(u64::from(spec.rounds), Ordering::Relaxed);
         self.spec_extended_rounds.fetch_add(u64::from(spec.extended_rounds), Ordering::Relaxed);
+        self.spec_split_rounds.fetch_add(u64::from(spec.split_rounds), Ordering::Relaxed);
         self.spec_drafted.fetch_add(u64::from(spec.drafted), Ordering::Relaxed);
         self.spec_accepted.fetch_add(u64::from(spec.accepted), Ordering::Relaxed);
         for (series, &n) in self.spec_drafted_at.iter().zip(&spec.drafted_at) {
@@ -1878,6 +1883,17 @@ impl Metrics {
             let extended = read(&self.spec_extended_rounds);
             let _ = writeln!(out, "{name}{{shape=\"base\"}} {}", rounds.saturating_sub(extended));
             let _ = writeln!(out, "{name}{{shape=\"extended\"}} {extended}");
+            // GitHub #690: and the rounds of two lanes or more whose lanes did
+            // not all ask the same shape, at whichever shape they ran: 0 on a
+            // load of one shape, where no lane asks.
+            let name = "ignis_speculative_shape_split_rounds_total";
+            declare(
+                &mut out,
+                name,
+                "counter",
+                "Verify rounds of two lanes or more some but not all of whose lanes asked the extended round shape.",
+            );
+            let _ = writeln!(out, "{name} {}", read(&self.spec_split_rounds));
             for (name, help, family) in [
                 (
                     "ignis_speculative_position_drafted_total",
@@ -2320,6 +2336,36 @@ mod tests {
             assert_eq!((at(drafted, position), at(accepted, position)), (want_drafted.to_owned(), want_accepted.to_owned()), "position {position}");
         }
         assert_eq!(text.lines().filter(|line| line.starts_with("ignis_speculative_position_drafted_total{")).count(), 15);
+        // GitHub #690: none of those rounds split its lanes' asks.
+        declared_once(&text, &[("ignis_speculative_shape_split_rounds_total", "counter")]);
+        assert_eq!(value(&text, "ignis_speculative_shape_split_rounds_total", ""), "0");
+    }
+
+    /// GitHub #690: the rounds of two lanes or more whose lanes did not all
+    /// ask the extended shape count apart, whichever shape they ran at, beside
+    /// the rounds by shape: a two-lane pair's three rounds, two of them with
+    /// one lane asking (one run extended, one at the base shape), one with
+    /// both, counted on each lane's request as every round is; a lone lane
+    /// that asked never splits.
+    #[test]
+    fn a_two_shape_loads_split_rounds_count_where_its_lanes_asked_apart() {
+        use ignis_core::types::{splits_shape_asks, SpecCounters};
+        for (lanes, asking, split) in [(1, 0, false), (1, 1, false), (2, 0, false), (2, 1, true), (2, 2, false), (4, 3, true), (4, 4, false)] {
+            assert_eq!(splits_shape_asks(lanes, asking), split, "{asking} of {lanes} lanes asking");
+        }
+        let metrics = Metrics::new();
+        let round = |extended: bool, asking: u32| {
+            SpecCounters::round(15, 9).at_shape(extended).in_split_round(splits_shape_asks(2, asking))
+        };
+        let lane = round(true, 1) + round(false, 1) + round(true, 2);
+        metrics.record_speculation(&lane);
+        metrics.record_speculation(&lane);
+        metrics.record_speculation(&SpecCounters::round(15, 15).at_shape(true).in_split_round(splits_shape_asks(1, 1)));
+        let text = metrics.render();
+        declared_once(&text, &[("ignis_speculative_shape_split_rounds_total", "counter")]);
+        assert_eq!(value(&text, "ignis_speculative_rounds_total", ""), "7");
+        assert_eq!(value(&text, "ignis_speculative_shape_rounds_total", "shape=\"extended\""), "5");
+        assert_eq!(value(&text, "ignis_speculative_shape_split_rounds_total", ""), "4");
     }
 
     /// GitHub #685: the per-position families print the draft positions the

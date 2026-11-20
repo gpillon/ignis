@@ -88,7 +88,9 @@ round for every lane](decode-round.md).
   `ignis_speculative_accepted_tokens_total`, the per-position pair
   `ignis_speculative_position_drafted_total` and
   `ignis_speculative_position_accepted_total`, and from 0.11.0 the rounds at
-  each round shape, `ignis_speculative_shape_rounds_total`
+  each round shape, `ignis_speculative_shape_rounds_total`, and the rounds of
+  two requests or more that did not all ask the same shape,
+  `ignis_speculative_shape_split_rounds_total`
   ([metrics](../reference/metrics.md)).
   They appear after the first speculative request; accepted over rounds is
   your live tokens-per-round.

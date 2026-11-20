@@ -686,6 +686,19 @@ pub struct SpecCounters {
     /// shape; the rest ran at its base shape, the only one of a load at 7
     /// drafts or fewer.
     pub extended_rounds: u32,
+    /// GitHub #690: of `rounds`, those of two lanes or more some but not all
+    /// of whose lanes asked the extended shape going into them
+    /// ([`splits_shape_asks`]), whichever shape they then ran at.
+    pub split_rounds: u32,
+}
+
+/// GitHub #690: whether a verify round of `lanes` lanes, `asking` of which
+/// asked the extended shape going into it, split its lanes' asks: two lanes
+/// or more, some of them asking and some not. A round of one lane runs at
+/// the shape it asks, and in a round whose lanes all ask, or none do, no
+/// lane's shape is another's choice.
+pub fn splits_shape_asks(lanes: usize, asking: u32) -> bool {
+    lanes >= 2 && asking > 0 && (asking as usize) < lanes
 }
 
 /// Draft positions the counters can carry: those a load at the widest
@@ -714,6 +727,7 @@ impl SpecCounters {
             drafted_at,
             accepted_at,
             extended_rounds: 0,
+            split_rounds: 0,
         }
     }
 
@@ -721,6 +735,13 @@ impl SpecCounters {
     /// `extended` (GitHub #689): a verify round's own, read off its run.
     pub fn at_shape(self, extended: bool) -> Self {
         Self { extended_rounds: if extended { self.rounds } else { 0 }, ..self }
+    }
+
+    /// The same counters with every round one that split its lanes' asks of
+    /// the extended shape where `split` (GitHub #690): a verify round's own,
+    /// read off its run.
+    pub fn in_split_round(self, split: bool) -> Self {
+        Self { split_rounds: if split { self.rounds } else { 0 }, ..self }
     }
 
     /// The per-position acceptance as the reference prints it: the
@@ -766,6 +787,7 @@ impl std::ops::Add for SpecCounters {
             drafted_at,
             accepted_at,
             extended_rounds: self.extended_rounds.saturating_add(other.extended_rounds),
+            split_rounds: self.split_rounds.saturating_add(other.split_rounds),
         }
     }
 }

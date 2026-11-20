@@ -64,6 +64,9 @@ pub struct IgnisDecodeOptions {
     /// GitHub #689: the verify round's shape, 0 the base shape or 1 the
     /// extended one; null asks for nothing.
     pub out_round_shape: *mut u32,
+    /// GitHub #690: how many of the verify round's lanes asked the extended
+    /// shape going into it; null asks for nothing.
+    pub out_shape_asks: *mut u32,
 }
 
 /// 1:1 with `struct ignis_prefill_options` (ADR 0016, P2-02, GitHub
@@ -175,11 +178,12 @@ mod tests {
     /// GitHub #267: `ignis_decode_options` with the teacher forcing appended
     /// last, so every field the serving path sets keeps its offset. uint32
     /// size and window, then thirteen pointers, then GitHub #692's uint32
-    /// and its padding; the leaf pins the same numbers
+    /// and its padding, then GitHub #689's and #690's pointers; the leaf
+    /// pins the same numbers
     /// (kernel/include/ignis_step.h) and refuses any other `size`.
     #[test]
     fn the_decode_options_mirror_is_the_leaf_structs_layout() {
-        assert_eq!(std::mem::size_of::<IgnisDecodeOptions>(), 136);
+        assert_eq!(std::mem::size_of::<IgnisDecodeOptions>(), 144);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_logits), 72);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_tokens), 80);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut_lanes), 88);
@@ -189,6 +193,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_shape_window), 120);
         // GitHub #689: the round's shape, after the forced shape.
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_round_shape), 128);
+        // GitHub #690: how many lanes asked it, last.
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_shape_asks), 136);
     }
 
     /// GitHub #520: `keeps_draw` filled the tail padding after
