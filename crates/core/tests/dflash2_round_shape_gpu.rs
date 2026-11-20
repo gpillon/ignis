@@ -317,8 +317,12 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
             }
             // And while it does not ask: a short base round leaves it at the
             // base shape, and `extended` forces it there.
-            round(&mut [&mut lane], &mut ask, EXIT_BUDGET, Some("extended"), "part 1: a forced extended round of 3 drafts");
+            round(&mut [&mut lane], &mut ask, EXIT_BUDGET, None, "part 1: a round of 3 drafts, after which the lane does not ask");
             round(&mut [&mut lane], &mut ask, 3, None, "part 1: a short base round of a lane that does not ask");
+            if ask[0] {
+                missing.push("part 1: a lane that did not ask asks after a base round its budget cut short".into());
+            }
+            round(&mut [&mut lane], &mut ask, EXIT_BUDGET, Some("extended"), "part 1: `extended` forces a lane that does not ask");
             round(&mut [&mut lane], &mut ask, 0, None, "part 1: after it, the base shape");
         }
 
