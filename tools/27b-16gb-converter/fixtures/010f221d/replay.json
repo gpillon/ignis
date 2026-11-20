@@ -1,0 +1,201 @@
+{
+ "schema": "qwen3.8-27b-trellis-replay-v1",
+ "status": "complete",
+ "layers": [
+  1,
+  3
+ ],
+ "sources": {
+  "quant": {
+   "repo": "turboderp/Qwen3.8-27B-exl3",
+   "branch": "SC_3.00bpw_H4",
+   "revision": "86b95530f9d365d90dd24d01a997a8de0cdf6c55",
+   "made_with_exllamav3": "1.4.2"
+  },
+  "base": {
+   "repo": "Qwen/Qwen3.8-27B",
+   "revision": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "abliterated": {
+   "repo": "someone/abliterated",
+   "revision": "fedcba9876543210fedcba9876543210fedcba98",
+   "how": "the base BF16 with these tensors laid over it, taken by HTTP range",
+   "tensors": {
+    "model.language_model.layers.1.linear_attn.out_proj.weight": "c4cf1711ec6a639a2403074109502a2e796392b6b7984cadc64a83c398e09044",
+    "model.language_model.layers.1.mlp.down_proj.weight": "1a67fb66c38c992a2843512ddcbe926e2c74c54f40c2b75f0a83502d5244241a",
+    "model.language_model.layers.2.linear_attn.out_proj.weight": "8cc5ed68ef456562e1088d1cf4cd3c610c616a88f417882b37d5bf4a8709e314",
+    "model.language_model.layers.2.mlp.down_proj.weight": "428c2663625f40e5b26db6f86bf3df20ea7aa28a6b776574e6e1ab2125865d88",
+    "model.language_model.layers.3.mlp.down_proj.weight": "49a198241840d531c0d9946759682c58d9a3004ed0b912ee7712372f8e8ec1be",
+    "model.language_model.layers.3.self_attn.o_proj.weight": "5b34d6bb99943b63be054e749d4383964b5217163951043dccf263e7b2e0020e"
+   }
+  }
+ },
+ "calibration": {
+  "file": "cal_trace.safetensors",
+  "repo": "turboderp/Qwen3.8-27B-exl3",
+  "revision": "86b95530f9d365d90dd24d01a997a8de0cdf6c55",
+  "sha256": "08d66ec004674a329a1402b420c5ec59affdf9ffbcd5eb5bf18d2cffce714ebd",
+  "rows": 4,
+  "cols": 16,
+  "excluded_rows": []
+ },
+ "quantizer": {
+  "exllamav3": "1.5.3",
+  "call": "exllamav3.conversion.convert_model's make_quant_args, get_H_data and Linear.convert_exl3, per matrix, on one device",
+  "args": {
+   "apply_out_scales": true,
+   "codebook": "mul1",
+   "hessians_reg": 0.025
+  },
+  "seed": "the layer's module index, L+1",
+  "capture": "layer L of the abliterated BF16, run whole, on the state through layers 0..L-1 as quantized"
+ },
+ "control": {
+  "rel_error": {
+   "max": 0.305,
+   "mean": 0.3025
+  },
+  "quant_rel_error_base": {
+   "max": 0.205,
+   "mean": 0.2025
+  },
+  "quant_rel_error_abliterated": {
+   "max": 0.405,
+   "mean": 0.4025
+  }
+ },
+ "matrices": {
+  "model.language_model.layers.1.linear_attn.out_proj": {
+   "layer": 1,
+   "seed": 2,
+   "K": 4,
+   "format": "TRELLIS_MUL1_K4",
+   "shape": [
+    128,
+    128
+   ],
+   "proxy_err": 0.0078277587890625,
+   "g_scale": 1.125244140625,
+   "q_fallback": false,
+   "apply_out_scales": true,
+   "seconds": 0.0,
+   "rel_error": 0.3,
+   "quant_rel_error_base": 0.2,
+   "quant_rel_error_abliterated": 0.4,
+   "record_sha256": "5313f837a73fa97f0345db0374d130919714bba26a09f6cac7758ad93b79a7c7"
+  },
+  "model.language_model.layers.1.mlp.down_proj": {
+   "layer": 1,
+   "seed": 2,
+   "K": 3,
+   "format": "TRELLIS_MUL1_K3",
+   "shape": [
+    128,
+    256
+   ],
+   "proxy_err": 0.01715373992919922,
+   "g_scale": 1.2744598388671875,
+   "q_fallback": false,
+   "apply_out_scales": true,
+   "seconds": 0.0,
+   "rel_error": 0.301,
+   "quant_rel_error_base": 0.201,
+   "quant_rel_error_abliterated": 0.401,
+   "record_sha256": "d2e6655c29afa6c223e46e1c27a4b25f8fb53f51baedf61356642c2b9b30ff35"
+  },
+  "model.language_model.layers.2.linear_attn.out_proj": {
+   "layer": 2,
+   "seed": 3,
+   "K": 4,
+   "format": "TRELLIS_MUL1_K4",
+   "shape": [
+    128,
+    128
+   ],
+   "proxy_err": 0.014451980590820312,
+   "g_scale": 1.231231689453125,
+   "q_fallback": false,
+   "apply_out_scales": true,
+   "seconds": 0.0,
+   "rel_error": 0.302,
+   "quant_rel_error_base": 0.202,
+   "quant_rel_error_abliterated": 0.402,
+   "record_sha256": "3fe99463cd5e69e95dd1dba20bc612487616882d3c3ec2e08b735929860039bd"
+  },
+  "model.language_model.layers.2.mlp.down_proj": {
+   "layer": 2,
+   "seed": 3,
+   "K": 3,
+   "format": "TRELLIS_MUL1_K3",
+   "shape": [
+    128,
+    256
+   ],
+   "proxy_err": 0.02422809600830078,
+   "g_scale": 1.3876495361328125,
+   "q_fallback": false,
+   "apply_out_scales": true,
+   "seconds": 0.0,
+   "rel_error": 0.303,
+   "quant_rel_error_base": 0.203,
+   "quant_rel_error_abliterated": 0.403,
+   "record_sha256": "34dd6b5af6b58e6d266822edc7a63550fed7950b0d6c11031932475a671fd7f3"
+  },
+  "model.language_model.layers.3.self_attn.o_proj": {
+   "layer": 3,
+   "seed": 4,
+   "K": 4,
+   "format": "TRELLIS_MUL1_K4",
+   "shape": [
+    128,
+    128
+   ],
+   "proxy_err": 0.02499866485595703,
+   "g_scale": 1.3999786376953125,
+   "q_fallback": false,
+   "apply_out_scales": true,
+   "seconds": 0.0,
+   "rel_error": 0.304,
+   "quant_rel_error_base": 0.204,
+   "quant_rel_error_abliterated": 0.404,
+   "record_sha256": "8b20eda6924e38ac1b7a7c7a7b14f4ccde23c4aade494c6c3321e40784bd8c16"
+  },
+  "model.language_model.layers.3.mlp.down_proj": {
+   "layer": 3,
+   "seed": 4,
+   "K": 3,
+   "format": "TRELLIS_MUL1_K3",
+   "shape": [
+    128,
+    256
+   ],
+   "proxy_err": 0.010980606079101562,
+   "g_scale": 1.175689697265625,
+   "q_fallback": false,
+   "apply_out_scales": true,
+   "seconds": 0.0,
+   "rel_error": 0.305,
+   "quant_rel_error_base": 0.205,
+   "quant_rel_error_abliterated": 0.405,
+   "record_sha256": "aba6292566d9f78a465b6ccf91257e14d84cef26c32f6dc03c0d1aa7f12380b3"
+  }
+ },
+ "command": "python tools/27b-16gb-converter/replay.py run --quant <quant> --bf16 <bf16> --abliterated <abliterated> --out <out>",
+ "converter": {
+  "tool": "tools/27b-16gb-converter",
+  "commit": "0000000000000000000000000000000000000000",
+  "dirty": false
+ },
+ "versions": {
+  "python": "3.11.9",
+  "torch": "2.13.0",
+  "exllamav3": "1.5.3",
+  "safetensors": "0.6.2"
+ },
+ "gpu": {
+  "name": "a test GPU",
+  "peak_allocated_bytes": 3221225472,
+  "peak_reserved_bytes": 4294967296
+ },
+ "seconds": 0
+}

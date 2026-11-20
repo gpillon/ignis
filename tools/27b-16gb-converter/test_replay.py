@@ -1,13 +1,14 @@
 import hashlib
 import json
 import os
+import re
 import struct
 
 import pytest
 
 import exl3
 import replay
-from conftest import make_sources, write_safetensors
+from conftest import body_k, make_sources, write_safetensors
 
 P = "model.language_model.layers."
 
@@ -228,6 +229,198 @@ def test_the_records_are_an_exl3_directory_of_the_plans_matrices_at_the_quants_k
             "matrices": {m.key: {"record_sha256": hashlib.sha256(records.record(records.matrix(m.key))).hexdigest()}
                          for m in planned}}, f)
     assert override.Override(out).problems(convert.text_matrices(quant)[0]) == []
+
+
+# --- the replay's GPU step on the CPU (#703) ---
+
+from conftest import (BF16_REVISION, CAL_TRACE, OVERRIDE_REPO, OVERRIDE_REVISION, REVISION, ReplayExllamav3,  # noqa: E402
+                      frozen, make_replay_sources, replay_argv)
+
+
+def _timeless(record):
+    """The record without its clock: the run's seconds and each matrix's."""
+    out = {k: v for k, v in record.items() if k != "seconds"}
+    out["matrices"] = {k: {f: v for f, v in m.items() if f != "seconds"} for k, m in record["matrices"].items()}
+    return out
+
+
+def replayed(tmp_path, monkeypatch, local=False, name="src"):
+    """`replay.py run` on the reduced sources (downloaded, or `local` at its recipe with its pins and trace),
+    on the CPU: (sources, stub, exit code, the records directory)."""
+    src = make_replay_sources(str(tmp_path / name), local=local)
+    stub = ReplayExllamav3(src).install(monkeypatch)
+    out = str(tmp_path / name / "override")
+    extra = ("--recipe", src["recipe"], "--quant-pins", src["pins"], "--trace", src["trace"]) if local else ()
+    code = replay.main(replay_argv(src, out, *extra), recipes=src["recipes"])
+    return src, stub, code, out
+
+
+def test_a_downloaded_quants_replay_writes_the_record_it_wrote_before(tmp_path, monkeypatch, capsys):
+    src, stub, code, out = replayed(tmp_path, monkeypatch)
+    assert code == 0, capsys.readouterr().out
+    with open(os.path.join(out, "replay.json"), encoding="utf-8") as f:
+        record = json.load(f)
+    # key for key, value for value, in the same order: only the clock differs
+    assert json.dumps(_timeless(record)) == json.dumps(_timeless(frozen("replay.json")))
+    assert stub.calibration["cal_data"] == os.path.join(src["quant"], CAL_TRACE)
+    assert [(k[len(P):], seed, K) for k, seed, K in stub.quantized] == [
+        ("1.linear_attn.out_proj", 2, 4), ("1.mlp.down_proj", 2, 3), ("2.linear_attn.out_proj", 3, 4),
+        ("2.mlp.down_proj", 3, 3), ("3.self_attn.o_proj", 4, 4), ("3.mlp.down_proj", 4, 3)]
+
+
+def test_a_local_quants_replay_names_it_by_its_pins_file_and_the_trace_by_its_recipes_pin(tmp_path, monkeypatch,
+                                                                                          capsys):
+    import convert
+    src, stub, code, out = replayed(tmp_path, monkeypatch, local=True)
+    assert code == 0, capsys.readouterr().out
+    with open(os.path.join(out, "replay.json"), encoding="utf-8") as f:
+        record = json.load(f)
+    trace = os.path.join(src["trace"], CAL_TRACE)
+    assert record["sources"]["quant"] == {
+        "recipe": {"name": "ig28a", "sha256": _sha256(os.path.join(src["recipes"], "ig28a.json"))}, "revision": None,
+        "pins": {"file": "quant.pins.json", "bytes": os.path.getsize(src["pins"]), "sha256": _sha256(src["pins"])},
+        "made_with_exllamav3": "1.5.3"}
+    assert record["calibration"] == {"file": CAL_TRACE, "recipe": "ig28a", "bytes": os.path.getsize(trace),
+                                     "sha256": _sha256(trace), "rows": 4, "cols": 16, "excluded_rows": []}
+    assert stub.calibration["cal_data"] == trace
+    # the command names every path by its role; nothing names the downloaded quant
+    assert record["command"] == ("python tools/27b-16gb-converter/replay.py run --quant <quant> --bf16 <bf16> "
+                                 "--abliterated <abliterated> --out <out> --recipe ig28a --quant-pins <quant-pins> "
+                                 "--trace <trace>")
+    text = json.dumps(record)
+    assert convert.REPO not in text and convert.BRANCH not in text and str(tmp_path) not in text
+    # the rest is the downloaded quant's record: the same matrices at the same K, records, errors and sources
+    def rest(r):
+        return {k: v for k, v in _timeless(r).items() if k not in ("calibration", "command")} | {
+            "sources": {k: v for k, v in r["sources"].items() if k != "quant"}}
+    assert rest(record) == rest(frozen("replay.json"))
+    with open(os.path.join(out, "quantization_config.json"), encoding="utf-8") as f:
+        assert json.load(f)["bits"] == 2.79
+
+
+def _local(src, *extra):
+    return ("--quant-pins", src["pins"], "--trace", src["trace"], *extra)
+
+
+def _said(capsys):
+    return capsys.readouterr().out.splitlines()
+
+
+# The reduced model's abliterated layers, for a command that runs without the stub (which sets them).
+LAYERS = ("--first", "1", "--last", "3")
+
+
+def test_the_check_takes_a_local_quant_at_its_recipe_with_its_pins_and_the_trace_its_recipe_pins(tmp_path, capsys):
+    src = make_replay_sources(str(tmp_path), local=True)
+    out = str(tmp_path / "override")
+    # at the default recipe, sc30, the local quant is refused as today: its configuration is not sc30's
+    assert replay.main(replay_argv(src, out, "--check", *LAYERS, *_local(src)), recipes=src["recipes"]) == 2
+    assert _said(capsys)[-1] == "REFUSED: the quant's quantization_config.json has bits = 2.79, not 3.0"
+    assert replay.main(replay_argv(src, out, "--check", *LAYERS, *_local(src, "--recipe", "ig28a")), recipes=src["recipes"]) == 0
+    said = _said(capsys)
+    assert said[-3] == ("plan: 6 matrices, layers 1-3: linear_attn.out_proj K4 x2; mlp.down_proj K3 x3; "
+                        "self_attn.o_proj K4 x1")
+    assert said[-2] == (f"sources: quant converted locally at the recipe ig28a, pinned by quant.pins.json "
+                        f"(sha256 {_sha256(src['pins'])}), base {BF16_REVISION}, abliterated "
+                        f"{OVERRIDE_REPO}@{OVERRIDE_REVISION}, {CAL_TRACE} {_sha256(os.path.join(src['trace'], CAL_TRACE))} "
+                        f"(the recipe ig28a's pin)")
+    assert said[-1] == "CHECK PASS"
+    assert not os.path.exists(out)
+
+
+def test_the_check_of_a_downloaded_quant_names_its_revision_and_the_plans_k(tmp_path, capsys):
+    src = make_replay_sources(str(tmp_path))
+    assert replay.main(replay_argv(src, str(tmp_path / "override"), "--check", *LAYERS), recipes=src["recipes"]) == 0
+    said = _said(capsys)
+    assert said[-3].startswith("plan: 6 matrices, layers 1-3: linear_attn.out_proj K4 x2;")
+    assert said[-2] == (f"sources: quant {REVISION}, base {BF16_REVISION}, abliterated {OVERRIDE_REPO}@{OVERRIDE_REVISION}, "
+                        f"{CAL_TRACE} {_sha256(os.path.join(src['quant'], CAL_TRACE))} (its LFS oid)")
+    assert said[-1] == "CHECK PASS"
+
+
+def _sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _flip_last_byte(path):
+    with open(path, "r+b") as f:
+        f.seek(-1, os.SEEK_END)
+        last = f.read(1)
+        f.seek(-1, os.SEEK_END)
+        f.write(bytes([last[0] ^ 1]))
+
+
+def _edit(path, change):
+    with open(path, encoding="utf-8") as f:
+        value = json.load(f)
+    change(value)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(value, f)
+
+
+def _recipe(src, **fields):
+    from conftest import IG28A_CONFIG, pin_dir, write_recipe
+    write_recipe(os.path.join(src["recipes"], "ig28a.json"), **({"weights_id": "trellis-ig28a",
+                 "quantization_config": IG28A_CONFIG, "files": pin_dir(src["trace"])} | fields))
+
+
+SHARD2 = "model-00002-of-00002.safetensors"
+TRACE_SHA = r"[0-9a-f]{64}"
+
+
+@pytest.mark.parametrize("change,message", [
+    # a quant file whose bytes or sha256 are not its pin's, or that its pins do not cover
+    (lambda s: _flip_last_byte(os.path.join(s["quant"], SHARD2)), f"{SHARD2} hashes to {TRACE_SHA}, its pin is {TRACE_SHA}$"),
+    (lambda s: _edit(s["pins"], lambda p: p["files"]["model-00001-of-00002.safetensors"].update(bytes=1)),
+     r"model-00001-of-00002\.safetensors is \d+ bytes, its pin is 1$"),
+    (lambda s: _edit(s["pins"], lambda p: p["files"].pop("config.json")),
+     r"config\.json: .*quant\.pins\.json gives no bytes and sha256 for it$"),
+    (lambda s: _edit(s["pins"], lambda p: p.pop("files")), r"quant\.pins\.json has no `files`"),
+    # a trace whose bytes or sha256 are not its recipe's pin, or that the recipe does not pin
+    (lambda s: _flip_last_byte(os.path.join(s["trace"], CAL_TRACE)),
+     f"cal_trace.safetensors hashes to {TRACE_SHA}, the recipe ig28a's pin is {TRACE_SHA}$"),
+    (lambda s: open(os.path.join(s["trace"], CAL_TRACE), "ab").write(b"\0"),
+     r"cal_trace\.safetensors is \d+ bytes, its pin is \d+$"),
+    (lambda s: os.remove(os.path.join(s["trace"], CAL_TRACE)), r"cal_trace\.safetensors is pinned, and missing from "),
+    (lambda s: _recipe(s, files={}), r"cal_trace\.safetensors: the recipe ig28a gives no bytes and sha256 for it$"),
+    # a quant that is not the named recipe's: its configuration, a matrix's K
+    (lambda s: _edit(os.path.join(s["quant"], "quantization_config.json"), lambda c: c.update(out_scales="auto")),
+     "the quant's quantization_config.json has out_scales = 'auto', not 'always'$"),
+    (lambda s: _recipe(s, tensors=body_k() | {P + "0.mlp.down_proj": 2}),
+     r"the quant is not the recipe ig28a's:\n  model\.language_model\.layers\.0\.mlp\.down_proj: K 3, the recipe's is 2$"),
+])
+def test_a_local_quant_whose_pins_trace_or_recipe_do_not_hold_is_refused_naming_the_file_or_field(
+        tmp_path, capsys, change, message):
+    src = make_replay_sources(str(tmp_path), local=True)
+    change(src)
+    out = tmp_path / "override"
+    for check in (("--check",), ()):     # the GPU step checks what the check does, before the GPU
+        argv = replay_argv(src, str(out), *check, *LAYERS, *_local(src, "--recipe", "ig28a"))
+        assert replay.main(argv, recipes=src["recipes"]) == 2
+        said = capsys.readouterr().out
+        assert said.startswith("REFUSED: ") and re.search(message, said.strip(), re.M), said
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("local,argv,message", [
+    (True, ("--recipe", "ig28a", "--quant-pins", "{pins}"), "a quant converted locally .--quant-pins. takes --trace"),
+    (True, ("--recipe", "ig28a", "--trace", "{trace}"), "--trace is a quant converted locally's, with --quant-pins"),
+    # without its pins a local quant is refused as a quant with no download record
+    (True, ("--recipe", "sc30",), "bits = 2.79, not 3.0"),
+    (False, ("--recipe", "ig28a"), "a downloaded quant is named turboderp/Qwen3.8-27B-exl3 SC_3.00bpw_H4, the recipe "
+                                   "sc30's: the recipe ig28a is replayed from a quant converted locally"),
+    (False, ("--recipe", "ig28c"), "no recipe 'ig28c' in .* .its recipes: ig28a, sc30."),
+])
+def test_a_quant_named_as_the_other_kind_or_at_no_recipe_is_refused(tmp_path, capsys, local, argv, message):
+    src = make_replay_sources(str(tmp_path), local=local)
+    if not local:
+        _recipe(dict(src, trace=src["quant"]))
+    argv = [a.format(**src) for a in argv]
+    assert replay.main(replay_argv(src, str(tmp_path / "override"), "--check", *LAYERS, *argv),
+                       recipes=src["recipes"]) == 2
+    said = capsys.readouterr().out
+    assert said.startswith("REFUSED: ") and re.search(message, said), said
 
 
 def test_records_not_the_plans_are_named(tmp_path):

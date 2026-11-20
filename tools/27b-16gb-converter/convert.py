@@ -136,6 +136,12 @@ def read_pins(path, root, names):
     return pins_of(files, path, root, names)
 
 
+def pins_file(path):
+    """How a record names a local quant's pins file `path`: its name, bytes and sha256 (the conversion's
+    `source.pins`, the replay's `sources.quant.pins`)."""
+    return {"file": os.path.basename(path), "bytes": os.path.getsize(path), "sha256": work.file_digest(path)}
+
+
 def pins_of(files, source, root, names):
     """{name: {bytes, sha256}}: each file of `names` under `root` by its pin in `files` (a pins file's or a
     recipe's, `source` names it), which it must have, and of its size. Refused names the file."""
@@ -302,18 +308,20 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     # (~20 GB, ~75 GB with the BF16 reference) run beside it.
     quant_files = list(quant.shards) + list(QUANT_META)
     if quant_pins is None:
-        quant_revision = revision_of(quant_root, quant_files, "the quant")
+        quant_revision, pinned_by = revision_of(quant_root, quant_files, "the quant"), None
         pins = pins_of(named["files"], f"the recipe {named['name']}", quant_root, quant_files)
     else:
         # A local conversion has no hub revision: its pins stand for the download record.
         quant_revision, pins = None, read_pins(quant_pins, quant_root, quant_files)
+        pinned_by = pins_file(quant_pins)
     bf16_files = [] if skip_errors else bf16_shards(bf16_root) + [INDEX]
     bf16_revision = revision_of(bf16_root, bf16_files, "the BF16 checkpoint") if bf16_files else None
     ov_files, ov_reference = [], None
     if override is not None:
-        if override.quant_revision != quant_revision:
-            raise Refused(f"the override was made against the quant at {override.quant_revision}, "
-                          f"this is {quant_revision}")
+        # Made against this quant: a downloaded one's revision, a local one's pins (#703).
+        unlike = override.made_against(quant_revision, pinned_by)
+        if unlike:
+            raise Refused(unlike)
         ov_files = list(override.quant.shards) + list(OVERRIDE_META)
         try:
             ov_reference = override.pin_reference()
@@ -404,9 +412,7 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
             "quantization_config": {k: quant.config.get(k) for k in named["quantization_config"]},
             "files": pinned,
             # A local conversion: the pins its files were checked against.
-            **({} if quant_pins is None else {"pins": {"file": os.path.basename(quant_pins),
-                                                       "bytes": os.path.getsize(quant_pins),
-                                                       "sha256": work.file_digest(quant_pins)}}),
+            **({} if quant_pins is None else {"pins": pinned_by}),
         },
         "served": {
             "file": os.path.basename(served_path),
@@ -455,6 +461,8 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
             "files": ov_pinned,
             "matrices": sorted(n for n, t in trellis.items() if t.get("override")),
             "quant_revision": override.quant_revision,
+            # Made against a local quant: its pins file, as `source.pins` names the quant converted.
+            **({} if override.quant_pins is None else {"quant_pins": override.quant_pins}),
             # Their errors are measured against the BF16 the override was made from, pinned by tensor.
             "reference": ov_reference,
         }
