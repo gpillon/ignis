@@ -7,8 +7,10 @@
 # worktree, command), that a refusal is at once and a wait ends at its limit, both naming the
 # holder, that a dead holder or a reused pid is free, that two takers of one stale record never
 # both win, and that a start hands the lock to the server and a stop or a failed start frees
-# it. Linux only (/proc). IGNIS_GPU_LOCK_DIR and TMPDIR point under a temporary directory it
-# removes, so the machine's lock and the profile's marker are never read or written.
+# it; and that the real Makefile's `make watch CUDA=1` runs cargo-watch as gpu-run's command,
+# refused at once, with stand-ins for cargo and the hook. Linux only (/proc).
+# IGNIS_GPU_LOCK_DIR and TMPDIR point under a temporary directory it removes, so the machine's
+# lock and the profile's marker are never read or written.
 
 set -uo pipefail
 
@@ -312,6 +314,22 @@ expect_code "make gpu-run, held" 2
 says "make gpu-run, held" "the card is held ($lock) by pid $first"
 [ ! -e "$tmp/state/gpu-run" ] || fail "make gpu-run, held: the command ran"
 lockctl release --pid "$first"
+
+# make watch, the real Makefile's recipe: with CUDA=1 cargo-watch is gpu-run's command, the lock
+# refused at once (no wait) and the guard as GPU_CHECK says; cargo and GPU_RUN are stand-ins
+# that print what they are given.
+watch_in() { make -C "$repo" --no-print-directory watch CARGO=true \
+    GPU_RUN='echo "run wait=$(GPU_LOCK_WAIT) guard=$$IGNIS_MK_GPU_GUARD: $$IGNIS_MK_GPU_CMD"' "$@"; }
+capture watch_in CUDA=1
+expect_code "make watch CUDA=1" 0
+says "make watch CUDA=1" "run wait=0 guard=1:"
+says "make watch CUDA=1" " true watch --why "
+capture watch_in CUDA=1 GPU_CHECK=0
+says "make watch CUDA=1 GPU_CHECK=0" "run wait=0 guard=0:"
+capture watch_in CUDA=0
+expect_code "make watch CUDA=0" 0
+! grep -qF "run wait=" <<< "$out" || fail "make watch CUDA=0: it ran under the lock:
+$out"
 
 if [ "$failed" -ne 0 ]; then
     printf 'gpu-lock-selftest: %d failure(s)\n' "$failed" >&2
