@@ -7,7 +7,8 @@ sidebar:
 
 Decoding one token at a time leaves the card waiting on the weight stream. The
 27B artifact carries a small drafter, **DFlash2**, grafted in beside the
-weights. After every token it proposes up to seven more; the model checks them
+weights. After every token it proposes up to seven more (from 0.11.0, up to
+fifteen under the `rtx5090` profile); the model checks them
 all in one pass and keeps the ones it would have chosen itself. On coding
 prompts that commits **5.43 tokens a round at one lane**, and one lane decodes
 at **367 tok/s**. Because the model decides, the output is the model's own, not
@@ -57,6 +58,7 @@ The full round, draft by draft:
 | 491 tok/s on predictable code, 167 tok/s on free prose, one lane, greedy | retained-slots build | [Retained slots on the host](../../findings/2026-09-28-retained-slots-on-the-host.md) |
 | **3.46 tokens a round** on 200 recorded agent turns, the fixed draft | teacher-forced replay, T=1.0, top_p 0.95, top_k 20, 7 drafts | [Sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md) |
 | **3.83 tokens a round** on the same turns under the sampled draft, the default from 0.11.0, against 3.45 under the fixed draft (+10.9%) | the same replay on the RTX 5090 | [The sampled draft served](../../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md) |
+| From 0.11.0, up to 15 drafts under `rtx5090`: a JSON answer **13.4 tokens a round** (7.9 at 7 drafts), 800 tok/s against 529 | one lane, greedy, the 27B NVFP4, FP8 exception weights, context 262,144, RTX 5090, alternated launches | [DFlash2 at 15 drafts served](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md) |
 
 :::caution[Greedy coding is the best case]
 The 367 and 1,065 tok/s are greedy coding numbers. Agent traffic samples, and
@@ -78,8 +80,8 @@ round for every lane](decode-round.md).
   [`spec.draft_tokens`](../reference/configuration.md#specdraft_tokens), 1 to 15
   (from 0.11.0; 1 to 7 before) and required with `dflash2`; past 7 the load holds
   [two round shapes](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
-  The built-in `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles set
-  `dflash2` at 7.
+  The built-in `rtx5090` profile sets `dflash2` at 15 (from 0.11.0; 7
+  before), and `rtxpro6000`, `rtx-16gb` and `rtx-24gb` at 7.
 - **The proposal head**: [`spec.draft_head`](../reference/configuration.md#specdraft_head),
   `full` or `shortlist`. The `ignis.runtime.draft_head` log line prints the
   choice at load.

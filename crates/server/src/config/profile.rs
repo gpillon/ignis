@@ -182,7 +182,15 @@ pub const NONE_PROFILE: &str = "none";
 /// as at 1,024, and against 1,024 it measured +1.9% / +2.2% cold prefill at
 /// 46K / 105K, the same at 8K / 14K, a lower 4K KLD and decode unchanged; a
 /// decoding lane's longest pause while a prompt prefills grows ~65% (finding
-/// 2026-10-21-the-27b-prefill-chunk-at-2048). Flash-Next's leg holds its decode
+/// 2026-10-21-the-27b-prefill-chunk-at-2048). It drafts up to 15 tokens a
+/// round with DFlash2 (spec #684, GitHub #696), each verify round at the base
+/// or the extended shape the shape rule and policy choose: served on this card
+/// against main at 7 drafts (2026-11-20), structured output decoded 24.6 to
+/// 64.3% faster, no free-text cell fell more than 2% below main, plain decode,
+/// the context and the KV pages held, and the first token of a cold 16K prompt
+/// came 8 ms (0.7%) later at the edge of the legs' spread, which the owner
+/// took as noise (finding 2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090).
+/// Flash-Next's leg holds its decode
 /// lanes at their own default (3), in its own section since the 27B takes the
 /// field too and keeps its 8 (GitHub #336), and raises `model.max_context` to
 /// 512K + 32K + 32K tokens, the floor the owner asked for on both the expert
@@ -239,7 +247,7 @@ pub const NONE_PROFILE: &str = "none";
 /// 20 GiB.
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
-/// DFlash2 at 7 tokens, as the other profiles, and vision on, explicit
+/// DFlash2 at 7 tokens, as every other profile but `rtx5090`, and vision on, explicit
 /// (ADR 0063 as amended by ADR 0075): at a 4,096-token envelope, an item bound
 /// of about 2,048 x 2,048 pixels, and residency `host`, written out so the
 /// profile table shows it. The tower sits in pinned host RAM and the pool is
@@ -293,10 +301,12 @@ pub const NONE_PROFILE: &str = "none";
 ///
 /// `rtx-24gb` is the 24 GB class (GitHub #480, spec #474): the RTX 3090 and
 /// RTX 4090, the cards `--profile auto` finds from 20 GiB up to 28 GiB. It
-/// takes the RTX 5090 profile's 27B values: `vram.qwen38.headroom_bytes`
-/// 1200M, a 2,048-token prefill chunk, DFlash2 at 7 tokens, vision on with
-/// residency `host` at the default envelope, and the decode lanes (8) and the
-/// drafter's head at their defaults. Like `rtx-16gb` it names no model: no
+/// takes the RTX 5090 profile's 27B values but its draft window:
+/// `vram.qwen38.headroom_bytes` 1200M, a 2,048-token prefill chunk, DFlash2
+/// at 7 tokens where the 5090 drafts 15 (GitHub #696: no 24 GB card has
+/// measured a window past 7), vision on with residency `host` at the default
+/// envelope, and the decode lanes (8) and the drafter's head at their
+/// defaults. Like `rtx-16gb` it names no model: no
 /// built-in entry states the 24 GB class, the 32 GB ones stay above it and the
 /// 16 GB ones fit it, so a start with no artifact resolves the default id
 /// `qwen3.8-27b` through the catalog's class-aware alias to the 16 GB entry.
@@ -349,7 +359,7 @@ const BUILT_IN: &str = r#"{
         },
         "vision": { "residency": "host", "qwen38": { "enabled": true } },
         "spec": {
-            "qwen38": { "backend": "dflash2", "draft_tokens": 7 },
+            "qwen38": { "backend": "dflash2", "draft_tokens": 15 },
             "qwen38flashnext": { "decode_lanes": 3 }
         }
     },
@@ -643,6 +653,18 @@ mod tests {
         let backend = field("spec", "backend").unwrap();
         assert_eq!(rtx5090.get(backend, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "dflash2");
         assert!(rtx5090.get(backend, Some(ModelFamily::FlashNext)).is_none(), "Flash-Next keeps speculation off here");
+        // GitHub #696: the served gate of spec #684 passed on this card, so the
+        // 27B drafts up to 15 tokens a round here, and a start resolves it so.
+        let draft = field("spec", "draft_tokens").unwrap();
+        assert_eq!(rtx5090.get(draft, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "15");
+        assert!(rtx5090.get(draft, Some(ModelFamily::FlashNext)).is_none() && rtx5090.get(draft, None).is_none());
+        {
+            use super::super::source::{resolve_settings, Fit, Sources};
+            let sources = Sources { profile: rtx5090.clone(), ..Sources::default() };
+            let spec = resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.spec;
+            let backend = Some(super::super::SpecChoice::Backend(ignis_core::SpeculativeBackend::Dflash2));
+            assert_eq!((spec.backend, spec.draft_tokens), (backend, Some(15)));
+        }
 
         // GitHub #336: both models take the lanes, so the profile scopes
         // Flash-Next's 3 to its own section; the 27B keeps its own 8.
@@ -803,7 +825,8 @@ mod tests {
 
     /// GitHub #480: `rtx-24gb` is the RTX 5090 profile's 27B values at the
     /// context measured for the 24 GB class, and nothing else: no Flash-Next
-    /// section, no general value, the lanes and the drafter's head unset.
+    /// section, no general value, the lanes and the drafter's head unset; and
+    /// (GitHub #696) DFlash2 at 7 drafts where the 5090's profile drafts 15.
     #[test]
     fn the_rtx_24gb_profile_takes_the_5090s_27b_values_at_its_measured_context() {
         use ignis_core::compute::ModelFamily::{FlashNext, Qwen38_27b};
@@ -836,9 +859,11 @@ mod tests {
         // GitHub #489: Flash-Next's section holds its prefill chunk alone.
         let flash: Vec<_> = rtx24.entries().filter(|(_, family, _)| *family == Some(FlashNext)).map(|(meta, _, _)| meta.name).collect();
         assert_eq!(flash, ["prefill_chunk"], "Flash-Next's section");
-        // The values the 5090's profile gives the 27B, but its context.
+        // The values the 5090's profile gives the 27B, but its context and,
+        // since GitHub #696, its draft window: the 5090's 15 is measured on
+        // the 5090 alone, so this class keeps 7 (asserted above).
         let rtx5090 = &profiles["rtx5090"];
-        for (group, name) in [("vram", "headroom_bytes"), ("model", "prefill_chunk"), ("spec", "backend"), ("spec", "draft_tokens"), ("spec", "decode_lanes"), ("spec", "draft_head")] {
+        for (group, name) in [("vram", "headroom_bytes"), ("model", "prefill_chunk"), ("spec", "backend"), ("spec", "decode_lanes"), ("spec", "draft_head")] {
             let meta = field(group, name).unwrap();
             let raw = |layer: &Layer| layer.get(meta, Some(Qwen38_27b)).map(|candidate| candidate.raw.clone());
             assert_eq!(raw(rtx24), raw(rtx5090), "{group}.{name}");
@@ -884,8 +909,8 @@ mod tests {
 
     /// GitHub #695 (spec #684): a DFlash2 load may name up to 15 drafts on any
     /// card, unmeasured for speed off the RTX 5090, so every built-in profile
-    /// but `rtx5090`, whose default moves on the spec's served gate, gives the
-    /// 27B DFlash2 at 7, the trellis body's `rtx-16gb` and `rtx-24gb`
+    /// but `rtx5090`, whose default moved to 15 on the spec's served gate
+    /// (GitHub #696), gives the 27B DFlash2 at 7, the trellis body's `rtx-16gb` and `rtx-24gb`
     /// included; and the 12 GB class keeps the MTP head at its own window.
     #[test]
     fn every_profile_but_rtx5090_drafts_the_27b_at_seven() {

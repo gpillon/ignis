@@ -59,6 +59,24 @@ NVFP4 with the context pinned at 262,144, DFlash2 with 7 drafts, greedy, on
 the RTX 5090; the RTX PRO 6000 has yet to confirm them
 ([the A/B](../../findings/2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md)).
 
+From 0.11.0 the `rtx5090` profile's 27B drafts up to 15 tokens a round, each
+verify round at 8 columns a lane or, while the text is predictable, at 16
+([past seven drafts](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+Against the same server at 7 drafts, one lane writing a greedy JSON answer
+went from 529 to 800 tok/s (+51%, 13.4 tokens a round against 7.9), a
+`response_format` JSON-schema answer from 526 to 864 (+64%, the same text),
+the same two at the model card's sampling +54% and +31%, and an agent turn
+with strict tools +25%. A conversation and prose at temperature 0.6 and at
+the model card's sampling, a code prompt and an agent prompt moved -0.7% to
++8.4%, none more than 2% below; plain decode without drafting, the context and
+the KV pages did not move, and a cold 16K prompt's first token came 8 ms
+(0.7%) later, at the edge of what the run resolves. Two requests side by side,
+a JSON answer beside a conversation, committed 812.8 tok/s together against
+653.4 at 7 drafts. Those are two launches per build on the 27B NVFP4 with FP8
+exception weights and the context pinned at 262,144, on the RTX 5090; the RTX
+PRO 6000 has yet to confirm them, and its profile keeps 7
+([the gate](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
+
 Prefill and decode share one model stream and take turns. The scheduler hands
 the engine one prefill chunk, then runs a decode round for the lanes already
 generating. Before chunking, a 32K prompt stopped every decoding lane for the
@@ -92,6 +110,8 @@ The path of a request through the scheduler, step by step:
 | **367 tok/s** one lane, **1,065 tok/s** the same eight prompts at once | eight coding prompts, greedy, 512 tokens, 262,144 context, DFlash2 with 7 drafts, no vision | [Quick wins A/B](../../findings/2026-09-24-upstream-quick-wins-ab.md) |
 | From 0.11.0, at equal FP8 exception weights: a 7,172-token JSON answer **382 tok/s** (before: 346), an 8K prompt's answer **430** (393), four at once **1,067** in aggregate (1,023), plain decode 89-90 (86); the same one-lane text | the 27B NVFP4, context 262,144, DFlash2 with 7 drafts (plain decode: drafting off), greedy, RTX 5090, alternated launches | [The 27B's decode served after spec #672](../../findings/2026-11-18-the-27bs-decode-served-on-the-rtx-5090-after-spec-672.md) |
 | From 0.11.0, a one-lane verify round's gap **537 us** (before: 1,108); a plain one-lane round's span 267 us shorter without the graph's 208 copies; launching the one-lane graph 14-23 us | RTX 5090, rounds timed on the GPU clock with no tracer | same |
+| From 0.11.0, up to 15 drafts under `rtx5090` against 7: a JSON answer **800 tok/s** (529), a JSON-schema answer **864** (526, the same text), at the model card's sampling +54% and +31%, strict tools +25%; free text -0.7% to +8.4%; plain decode, context and KV pages unchanged; a JSON answer beside a conversation 813 tok/s together (653) | the 27B NVFP4, FP8 exception weights, context 262,144, one lane (the pair: two), 20 requests an arm on free text, RTX 5090, alternated launches | [DFlash2 at 15 drafts served](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md) |
+| From 0.11.0, a one-lane verify round at 16 columns **1.13 times** one at 8 (16,878 against 14,915 us), 1.29, 1.36 and 1.34 times at 2 to 4 lanes | RTX 5090, about 3.5-5K tokens of context, rounds timed on the GPU clock | same |
 | Cold prefill **11,344 tok/s** at 46K, 9,008 at 105K; ignis's GDN prefill +4.8% and +3.9% of it against the vendored kernels, one session | the 27B NVFP4, the `rtx5090` profile (2,048-token chunk), RTX 5090 | [The GDN prefill on Blackwell](../../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) |
 | From 0.11.0, a cold 16K prompt **1.24 s** (before: 1.52 s), a cold 64K prompt **5.87 s** (6.80 s), the first request after a load 1.24 s (1.76 s); decode unchanged by them, 389.6 against 389.8 tok/s | the 27B NVFP4, context 262,144, FP8 exception weights, RTX 5090, alternated launches | [The 27B's cold prefill served after spec #646](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md) |
 | The 2,048-token chunk: +1.9% at 46K, +2.2% at 105K against 1,024 | the 27B, RTX 5090 | [The 27B's prefill chunk at 2,048](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md) |

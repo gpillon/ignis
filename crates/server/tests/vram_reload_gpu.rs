@@ -47,15 +47,18 @@ const MODEL_27B: &str = "qwen3.8-27b";
 /// The two-shape load's draft window (GitHub #687).
 const TWO_SHAPE_DRAFT_TOKENS: u32 = 15;
 
+/// The one-shape load's draft window, named since the `rtx5090` profile's
+/// default became 15 (GitHub #696): the load the reload was first held at.
+const SEVEN_DRAFT_TOKENS: u32 = 7;
+
 /// The defaults at a context that fits beside the desktop, with idle unload
 /// off (ADR 0049): the reload is the test's. The pool takes the rest of the
-/// budget at any context. `draft_tokens` names a DFlash2 window; `None` is
-/// the defaults' 7.
-fn options(draft_tokens: Option<u32>) -> ignis_server::config::Config {
-    let mut args: Vec<String> = ["--model-max-context", "16384", "--model-idle-unload", "0"].map(String::from).to_vec();
-    if let Some(tokens) = draft_tokens {
-        args.extend(["--spec-backend".to_owned(), "dflash2".to_owned(), "--spec-draft-tokens".to_owned(), tokens.to_string()]);
-    }
+/// budget at any context. `draft_tokens` names the DFlash2 window.
+fn options(draft_tokens: u32) -> ignis_server::config::Config {
+    let mut args: Vec<String> = ["--model-max-context", "16384", "--model-idle-unload", "0", "--spec-backend", "dflash2", "--spec-draft-tokens"]
+        .map(String::from)
+        .to_vec();
+    args.push(draft_tokens.to_string());
     match ignis_server::config::resolve(&args, |_| None).expect("the options resolve") {
         ignis_server::config::ConfigOutcome::Config(config) => {
             ignis_server::config::Config { model: MODEL_27B.to_owned(), model_named: true, ..config }
@@ -85,7 +88,7 @@ const UNDER_SLACK_BYTES: u64 = 4 << 20;
 /// it returns: its KV pool's pages and the free memory NVML reads once it is
 /// in; `None` when the GPU profile says to skip. Its plan's `cuda_context`
 /// line is printed.
-fn one_load(artifact: &Path, draft_tokens: Option<u32>) -> Option<(u32, u64)> {
+fn one_load(artifact: &Path, draft_tokens: u32) -> Option<(u32, u64)> {
     let loaded = match ignis_server::load::prepare_model(&options(draft_tokens), artifact).and_then(ignis_server::load::load_model) {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -166,7 +169,7 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime");
     let _guard = runtime.enter();
 
-    let Some((cold, cold_free)) = one_load(artifact, None) else {
+    let Some((cold, cold_free)) = one_load(artifact, SEVEN_DRAFT_TOKENS) else {
         return;
     };
     assert!(CudaDevice::context_created(), "the cold load made the context, and the teardown kept it");
@@ -175,7 +178,7 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
     let context = ignis_runtime::ContextCharge::of(reading);
     assert_eq!(context.source, ignis_runtime::ContextSource::Measured, "the context was not measured: {reading}");
     let (seven_added_back, seven_held) = added_back_and_held(context, &reading.to_string(), "the cold load");
-    let (reload, reload_free) = one_load(artifact, None).expect("the reload loads what the cold start loaded");
+    let (reload, reload_free) = one_load(artifact, SEVEN_DRAFT_TOKENS).expect("the reload loads what the cold start loaded");
     println!("27B KV pool: cold {cold} pages, reload {reload} pages; NVML free once in: cold {cold_free} B, reload {reload_free} B");
     assert!(
         cold.abs_diff(reload) <= cold / 100,
@@ -184,9 +187,9 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
 
     // GitHub #687: a two-shape load, planned on what the 7-draft loads left,
     // then torn down, and its reload.
-    let (two_shape, _) = one_load(artifact, Some(TWO_SHAPE_DRAFT_TOKENS)).expect("a two-shape load after the 7-draft ones");
+    let (two_shape, _) = one_load(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("a two-shape load after the 7-draft ones");
     let (two_shape_added_back, two_shape_held) = added_back_and_held(context, &reading.to_string(), "the two-shape load");
-    let (two_shape_reload, _) = one_load(artifact, Some(TWO_SHAPE_DRAFT_TOKENS)).expect("the two-shape load's reload");
+    let (two_shape_reload, _) = one_load(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("the two-shape load's reload");
     println!(
         "27B KV pool at {TWO_SHAPE_DRAFT_TOKENS} drafts: {two_shape} pages after the 7-draft loads, reload {two_shape_reload} pages"
     );

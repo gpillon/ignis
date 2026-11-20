@@ -59,7 +59,9 @@ loads is the table of
 No profile here carries a speed for an RTX 30 or RTX 40 card: those come
 from the reports of people who have one, collected on
 [issue #643](https://github.com/gpillon/ignis/issues/643).
-Every profile drafts 7 tokens a round. From 0.11.0 a DFlash2 load may name
+Every profile drafts 7 tokens a round but `rtx5090`, which from 0.11.0
+drafts up to 15 (0.10.0: 7), measured on that card ([below](#rtx5090)).
+From 0.11.0 a DFlash2 load may name
 up to 15 on any card (`--spec-draft-tokens`), at the
 VRAM [the configuration reference](../configuration/context-and-speculation.md)
 states for the profile's lanes. Its rounds are held correct on the RTX 5090
@@ -72,8 +74,8 @@ off the RTX 5090, so no other profile's default moves.
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` and `rtx-12gb` are
 derived from them, since no 16 or 12 GB card exists in the project;
-`rtx-24gb` takes the 5090's values for the 27B, at a context measured on the
-5090 held to a 24 GiB budget.
+`rtx-24gb` takes the 5090's values for the 27B but its draft window, at a
+context measured on the 5090 held to a 24 GiB budget.
 
 ### `rtx5090`
 
@@ -83,7 +85,7 @@ The default: a 32 GB RTX 5090.
 |---|---|---|
 | Context (`model.max_context`) | 917,504 | 589,824 |
 | Vision | on, tower and pool in host RAM (`vision.residency: host`) | off; from 0.11.0, with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in host RAM ([Flash-Next](../configuration/vision.md#flash-next)) |
-| Speculation | DFlash2, 7 draft tokens | off |
+| Speculation | DFlash2, 15 draft tokens (from 0.11.0; 7 before) | off |
 | Decode lanes | 8 (the default) | 3 |
 | Prefill chunk | 2,048 | 8,192 |
 | VRAM headroom | 1,200 MiB | 1,536 MiB (the default) |
@@ -106,6 +108,21 @@ Why each:
   with at least 28,483 MiB free at start, against 28,993 MiB with BF16, and on
   2026-11-18, with 28,549 MiB free, BF16 adapted to 786,432 tokens and yarn:3
   while FP8 kept them ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
+- **DFlash2 at 15 drafts**, from 0.11.0 (0.10.0 drafts 7). Each verify round
+  takes the base shape, or the extended one while a request's text is
+  predictable ([past seven drafts](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+  Served on this card against 7 drafts, one request at a time with the
+  context pinned at 262,144: a JSON answer decoded 51% faster and a
+  `response_format` JSON-schema answer 64% faster, the same text; at the
+  model card's sampling 54% and 31%; an agent turn with strict tools 25%. A
+  conversation, prose, code and an agent prompt stayed within 2% of 7 drafts
+  or above it, plain decode, the context and the KV pages did not move, and a
+  cold 16K prompt's first token came 8 ms (0.7%) later, at the edge of what
+  the run resolves. At eight lanes both shapes are 64 columns, so the plan is
+  528 bytes over a 7-draft load's, within one KV page
+  ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
+  `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
+  to measure a window past 7, so `rtxpro6000` keeps 7.
 - **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
   for each image and maps the embedding pool in pinned host RAM, so a vision
   load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
@@ -356,9 +373,10 @@ resolves the default id `qwen3.8-27b` to that entry
 
 Why each:
 
-- **The 5090's values for the 27B.** The headroom, the 2,048-token chunk,
-  DFlash2 at 7 drafts and vision in host RAM are what `rtx5090` gives the
-  27B; the lanes and the drafter's head stay at their defaults.
+- **The 5090's values for the 27B, but its draft window.** The headroom, the
+  2,048-token chunk, DFlash2 and vision in host RAM are what `rtx5090` gives
+  the 27B; the lanes and the drafter's head stay at their defaults, and the
+  window stays 7 where `rtx5090` drafts 15 from 0.11.0.
 - **Past 7 drafts, within one KV page.** At eight lanes both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes)
   are 64 columns, so `--spec-draft-tokens 15` plans 528 bytes more than 7,

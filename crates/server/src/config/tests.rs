@@ -4630,7 +4630,8 @@ fn auto_picks_rtx_24gb_on_an_rtx_3090_and_on_a_24gb_blackwell_card() {
 /// GitHub #480: `rtx-24gb` gives the 27B the RTX 5090 profile's 27B values at
 /// the context measured for the 24 GB class, 1,048,576 tokens (YaRN at 4
 /// under `auto` rope scaling): headroom 1200M, a 2,048-token chunk, DFlash2
-/// at 7, vision on in host RAM at the default envelope, the default lanes and
+/// at 7 (the 5090's 15 since GitHub #696 is that card's measurement alone),
+/// vision on in host RAM at the default envelope, the default lanes and
 /// head, every one a value the load adapts. Flash-Next resolves under it with
 /// nothing of its own.
 #[test]
@@ -4651,10 +4652,13 @@ fn the_rtx_24gb_profile_serves_the_27b_with_the_5090s_values_at_the_measured_con
     assert_eq!(s27.settings().spec.draft_head, None, "the drafter's head at its default");
     assert_eq!(s27.adaptable(), crate::adaptation::Adaptable::ALL, "every value the profile's or a default, so every one adapts");
 
-    // The 5090 profile's 27B values, the context and (GitHub #508) the
-    // device retained slots apart.
+    // The 5090 profile's 27B values, the context, (GitHub #508) the device
+    // retained slots and (GitHub #696) the draft window apart: the 5090
+    // drafts 15, this class 7.
     let rtx5090 = config(&["--profile", "rtx5090"]);
     let mut want = rtx5090.for_family(ModelFamily::Qwen38_27b).unwrap().settings().clone();
+    assert_eq!(want.spec.draft_tokens, Some(15));
+    want.spec.draft_tokens = Some(7);
     want.model.max_context = 1_048_576;
     want.reuse.retained_device = Some(profile::RTX_24GB_RETAINED_DEVICE_SLOTS);
     // GitHub #489: and the solo width pinned to the chunk.

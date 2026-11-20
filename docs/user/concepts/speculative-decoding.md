@@ -86,7 +86,8 @@ From 0.11.0 the 27B drafts with **DFlash2** or with its own **MTP head**, one
 per load, chosen at start with `--spec-backend`; earlier releases refuse
 `--spec-backend mtp` on the 27B. DFlash2 is the default on every card class
 but the 12 GB one: every built-in profile but `rtx-12gb` loads it, at 7 draft
-tokens. MTP is the 12 GB class's default, from 0.11.0, and opt-in on the
+tokens, and from 0.11.0 `rtx5090` at 15. MTP is the 12 GB class's default,
+from 0.11.0, and opt-in on the
 others (`--spec-backend mtp`), for the card where DFlash2's memory is what the
 context lacks. Both are verified by the same rounds, so neither changes the
 text: greedy output is the spec-off text up to near-ties, and sampling keeps
@@ -100,7 +101,7 @@ with, under `--profile auto`:
 | 12 GB, below 14 GiB (from 0.11.0) | `rtx-12gb` | MTP, 7 draft tokens: DFlash2's 0.7 GB more is the context there ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)) |
 | 16 GB | `rtx-16gb` | DFlash2, 7 draft tokens |
 | 24 GB | `rtx-24gb` | DFlash2, 7 draft tokens |
-| 32 GB | `rtx5090` | DFlash2, 7 draft tokens |
+| 32 GB | `rtx5090` | DFlash2, 15 draft tokens (from 0.11.0; 7 before) |
 | 96 GB | `rtxpro6000` | DFlash2, 7 draft tokens |
 
 Either drafter can be named on any class: `--spec-backend mtp` on the larger
@@ -149,13 +150,17 @@ taken at the opener already carries the window as it stood there.
   lanes
   ([retained slots on the host](../../findings/2026-09-28-retained-slots-on-the-host.md),
   [upstream quick wins](../../findings/2026-09-24-upstream-quick-wins-ab.md)).
-- **How many drafts.** Seven is what the built-in profiles use. On the RTX PRO
-  6000 it beat four in every cell measured but one, and was 1.6 to 3.3 times
-  speculation off
-  ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
-  From 0.11.0 a load can name up to 15
-  ([past seven drafts](#past-seven-drafts-two-round-shapes)), unmeasured for
-  speed: every profile keeps 7.
+- **How many drafts.** Seven is what the built-in profiles use but
+  `rtx5090`, which from 0.11.0 drafts up to 15
+  ([past seven drafts](#past-seven-drafts-two-round-shapes)): served on the
+  RTX 5090 against 7, structured output decoded 25 to 64% faster and no
+  free-text cell fell more than 2% below
+  ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
+  On the RTX PRO 6000 seven beat four in every cell measured but one, and was
+  1.6 to 3.3 times speculation off
+  ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)). A
+  load can name up to 15 on any card; off the RTX 5090 that is unmeasured for
+  speed, so every other profile keeps 7.
 - **The proposal head.** The drafter proposes with the target's own output head
   by default (`--spec-draft-head full`). `shortlist` uses a smaller 4-bit head
   over the 131,072 most frequent tokens, at +356 MB of VRAM; it accepted 7
@@ -202,13 +207,18 @@ in who pays the wider round:
   (`--spec-shape-estimate-rounds`); a request that asks with no extended round
   among them is granted one, so that its estimate has something to read. A
   request that does not ask then pays for its neighbour when the round as a
-  whole gains: estimated from the measured periods, a JSON answer beside a
-  conversation gains about 15% together, the JSON answer +32% and the
-  conversation -22%, while a moderately predictable answer beside a
-  conversation does not pass and stays at the base shape.
+  whole gains. Served on the RTX 5090 at two lanes at 15 drafts, a greedy
+  JSON answer beside a conversation at temperature 0.6 (FP8 exception
+  weights, the context pinned at 262,144) committed 17.8% more tokens a
+  second together than under `all`, the JSON answer 29.1% more and the
+  conversation 12.3% fewer; a moderately predictable answer (a long JSON
+  array) beside the same conversation, 1.2% more, inside the run's spread,
+  with 27.6% of its rounds extended
+  ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
 - `all` runs it extended only when every lane in it asks, so no request ever
-  pays the wider round for another: the JSON answer beside a conversation
-  then gains nothing.
+  pays the wider round for another: beside a conversation the JSON answer
+  then goes extended only in the rounds where the conversation asks too
+  (10.6% of that pair's rounds), and the conversation keeps its speed.
 
 The ratios are measured on the RTX 5090 with the extended round's cost levers
 on, at about 3.5-5K tokens of context: 1.128, 1.29, 1.363 and 1.344 at 1 to 4
@@ -271,9 +281,10 @@ one, up to the draft window.
   ([finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)).
   A window of 0 loads no speculation: the same load as
   `--spec-backend off`, with nothing of the head bound and the same VRAM plan.
-  A window a profile gives beside its own DFlash2 (every built-in profile's 7
-  but `rtx-12gb`'s, which is the head's own) is DFlash2's: `--spec-backend
-  mtp` over it takes the head's own default.
+  A window a profile gives beside its own DFlash2 (`rtx5090`'s 15 from
+  0.11.0, every other built-in profile's 7 but `rtx-12gb`'s, which is the
+  head's own) is DFlash2's: `--spec-backend mtp` over it takes the head's own
+  default.
 - **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
   1, the head committed 3.9 tokens a round at 7 draft tokens on both artifacts
   (one is the anchor): its first draft was taken 74% of the time, its seventh
