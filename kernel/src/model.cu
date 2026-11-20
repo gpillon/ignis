@@ -27,6 +27,7 @@
 #include "ignis_step.h"
 
 #include "attention_readout.h"
+#include "dflash2_small_t.h"
 #include "draft_window.h"
 #include "extended_attention.h"
 #include "fp8_exception.h"
@@ -1825,10 +1826,15 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
   // or `quant`, `fused`, `split`), IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
   // `token`), IGNIS_FP8_GEMV_PAIRED (GitHub #678: unset or `1`, `0`; each call of the FP8 q | k |
-  // gate | v projection reads it again, kernel/src/fp8_exception.h) and IGNIS_FP8_W8A8_TILE16 (GitHub
-  // #693: unset or `1`, `0`; each quantizing call of an FP8 exception matrix reads it again, there).
+  // gate | v projection reads it again, kernel/src/fp8_exception.h), IGNIS_FP8_W8A8_TILE16 (GitHub
+  // #693: unset or `1`, `0`; each quantizing call of an FP8 exception matrix reads it again, there),
+  // IGNIS_DFLASH2_APPEND_KV_ONLY and IGNIS_DFLASH2_SMALL_T_FILL (GitHub #694: unset or `1`, `0`; each
+  // call of the drafter's append and of its forward's small products reads them again,
+  // kernel/src/dflash2_small_t.h).
   bool fp8_gemv_paired = true;
   bool fp8_w8a8_tile16 = true;
+  bool dflash2_append_kv_only = true;
+  bool dflash2_small_t_fill = true;
   if (!gdn_prefill_route(out.gdn_prefill_ours) ||
       !load_switch(ignis::hq_decode_attention::switch_for_load, out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
@@ -1836,7 +1842,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       !load_switch(ignis::prefill_swiglu::route_for_load, out.prefill_swiglu) ||
       !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout) ||
       !load_switch(ignis::fp8_exception::gemv_paired, fp8_gemv_paired) ||
-      !load_switch(ignis::fp8_exception::w8a8_tile16, fp8_w8a8_tile16)) {
+      !load_switch(ignis::fp8_exception::w8a8_tile16, fp8_w8a8_tile16) ||
+      !load_switch(ignis::dflash2_small_t::append_kv_only, dflash2_append_kv_only) ||
+      !load_switch(ignis::dflash2_small_t::small_t_fill, dflash2_small_t_fill)) {
     return nullptr;
   }
 
