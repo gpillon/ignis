@@ -22,7 +22,7 @@
 
 #include "dflash2_small_t.h"
 
-#include "process_environment.h"
+#include "card_lever.h"
 
 #include "ninfer/ops/linear.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -159,13 +159,9 @@ bool one_small_t_launch(std::int32_t rows, std::int32_t inputs, std::int32_t tok
 
 } // namespace
 
-bool append_kv_only() {
-  return ignis::named_switch("IGNIS_DFLASH2_APPEND_KV_ONLY", true, {{"0", false}, {"1", true}});
-}
+bool append_kv_only() { return ignis::card_lever::takes_here("IGNIS_DFLASH2_APPEND_KV_ONLY"); }
 
-bool small_t_fill() {
-  return ignis::named_switch("IGNIS_DFLASH2_SMALL_T_FILL", true, {{"0", false}, {"1", true}});
-}
+bool small_t_fill() { return ignis::card_lever::takes_here("IGNIS_DFLASH2_SMALL_T_FILL"); }
 
 bool projects_key_value_only(const ninfer::Weight &qkv, std::int32_t tokens, IgnisA16Call call) {
   return call == IgnisA16Call::General && shaped<Nvfp4DFlash2QkvGeometry>(qkv) &&

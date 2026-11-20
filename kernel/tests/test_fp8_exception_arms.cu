@@ -21,12 +21,15 @@
 //          grouped q | k | gate | v [14336][5120] (BF16 and fp32 outputs) and the [5120][6144]
 //          output projection (fp32 output and the residual add) bit for bit the default tile, each
 //          tile's outputs poisoned apart first; and the tile a dispatcher takes, by the tile's
-//          launch counter, as the measurement switch IGNIS_FP8_W8A8_TILE16 names it at each call:
-//          unset or `1` the 16-token tile for an AllowA8 call of 9..16 tokens and no other, `0`
-//          the default tile at every width, any other value refused by name.
+//          launch counter, as the measurement switch IGNIS_FP8_W8A8_TILE16 names it at each call on
+//          this card (kernel/src/card_lever.h): `1` the 16-token tile for an AllowA8 call of 9..16
+//          tokens and no other, unset the same on a card of compute capability 12 and the default
+//          tile on any other, `0` the default tile at every width, any other value refused by
+//          name.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE; a missing GPU fails.
 
+#include "card_lever.h"
 #include "fp8_exception.h"
 #include "fp8_test_common.h"
 #include "ignis_fp8_linear.h"
@@ -491,8 +494,9 @@ void tile16_bits() {
 }
 
 // GitHub #693: which tile the dispatchers' W8A8 calls take, by the 16-token tile's launch counter,
-// on zeroed weights: one launch a call of 9..16 tokens under AllowA8 unless IGNIS_FP8_W8A8_TILE16=0,
-// none at 8 tokens (the BF16-activation route), at 17 or under A16Only.
+// on zeroed weights: one launch a call of 9..16 tokens under AllowA8 where IGNIS_FP8_W8A8_TILE16 turns
+// the tile on (`1`, or unset on compute capability 12), none at 8 tokens (the BF16-activation
+// route), at 17 or under A16Only.
 void tile16_arms() {
   constexpr const char *kSwitch = "IGNIS_FP8_W8A8_TILE16";
   const fe::QkgvLayout layout = fe::qkgv_layout();
@@ -505,9 +509,11 @@ void tile16_arms() {
   DeviceBytes dx(x.size() * 2), dr(17 * kHidden * 2);
   upload(dx, x);
   const char *const values[3] = {nullptr, "1", "0"};
+  // Unset, the tile is this card's to decide.
+  const bool unset_on = ignis::card_lever::runs_by_default(ignis::card_lever::device_major());
   for (const char *value : values) {
     set_environment(kSwitch, value);
-    const bool tile16 = value == nullptr || std::strcmp(value, "1") == 0;
+    const bool tile16 = value == nullptr ? unset_on : std::strcmp(value, "1") == 0;
     const std::string named = std::string(kSwitch) + (value == nullptr ? " unset" : std::string("=") + value);
     for (int tokens : {8, 9, 16, 17}) {
       for (LinearPolicy policy : {LinearPolicy::A16Only, LinearPolicy::AllowA8}) {

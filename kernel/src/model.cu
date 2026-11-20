@@ -1830,7 +1830,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // #693: unset or `1`, `0`; each quantizing call of an FP8 exception matrix reads it again, there),
   // IGNIS_DFLASH2_APPEND_KV_ONLY and IGNIS_DFLASH2_SMALL_T_FILL (GitHub #694: unset or `1`, `0`; each
   // call of the drafter's append and of its forward's small products reads them again,
-  // kernel/src/dflash2_small_t.h).
+  // kernel/src/dflash2_small_t.h); unset, those last three run their lever on a card of compute
+  // capability 12 alone (kernel/src/card_lever.h).
   bool fp8_gemv_paired = true;
   bool fp8_w8a8_tile16 = true;
   bool dflash2_append_kv_only = true;

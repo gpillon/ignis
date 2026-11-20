@@ -508,6 +508,16 @@ target_include_directories(ignis_kernel_decode_graph_copies_test PRIVATE ${CMAKE
 target_link_libraries(ignis_kernel_decode_graph_copies_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_decode_graph_copies_test COMMAND ignis_kernel_decode_graph_copies_test)
 
+# Spec #684 (GitHub #693, #694): OURS -- where a cost lever measured on the RTX
+# 5090 alone runs (kernel/src/card_lever.h): unset, on a card of compute
+# capability 12 and nowhere else; `1` on every card; `0` nowhere; a bad value of
+# IGNIS_FP8_W8A8_TILE16, IGNIS_DFLASH2_APPEND_KV_ONLY or
+# IGNIS_DFLASH2_SMALL_T_FILL refused by name. Host-only.
+add_executable(ignis_kernel_card_lever_test test_card_lever.cpp)
+target_include_directories(ignis_kernel_card_lever_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_card_lever_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_card_lever_test COMMAND ignis_kernel_card_lever_test)
+
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in
 # `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a

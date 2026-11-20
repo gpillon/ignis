@@ -16,11 +16,12 @@
 //     or tensor-core route) -- a decode round, a one-lane verify round;
 //   - T above it under AllowA8: x quantized per token to E4M3 in the call's workspace, then the
 //     W8A8 GEMM (ignis_image_gemm.h) -- a prefill chunk, a verify round of two lanes or more, a
-//     one-lane round at the extended shape; up to 16 tokens on the GEMM's 16-token tile (GitHub
-//     #693, w8a8_tile16).
+//     one-lane round at the extended shape; up to 16 tokens on the GEMM's 16-token tile on a card
+//     of compute capability 12 (GitHub #693, w8a8_tile16).
 #ifndef IGNIS_FP8_EXCEPTION_H
 #define IGNIS_FP8_EXCEPTION_H
 
+#include "card_lever.h"
 #include "ignis_fp8_linear.h"
 #include "ignis_image_gemm.h"
 #include "process_environment.h"
@@ -77,10 +78,12 @@ inline bool gemv_paired() { return ignis::named_switch("IGNIS_FP8_GEMV_PAIRED", 
 // GitHub #693 (spec #684): whether a call that quantizes its activations takes the W8A8 GEMM's
 // 16-token tile at up to 16 tokens (ignis_image_gemm_w8a8_grouped_tile16 and _add_tile16) or its
 // default 128-token tile at every width, as the measurement switch IGNIS_FP8_W8A8_TILE16 names it
-// at each call, so a graph keeps the tile its capture read: unset or `1` the 16-token tile, `0` the
-// default one. The outputs are the same bits either way. Throws std::invalid_argument, naming the
-// variable, on any other value; the load reads it once, so such a value refuses the load.
-inline bool w8a8_tile16() { return ignis::named_switch("IGNIS_FP8_W8A8_TILE16", true, {{"0", false}, {"1", true}}); }
+// at each call, so a graph keeps the tile its capture read (kernel/src/card_lever.h): unset, the
+// 16-token tile on a card of compute capability 12, where it was measured, and the default one on
+// every other; `1` the 16-token tile on any card; `0` the default one. The outputs are the same
+// bits either way. Throws std::invalid_argument, naming the variable, on any other value; the load
+// reads it once, so such a value refuses the load.
+inline bool w8a8_tile16() { return ignis::card_lever::takes_here("IGNIS_FP8_W8A8_TILE16"); }
 
 // Whether a quantizing call of width `tokens` runs on the 16-token tile.
 inline bool takes_tile16(std::int32_t tokens) {

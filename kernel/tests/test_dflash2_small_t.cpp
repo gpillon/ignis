@@ -16,13 +16,16 @@
 //              `ops::linear` at every width it takes on 4 warps a CTA, 5 to 16 columns: the base
 //              block at 1 and 2 lanes, the extended at 1, a window of 10's 11 among them, one launch
 //              of ours a call by the launch counter.
-//   routes     which route a call takes, as the measurement switches name it at each call: unset or
-//              `1` ours at those widths, `0` today's at every width; never at 1, 4, 33 or 64
-//              columns, for a prefill chunk's taps, or for another of the drafter's weights; any
-//              other value refused by name.
+//   routes     which route a call takes, as the measurement switches name it at each call on this
+//              card (kernel/src/card_lever.h): `1` ours at those widths, unset ours there on a card
+//              of compute capability 12 and today's on any other, `0` today's at every width; never
+//              at 1, 4, 33 or 64 columns, for a prefill chunk's taps, or for another of the
+//              drafter's weights; any other value refused by name. The fill's bits run under `1`,
+//              so they are held on every card.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE, so a missing or busy GPU fails this test.
 
+#include "card_lever.h"
 #include "dflash2_small_t.h"
 
 #include "ignis_nvfp4_a16_mma.h"
@@ -195,7 +198,7 @@ void key_value_bits(const DeviceWeight &qkv) {
 }
 
 void fill_bits(const DeviceWeight &weight, const char *name) {
-  set_environment(kFillSwitch, nullptr);
+  set_environment(kFillSwitch, "1");
   for (std::int32_t tokens = 5; tokens <= 16; ++tokens) {
     const Activation a(tokens, 9500U + static_cast<std::uint32_t>(tokens));
     Output today(weight.weight.n, tokens, 0xA5);
@@ -212,6 +215,7 @@ void fill_bits(const DeviceWeight &weight, const char *name) {
     check(same, what + ": ops::linear's bytes");
     check(launches == 1, what + ": one launch of ours");
   }
+  set_environment(kFillSwitch, nullptr);
 }
 
 // Whether `read` throws std::invalid_argument naming `name` under `name`=2.
@@ -234,8 +238,10 @@ void routes(const DeviceWeight &qkv, const DeviceWeight &conv) {
   attention_out.n = 5120;
   attention_out.k = 4096;
   const char *const values[3] = {nullptr, "1", "0"};
+  // Unset, the levers are this card's to decide.
+  const bool unset_on = ignis::card_lever::runs_by_default(ignis::card_lever::device_major());
   for (const char *value : values) {
-    const bool on = value == nullptr || std::strcmp(value, "1") == 0;
+    const bool on = value == nullptr ? unset_on : std::strcmp(value, "1") == 0;
     set_environment(kKeyValueSwitch, value);
     set_environment(kFillSwitch, value);
     const std::string named = std::string("switches ") + (value == nullptr ? "unset" : std::string("=") + value);
