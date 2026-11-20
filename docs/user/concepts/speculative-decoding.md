@@ -183,7 +183,11 @@ and costs it what [the configuration reference](../configuration/context-and-spe
 states below 8 lanes (at 8 lanes, a few hundred bytes). The measurement switch
 `IGNIS_ROUND_SHAPE=extended` ([Testing](../contributing/testing.md)) runs
 every round of 4 lanes or fewer at the extended shape instead, a round with a
-lane held to a grammar excepted. The VRAM plan holds both shapes, and the
+lane held to a grammar excepted. An extended round attends in chunks of 8
+columns (6 over `bf16` KV), each reading what the one before appended: on
+ignis's own route where the load's rounds take it (an RTX 50 or RTX PRO card
+over `hq-e8-2b`), on the vendored chunked route elsewhere, the same bytes
+either way. The VRAM plan holds both shapes, and the
 extended shape's captured graphs hold about 20 MiB outside it. A load at 7
 drafts or fewer has the one shape it had. The MTP head keeps 0 to 7.
 

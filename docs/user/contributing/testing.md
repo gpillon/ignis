@@ -207,6 +207,21 @@ the other. They are no configuration fields: `GET /v1/config` and
   at each capture of the decode graphs, once per load; any other value
   refuses the load, naming the variable. `ignis.runtime.decode_graph_capture`'s
   `decode_nodes` and `verify_nodes` show which round each width captured.
+- `IGNIS_EXTENDED_ATTENTION=ours|vendored` (from 0.11.0) picks, at each
+  capture of the decode graphs, the attention route of the extended round (a
+  DFlash2 load of the 27B past 7 draft tokens, `IGNIS_ROUND_SHAPE` below). Its
+  9 to 16 columns a lane run in chunks of 8 columns (of 6 over `bf16` KV), the
+  second chunk reading the keys and values the first appended. Unset, or
+  `ours`: wherever the load's decode and verify rounds take ignis's own route
+  (`IGNIS_HQ_DECODE_ATTENTION` above), the extended round's chunks take it
+  too; `vendored` runs them on the vendored chunked route, the comparison a
+  speed measurement of the two needs. The bytes are the same
+  (`ignis_kernel_hq_verify_chunked_exact_test`), so are the tokens (the round
+  identity test below, arm `extended-attention-vendored`). Everywhere the
+  load's rounds take the vendored route, the extended round's chunks are the
+  vendored ones whatever the variable says. A load at 7 drafts or fewer, an
+  MTP load and Flash-Next never read it; any other value refuses the load,
+  naming the variable.
 - `IGNIS_FP8_GEMV_PAIRED=0` (from 0.11.0) gives the 27B's grouped q, k, gate
   and v exception projection under `fp8` exception weights its one-row GEMV
   back, one output row a warp, the comparison a speed measurement of the

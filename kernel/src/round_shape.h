@@ -1,7 +1,7 @@
-// ignis kernel leaf - GitHub #687 (spec #684): a DFlash2 load's two round shapes, the measurement
-// switch that names the shape of its rounds, and the one-lane attention of an extended round -- OURS.
-// Pure functions of what the host holds before a round launches: no CUDA and no model, so a
-// host-only test holds them from a table (kernel/tests/test_one_lane_chunks.cpp).
+// ignis kernel leaf - GitHub #687 (spec #684): a DFlash2 load's two round shapes and the measurement
+// switch that names the shape of its rounds -- OURS. Pure functions of what the host holds before a
+// round launches: no CUDA and no model. An extended round's attention is
+// kernel/src/extended_attention.h (GitHub #688).
 //
 // A DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS drafts holds two round shapes on one set of
 // buffers (kernel/src/model_internal.h `ignis_model::extended_shape`): its base shape, 8 columns a
@@ -40,17 +40,6 @@ inline Named read_switch() {
 // with no lane whose commit the host cuts (`host_cut`: such a round keeps the base shape).
 inline bool runs_extended(Named named, std::uint64_t lanes, std::uint32_t extended_lanes, bool host_cut) {
   return named == Named::kExtended && extended_lanes != 0 && lanes <= extended_lanes && !host_cut;
-}
-
-// Whether a batch round's attention runs its one lane in chunks of the small-T tile
-// (`small_t_tile` columns: 8 over hq-e8-2b, 6 over BF16) instead of through the vendored wrapper: an
-// extended round's one lane alone, whose 9..16 columns the wrapper's resolver would send to its
-// prompt route -- a workspace sized for the whole context, which a decode load does not reserve. At
-// two lanes or more the wrapper chunks by the tile itself; every round of the base shape, and every
-// round of a load without an extended shape, is the wrapper's, on every KV format.
-inline bool one_lane_in_chunks(bool extended_round, std::int32_t lanes, std::int32_t lane_columns,
-                               std::int32_t small_t_tile) {
-  return extended_round && lanes == 1 && lane_columns > small_t_tile;
 }
 
 } // namespace ignis::round_shape

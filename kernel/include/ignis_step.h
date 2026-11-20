@@ -642,7 +642,13 @@ struct ignis_program_stats {
  * replayed or eager (kernel/src/gdn_gating_home.h): the home the switch
  * names on a card of compute capability 12, the round's chain on every other
  * (`ignis_program_stats::gdn_gating`). Any other value refuses the call like
- * IGNIS_ROUND_TIMING's, and so does a branch whose stream CUDA cannot make. */
+ * IGNIS_ROUND_TIMING's, and so does a branch whose stream CUDA cannot make.
+ *
+ * GitHub #688: on a load with an extended round shape each call also reads
+ * IGNIS_EXTENDED_ATTENTION (`ours` or `vendored`; unset is `ours`): the route
+ * of every extended round's attention chunks from then on, replayed or eager
+ * (kernel/src/extended_attention.h, `ignis_model_extended_attention`). Any
+ * other value refuses the call like IGNIS_ROUND_TIMING's. */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 
