@@ -1146,6 +1146,7 @@ function SpeculationCard({ speculation, win }: { speculation: Speculation; win: 
           ["Tokens per round", speculation.tokensPerRound === null ? "-" : speculation.tokensPerRound.toFixed(2)],
           ["Rounds", formatCount(speculation.rounds.window)],
           ["Drafts committed", formatCount(speculation.accepted.window)],
+          ...(speculation.extendedShare === null ? [] : [["Extended rounds", asShare(speculation.extendedShare)] as [string, string]]),
         ]}
       />
       {positions.length > 0 && <Figures items={positions} />}

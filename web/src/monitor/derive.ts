@@ -198,6 +198,8 @@ export type Speculation = {
   tokensPerRound: number | null;
   /** Per draft position (1 first): rounds that committed it over rounds that proposed it, in the window. */
   byPosition: (number | null)[];
+  /** Verify rounds run at the extended shape over all verify rounds, in the window (#689); null where the shape family is not printed or no round ran. */
+  extendedShare: number | null;
 };
 
 /**
@@ -762,6 +764,8 @@ export function deriveSpeculation(points: Point[], since: number): Speculation {
       increaseOver(points, (s) => s.speculation?.positionDrafted[j] ?? null, since),
     ),
   );
+  const baseRounds = increaseOver(points, (s) => s.speculation?.shapeRounds?.base ?? null, since);
+  const extendedRounds = increaseOver(points, (s) => s.speculation?.shapeRounds?.extended ?? null, since);
   return {
     rounds,
     drafted,
@@ -770,6 +774,7 @@ export function deriveSpeculation(points: Point[], since: number): Speculation {
     tokensPerRound:
       rounds.window !== null && accepted.window !== null && rounds.window > 0 ? (rounds.window + accepted.window) / rounds.window : null,
     byPosition,
+    extendedShare: shareOf(extendedRounds, baseRounds !== null && extendedRounds !== null ? baseRounds + extendedRounds : null),
   };
 }
 
