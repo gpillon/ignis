@@ -210,6 +210,11 @@ outside it. The measurement switch `IGNIS_ROUND_SHAPE=base|extended`
 the rule. A load at 7 drafts or fewer has the one shape it had. The MTP head
 keeps 0 to 7.
 
+An extended round attends in chunks of 8 columns (6 over `bf16` KV), each
+reading what the one before appended: on ignis's own route where the load's
+rounds take it (an RTX 50 or RTX PRO card over `hq-e8-2b`), on the vendored
+chunked route elsewhere, the same bytes either way.
+
 The two shapes compute a column's logits up to rounding, not bit for bit:
 past 8 columns a lane the round takes other routes, and the extended round is
 held to the base round's numerical class, not to its bytes

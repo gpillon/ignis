@@ -151,9 +151,9 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
     // 8 plain counters, 3 reject reasons, 36 retained series (disk's 12 null without the tier), 3 skips, 4 KV-disk, then
     // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
-    // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals
+    // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals and the 2 round shapes (#689)
     // (GitHub #307), the image jobs' 6 outcomes (timed_out since ADR 0058), images, 4 phases and duration count (GitHub #324), the loop guard's watched, looped, 7 outcomes, tokens and score count with the budget's closes (GitHub #330), the structured output's 3 types (tool since #611) by 3 counters and repair count (#593), the tool calls' 3 outcomes, 6 kinds and strict tools outside the subset (#608) with the values split (#610) and the keys held would close (#641), and 2 histogram counts. The speech model's 8 transcription series, audio seconds and wait count (spec speech/02).
-    expect(counterValues(empty)).toHaveLength(157);
+    expect(counterValues(empty)).toHaveLength(159);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
     expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(82);
@@ -204,10 +204,23 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
       accepted: 15,
       positionDrafted: [10, 10, 0, 0, 0, 0, 0],
       positionAccepted: [8, 7, 0, 0, 0, 0, 0],
+      shapeRounds: null,
     });
     expect(readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION)).speculation).toBeNull();
-    const stray = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\nignis_speculative_position_drafted_total{position="8"} 1\n`));
-    expect(stray.unknown).toEqual([{ name: "ignis_speculative_position_drafted_total", labels: { position: "8" }, value: 1 }]);
+    const stray = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\nignis_speculative_position_drafted_total{position="0"} 1\n`));
+    expect(stray.unknown).toEqual([{ name: "ignis_speculative_position_drafted_total", labels: { position: "0" }, value: 1 }]);
+    // A 15-draft load prints positions 1..15: all read, none unknown.
+    const wide = ["drafted", "accepted"].flatMap((kind) => Array.from({ length: 15 }, (_, j) => `ignis_speculative_position_${kind}_total{position="${j + 1}"} ${j}`));
+    const fifteen = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}ignis_speculative_rounds_total 1\n${wide.join("\n")}\n`));
+    expect(fifteen.unknown).toEqual([]);
+    expect(fifteen.speculation?.positionDrafted).toHaveLength(15);
+    expect(fifteen.speculation?.positionDrafted[14]).toBe(14);
+    // The shape family (#689) is read, not unknown; a shape it does not name is.
+    const shapes = (...lines: string[]) => readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\n${lines.join("\n")}\n`));
+    const shaped = shapes('ignis_speculative_shape_rounds_total{shape="base"} 7', 'ignis_speculative_shape_rounds_total{shape="extended"} 3');
+    expect(shaped.unknown).toEqual([]);
+    expect(shaped.speculation?.shapeRounds).toEqual({ base: 7, extended: 3 });
+    expect(shapes('ignis_speculative_shape_rounds_total{shape="narrow"} 1').unknown).toHaveLength(1);
   });
 
   // GitHub #330: the loop guard's family, all at once after the first watched request, and the budget's own close counter.

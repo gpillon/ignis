@@ -182,8 +182,8 @@ use ignis_core::step::{
     PermittedLane, Redirect, SamplingParams, VerifyLane,
 };
 use ignis_core::{
-    DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling,
-    Speculation, SpeculativeBackend, Vision,
+    DraftRule, DrafterSampling, ExceptionWeights, HqDecodeAttention, KvFormat, PrefillAttention, PrefillLinear,
+    RopeScaling, Speculation, SpeculativeBackend, Vision,
 };
 
 /// One arm of the round: the measurement switches it sets (every other switch
@@ -227,6 +227,9 @@ const ARMS: &[Arm] = &[
     Arm { name: "gdn-gating-branch", switches: &[("IGNIS_GDN_GATING", "branch")], graphs: true },
 
     // #688's arm, below this line.
+    // An extended round's attention on the vendored chunked route, to which the unset switch's
+    // chunks on ignis's route are held at 1-4 lanes, on the loads of two shapes.
+    Arm { name: "extended-attention-vendored", switches: &[(EXTENDED_ATTENTION, "vendored")], graphs: true },
 
     // #689's arms, below this line.
 
@@ -236,6 +239,12 @@ const ARMS: &[Arm] = &[
     // the rule load's crossings ([`CROSSING_KINDS`]).
 
     // #693's arm, below this line.
+    // The FP8 exception products' 128-token tile at 9-16 tokens, main's: an `fp8` load's lever
+    // (`bf16` runs no W8A8 product). It reaches a one-lane extended round (16 columns, 11 on the
+    // window of 10), a two-lane base round (16) and a prefill chunk of 9-16 tokens
+    // (`a_prefill_whose_last_chunk_is_9_to_16_tokens_writes_the_same_bytes_on_both_fp8_tiles`);
+    // an extended round of 2-4 lanes (32-64 columns) takes the 128-token tile either way.
+    Arm { name: TILE128_ARM, switches: &[("IGNIS_FP8_W8A8_TILE16", "0")], graphs: true },
 
     // #694's arms, below this line.
 
@@ -257,6 +266,10 @@ const CROSSING: [Option<&str>; 4] = [Some("base"), Some("extended"), Some("base"
 /// The kinds of round each crossing runs on: live, host-cut (#691) and
 /// teacher-forced.
 const CROSSING_KINDS: [Round; 3] = [Round::Verify, Round::Cut, Round::Forced];
+
+/// #688: the switch that names the route of an extended round's attention,
+/// read at each capture ([`extended_attention`]).
+const EXTENDED_ATTENTION: &str = "IGNIS_EXTENDED_ATTENTION";
 
 /// #687: the drafts a verify round of `width` lanes carries each lane on
 /// `load`: the load's window on a load of one shape; on a load of two, the
@@ -733,6 +746,25 @@ fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label
     assert!(verify_copies.iter().all(|&c| c == verify), "{label}: arm `{}`: the verify graphs copy {verify} nodes", arm.name);
 }
 
+/// #688: the route the arm's extended rounds attend on. On a load of two
+/// shapes, ignis's own route in chunks wherever the load's rounds take
+/// ignis's route ([`Model::hq_decode_attention`]), unless the arm's capture
+/// read [`EXTENDED_ATTENTION`]`=vendored`, and the vendored chunked route
+/// otherwise; an arm with no graph runs before the load's first capture, as
+/// the switch unset decides. Nothing on a load of one shape. So the arm on
+/// the vendored chunks, whose tokens equal the reference's, ran on them, and
+/// the reference and the `eager` arm on ignis's.
+fn extended_attention(model: &Model, load: &Load, arm: &Arm, label: &str) {
+    let vendored = arm.graphs && arm.switches.contains(&(EXTENDED_ATTENTION, "vendored"));
+    let ours = model.hq_decode_attention() == HqDecodeAttention::Ours && !vendored;
+    let want = load.two_shapes().then_some(if ours { HqDecodeAttention::Ours } else { HqDecodeAttention::Vendored });
+    let got = model.extended_attention();
+    assert_eq!(got, want, "{label}: arm `{}`: the route of the extended round's attention", arm.name);
+    if let Some(route) = got {
+        println!("round_identity_gpu {label}: arm `{}`: the extended round attends on the {} chunks", arm.name, route.as_str());
+    }
+}
+
 /// #686 (spec #684): the round shapes a load builds, and the program's stats
 /// report each apart. Its base shape, at the load's window and lanes (#687:
 /// at [`BASE_WINDOW`] on a load of two shapes): its graphs are the load's
@@ -996,6 +1028,7 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         copy_free_graphs(model, pool, load, arm, label);
     }
     round_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
+    extended_attention(model, load, arm, label);
     let folds = folds_in_flight();
     let extended_before = extended_rounds();
     let sessions = KINDS
@@ -1267,4 +1300,96 @@ fn a_fifteen_draft_loads_base_rounds_commit_a_seven_draft_loads_tokens() {
         compared += 1;
     }
     assert!(compared > 0 || skipped, "no exception setting was compared: check IGNIS_ROUND_IDENTITY_WEIGHTS");
+}
+
+/// #693: the arm that gives the FP8 exception products their 128-token tile
+/// back at 9 to 16 tokens, and the load the prefill test below holds it to the
+/// reference on.
+const TILE128_ARM: &str = "fp8-w8a8-tile128";
+const TILE128_PREFILL_LOAD: &str = "nvfp4-dflash2";
+
+/// #693: a prefill whose last chunk is 9 to 16 tokens -- a prompt of one
+/// [`CHUNK`] and that many more -- writes the same bytes on the FP8 exception
+/// products' 16-token tile (the reference, every switch unset) as on
+/// [`TILE128_ARM`]'s 128-token one: the span's last logits bit for bit, then
+/// [`PLAIN_ROUNDS`] greedy plain rounds' tokens, which read the keys, values
+/// and GDN state the chunk wrote. Eager, on `fp8` exception weights only
+/// (`bf16` runs no W8A8 product). The first test's session never takes the
+/// 16-token tile at a prefill: its prompts fit one chunk of more than 16
+/// tokens. It runs where the `IGNIS_ROUND_IDENTITY_*` filters select its load,
+/// its arm and `fp8`.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn a_prefill_whose_last_chunk_is_9_to_16_tokens_writes_the_same_bytes_on_both_fp8_tiles() {
+    let load = LOADS.iter().find(|load| load.name == TILE128_PREFILL_LOAD).expect("the prefill test's load is in LOADS");
+    let arm = ARMS.iter().find(|arm| arm.name == TILE128_ARM).expect("the 128-token tile's arm is in ARMS");
+    let loads = selected("IGNIS_ROUND_IDENTITY_LOADS", &LOADS.iter().map(|load| load.name).collect::<Vec<_>>());
+    let arms = selected("IGNIS_ROUND_IDENTITY_ARMS", &ARMS.iter().map(|arm| arm.name).collect::<Vec<_>>());
+    let weights = selected("IGNIS_ROUND_IDENTITY_WEIGHTS", &ExceptionWeights::NAMES);
+    if !(loads.contains(&load.name) && arms.contains(&arm.name) && weights.contains(&ExceptionWeights::Fp8.as_str())) {
+        println!("round_identity_gpu: the IGNIS_ROUND_IDENTITY_* filters leave out {}, `{}` or fp8", load.name, arm.name);
+        return;
+    }
+    let mut device = match CudaDevice::create(0) {
+        Ok(device) => device,
+        Err(e) => {
+            if gpu_profile::skip_or_fail(&format!("CUDA unavailable: {e}")) {
+                return;
+            }
+            unreachable!("skip_or_fail panics under the profile");
+        }
+    };
+    let path = Path::new(load.artifact);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("{}: artifact absent: {}", load.name, load.artifact)) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", load.artifact));
+    let script = script(&reader);
+    let lengths: Vec<usize> = script.prompts.iter().map(Vec::len).collect();
+    println!("round_identity_gpu {}: the session's prompts are {lengths:?} tokens", load.name);
+    // One long prompt: the session's prompts end to end.
+    let long: Vec<i32> = script.prompts.concat();
+    let tails = 9..=16u32;
+    assert!(long.len() as u32 >= CHUNK + tails.end(), "the prompts end to end are {} tokens", long.len());
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    // `None` is a skip the profile allows (`with_load`).
+    let _ = with_load(&mut device, &reader, load, ExceptionWeights::Fp8, |model, pool, label| {
+        let spans = |arm: &Arm| -> Vec<(Vec<u32>, Vec<i32>)> {
+            apply(arm, None);
+            let written = tails
+                .clone()
+                .map(|tail| {
+                    let what = format!("{label}: arm `{}`, a last chunk of {tail} tokens", arm.name);
+                    let prompt = &long[..(CHUNK + tail) as usize];
+                    let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
+                    let mut logits = vec![0f32; vocab];
+                    prefill_program_sampled(model, pool, &mut seq, prompt, 0, SamplingParams::greedy(), Some(&mut logits))
+                        .unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
+                    let mut tokens = Vec::new();
+                    for _ in 0..PLAIN_ROUNDS {
+                        let mut refs = vec![&mut seq];
+                        let drawn = decode_program_batch_sampled(model, pool, &mut refs, &[SamplingParams::greedy()])
+                            .unwrap_or_else(|e| panic!("{what}: plain round: {e}"));
+                        expect_replay(model, pool, false, &what);
+                        tokens.extend(drawn);
+                    }
+                    (logits.iter().map(|v| v.to_bits()).collect(), tokens)
+                })
+                .collect();
+            apply(&REFERENCE, None);
+            written
+        };
+        let want = spans(&REFERENCE);
+        let got = spans(arm);
+        for ((tail, (want_logits, want_tokens)), (got_logits, got_tokens)) in tails.clone().zip(&want).zip(&got) {
+            let moved = want_logits.iter().zip(got_logits).filter(|(a, b)| a != b).count();
+            assert_eq!(moved, 0, "{label}: a last chunk of {tail} tokens: {moved} of {vocab} logits differ between the tiles");
+            assert_eq!(want_tokens, got_tokens, "{label}: a last chunk of {tail} tokens: the plain rounds' tokens");
+        }
+        println!(
+            "round_identity_gpu {label}: arm `{}`: prefills of {CHUNK} + 9..=16 tokens write the reference's logits bit \
+             for bit and its {PLAIN_ROUNDS} plain rounds' tokens",
+            arm.name
+        );
+    });
 }

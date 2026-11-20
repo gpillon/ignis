@@ -25,6 +25,19 @@ impl HqDecodeAttention {
         }
     }
 
+    /// GitHub #688 (spec #684): the leaf's code for the route of an extended
+    /// round's attention chunks (`enum ignis_extended_attention`): 0 a load
+    /// without an extended round shape, 1 the vendored chunked small-T route,
+    /// 2 ours one chunk at a time; `Err` with any other.
+    pub const fn from_extended_abi(code: u32) -> Result<Option<Self>, u32> {
+        match code {
+            0 => Ok(None),
+            1 => Ok(Some(Self::Vendored)),
+            2 => Ok(Some(Self::Ours)),
+            _ => Err(code),
+        }
+    }
+
     /// The switch's own spellings, which the load's `ignis.runtime.decode_routes`
     /// line reports.
     pub const fn as_str(self) -> &'static str {

@@ -209,6 +209,21 @@ the other. They are no configuration fields: `GET /v1/config` and
   at each capture of the decode graphs, once per load; any other value
   refuses the load, naming the variable. `ignis.runtime.decode_graph_capture`'s
   `decode_nodes` and `verify_nodes` show which round each width captured.
+- `IGNIS_EXTENDED_ATTENTION=ours|vendored` (from 0.11.0) picks, at each
+  capture of the decode graphs, the attention route of the extended round (a
+  DFlash2 load of the 27B past 7 draft tokens, `IGNIS_ROUND_SHAPE` below). Its
+  9 to 16 columns a lane run in chunks of 8 columns (of 6 over `bf16` KV),
+  each chunk reading the keys and values the one before appended. Unset, or
+  `ours`: wherever the load's decode and verify rounds take ignis's own route
+  (`IGNIS_HQ_DECODE_ATTENTION` above), the extended round's chunks take it
+  too; `vendored` runs them on the vendored chunked route, the comparison a
+  speed measurement of the two needs. The bytes are the same
+  (`ignis_kernel_hq_verify_chunked_exact_test`), so are the tokens (the round
+  identity test below, arm `extended-attention-vendored`). Everywhere the
+  load's rounds take the vendored route, the extended round's chunks are the
+  vendored ones whatever the variable says. A load at 7 drafts or fewer, an
+  MTP load and Flash-Next never read it; any other value refuses the load,
+  naming the variable.
 - `IGNIS_FP8_GEMV_PAIRED=0` (from 0.11.0) gives the 27B's grouped q, k, gate
   and v exception projection under `fp8` exception weights its one-row GEMV
   back, one output row a warp, the comparison a speed measurement of the
@@ -218,6 +233,20 @@ the other. They are no configuration fields: `GET /v1/config` and
   keeps the one-row GEMV either way, as do Flash-Next's FP8 projections, and a
   `bf16` load runs neither. It is read at each call, so a decode graph keeps
   the form its capture read; any other value refuses the load, naming the
+  variable.
+- `IGNIS_FP8_W8A8_TILE16=0` (from 0.11.0) gives the 27B's exception products
+  under `fp8` exception weights their 128-token tile back for a call of 9 to
+  16 tokens, the comparison a speed measurement of the 16-token tile needs.
+  Unset, or `1`, such a call (a one-lane round at the extended shape, a
+  two-lane round at the base shape, a prefill chunk of 9 to 16 tokens) runs
+  the product of FP8 activations on a tile of 16 tokens and 64 output rows,
+  whose outputs are the 128-token tile's byte for byte
+  (`ignis_kernel_fp8_exception_arms_test`), so the tokens are the same (the
+  round identity test below, arm `fp8-w8a8-tile128`). A call of 8 tokens or
+  fewer keeps its BF16-activation GEMV and one of 17 or more the 128-token
+  tile either way, Flash-Next's FP8 projections are their own, and a `bf16`
+  load runs no such product. It is read at each call, so a graph keeps the
+  tile its capture read; any other value refuses the load, naming the
   variable.
 - `IGNIS_GDN_GATING=chain|branch` (from 0.11.0) picks, at each capture of
   the decode graphs, where each GDN layer of the 27B computes its gating (the
@@ -267,8 +296,10 @@ extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
 under the shape rule (`nvfp4-dflash2-w15-rule`), every round's shape held to
 what its lanes asked and the same lanes taken from the base shape to the
 extended one and back on live, host-cut and teacher-forced rounds at 1 to 4
-lanes; and a
-second test holds a 15-draft load's base rounds to a 7-draft load's tokens. Each arm is
+lanes; a
+second test holds a 15-draft load's base rounds to a 7-draft load's tokens;
+and a third holds a prefill whose last chunk is 9 to 16 tokens to the same
+logits, bit for bit, under `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is
 held to the graphs' replay with every switch unset; a change behind a switch
 of its own adds that switch as an arm, as the file says. The whole run
 materializes fourteen loads in turn, so a narrow one is

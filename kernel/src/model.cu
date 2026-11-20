@@ -28,6 +28,7 @@
 
 #include "attention_readout.h"
 #include "draft_window.h"
+#include "extended_attention.h"
 #include "fp8_exception.h"
 #include "ignis_dense_prefill.h"
 #include "gdn_prefill.h"
@@ -1792,16 +1793,19 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // on their own, in this order, so a value a switch does not know refuses the plan and the load by
   // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
   // or `quant`, `fused`, `split`), IGNIS_W4A4_ACTIVATION_LAYOUT (GitHub #652: unset or `ktile`,
-  // `token`) and IGNIS_FP8_GEMV_PAIRED (GitHub #678: unset or `1`, `0`; each call of the FP8 q | k |
-  // gate | v projection reads it again, kernel/src/fp8_exception.h).
+  // `token`), IGNIS_FP8_GEMV_PAIRED (GitHub #678: unset or `1`, `0`; each call of the FP8 q | k |
+  // gate | v projection reads it again, kernel/src/fp8_exception.h) and IGNIS_FP8_W8A8_TILE16 (GitHub
+  // #693: unset or `1`, `0`; each quantizing call of an FP8 exception matrix reads it again, there).
   bool fp8_gemv_paired = true;
+  bool fp8_w8a8_tile16 = true;
   if (!gdn_prefill_route(out.gdn_prefill_ours) ||
       !load_switch(ignis::hq_decode_attention::switch_for_load, out.hq_decode_attention) ||
       !mtp_head_linear_route(out.mtp_head_linear_ours) ||
       !tma_descriptor_cache_route(out.tma_descriptor_cache) ||
       !load_switch(ignis::prefill_swiglu::route_for_load, out.prefill_swiglu) ||
       !load_switch(ignis::w4a4_activation_layout::layout_for_load, out.w4a4_activation_layout) ||
-      !load_switch(ignis::fp8_exception::gemv_paired, fp8_gemv_paired)) {
+      !load_switch(ignis::fp8_exception::gemv_paired, fp8_gemv_paired) ||
+      !load_switch(ignis::fp8_exception::w8a8_tile16, fp8_w8a8_tile16)) {
     return nullptr;
   }
 
@@ -3163,6 +3167,21 @@ extern "C" uint32_t ignis_model_hq_decode_attention(const struct ignis_model *mo
     return IGNIS_HQ_DECODE_ATTENTION_VENDORED;
   }
   return model->hq_decode_attention_ours ? IGNIS_HQ_DECODE_ATTENTION_OURS : IGNIS_HQ_DECODE_ATTENTION_VENDORED;
+}
+
+// GitHub #688: the rule an extended round's call takes (kernel/src/gqa_layer.cu `run_gqa_layer_batch`), at
+// the shape's columns a lane: a load whose rounds take ignis's route is an hq-e8-2b load.
+extern "C" uint32_t ignis_model_extended_attention(const struct ignis_model *model) {
+  if (model == nullptr || model->flash_next || model->extended_shape == nullptr) {
+    return IGNIS_EXTENDED_ATTENTION_NONE;
+  }
+  const auto columns = static_cast<std::int32_t>(model->extended_shape->window + 1);
+  const bool serves = model->hq_decode_attention_ours &&
+                      ignis::hq_decode_attention::serves_chunked(kIgnisGqaQHeads, columns, ninfer::DType::U8);
+  return ignis::extended_attention::route_of(model->hq_decode_attention_ours, model->extended_attention, serves) ==
+                 ignis::extended_attention::Route::kOurs
+             ? IGNIS_EXTENDED_ATTENTION_OURS
+             : IGNIS_EXTENDED_ATTENTION_VENDORED;
 }
 
 extern "C" uint32_t ignis_model_mtp_head_linear(const struct ignis_model *model) {
