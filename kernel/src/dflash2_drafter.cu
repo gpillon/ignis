@@ -2,6 +2,7 @@
 // verify round -- see kernel/src/dflash2_drafter.h for the contract.
 
 #include "dflash2_drafter.h"
+#include "dflash2_small_t.h"
 #include "sampled_draft.h"
 #include "trellis_body.h"
 
@@ -96,13 +97,23 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
   for (std::size_t layer = 0; layer < kDflash2Layers; ++layer) {
     ninfer::DeviceArena::Scope layer_scope = arena.scope();
     const Dflash2LayerWeights &w = weights.layers[layer];
-    ninfer::Tensor qkv = arena.alloc(ninfer::DType::BF16, {query_size + 2 * kv_width, columns, 1, 1});
-    ignis_linear_a16(context, w.query_key_value, qkv, call, stream);
+    // GitHub #694: the append keeps only the key and value rows of the q | k | v product; where
+    // IGNIS_DFLASH2_APPEND_KV_ONLY takes the call it projects those rows alone, the same bytes
+    // (kernel/src/dflash2_small_t.h). `key_row` is where they start in `qkv`.
+    const bool key_value_only =
+        ignis::dflash2_small_t::projects_key_value_only(w.query_key_value, columns, call);
+    const std::int32_t key_row = key_value_only ? 0 : query_size;
+    ninfer::Tensor qkv = arena.alloc(ninfer::DType::BF16, {key_row + 2 * kv_width, columns, 1, 1});
+    if (key_value_only) {
+      ignis::dflash2_small_t::key_value_linear(context, w.query_key_value, qkv, stream);
+    } else {
+      ignis_linear_a16(context, w.query_key_value, qkv, call, stream);
+    }
     ninfer::Tensor key_raw = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor key     = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
     ninfer::Tensor value   = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
-    copy_bf16_rows(key_raw, qkv, query_size, stream);
-    copy_bf16_rows(value, qkv, query_size + kv_width, stream);
+    copy_bf16_rows(key_raw, qkv, key_row, stream);
+    copy_bf16_rows(value, qkv, key_row + kv_width, stream);
 
     ninfer::Tensor key_heads = key.view({head_dim, kv_heads, columns});
     ninfer::ops::rmsnorm(key_raw.view({head_dim, kv_heads, columns}),
@@ -167,13 +178,15 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerify
                            /*unit_offset=*/false, normed, stream);
       ninfer::Tensor dynamic = arena.alloc(
           ninfer::DType::BF16, {static_cast<std::int32_t>(w.attention_conv_proj.n), columns, 1, 1});
-      ninfer::ops::linear(normed, w.attention_conv_proj, dynamic, stream);
+      // GitHub #694: the conv projections and q | k | v on 4 warps a CTA at 5 to 16 columns unless
+      // IGNIS_DFLASH2_SMALL_T_FILL=0 (kernel/src/dflash2_small_t.h); the same bytes.
+      ignis::dflash2_small_t::forward_linear(normed, w.attention_conv_proj, dynamic, stream);
       ninfer::Tensor conv_hidden = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
       ninfer::ops::dflash2_dynamic_conv(normed, dynamic, attention_base, 0, block, conv_hidden,
                                         stream);
       ninfer::Tensor qkv =
           arena.alloc(ninfer::DType::BF16, {query_size + 2 * kv_width, columns, 1, 1});
-      ninfer::ops::linear(conv_hidden, w.query_key_value, qkv, stream);
+      ignis::dflash2_small_t::forward_linear(conv_hidden, w.query_key_value, qkv, stream);
       ninfer::Tensor query_raw = arena.alloc(ninfer::DType::BF16, {query_size, columns, 1, 1});
       ninfer::Tensor key_raw   = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
       ninfer::Tensor value     = arena.alloc(ninfer::DType::BF16, {kv_width, columns, 1, 1});
@@ -214,7 +227,7 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerify
                            kDflash2RmsEps, /*unit_offset=*/false, normed, stream);
       ninfer::Tensor dynamic = arena.alloc(
           ninfer::DType::BF16, {static_cast<std::int32_t>(w.mlp_conv_proj.n), columns, 1, 1});
-      ninfer::ops::linear(normed, w.mlp_conv_proj, dynamic, stream);
+      ignis::dflash2_small_t::forward_linear(normed, w.mlp_conv_proj, dynamic, stream);
       ninfer::Tensor conv_hidden = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
       ninfer::ops::dflash2_dynamic_conv(normed, dynamic, mlp_base, 0, block, conv_hidden, stream);
       const auto intermediate_rows = static_cast<std::int32_t>(w.mlp_down.k);

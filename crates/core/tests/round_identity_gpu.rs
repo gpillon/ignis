@@ -247,6 +247,15 @@ const ARMS: &[Arm] = &[
     Arm { name: TILE128_ARM, switches: &[("IGNIS_FP8_W8A8_TILE16", "0")], graphs: true },
 
     // #694's arms, below this line.
+    // The drafter's append projecting its whole q | k | v product, main's: the lever projects only
+    // the key and value rows it keeps in an append of 5-32 columns (a base round at 1-4 lanes, an
+    // extended one at 1-2, 11 and 22 columns on the window of 10); a wider append, a prefill
+    // chunk's taps and a carried anchor project the whole product either way.
+    Arm { name: "dflash2-append-qkv", switches: &[("IGNIS_DFLASH2_APPEND_KV_ONLY", "0")], graphs: true },
+    // The drafter forward's conv projections and q | k | v on the vendored launch, main's: the lever
+    // runs them on 4 warps a CTA at 5-16 columns (a base round at 1-2 lanes, an extended one at 1,
+    // 11 columns on the window of 10); a wider round runs the vendored launch either way.
+    Arm { name: "dflash2-small-t-vendored", switches: &[("IGNIS_DFLASH2_SMALL_T_FILL", "0")], graphs: true },
 
     // #695's arms, below this line.
 ];
