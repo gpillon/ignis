@@ -292,8 +292,9 @@ the other. They are no configuration fields: `GET /v1/config` and
   round at the base shape, 8 columns a lane, the round of a load at 7 drafts
   token for token. `extended`: every round of 1 to 4 lanes at the extended
   shape, the window + 1 columns a lane. Under all three a round of 5 to 8
-  lanes, or one with a lane held to a grammar, runs at the base shape, and
-  each round's outcome still moves its lanes' asks. Both
+  lanes runs at the base shape, a round with a lane held to a grammar takes
+  its shape as any other does, and each round's outcome still moves its
+  lanes' asks. Both
   shapes' verify and drafter-append graphs are captured at every load, so
   the switch flips between rounds of one load with no capture. A load at 7
   drafts or fewer, an MTP load and Flash-Next never read it. Any other value
@@ -317,7 +318,8 @@ and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
 extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
 under the shape rule (`nvfp4-dflash2-w15-rule`), every round's shape held to
 what its lanes asked and the same lanes taken from the base shape to the
-extended one and back on live and teacher-forced rounds at 1 to 4 lanes; a
+extended one and back on live, host-cut and teacher-forced rounds at 1 to 4
+lanes; a
 second test holds a 15-draft load's base rounds to a 7-draft load's tokens;
 and a third holds a prefill whose last chunk is 9 to 16 tokens to the same
 logits, bit for bit, under `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is
