@@ -512,7 +512,8 @@ docs-reference: ## Regenerate docs/user/reference/ from the code: fields, profil
 # (ADR 0081). The scripts are the standard library alone; the records workflow
 # runs records-check on every push that touches either folder. The ADR check
 # also refuses a change to an earlier ADR's text since the merge base with
-# origin/main (--since auto): a typo fix says [typo ADR-NNNN] in its commit.
+# origin/main (--since auto): a typo fix says [typo ADR-NNNN] in its commit,
+# an edit in place the owner decided [edit ADR-NNNN].
 .PHONY: records
 records: ## Regenerate the ADR and findings indexes from each file's frontmatter
 	$(PYTHON) mk/adr-index.py --write
