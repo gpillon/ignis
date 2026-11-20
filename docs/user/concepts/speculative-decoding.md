@@ -190,10 +190,13 @@ from what each lane's own earlier rounds did, the **shape rule**:
 
 A round of 1 to 4 lanes runs at the extended shape when every lane in it asks
 for it, so no request pays the wider round for another; a round of 5 to 8
-lanes, or one with a lane held to a grammar, runs at the base shape. Text the
-drafter predicts far ahead (a JSON answer, a long tool call's arguments) goes
-extended and stays there; free text rarely takes all 7, so it stays at the
-base shape and decodes as at 7 drafts (a greedy answer can differ at a
+lanes runs at the base shape. A request held to a grammar (`response_format`,
+a held tool's calls) asks as any other does: its rounds take the shape the rule
+gives them, the grammar's check cuts each run at its first miss at that shape,
+and the rule counts the drafts the model took, not the ones the check kept.
+Text the drafter predicts far ahead (a JSON answer, a long tool call's
+arguments) goes extended and stays there; free text rarely takes all 7, so it
+stays at the base shape and decodes as at 7 drafts (a greedy answer can differ at a
 near-tie where the shape changes, below). A request evicted and restored
 keeps what it asked. `/metrics` counts the rounds at each shape
 (`ignis_speculative_shape_rounds_total`) and, per position up to the window,
