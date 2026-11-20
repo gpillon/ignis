@@ -140,9 +140,6 @@ export type ExpertPhase = (typeof EXPERT_PHASES)[number];
 export const NGRAM_SOURCES = ["hot", "file"] as const;
 export type NgramSource = (typeof NGRAM_SOURCES)[number];
 
-/** The draft positions every load prints (MIN_DRAFT_POSITIONS, crates/core/src/speculation.rs): the per-position families' labels "1".."7". */
-export const DRAFT_POSITIONS = 7;
-
 /**
  * Speculative decoding (GitHub #307): verify rounds, drafts verified and
  * committed, and per draft position how many rounds proposed it and committed
@@ -597,8 +594,13 @@ export function readSnapshot({ families }: Exposition): Snapshot {
   }
 
   if (families.has(SPEC_FAMILIES.rounds)) {
+    // The per-position families print the positions "1".."N" of the most a load drafts (7 up to 15): read what is printed.
+    const printed = [SPEC_FAMILIES.positionDrafted, SPEC_FAMILIES.positionAccepted].flatMap((family) =>
+      samples(family).map((s) => Number(s.labels.position)),
+    );
+    const draftPositions = Math.max(0, ...printed.filter((n) => Number.isInteger(n)));
     const positions = (family: string) =>
-      Array.from({ length: DRAFT_POSITIONS }, (_, j) => valueOf(family, ["position", String(j + 1)]));
+      Array.from({ length: draftPositions }, (_, j) => valueOf(family, ["position", String(j + 1)]));
     snap.speculation = {
       rounds: valueOf(SPEC_FAMILIES.rounds),
       drafted: valueOf(SPEC_FAMILIES.drafted),
@@ -748,7 +750,7 @@ function inContract(family: string, s: Sample): boolean {
     case SPEC_FAMILIES.positionDrafted:
     case SPEC_FAMILIES.positionAccepted: {
       const position = Number(s.labels.position);
-      return Number.isInteger(position) && position >= 1 && position <= DRAFT_POSITIONS && Object.keys(s.labels).length === 1;
+      return Number.isInteger(position) && position >= 1 && Object.keys(s.labels).length === 1;
     }
     default:
       return Object.keys(s.labels).length === 0;

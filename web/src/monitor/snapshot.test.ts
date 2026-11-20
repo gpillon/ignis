@@ -207,7 +207,16 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     });
     expect(readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION)).speculation).toBeNull();
     const stray = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\nignis_speculative_position_drafted_total{position="8"} 1\n`));
-    expect(stray.unknown).toEqual([{ name: "ignis_speculative_position_drafted_total", labels: { position: "8" }, value: 1 }]);
+    expect(stray.unknown).toEqual([{ name: "ignis_speculative_position_drafted_total", labels: { position: "0" }, value: 1 }]);
+    // A 15-draft load prints positions 1..15: all read, none unknown.
+    const wide = ["drafted", "accepted"].flatMap((kind) => Array.from({ length: 15 }, (_, j) => `ignis_speculative_position_${kind}_total{position="${j + 1}"} ${j}`));
+    const fifteen = readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}ignis_speculative_rounds_total 1
+${wide.join("
+")}
+`));
+    expect(fifteen.unknown).toEqual([]);
+    expect(fifteen.speculation?.positionDrafted).toHaveLength(15);
+    expect(fifteen.speculation?.positionDrafted[14]).toBe(14);
   });
 
   // GitHub #330: the loop guard's family, all at once after the first watched request, and the budget's own close counter.

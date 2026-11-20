@@ -2,7 +2,6 @@ import { formatCount, formatSeconds, formatShare, formatWindow } from "./format.
 import { type CounterPick, increaseOver, type Point, rollingRate, windowHistogram } from "./history.ts";
 import { histogramMean, histogramQuantile } from "./quantile.ts";
 import {
-  DRAFT_POSITIONS,
   EXPERT_CLASSES,
   EXPERT_PHASES,
   type ExpertClass,
@@ -757,7 +756,7 @@ export function deriveSpeculation(points: Point[], since: number): Speculation {
   const rounds = tally((s) => s.speculation?.rounds ?? null);
   const drafted = tally((s) => s.speculation?.drafted ?? null);
   const accepted = tally((s) => s.speculation?.accepted ?? null);
-  const byPosition = Array.from({ length: DRAFT_POSITIONS }, (_, j) =>
+  const byPosition = Array.from({ length: last.speculation?.positionDrafted.length ?? 0 }, (_, j) =>
     shareOf(
       increaseOver(points, (s) => s.speculation?.positionAccepted[j] ?? null, since),
       increaseOver(points, (s) => s.speculation?.positionDrafted[j] ?? null, since),
