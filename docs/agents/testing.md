@@ -279,12 +279,6 @@ that doesn't run anything.
 
 ## Writing the tests
 
-- New behavior: its test lands with the change, before the task is
-  reported done — and it exercises the new path, not the old world
-  (a test that already passed before the change proves nothing about
-  it).
-- Bug fix: the regression test goes first — reproduce the bug, watch
-  the test go red, then fix.
 - The standard loop is red-green, driven by the `/tdd` skill.
 - Logging on the prefill/decode path: the hotpath lint
   (`crates/logging/src/hotpath_lint.rs`) fails `cargo test` on an
@@ -665,7 +659,7 @@ mk/cuda-build-check.sh --require '86;120a' <binary>...`.
 
 ## Done means
 
-1. every new or changed behavior has a test that covers it
+1. every seam agreed for the change has its test (`/tdd`)
 2. `cargo test` passes workspace-wide (machine-local skips allowed)
 3. `cargo check --workspace --features cuda,logits-capture --tests` is
    clean (`make check CUDA=1`). The

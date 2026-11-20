@@ -6,18 +6,14 @@ the skill leaves open.
 
 ## Worktrees
 
-The integration branch and each implementer's branch get their own worktree,
-one per ticket, every implementer branch starting from the integration branch.
+The integration branch has its own worktree too.
 Each worktree builds into its own target directory: two worktrees on one
 `CARGO_TARGET_DIR` link each other's workspace crates, with no error unless a
 signature happens to break.
 
 ## Agents
 
-Each ticket gets a fresh implementer whose brief points at the spec, the
-ticket and any shared notes, which live in the coordinator's `.scratch/`. An
-implementer is stopped once it reports; follow-up work goes to a new agent with
-a short handoff in the scratchpad, never back to the finished one.
+The notes the implementers share live in the coordinator's `.scratch/`.
 
 ## Checks
 
@@ -35,15 +31,12 @@ the branch and deletes `ci/<spec>` once the owner has merged.
 
 ## The end of a build
 
-There is no pull request. Each implementer's branch merges into the
-integration branch, the coordinator reports that branch, and the owner merges
-it into `main` locally; nothing is pushed until the owner says so. Tickets
-close as `docs/agents/issue-tracker.md` says under "Closing work".
+There is no pull request: the owner merges the integration branch into `main`
+locally, and nothing is pushed until the owner says so.
 
-An implementer merges the integration branch into its own before it reports,
-with a message its brief gives it, such as `Merge 374-integration into the T2
-branch before the report (#377)`: the commit-message hook refuses git's
-default one.
+An implementer's merge of the integration branch into its own takes a message
+its brief gives it, such as `Merge 374-integration into the T2 branch before
+the report (#377)`: the commit-message hook refuses git's default one.
 
 ## Cleanup
 
