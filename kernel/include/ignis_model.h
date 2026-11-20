@@ -592,23 +592,26 @@ struct ignis_model_load_options {
   /* GitHub #689 (spec #684): the shape rule's thresholds on a DFlash2 load
    * past IGNIS_BASE_SHAPE_DRAFT_TOKENS (kernel/src/round_shape.h
    * `asks_extended`), read only there: the drafts a full base round must
-   * take for its lane to ask the extended shape, 1..IGNIS_BASE_SHAPE_DRAFT_TOKENS
-   * (0 = 7, every one), and the drafts an extended round must take for its
-   * lane to keep asking it, 1..`draft_tokens` (0 = 6). A value outside its
-   * range is refused, naming the field: past the window no round could keep
-   * a lane at the extended shape. Appended at the end: the struct grew by
-   * two words. */
+   * take for its lane to ask the extended shape, 1..IGNIS_BASE_SHAPE_DRAFT_TOKENS,
+   * and the drafts an extended round must take for its lane to keep asking
+   * it, 1..`draft_tokens`; 0 is each's default, the server's
+   * (kernel/src/round_shape.h `kDefaultEnterAccepted`,
+   * `kDefaultStayAccepted`). A value outside its range is refused, naming
+   * the field: past the window no round could keep a lane at the extended
+   * shape. Appended at the end: the struct grew by two words. */
   uint32_t shape_enter_accepted;
   uint32_t shape_stay_accepted;
   /* GitHub #690 (spec #684): the shape policy on such a load, read only
    * there: enum ignis_shape_policy; the verify rounds of its own a lane's
-   * expectations read over, 1..IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS (0 = 16); and
-   * the extended round's period over the base round's at 1..
-   * IGNIS_EXTENDED_SHAPE_MAX_LANES lanes, in thousandths, 1000..2000 each
-   * (0 = that lane count's default: 1150, 1230, 1270, 1310; the one-lane
-   * entry is not read, a lane alone running at the shape it asks). A value
-   * outside its range is refused, naming the field. Appended at the end: the
-   * struct grew by six words. */
+   * expectations read over, 1..IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS; and the
+   * extended round's period over the base round's at 1..
+   * IGNIS_EXTENDED_SHAPE_MAX_LANES lanes, in thousandths, each in
+   * kPeriodRatioMinMilli..kPeriodRatioMaxMilli (the one-lane entry is not
+   * read, a lane alone running at the shape it asks); 0 is each's default,
+   * the server's, a ratio's that lane count's (kernel/src/round_shape.h
+   * `kDefaultEstimateRounds`, `kDefaultPeriodRatios`). A value outside its
+   * range is refused, naming the field. Appended at the end: the struct grew
+   * by six words. */
   uint32_t shape_policy;
   uint32_t shape_estimate_rounds;
   uint32_t shape_period_ratios[IGNIS_EXTENDED_SHAPE_MAX_LANES];

@@ -237,7 +237,8 @@ the other. They are no configuration fields: `GET /v1/config` and
 - `IGNIS_FP8_W8A8_TILE16=0` (from 0.11.0) gives the 27B's exception products
   under `fp8` exception weights their 128-token tile back for a call of 9 to
   16 tokens, the comparison a speed measurement of the 16-token tile needs.
-  Unset, or `1`, such a call (a one-lane round at the extended shape, a
+  Unset on a card of compute capability 12, where the tile was measured, or
+  `1` on any card, such a call (a one-lane round at the extended shape, a
   two-lane round at the base shape, a prefill chunk of 9 to 16 tokens) runs
   the product of FP8 activations on a tile of 16 tokens and 64 output rows,
   whose outputs are the 128-token tile's byte for byte
@@ -245,32 +246,40 @@ the other. They are no configuration fields: `GET /v1/config` and
   round identity test below, arm `fp8-w8a8-tile128`). A call of 8 tokens or
   fewer keeps its BF16-activation GEMV and one of 17 or more the 128-token
   tile either way, Flash-Next's FP8 projections are their own, and a `bf16`
-  load runs no such product. It is read at each call, so a graph keeps the
-  tile its capture read; any other value refuses the load, naming the
-  variable.
+  load runs no such product. Unset on any other card, the 128-token tile
+  stays, as `0` keeps it everywhere; `1` there is the measurement off the
+  RTX 5090. It is read at each call, so a graph keeps the tile its capture
+  read; any other value refuses the load, naming the variable.
 - `IGNIS_DFLASH2_APPEND_KV_ONLY=0` (from 0.11.0) gives the 27B's DFlash2
   drafter its whole q, k and v product back in the append after a verify
-  round, the comparison a speed measurement of the append needs. Unset, or
-  `1`, an append of 5 to 32 columns (a round at the base shape of 1 to 4
+  round, the comparison a speed measurement of the append needs. Unset on a
+  card of compute capability 12, where the lever was measured, or `1` on any
+  card, an append of 5 to 32 columns (a round at the base shape of 1 to 4
   lanes, one at the extended shape of 1 or 2) projects only the key and value
   rows the drafter keeps, a third of the product, and they are the whole
   product's rows byte for byte (`ignis_kernel_dflash2_small_t_test`), so the
   tokens are the same (the round identity test below, arm
   `dflash2-append-qkv`). A wider append, and the append of a prefill chunk or
-  of a carried anchor, keep the whole product either way. It is read at each call, so a graph keeps the
-  product its capture read; any other value refuses the load, naming the
-  variable.
+  of a carried anchor, keep the whole product either way. Unset on any other
+  card, the whole product stays, as `0` keeps it everywhere; `1` there is
+  the measurement off the RTX 5090. It is read at each call, so a graph
+  keeps the product its capture read; any other value refuses the load,
+  naming the variable.
 - `IGNIS_DFLASH2_SMALL_T_FILL=0` (from 0.11.0) gives the 27B's DFlash2
   drafter's conv projections and q, k and v product their vendored launch
   back for a call of 5 to 16 columns, 8 or 16 warps a block, the comparison a
-  speed measurement of the launch needs. Unset, or `1`, such a call (a round
-  at the base shape of 1 or 2 lanes, one at the extended shape of 1) runs on
-  blocks of 4 warps, two or four times as many, whose outputs are the
-  vendored launch's byte for byte (`ignis_kernel_dflash2_small_t_test`), so
+  speed measurement of the launch needs. Unset on a card of compute
+  capability 12, where the lever was measured, or `1` on any card, such a
+  call (a round at the base shape of 1 or 2 lanes, one at the extended shape
+  of 1) runs on blocks of 4 warps, two or four times as many, whose outputs
+  are the vendored launch's byte for byte (`ignis_kernel_dflash2_small_t_test`), so
   the tokens are the same (the round identity test below, arm
   `dflash2-small-t-vendored`). A wider call keeps the vendored launch either
-  way, as do the drafter's other products. It is read at each call, so a graph keeps the launch its capture
-  read; any other value refuses the load, naming the variable.
+  way, as do the drafter's other products. Unset on any other card, the
+  vendored launch stays, as `0` keeps it everywhere; `1` there is the
+  measurement off the RTX 5090. It is read at each call, so a graph keeps
+  the launch its capture read; any other value refuses the load, naming the
+  variable.
 - `IGNIS_GDN_GATING=chain|branch` (from 0.11.0) picks, at each capture of
   the decode graphs, where each GDN layer of the 27B computes its gating (the
   a and b products of the layer's normed input and the decay and update gates
@@ -303,7 +312,8 @@ the other. They are no configuration fields: `GET /v1/config` and
   and rounds, and how many of them ran eagerly, are in the program's stats;
   `ignis.runtime.decode_graph_capture` lists the shapes (`round_shapes`), and
   `ignis.runtime.verify_graph_capture_incomplete` names a shape's widths whose
-  verify graph could not be captured, whose rounds run eagerly.
+  verify graph, or drafter's append graph (`graph`), could not be captured,
+  whose rounds run that part eagerly.
 
 ### The round identity test
 
@@ -326,9 +336,10 @@ profiles load, the same way at each profile's lanes (`trellis-16gb-w15-rule`
 at 2, `trellis-24gb-w15-rule` at 8) and at 8 draft tokens under
 `IGNIS_ROUND_SHAPE=extended` (`trellis-16gb-w8`); a second test holds a
 15-draft load's base rounds to a 7-draft load's tokens, on the NVFP4 artifact
-and on both trellis loads at 15; and a third holds a prefill whose last chunk is 9 to 16 tokens to the same
-logits, bit for bit, under `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is
-held to the graphs' replay with every switch unset; a change behind a switch
+and on both trellis loads at 15; and a third holds a prefill whose last
+chunk is 9 to 16 tokens to the same logits, bit for bit, under
+`IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is held to the graphs' replay
+with every switch unset; a change behind a switch
 of its own adds that switch as an arm, as the file says. The whole run
 materializes nineteen loads in turn for the first test and eight for the
 second, so a narrow one is the usual run:
@@ -349,9 +360,10 @@ verify round to its base round's numerical class
 ([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)),
 on the NVFP4 artifact with DFlash2 at 15 draft tokens under FP8 exception
 weights, and in a second test on the 16 GB class's trellis artifact under its
-own exception weights, BF16, on an RTX 5090 (another card skips both). Speculation off writes each
-prompt's greedy text; both shapes are then teacher-forced to it at 1 to 4
-lanes, once offered the text as their drafts and once replaying their captured
+own exception weights, BF16, on an RTX 5090 (another card skips both).
+Speculation off writes each prompt's greedy text; both shapes are then
+teacher-forced to it at 1 to 4 lanes, once offered the text as their drafts
+and once replaying their captured
 graphs on the drafter's own drafts, and every extended row is held to the base
 row at the same text index and lane count, in BF16 ulps, by bounds named in the
 file with their measured values. Each test loads once and takes about two and

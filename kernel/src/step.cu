@@ -336,22 +336,19 @@ std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
 // was made from -- a decode-logits column no later round or prefill draw has
 // written, or the verify logits of the last verify round, the one that cut
 // the lane's commit. GitHub #687: a load's two round shapes write one logits
-// buffer, so the last verify round is the latest of either shape's, whose
-// stamps both come from the model's one counter; a record's column is the
-// buffer's own, at the stride of the round that wrote it.
+// buffer (the base shape's, which the extended one holds too), so the last
+// verify round is the latest of either shape's (`ignis_latest_verify_shape`);
+// a record's column is the buffer's own, at the stride of the round that
+// wrote it. A verify round's record carries its round's stamp, never 0.
 bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept) {
   if (kept.source == IgnisKeptSource::kVerifyLogits) {
-    const IgnisVerifyRound *verify = model->base_shape.get();
-    if (verify == nullptr) {
+    const IgnisVerifyRound *latest = ignis_latest_verify_shape(*model);
+    if (latest == nullptr) {
       return false;
     }
-    std::uint64_t latest = verify->kept_epoch;
-    if (model->extended_shape != nullptr) {
-      latest = std::max(latest, model->extended_shape->kept_epoch);
-    }
     const std::uint64_t columns =
-        verify->logits->bytes / (static_cast<std::uint64_t>(model->vocab) * sizeof(std::uint16_t));
-    return static_cast<std::uint64_t>(kept.column) < columns && latest == kept.epoch;
+        latest->logits->bytes / (static_cast<std::uint64_t>(model->vocab) * sizeof(std::uint16_t));
+    return static_cast<std::uint64_t>(kept.column) < columns && latest->kept_epoch == kept.epoch;
   }
   return static_cast<std::uint32_t>(kept.column) < model->decode_lanes &&
          model->kept_column_epochs[static_cast<std::size_t>(kept.column)] == kept.epoch;
@@ -2200,7 +2197,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
   const std::uint32_t k = verify.window;
   const std::uint32_t lane_columns = k + 1;
   // GitHub #689: whether the round is at its load's extended shape.
-  const bool extended = &verify == model->extended_shape.get();
+  const bool extended = verify.extended();
   // GitHub #687: the caller's arrays are strided by the load's window
   // (`speculative_window`), the round's buffers by its shape's: equal on a
   // load of one shape, and on a load of two at its extended shape; a base
@@ -3101,6 +3098,15 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
                     std::to_string(i) + ")");
           return -1;
         }
+      }
+      // GitHub #690: how many of the round's lanes ask the extended shape going
+      // into it, before its outcome moves their asks.
+      if (options->out_shape_asks != nullptr) {
+        std::uint32_t asking = 0;
+        for (uint64_t i = 0; model->extended_shape != nullptr && i < batch_size; ++i) {
+          asking += sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
+        }
+        *options->out_shape_asks = asking;
       }
       // GitHub #692 (test-only): a teacher-forced round that names its shape
       // runs at it, and nothing below chooses one for it.

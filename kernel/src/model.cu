@@ -1793,7 +1793,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
                  : name == "shape_estimate_rounds"
                      ? " must be in 1.." + std::to_string(IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS) +
                            " (0: the default), the rounds a lane keeps"
-                     : " must each be in 1000..2000 thousandths (0: that lane count's default)"));
+                     : " must each be in " + std::to_string(ignis::round_shape::kPeriodRatioMinMilli) + ".." +
+                           std::to_string(ignis::round_shape::kPeriodRatioMaxMilli) +
+                           " thousandths (0: that lane count's default)"));
       return nullptr;
     }
   }
@@ -1830,7 +1832,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   // #693: unset or `1`, `0`; each quantizing call of an FP8 exception matrix reads it again, there),
   // IGNIS_DFLASH2_APPEND_KV_ONLY and IGNIS_DFLASH2_SMALL_T_FILL (GitHub #694: unset or `1`, `0`; each
   // call of the drafter's append and of its forward's small products reads them again,
-  // kernel/src/dflash2_small_t.h).
+  // kernel/src/dflash2_small_t.h); unset, those last three run their lever on a card of compute
+  // capability 12 alone (kernel/src/card_lever.h).
   bool fp8_gemv_paired = true;
   bool fp8_w8a8_tile16 = true;
   bool dflash2_append_kv_only = true;

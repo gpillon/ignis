@@ -414,6 +414,7 @@ describe("deriveSpeculation", () => {
     positionDrafted: [at1[0], at2[0], 0, 0, 0, 0, 0],
     positionAccepted: [at1[1], at2[1], 0, 0, 0, 0, 0],
     shapeRounds: shapes,
+    splitRounds: null,
   });
 
   it("reads acceptance, tokens per round and each position's share over the window", () => {

@@ -219,6 +219,7 @@ fn speculative_rounds_add_up_on_the_done_event() {
             drafted_at: at_positions(&[2, 2]),
             accepted_at: at_positions(&[1, 1]),
             extended_rounds: 0,
+            split_rounds: 0,
         })
     );
 }

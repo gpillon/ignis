@@ -1,5 +1,7 @@
 // ignis kernel leaf - GitHub #688 (spec #684): the attention of a round at a load's extended shape
-// (kernel/src/round_shape.h), 9..16 columns a lane at 1..4 lanes -- OURS, leaf-internal.
+// (kernel/src/round_shape.h), 9..16 columns a lane at 1..4 lanes -- an ADAPTED op (ADR 0051 tier
+// 2), leaf-internal: its chunk loop is restated from the vendored wrapper, ours otherwise
+// (kernel/src/extended_attention.cu names its upstream, as kernel/NOTICE does).
 //
 // Such a round's columns are past the vendored small-T tile (8 columns over hq-e8-2b, 6 over BF16),
 // so its attention runs in chunks of the tile, each chunk appending its own columns' K and V and

@@ -694,7 +694,7 @@ impl Speculation {
     /// the load's window could never keep a lane there, and is refused naming
     /// the threshold and the window; every other load never reads the rule.
     pub fn with_shape_rule(self, shape_rule: ShapeRule) -> Result<Self, String> {
-        if self.round_shapes(1).1.is_some() && shape_rule.stay_accepted > self.draft_tokens {
+        if self.has_extended_shape() && shape_rule.stay_accepted > self.draft_tokens {
             return Err(format!(
                 "the shape rule's stay threshold {} is past the window of {} drafts, which no extended round can take",
                 shape_rule.stay_accepted, self.draft_tokens
@@ -762,6 +762,13 @@ impl Speculation {
         draft_positions(self.draft_tokens)
     }
 
+    /// Whether a load of this option holds an extended round shape beside its
+    /// base shape ([`Speculation::round_shapes`]): DFlash2 past
+    /// [`BASE_SHAPE_DRAFT_TOKENS`] drafts, at every lane count.
+    pub fn has_extended_shape(&self) -> bool {
+        self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens > BASE_SHAPE_DRAFT_TOKENS
+    }
+
     /// The round shapes a load of `decode_lanes` lanes holds (GitHub #687,
     /// `plan_load_sizes`, `kernel/src/model.cu`): its base shape, and its
     /// extended shape where it has one. Up to [`BASE_SHAPE_DRAFT_TOKENS`], and
@@ -772,7 +779,7 @@ impl Speculation {
     /// hold one set of device buffers, each the larger of the two shapes', so
     /// the plan's lines take each buffer once.
     pub fn round_shapes(&self, decode_lanes: u32) -> (RoundShape, Option<RoundShape>) {
-        if self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens > BASE_SHAPE_DRAFT_TOKENS {
+        if self.has_extended_shape() {
             let extended = RoundShape { window: self.draft_tokens, lanes: decode_lanes.min(EXTENDED_SHAPE_MAX_LANES) };
             (RoundShape { window: BASE_SHAPE_DRAFT_TOKENS, lanes: decode_lanes }, Some(extended))
         } else {
@@ -996,6 +1003,41 @@ impl Dflash2RoundBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GitHub #689, #690 (ADR 0046): the shape rule's and the shape policy's
+    /// defaults are declared once, here (and the server's schema takes
+    /// them); the leaf repeats them only as what a load's 0 stands for, and
+    /// the range of a period ratio, in named constants of
+    /// `kernel/src/round_shape.h`, which this reads as text and holds to
+    /// these. No toolchain: a value changed on one side alone goes red here.
+    #[test]
+    fn the_leafs_shape_defaults_are_the_cores() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/src/round_shape.h");
+        let header = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let constant = |name: &str| -> String {
+            let line = header
+                .lines()
+                .find(|line| line.starts_with("inline constexpr") && line.contains(&format!(" {name} = ")))
+                .unwrap_or_else(|| panic!("round_shape.h declares no `{name} = ...;` line"));
+            let value = line.split_once(" = ").expect("an initializer").1;
+            value.trim_end().strip_suffix(';').unwrap_or_else(|| panic!("`{name}` ends its line")).trim().to_owned()
+        };
+        let number = |name: &str| constant(name).parse::<u32>().unwrap_or_else(|e| panic!("`{name}`: {e}"));
+        assert_eq!(number("kDefaultEnterAccepted"), ShapeRule::DEFAULT_ENTER_ACCEPTED);
+        assert_eq!(number("kDefaultStayAccepted"), ShapeRule::DEFAULT_STAY_ACCEPTED);
+        assert_eq!(number("kDefaultEstimateRounds"), ShapeEstimate::DEFAULT_ROUNDS);
+        let ratios: Vec<u32> = constant("kDefaultPeriodRatios")
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .split(',')
+            .map(|ratio| ratio.trim().parse().unwrap_or_else(|e| panic!("kDefaultPeriodRatios: {e}")))
+            .collect();
+        assert_eq!(ratios, ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI);
+        assert_eq!(
+            number("kPeriodRatioMinMilli")..=number("kPeriodRatioMaxMilli"),
+            ShapeEstimate::PERIOD_RATIO_MILLI_RANGE
+        );
+    }
 
     /// ADR 0063: `auto` is a third spelling of the setting, not a third
     /// head, and resolves to the full head; the two heads stay themselves.

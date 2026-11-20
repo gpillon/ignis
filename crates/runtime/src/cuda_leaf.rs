@@ -429,18 +429,28 @@ fn capture_complete(ready: u32, lanes: u32) -> bool {
     ready >= lanes
 }
 
-/// GitHub #687: the round shapes a capture left without a verify graph at a
-/// width they serve, each as its draft window and those widths. A round of
-/// such a shape at such a width runs eagerly: the same tokens, without the
-/// graph's gain (never a refusal of service, ADR 0019), which the load says
-/// in a structured event rather than leave to a silent fallback.
-fn round_shapes_without_graphs(stats: &step::ProgramStats) -> Vec<(u32, Vec<u32>)> {
+/// GitHub #687: the round shapes a capture left without a graph at a width
+/// they serve, each as its draft window, the graph (`verify`, or
+/// `drafter_append`: the DFlash2 drafter's append after the round's commit)
+/// and those widths. A round of such a shape at such a width runs that part
+/// eagerly: the same tokens, without the graph's gain (never a refusal of
+/// service, ADR 0019), which the load says in a structured event rather than
+/// leave to a silent fallback. The append's graphs are captured only where
+/// the rounds defer their commit (a DFlash2 load, unless
+/// `IGNIS_DEFER_VERIFY=0`), which the stats do not say, so a load is taken to
+/// capture them when any of its shapes holds one: a capture that failed every
+/// append of every shape is in the stats alone.
+fn round_shapes_without_graphs(stats: &step::ProgramStats) -> Vec<(u32, &'static str, Vec<u32>)> {
+    let appends = stats.shapes().iter().any(|shape| shape.drafter_append_graph_ready_mask != 0);
     stats
         .shapes()
         .iter()
-        .filter_map(|shape| {
-            let widths = shape.widths_without_a_graph();
-            (!widths.is_empty()).then_some((shape.window, widths))
+        .flat_map(|shape| {
+            let append = if appends { shape.widths_without_an_append_graph() } else { Vec::new() };
+            [("verify", shape.widths_without_a_graph()), ("drafter_append", append)]
+                .into_iter()
+                .filter(|(_, widths)| !widths.is_empty())
+                .map(|(graph, widths)| (shape.window, graph, widths))
         })
         .collect()
 }
@@ -610,8 +620,8 @@ impl CudaLeaf {
                 let accepted = (run.tokens.len() as u32).saturating_sub(1).min(run.extent);
                 LaneRun {
                     tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
-                    // GitHub #689: and the round's shape.
-                    spec: Some(SpecCounters::round(run.extent, accepted).at_shape(run.extended)),
+                    // GitHub #689, #690: and the round's shape, and whether it split its lanes' asks.
+                    spec: Some(SpecCounters::round(run.extent, accepted).at_shape(run.extended).in_split_round(run.split)),
                     drawn_probability: None,
                     redirected: run.redirected,
                 }
@@ -845,14 +855,15 @@ impl StepLeaf for CudaLeaf {
             round_shapes = ?round_shapes,
             "decode graph capture"
         );
-        for (window, widths) in round_shapes_without_graphs(&graphs) {
+        for (window, graph, widths) in round_shapes_without_graphs(&graphs) {
             // hotpath-lint-allow: same model-load-time call as above.
             tracing::warn!(
                 name: "ignis.runtime.verify_graph_capture_incomplete",
                 window,
+                graph,
                 widths = ?widths,
                 error = %step::last_decode_graph_error(),
-                "verify graph capture: these widths of the round shape run their verify rounds eagerly"
+                "verify graph capture: these widths of the round shape run this graph's part of their verify rounds eagerly"
             );
         }
         if !capture_complete(capture.ready_count(), self.config.slot_count) {
@@ -1364,15 +1375,19 @@ mod tests {
     /// at a width it serves is named, shape by shape and width by width, and
     /// one that reached every width of every shape names nothing: an extended
     /// shape of 4 lanes is complete at widths 1..=4, a base shape of 2 lanes
-    /// at 1..=2.
+    /// at 1..=2. The same for the drafter's append after a round, on a load
+    /// that captures it (some shape holds an append graph): a load with none,
+    /// as under `IGNIS_DEFER_VERIFY=0` or with no drafter, names no append.
     #[test]
     fn the_capture_names_each_round_shapes_widths_without_a_graph() {
-        let shape = |window, lanes, ready| step::RoundShapeStats {
+        let appending = |window, lanes, ready, append| step::RoundShapeStats {
             window,
             lanes,
             verify_graph_ready_mask: ready,
+            drafter_append_graph_ready_mask: append,
             ..step::RoundShapeStats::default()
         };
+        let shape = |window, lanes, ready| appending(window, lanes, ready, 0);
         let stats = |shapes: &[step::RoundShapeStats]| {
             let mut stats = step::ProgramStats { round_shape_count: shapes.len() as u32, ..step::ProgramStats::default() };
             stats.round_shapes[..shapes.len()].copy_from_slice(shapes);
@@ -1383,13 +1398,27 @@ mod tests {
         assert!(round_shapes_without_graphs(&stats(&[shape(7, 2, 0x03), shape(15, 2, 0x03)])).is_empty());
         assert_eq!(
             round_shapes_without_graphs(&stats(&[shape(7, 8, 0xff), shape(15, 4, 0b1011)])),
-            vec![(15, vec![3])],
+            vec![(15, "verify", vec![3])],
             "the extended shape's width 3"
         );
         assert_eq!(
             round_shapes_without_graphs(&stats(&[shape(7, 8, 0x7f), shape(12, 4, 0)])),
-            vec![(7, vec![8]), (12, vec![1, 2, 3, 4])],
+            vec![(7, "verify", vec![8]), (12, "verify", vec![1, 2, 3, 4])],
             "the base shape's width 8, and every width of the extended shape"
+        );
+        assert!(
+            round_shapes_without_graphs(&stats(&[appending(7, 8, 0xff, 0xff), appending(15, 4, 0x0f, 0x0f)])).is_empty(),
+            "every append graph captured"
+        );
+        assert_eq!(
+            round_shapes_without_graphs(&stats(&[appending(7, 8, 0xff, 0xff), appending(15, 4, 0x0f, 0b0111)])),
+            vec![(15, "drafter_append", vec![4])],
+            "the extended shape's append at width 4"
+        );
+        assert_eq!(
+            round_shapes_without_graphs(&stats(&[appending(7, 2, 0x03, 0x03), appending(15, 2, 0x01, 0)])),
+            vec![(15, "verify", vec![2]), (15, "drafter_append", vec![1, 2])],
+            "the extended shape's verify graph at width 2 and its every append"
         );
     }
 

@@ -861,6 +861,12 @@ struct ignis_decode_options {
    * the extended shape of a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS
    * drafts. NULL asks for nothing; a plain round writes nothing. */
   uint32_t *out_round_shape;
+  /* GitHub #690 (spec #684): receives how many of the verify round's lanes
+   * asked the extended shape going into it, the asks its shape was chosen
+   * from (kernel/src/round_shape.h `asks_extended`), before the round's
+   * outcome moves them: 0 on a 27B load of one shape. NULL asks for nothing;
+   * a plain round, and Flash-Next's verify round, write nothing. */
+  uint32_t *out_shape_asks;
 };
 
 #ifdef __cplusplus
@@ -868,8 +874,8 @@ struct ignis_decode_options {
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #267 appended
  * `forced_tokens` after every field the serving path sets, GitHub #590 the
  * host cut after it, GitHub #692 the forced drafts and shape after that,
- * and GitHub #689 the round's shape after them. */
-static_assert(sizeof(struct ignis_decode_options) == 136 &&
+ * GitHub #689 the round's shape after them and GitHub #690 its asks last. */
+static_assert(sizeof(struct ignis_decode_options) == 144 &&
                   offsetof(struct ignis_decode_options, out_logits) == 72 &&
                   offsetof(struct ignis_decode_options, forced_tokens) == 80 &&
                   offsetof(struct ignis_decode_options, host_cut_lanes) == 88 &&
@@ -877,7 +883,8 @@ static_assert(sizeof(struct ignis_decode_options) == 136 &&
                   offsetof(struct ignis_decode_options, host_cut_context) == 104 &&
                   offsetof(struct ignis_decode_options, forced_drafts) == 112 &&
                   offsetof(struct ignis_decode_options, forced_shape_window) == 120 &&
-                  offsetof(struct ignis_decode_options, out_round_shape) == 128,
+                  offsetof(struct ignis_decode_options, out_round_shape) == 128 &&
+                  offsetof(struct ignis_decode_options, out_shape_asks) == 136,
               "ignis_decode_options drifted from crates/core/src/step_abi.rs IgnisDecodeOptions");
 #endif
 

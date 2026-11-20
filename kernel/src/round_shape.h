@@ -32,13 +32,25 @@ inline bool has_extended_shape(int32_t backend, uint32_t draft_tokens) {
   return backend == IGNIS_SPECULATIVE_DFLASH2 && draft_tokens > IGNIS_BASE_SHAPE_DRAFT_TOKENS;
 }
 
+// The defaults a load's 0 stands for in the shape rule's and the shape policy's fields
+// (`ignis_model_load_options`), and the range of a period ratio: the server's, declared in
+// crates/server/src/config/schema.rs from ignis_core's (`ShapeRule`, `ShapeEstimate`), to which a
+// CPU test holds these lines (crates/core/src/speculation.rs,
+// `the_leafs_shape_defaults_are_the_cores`). One constant a line, `name = value;`, as it reads them.
+inline constexpr std::uint32_t kDefaultEnterAccepted = 7;
+inline constexpr std::uint32_t kDefaultStayAccepted = 6;
+inline constexpr std::uint32_t kDefaultEstimateRounds = 16;
+inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1150, 1230, 1270, 1310};
+inline constexpr std::uint32_t kPeriodRatioMinMilli = 1000;
+inline constexpr std::uint32_t kPeriodRatioMaxMilli = 2000;
+
 // GitHub #689: the shape rule's thresholds, a load's (`ignis_model_load_options`, the server's
 // `spec.shape_enter_accepted` and `spec.shape_stay_accepted`).
 struct ShapeRule {
-  // The drafts a full base round must take for its lane to ask the extended shape: 7, every one.
-  std::uint32_t enter_accepted = 7;
+  // The drafts a full base round must take for its lane to ask the extended shape: every one.
+  std::uint32_t enter_accepted = kDefaultEnterAccepted;
   // The drafts an extended round must take for its lane to keep asking it.
-  std::uint32_t stay_accepted = 6;
+  std::uint32_t stay_accepted = kDefaultStayAccepted;
 };
 
 // The shape rule: what a lane asks of its next round after one at the extended shape (`extended`)
@@ -136,12 +148,12 @@ struct ShapePolicy {
   // does not ask pays one extended round in 17 for it -- about 1% of its rate at two lanes, where an
   // extended round costs it about 19% -- and a lane whose text turns predictable waits at most 16
   // rounds behind an estimate from before. Provisional, as the ratios are.
-  std::uint32_t estimate_rounds = 16;
+  std::uint32_t estimate_rounds = kDefaultEstimateRounds;
   // The extended round's period over the base round's, in thousandths, at 1..4 lanes: measured on
   // the RTX 5090 at 1, 2 and 4 lanes before the cost levers (1.15, 1.23, 1.31), 3 lanes the line
   // between 2 and 4 -- provisional until measured with the build they ship in. The one-lane entry
   // is not read: a lane alone runs at the shape it asks.
-  std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> period_ratios = {1150, 1230, 1270, 1310};
+  std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> period_ratios = kDefaultPeriodRatios;
 };
 
 // The shape policy a load's options give (`policy`, IGNIS_SHAPE_POLICY_*; `estimate_rounds`, 0 the
@@ -164,7 +176,7 @@ inline const char *policy_of(std::uint32_t policy, std::uint32_t estimate_rounds
   }
   for (std::size_t lanes = 0; lanes < resolved.period_ratios.size(); ++lanes) {
     const std::uint32_t ratio = period_ratios[lanes];
-    if (ratio != 0 && (ratio < 1000 || ratio > 2000)) {
+    if (ratio != 0 && (ratio < kPeriodRatioMinMilli || ratio > kPeriodRatioMaxMilli)) {
       return "shape_period_ratios";
     }
     if (ratio != 0) {

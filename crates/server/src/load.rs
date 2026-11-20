@@ -798,7 +798,7 @@ fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String
                 crate::config::decimal_text(drafter.temperature_factor_milli),
                 crate::config::decimal_text(drafter.top_p_milli)
             );
-            if s.round_shapes(1).1.is_none() {
+            if !s.has_extended_shape() {
                 return line;
             }
             let (rule, estimate) = (s.shape_rule(), s.shape_estimate());

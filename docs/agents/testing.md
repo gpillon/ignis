@@ -328,7 +328,9 @@ than computed from a flag. A request that names no cap generates at most
 needs a request to run to the context sends `max_tokens` or that `0`.
 
 Speculation is a load option too (GitHub #150): `--spec-backend dflash2
---spec-draft-tokens N` (N in 1..7, both flags or neither) binds the drafter's 66
+--spec-draft-tokens N` (both flags or neither; N in 1..15 for `dflash2`, past 7
+two round shapes, in 0..7 for `mtp` on the 27B and 1..7 on Flash-Next, in 1..7
+for the test-only `verify-only`) binds the drafter's 66
 `dflash2/*` objects and grows the prefill scratch by the drafter's context
 append; its sequence pool carries the drafter window per slot (40 MiB each
 slot, GitHub #152); `ignis.model.loaded` records it as
