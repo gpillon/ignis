@@ -326,7 +326,7 @@ def frozen(adr_dir, adrs, since):
             texts[path] = out[at:at + size].decode("utf-8", "replace")
             at += size + 1
 
-    def typo_fix(number):
+    def covering_marks(number):
         """The marks ("typo", "edit") of the commits since the base that change ADR
         `number`'s text when every one of them names it, else none: a commit that
         changes its frontmatter alone needs no mark, one marked commit does not
@@ -340,15 +340,15 @@ def frozen(adr_dir, adrs, since):
             blob = git(root, "show", f"{rev}:{name}").stdout
             return decision_text(blob.decode("utf-8", "replace"))
 
-        fixed = set()
+        marks = set()
         for entry in log.split("\x1e")[1:]:
             sha, message, names = entry.split("\x1f", 2)
             if all(text_at(f"{sha}^", name) == text_at(sha, name) for name in names.split()):
                 continue
             if ref(number) not in marked(message):
                 return set()
-            fixed |= marked(message)[ref(number)]
-        return fixed
+            marks |= marked(message)[ref(number)]
+        return marks
 
     problems, notes = [], []
     for path, was in texts.items():
@@ -362,10 +362,10 @@ def frozen(adr_dir, adrs, since):
             problems.append(f"{path}: ADR {number} existed at {base[:8]} and is gone: an ADR "
                             "is never deleted, a later one supersedes it (ADR 0081)")
         elif decision_text(was) != decision_text(adr.path.read_text(encoding="utf-8")):
-            fixed = typo_fix(number)
-            if fixed:
+            marks = covering_marks(number)
+            if marks:
                 notes.append(f"adr-index: ADR {number}'s text changed since {base[:8]}, "
-                             + ("as an edit its commit names" if "edit" in fixed
+                             + ("as an edit its commit names" if "edit" in marks
                                 else "as a typo fix its commit names"))
             else:
                 problems.append(
