@@ -642,7 +642,13 @@ struct ignis_program_stats {
  * replayed or eager (kernel/src/gdn_gating_home.h): the home the switch
  * names on a card of compute capability 12, the round's chain on every other
  * (`ignis_program_stats::gdn_gating`). Any other value refuses the call like
- * IGNIS_ROUND_TIMING's, and so does a branch whose stream CUDA cannot make. */
+ * IGNIS_ROUND_TIMING's, and so does a branch whose stream CUDA cannot make.
+ *
+ * GitHub #688: on a load with an extended round shape each call also reads
+ * IGNIS_EXTENDED_ATTENTION (`ours` or `vendored`; unset is `ours`): the route
+ * of every extended round's attention chunks from then on, replayed or eager
+ * (kernel/src/extended_attention.h, `ignis_model_extended_attention`). Any
+ * other value refuses the call like IGNIS_ROUND_TIMING's. */
 int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
                                    uint64_t *out_capture_micros, uint32_t *out_ready_mask);
 
@@ -822,7 +828,9 @@ struct ignis_decode_options {
    * back into the leaf. A negative return, or one outside 1..run_count, fails
    * the round with every lane as it was. Only a 27B verify round takes a
    * host cut: a plain round, a teacher-forced one and a Flash-Next load
-   * refuse it (#581). All three NULL: no host cut. */
+   * refuse it (#581). All three NULL: no host cut. GitHub #691: on a DFlash2
+   * load of two round shapes the round takes the shape it would without the
+   * host, and the run and the kept column are at that shape's stride. */
   const uint8_t *host_cut_lanes; /* [batch_size], or NULL */
   int32_t (*host_cut)(void *context, uint64_t lane, const int32_t *run, int32_t run_count);
   void *host_cut_context;
@@ -932,7 +940,9 @@ int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *p
  * ended at. Not another verify round's draw, nor a redirected one, nor that
  * of a sequence restored, cloned or claimed since: a repair of those is
  * refused. The scores last until a later round or prefill draw writes their
- * column (a verify round's: the next verify round), after which a repair is
+ * column (a verify round's: the next verify round, of either round shape on
+ * a DFlash2 load of two, which share the verify logits, GitHub #691), after
+ * which a repair is
  * refused as well -- a caller repairs right after the call that drew, before
  * the next call on the model. A Flash-Next load refuses every repair (#581).
  *

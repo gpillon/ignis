@@ -637,7 +637,8 @@ pub fn last_decode_graph_error() -> String {
 /// The one `Err` is a measurement switch read at capture with a value it
 /// does not know (`IGNIS_ROUND_TIMING`, GitHub #674;
 /// `IGNIS_DECODE_GRAPH_COPIES`, GitHub #677, #680; `IGNIS_DEFER_VERIFY`, GitHub
-/// #676; `IGNIS_GDN_GATING`, GitHub #681), named in the message.
+/// #676; `IGNIS_GDN_GATING`, GitHub #681; `IGNIS_EXTENDED_ATTENTION` on a
+/// load with an extended round shape, GitHub #688), named in the message.
 ///
 /// Called again on the same load and pool, it replaces every graph the
 /// earlier call captured: how a test flips such a switch in one process

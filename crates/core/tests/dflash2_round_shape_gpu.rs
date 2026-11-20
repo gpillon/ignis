@@ -15,8 +15,8 @@
 //! artifact: the NVFP4 body, DFlash2 at 15 under the sampled draft, hq-e8-2b,
 //! FP8 exception weights, 8 lanes, the rule at its default thresholds and
 //! `IGNIS_ROUND_SHAPE` unset unless a round names it; the first load under
-//! the policy `all` (parts 1 to 4), the second under `aggregate`, the default
-//! (part 4).
+//! the policy `all` (parts 1 to 5), the second under `aggregate`, the default
+//! (part 5).
 //!
 //! The rounds are live and greedy, on a text the drafter predicts far ahead
 //! (counting), so the accept is the text's, not the test's: the test keeps a
@@ -40,7 +40,13 @@
 //! 3. **A lane's ask is its sequence's**: a lane that asks, snapshotted and
 //!    restored onto a fresh handle and onto its own, still asks; a blob that
 //!    does not ask, restored onto a handle that did, does not.
-//! 4. **The policy on forced accepts** (#690): two lanes, each round
+//! 4. **A cut round asks by the target's accept** (#691): a lane whose every
+//!    run the host cuts to its anchor alone, as a grammar's first draft
+//!    refused would, takes the shape its own rounds give it, the rule reading
+//!    the drafts the target accepted and not the none the cut kept: it enters
+//!    after a base round whose 7 drafts were taken and stays while its
+//!    extended rounds take 6.
+//! 5. **The policy on forced accepts** (#690): two lanes, each round
 //!    teacher-forced with drafts the recording agrees with for as many as the
 //!    test says ([`forced_round`]), so the accepts are the test's, not the
 //!    text's. A lane that takes every draft beside one that takes 2 (a high
@@ -69,8 +75,8 @@ use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, model_scope, Model};
 use ignis_core::seq::{snapshot_format_version, Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
-    capture_decode_graphs, decode_program_verify_forced_with, decode_program_verify_runs, prefill_program_sampled, LaneVerifyRun,
-    SamplingParams, TeacherForcing, VerifyLane,
+    capture_decode_graphs, decode_program_verify_cut, decode_program_verify_forced_with, decode_program_verify_runs,
+    prefill_program_sampled, LaneVerifyRun, SamplingParams, TeacherForcing, VerifyLane,
 };
 use ignis_core::{
     DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, ShapeEstimate, ShapePolicy,
@@ -233,7 +239,7 @@ fn forced_round(
     extended
 }
 
-/// #690: part 4 on a load under `policy`: two fresh lanes through the
+/// #690: part 5 on a load under `policy`: two fresh lanes through the
 /// courses of its note, each round's shape held to the course's.
 fn the_policy_on_forced_accepts(model: &Model, pool: &SeqPool, policy: ShapePolicy, prompt: &[i32], failures: &mut Vec<String>) {
     const ROUNDS: usize = 6;
@@ -248,15 +254,15 @@ fn the_policy_on_forced_accepts(model: &Model, pool: &SeqPool, policy: ShapePoli
     for (case, agree, shapes) in courses {
         let mut lanes: Vec<Seq<'_>> = (0..2)
             .map(|lane| {
-                let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("part 4: alloc lane {lane}: {e}"));
+                let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("part 5: alloc lane {lane}: {e}"));
                 prefill_program_sampled(model, pool, &mut seq, prompt, 0, SamplingParams::greedy(), None)
-                    .unwrap_or_else(|e| panic!("part 4: prefill lane {lane}: {e}"));
+                    .unwrap_or_else(|e| panic!("part 5: prefill lane {lane}: {e}"));
                 seq
             })
             .collect();
         let [a, b] = &mut lanes[..] else { unreachable!("two lanes") };
         for (at, &want) in shapes.iter().enumerate() {
-            let what = format!("part 4, `{}`, {case} beside a lane that takes 2: round {at}", policy.as_str());
+            let what = format!("part 5, `{}`, {case} beside a lane that takes 2: round {at}", policy.as_str());
             let extended = forced_round(model, pool, &mut [&mut *a, &mut *b], &[agree, 2], prompt, 5 * at, failures, &what);
             println!("dflash2_round_shape_gpu {what}: {}", if extended { "extended" } else { "base" });
             if extended != want {
@@ -520,9 +526,54 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
                 missing.push("part 3: the lane never asked".into());
             }
         }
+
+        // 4. A cut round asks by the target's accept (#691). Every run is cut
+        // to its anchor, the draft after it pending: a rule that read the cut
+        // would see no draft taken and never ask. Each round is held to the
+        // mirror, which the round before moved by what the target accepted.
+        {
+            let mut lane = fresh("part 4");
+            let mut ask = false;
+            let (mut entered, mut stayed) = (false, false);
+            for at in 0..PATIENCE {
+                let what = format!("part 4: cut round {at}");
+                let mut accepted = 0u32;
+                let lanes = [VerifyLane::greedy(&[])];
+                let runs = decode_program_verify_cut(&model, &pool, &mut [&mut lane], &lanes, WINDOW, &[true], &mut |_, run| {
+                    accepted = run.len() as u32 - 1;
+                    1
+                })
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+                let run = &runs[0];
+                println!(
+                    "dflash2_round_shape_gpu {what}: asking {ask}, {}, accepted {accepted}, kept {}",
+                    shape(run.extended),
+                    run.tokens.len()
+                );
+                if run.extended != ask {
+                    failures.push(format!("{what}: a lane {} ran {}", if ask { "that asks" } else { "that does not ask" }, shape(run.extended)));
+                }
+                if run.tokens.len() != 1 {
+                    failures.push(format!("{what}: the cut kept {} tokens, not the anchor alone", run.tokens.len()));
+                }
+                let was = ask;
+                ask = asks_after(rule, ask, run.extended, run.extent, accepted);
+                // Counted where the next round holds the ask to its shape.
+                if at + 1 < PATIENCE {
+                    entered |= !run.extended && ask;
+                    stayed |= run.extended && was && ask;
+                }
+            }
+            if !entered {
+                missing.push("part 4: no base round the host cut had all 7 drafts taken, so no cut sent its lane extended".into());
+            }
+            if !stayed {
+                missing.push("part 4: no extended round the host cut took 6 drafts, so no cut kept its lane asking".into());
+            }
+        }
         failures.extend(missing);
 
-        // 4. The policy on forced accepts: `all` here, `aggregate` below.
+        // 5. The policy on forced accepts: `all` here, `aggregate` below.
         the_policy_on_forced_accepts(&model, &pool, ShapePolicy::All, &prompt, &mut failures);
     }
     {

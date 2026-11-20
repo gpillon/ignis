@@ -10,8 +10,8 @@
 //! threshold, and a base round its budget cut short leaves its ask; after an
 //! extended round it asks while the round took at least the stay threshold.
 //!
-//! The policy, at 1 to 4 lanes with no lane the host cuts and
-//! `IGNIS_ROUND_SHAPE` unset: `all`, extended when every lane asks;
+//! The policy, at 1 to 4 lanes with `IGNIS_ROUND_SHAPE` unset (a lane the
+//! host cuts asks like any other, #691): `all`, extended when every lane asks;
 //! `aggregate`, at one lane the lane's ask, and at two or more extended when a
 //! lane asks whose last rounds hold no extended round (granted), or else when
 //!
@@ -71,8 +71,8 @@ impl Lane {
     }
 }
 
-/// Whether a round of `lanes` (1 to 4 of them, none cut by the host, the
-/// switch unset) runs at the extended shape under `policy`.
+/// Whether a round of `lanes` (1 to 4 of them, the switch unset) runs at the
+/// extended shape under `policy`.
 pub fn extends(policy: ShapePolicy, estimate: ShapeEstimate, lanes: &[&Lane]) -> bool {
     match policy {
         ShapePolicy::All => lanes.iter().all(|lane| lane.asks),

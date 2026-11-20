@@ -3104,12 +3104,12 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
       }
       // GitHub #692 (test-only): a teacher-forced round that names its shape
       // runs at it, and nothing below chooses one for it.
-      // GitHub #687, #689, #690: on a load of two round shapes, the round runs
-      // at the extended shape when the shape policy gives it from its lanes'
-      // asks and recent rounds, it has no more lanes than that shape runs and
-      // no lane whose commit the host cuts (kernel/src/round_shape.h);
+      // GitHub #687, #689, #690, #691: on a load of two round shapes, the
+      // round runs at the extended shape when the shape policy gives it from
+      // its lanes' asks and recent rounds, a lane the host cuts among them,
+      // and it has no more lanes than that shape runs (kernel/src/round_shape.h);
       // IGNIS_ROUND_SHAPE, read here at each round, forces either shape over
-      // the rule.
+      // the rule and the policy.
       if (options->forced_shape_window != 0) {
         shape = ignis_round_shape_at(*model, options->forced_shape_window);
         if (shape == nullptr) {
@@ -3134,9 +3134,6 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           set_error(std::string("ignis_program_decode: ") + e.what());
           return -1;
         }
-        const bool host_cut = options->host_cut_lanes != nullptr &&
-                              std::any_of(options->host_cut_lanes, options->host_cut_lanes + batch_size,
-                                          [](std::uint8_t cut) { return cut != 0; });
         std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> asks{};
         // GitHub #690: and what each lane's recent rounds say, which `aggregate` reads.
         std::array<ignis::round_shape::LaneEstimate, IGNIS_DECODE_MAX_BATCH> estimates{};
@@ -3148,7 +3145,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           }
         }
         if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes,
-                                              host_cut, model->shape_policy, estimates.data())) {
+                                              model->shape_policy, estimates.data())) {
           shape = model->extended_shape.get();
         }
       }

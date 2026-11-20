@@ -13,6 +13,7 @@
 #include "ignis_trellis_linear.h"
 
 #include "prefill_swiglu.h"
+#include "process_environment.h"
 #include "rope_scaling.h"
 #include "round_shape.h"
 #include "round_timing.h"
@@ -716,6 +717,12 @@ struct ignis_model {
   // by every call of the batch body (kernel/src/gqa_layer.cu
   // `run_gqa_layer_batch`), so every graph captured on this load bakes it in.
   bool hq_decode_attention_ours = false;
+  // GitHub #688 (spec #684): what IGNIS_EXTENDED_ATTENTION named at the latest
+  // `ignis_decode_graph_capture` (kernel/src/extended_attention.h), unset
+  // before a load's first: whether an extended round's chunks take the route
+  // above where the load takes it, or the vendored chunks. Read by every call
+  // of an extended round (kernel/src/gqa_layer.cu), replayed or eager.
+  ignis::RouteSwitch extended_attention = ignis::RouteSwitch::Unset;
   // GitHub #627 (spec #618): the MTP head's matrices, decided once at an MTP
   // load (model.cu `mtp_head_linear_route`): ours on an RTX 30 or RTX 40 card
   // (kernel/src/w8_imma.h) when true, the vendored `ops::linear` otherwise;

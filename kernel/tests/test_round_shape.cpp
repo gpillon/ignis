@@ -14,9 +14,10 @@
 //   2. The thresholds a load takes: a stay threshold past the load's window could never keep a lane
 //      at the extended shape, and an entry threshold past the base window could never send one
 //      there, so a load refuses either, naming the field.
-//   3. Under either shape policy a round of 5..8 lanes always runs at the base shape, a load with
-//      no extended shape never extended, and a round with a lane whose commit the host cuts at the
-//      base shape (#687); under `all` a round of 1..4 lanes is extended when every lane in it asks.
+//   3. Under either shape policy a round of 5..8 lanes always runs at the base shape and a load
+//      with no extended shape never extended; under `all` a round of 1..4 lanes is extended when
+//      every lane in it asks. A lane whose commit the host cuts asks like any other (#691): the
+//      policy reads no host cut.
 //   4. What a lane's expectations read (#690, `spec.shape_estimate_rounds`): its verify rounds that
 //      drafted the base window at least, the most recent of them, each round's tokens at the base
 //      shape (its accepts up to 7, and the target's own token) and an extended round's accepts past
@@ -255,7 +256,7 @@ constexpr LaneEstimate kStopped{16, 128, 16, 0};
 constexpr LaneEstimate kNewcomer{0, 0, 0, 0};
 
 // Table 3: the round's shape from its lanes' asks and the forcing switch, under both policies: the
-// lanes limit, a load with no extended shape, a host cut; and `all`'s one quiet lane.
+// lanes limit and a load with no extended shape; and `all`'s one quiet lane.
 void check_the_policy() {
   constexpr std::uint32_t kExtendedLanes = 4;
   constexpr std::size_t kMostLanes = 8;
@@ -274,16 +275,14 @@ void check_the_policy() {
         const std::vector<LaneEstimate> paying(lanes, kJson);
         const std::vector<LaneEstimate> unread(lanes, kUnread);
         const auto runs = [&](const std::vector<std::uint8_t> &asks, const std::vector<LaneEstimate> &estimates,
-                              std::uint32_t extended_lanes, bool host_cut) {
-          return runs_extended(named, asks.data(), lanes, extended_lanes, host_cut, shape_policy, estimates.data());
+                              std::uint32_t extended_lanes) {
+          return runs_extended(named, asks.data(), lanes, extended_lanes, shape_policy, estimates.data());
         };
         // A load with no extended shape never runs one, whatever its lanes ask.
-        check(!runs(all, paying, /*extended_lanes=*/0, false), at + ", no extended shape: base");
-        // A round with a lane whose commit the host cuts keeps the base shape (#687; #691 changes it).
-        check(!runs(all, paying, kExtendedLanes, /*host_cut=*/true), at + ", a host cut: base");
-        const bool every = runs(all, paying, kExtendedLanes, false);
-        const bool granted = runs(all, unread, kExtendedLanes, false);
-        const bool nobody = runs(none, paying, kExtendedLanes, false);
+        check(!runs(all, paying, /*extended_lanes=*/0), at + ", no extended shape: base");
+        const bool every = runs(all, paying, kExtendedLanes);
+        const bool granted = runs(all, unread, kExtendedLanes);
+        const bool nobody = runs(none, paying, kExtendedLanes);
         if (lanes > kExtendedLanes) {
           check(!every && !granted && !nobody, at + ": past the extended shape's 4 lanes, base whatever they ask");
           continue;
@@ -303,7 +302,7 @@ void check_the_policy() {
           for (std::size_t quiet = 0; policy == Policy::kAll && quiet < lanes; ++quiet) {
             std::vector<std::uint8_t> asks(lanes, 1);
             asks[quiet] = 0;
-            check(!runs(asks, paying, kExtendedLanes, false), at + ", lane " + std::to_string(quiet) + " not asking: base");
+            check(!runs(asks, paying, kExtendedLanes), at + ", lane " + std::to_string(quiet) + " not asking: base");
           }
           break;
         }
@@ -434,7 +433,7 @@ void check_aggregate() {
   for (const Policy policy : {Policy::kAggregate, Policy::kAll}) {
     for (const Row &row : rows) {
       const bool want = policy == Policy::kAggregate ? row.aggregate : row.all;
-      const bool got = runs_extended(Named::kRule, row.asks.data(), row.asks.size(), /*extended_lanes=*/4, false,
+      const bool got = runs_extended(Named::kRule, row.asks.data(), row.asks.size(), /*extended_lanes=*/4,
                                      policy_of(policy), row.lanes.data());
       check(got == want, name_of(policy) + ", " + row.what + ": " + (want ? "extended" : "base"));
     }
@@ -445,7 +444,7 @@ void check_aggregate() {
       const std::vector<std::uint8_t> asks(lanes, 1);
       for (const LaneEstimate &estimate : {kJson, kUnread}) {
         const std::vector<LaneEstimate> estimates(lanes, estimate);
-        check(!runs_extended(Named::kRule, asks.data(), lanes, /*extended_lanes=*/4, false, policy_of(policy),
+        check(!runs_extended(Named::kRule, asks.data(), lanes, /*extended_lanes=*/4, policy_of(policy),
                              estimates.data()),
               name_of(policy) + ", " + std::to_string(lanes) + " lanes, every lane asking: base");
       }
@@ -459,16 +458,16 @@ void check_aggregate() {
   const std::vector<std::uint8_t> one_of_two = {1, 0};
   const std::vector<LaneEstimate> moderate = {kModerate, kConversation};
   const std::vector<LaneEstimate> json = {kJson, kConversation};
-  check(runs_extended(Named::kRule, one_of_two.data(), 2, 4, false, free, moderate.data()),
+  check(runs_extended(Named::kRule, one_of_two.data(), 2, 4, free, moderate.data()),
         "a ratio of 1 at two lanes: any draft past 7 extends the round");
-  check(!runs_extended(Named::kRule, one_of_two.data(), 2, 4, false, dear, json.data()),
+  check(!runs_extended(Named::kRule, one_of_two.data(), 2, 4, dear, json.data()),
         "a ratio of 2 at two lanes: a JSON answer no longer carries a conversation");
   ShapePolicy two_lanes_only = policy_of(Policy::kAggregate);
   two_lanes_only.period_ratios = {1150, 1000, 2000, 2000};
   const std::vector<std::uint8_t> one_of_three = {1, 0, 0};
   const std::vector<LaneEstimate> moderate3 = {kModerate, kConversation, kConversation};
-  check(runs_extended(Named::kRule, one_of_two.data(), 2, 4, false, two_lanes_only, moderate.data()) &&
-            !runs_extended(Named::kRule, one_of_three.data(), 3, 4, false, two_lanes_only, moderate3.data()),
+  check(runs_extended(Named::kRule, one_of_two.data(), 2, 4, two_lanes_only, moderate.data()) &&
+            !runs_extended(Named::kRule, one_of_three.data(), 3, 4, two_lanes_only, moderate3.data()),
         "each lane count reads its own ratio");
 }
 
@@ -547,7 +546,7 @@ void check_a_lanes_course() {
   for (const Step &step : course) {
     const std::uint8_t lane = asks ? 1 : 0;
     const LaneEstimate estimate = estimate_of(rounds, recorded, policy.estimate_rounds);
-    const bool extended = runs_extended(Named::kRule, &lane, 1, /*extended_lanes=*/4, false, policy, &estimate);
+    const bool extended = runs_extended(Named::kRule, &lane, 1, /*extended_lanes=*/4, policy, &estimate);
     check(extended == step.extended, "a lane's course, round " + std::to_string(at) + " runs " +
                                          (step.extended ? "extended" : "base"));
     const std::int32_t extent = step.budget_extent >= 0 ? step.budget_extent : extended ? kWindow : kBase;
@@ -600,7 +599,7 @@ void check_a_pairs_course() {
                                          static_cast<std::uint8_t>(asks[1] ? 1 : 0)};
       const LaneEstimate estimates[2] = {estimate_of(rounds[0], recorded[0], policy.estimate_rounds),
                                          estimate_of(rounds[1], recorded[1], policy.estimate_rounds)};
-      const bool extended = runs_extended(Named::kRule, lane_asks, 2, /*extended_lanes=*/4, false, policy, estimates);
+      const bool extended = runs_extended(Named::kRule, lane_asks, 2, /*extended_lanes=*/4, policy, estimates);
       const bool want = policy.policy == Policy::kAggregate && step.extended;
       check(extended == want, under + ", a pair's course, round " + std::to_string(at) + " runs " +
                                   (want ? "extended" : "base"));

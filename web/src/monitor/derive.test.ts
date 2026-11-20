@@ -407,12 +407,13 @@ describe("assessHealth", () => {
 
 // GitHub #307: acceptance is read over the window, overall and per draft position.
 describe("deriveSpeculation", () => {
-  const spec = (rounds: number, drafted: number, accepted: number, at1: [number, number], at2: [number, number]) => ({
+  const spec = (rounds: number, drafted: number, accepted: number, at1: [number, number], at2: [number, number], shapes: { base: number; extended: number } | null = null) => ({
     rounds,
     drafted,
     accepted,
     positionDrafted: [at1[0], at2[0], 0, 0, 0, 0, 0],
     positionAccepted: [at1[1], at2[1], 0, 0, 0, 0, 0],
+    shapeRounds: shapes,
   });
 
   it("reads acceptance, tokens per round and each position's share over the window", () => {
@@ -422,6 +423,15 @@ describe("deriveSpeculation", () => {
     expect(s.acceptance).toBeCloseTo(15 / 20);
     expect(s.tokensPerRound).toBeCloseTo(25 / 10);
     expect(s.byPosition.slice(0, 3)).toEqual([0.8, 0.7, null]);
+  });
+
+  it("reads the extended rounds' share of the verify rounds over the window, only where the shape family is printed", () => {
+    const shaped = [
+      at(0, { speculation: spec(100, 200, 120, [100, 70], [100, 50], { base: 90, extended: 10 }) }),
+      at(60_000, { speculation: spec(110, 220, 135, [110, 78], [110, 57], { base: 92, extended: 18 }) }),
+    ];
+    expect(deriveSpeculation(shaped, 0).extendedShare).toBeCloseTo(8 / 10);
+    expect(deriveSpeculation([at(0, { speculation: spec(100, 200, 120, [100, 70], [100, 50]) })], 0).extendedShare).toBeNull();
   });
 
   it("is absent from the dashboard until a verify round ran", () => {

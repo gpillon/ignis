@@ -140,9 +140,6 @@ export type ExpertPhase = (typeof EXPERT_PHASES)[number];
 export const NGRAM_SOURCES = ["hot", "file"] as const;
 export type NgramSource = (typeof NGRAM_SOURCES)[number];
 
-/** The draft positions every load prints (MIN_DRAFT_POSITIONS, crates/core/src/speculation.rs): the per-position families' labels "1".."7". */
-export const DRAFT_POSITIONS = 7;
-
 /**
  * Speculative decoding (GitHub #307): verify rounds, drafts verified and
  * committed, and per draft position how many rounds proposed it and committed
@@ -154,6 +151,8 @@ export type Speculation = {
   accepted: number | null;
   positionDrafted: (number | null)[];
   positionAccepted: (number | null)[];
+  /** Verify rounds a load ran at each round shape (#689); null where the family is not printed. */
+  shapeRounds: { base: number | null; extended: number | null } | null;
 };
 
 /** One expert-cache family: a count per K class and phase. */
@@ -394,6 +393,7 @@ const SPEC_FAMILIES = {
   accepted: "ignis_speculative_accepted_tokens_total",
   positionDrafted: "ignis_speculative_position_drafted_total",
   positionAccepted: "ignis_speculative_position_accepted_total",
+  shapeRounds: "ignis_speculative_shape_rounds_total",
 } as const;
 
 /** The image families (GitHub #324). */
@@ -597,14 +597,22 @@ export function readSnapshot({ families }: Exposition): Snapshot {
   }
 
   if (families.has(SPEC_FAMILIES.rounds)) {
+    // The per-position families print the positions "1".."N" of the most a load drafts (7 up to 15): read what is printed.
+    const printed = [SPEC_FAMILIES.positionDrafted, SPEC_FAMILIES.positionAccepted].flatMap((family) =>
+      samples(family).map((s) => Number(s.labels.position)),
+    );
+    const draftPositions = Math.max(0, ...printed.filter((n) => Number.isInteger(n)));
     const positions = (family: string) =>
-      Array.from({ length: DRAFT_POSITIONS }, (_, j) => valueOf(family, ["position", String(j + 1)]));
+      Array.from({ length: draftPositions }, (_, j) => valueOf(family, ["position", String(j + 1)]));
     snap.speculation = {
       rounds: valueOf(SPEC_FAMILIES.rounds),
       drafted: valueOf(SPEC_FAMILIES.drafted),
       accepted: valueOf(SPEC_FAMILIES.accepted),
       positionDrafted: positions(SPEC_FAMILIES.positionDrafted),
       positionAccepted: positions(SPEC_FAMILIES.positionAccepted),
+      shapeRounds: families.has(SPEC_FAMILIES.shapeRounds)
+        ? { base: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "base"]), extended: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "extended"]) }
+        : null,
     };
   }
 
@@ -745,10 +753,12 @@ function inContract(family: string, s: Sample): boolean {
       return oneOf(EXPERT_CLASSES, s.labels.class) && (s.labels.state === "capacity" || s.labels.state === "in_use") && Object.keys(s.labels).length === 2;
     case NGRAM_FAMILIES.rows:
       return oneOf(NGRAM_SOURCES, s.labels.source) && Object.keys(s.labels).length === 1;
+    case SPEC_FAMILIES.shapeRounds:
+      return (s.labels.shape === "base" || s.labels.shape === "extended") && Object.keys(s.labels).length === 1;
     case SPEC_FAMILIES.positionDrafted:
     case SPEC_FAMILIES.positionAccepted: {
       const position = Number(s.labels.position);
-      return Number.isInteger(position) && position >= 1 && position <= DRAFT_POSITIONS && Object.keys(s.labels).length === 1;
+      return Number.isInteger(position) && position >= 1 && Object.keys(s.labels).length === 1;
     }
     default:
       return Object.keys(s.labels).length === 0;
@@ -780,6 +790,8 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.speculation?.rounds ?? null,
     s.speculation?.drafted ?? null,
     s.speculation?.accepted ?? null,
+    s.speculation?.shapeRounds?.base ?? null,
+    s.speculation?.shapeRounds?.extended ?? null,
     ...IMAGE_OUTCOMES.map((outcome) => s.images?.jobs[outcome] ?? null),
     s.images?.images ?? null,
     ...IMAGE_PHASES.map((phase) => s.images?.phaseSeconds[phase] ?? null),

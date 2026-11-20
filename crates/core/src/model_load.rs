@@ -250,6 +250,8 @@ pub(crate) mod ffi {
 
         pub fn ignis_model_hq_decode_attention(model: *const IgnisModel) -> u32;
 
+        pub fn ignis_model_extended_attention(model: *const IgnisModel) -> u32;
+
         pub fn ignis_model_mtp_head_linear(model: *const IgnisModel) -> u32;
 
         pub fn ignis_model_prefill_swiglu(model: *const IgnisModel) -> u32;
@@ -295,6 +297,19 @@ impl Model {
         let code = unsafe { ffi::ignis_model_hq_decode_attention(self.handle) };
         crate::HqDecodeAttention::from_abi(code)
             .unwrap_or_else(|| panic!("ignis_model_hq_decode_attention: unknown route {code}"))
+    }
+
+    /// GitHub #688 (spec #684): the route this load's extended rounds attend
+    /// on, in chunks of the small-T tile, as the latest
+    /// [`crate::step::capture_decode_graphs`] decided it (before the load's
+    /// first, as the switch unset decides it): ours where
+    /// [`Model::hq_decode_attention`] is, unless `IGNIS_EXTENDED_ATTENTION=vendored`;
+    /// the vendored chunked route otherwise; `None` on a load without an
+    /// extended round shape.
+    pub fn extended_attention(&self) -> Option<crate::HqDecodeAttention> {
+        let code = unsafe { ffi::ignis_model_extended_attention(self.handle) };
+        crate::HqDecodeAttention::from_extended_abi(code)
+            .unwrap_or_else(|unknown| panic!("ignis_model_extended_attention: unknown route {unknown}"))
     }
 
     /// The route this load's MTP head runs its matrices on (GitHub #627), as

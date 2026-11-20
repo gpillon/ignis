@@ -211,27 +211,36 @@ both leaf-internal (ADR 0093).
     and three partial tensors in their order and shapes (`allocate_small_t_workspace`), and
     `src/ops/launcher/gqa_attention_decode.cu`: `gqa_attention_small_t_launch_for`'s hq-route
     grid and arguments and the reducer's block, chunk and grid, restated in
-    `hq_decode_attention.cu`, which then launches the vendored reducer unchanged.
+    `hq_decode_attention.cu`, which then launches the vendored reducer unchanged;
+  - GitHub #688: from the same launcher, a chunk of the chunked small-T route at its first column
+    (the invocation's full width and column begin) and the reducer's profile at that offset,
+    restated in `hq_decode_attention.cu`'s `attend_chunk`, the chunk an extended round's loop runs
+    on the route (`kernel/src/extended_attention.cu`, below).
 - Changed here: twelve decode warps feed eight MMA warps through a ring of three shared-memory
   tiles under mbarriers, one block of 640 threads per SM; QK is split by row group and key
   half, PV by output dimension. Its decoder, `kernel/src/hq_decode_lean.cuh`, is our own, from
   ignis's #268 decoder and not upstream code. The file header lists the parts. The vendored
   kernel stays in the subtree, not edited, as its oracle, bit for bit
-  (`kernel/tests/test_hq_verify_exact.cu`), and as the route of every other card and call
+  (`kernel/tests/test_hq_verify_exact.cu`; past the tile, the vendored chunked route,
+  `kernel/tests/test_hq_verify_chunked_exact.cu`), and as the route of every other card and call
   (`kernel/vendor/VENDOR.md`).
 
-### The extended round's one-lane attention in `kernel/src/gqa_layer.cu` (spec #684, GitHub #687)
-`run_gqa_layer_batch`'s loop over the small-T tile for the one lane of an extended verify round,
-which the vendored wrapper's resolver sends to its prompt route.
+### The extended round's chunk loop, `kernel/src/extended_attention.cu` (spec #684, GitHub #687, #688)
+`ignis::extended_attention::attend`: the one loop over the small-T tile of an extended verify
+round's attention, 9..16 columns a lane at 1..4 lanes, which `run_gqa_layer_batch`
+(`kernel/src/gqa_layer.cu`) runs for every such call, the one lane included, which the vendored
+wrapper's resolver sends to its prompt route.
 - Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
   (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
   `src/ops/wrapper/gqa_attention.cpp`'s `launch_chunked_small_t` (per chunk of the tile a
   workspace scope, the chunk's split capacity and `allocate_small_t_workspace`'s three partial
-  tensors in their order and shapes, then the launcher at the chunk's first column), restated at
-  one lane.
+  tensors in their order and shapes, then the launcher at the chunk's first column), restated.
 - Called and not copied: `gqa_small_t_chunk_tokens`, `gqa_attention_split_capacity` and
-  `gqa_attention_small_t_launch` (`src/ops/launcher/gqa_attention.h`). Changed here: nothing but
-  the lane count the vendored resolver gives that loop.
+  `gqa_attention_small_t_launch` (`src/ops/launcher/gqa_attention.h`). Changed here: the lane
+  count the vendored resolver gives that loop (one lane too), and a chunk's launch, which runs on
+  ignis's route over hq-e8-2b (`ignis::hq_decode_attention::attend_chunk`, the launcher's chunk at
+  its first column restated, above) where the round takes it, and is the vendored launcher's
+  elsewhere.
 
 ### `kernel/src/prefill_swiglu.cuh` and `kernel/src/prefill_swiglu.cu` (spec #646, GitHub #651, #653)
 The 27B prefill's MLP gate and up product with SwiGLU in its epilogue

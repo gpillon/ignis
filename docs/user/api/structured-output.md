@@ -581,6 +581,13 @@ ones after it are lost, to be drafted again in the next round. Greedy answers
 are the same with speculation on and off, up to the near-ties any request
 has.
 
+From 0.11.0, on a 27B load that drafts more than 7 tokens a round with DFlash2
+(`--spec-draft-tokens` 8 to 15), a structured request's rounds take the
+[round shape](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)
+its own earlier rounds earn, as any request's do: an answer the drafter
+predicts far ahead, as JSON often is, is checked and repaired in rounds of up
+to the whole window.
+
 The requests decoding beside a structured one are not touched: they keep
 every draft they would have kept, and the round runs as it does without the
 structured request. The only extra work is the check on the structured

@@ -190,8 +190,8 @@ from what each lane's own earlier rounds did, the **shape rule**:
 
 The **shape policy** (`--spec-shape-policy`) then turns the lanes' asks into
 the round's shape. A request alone runs at the shape it asks, and a round of 5
-to 8 lanes, or one with a lane held to a grammar, at the base shape, under
-either policy. At 2 to 4 lanes they differ in who pays the wider round:
+to 8 lanes at the base shape, under either policy. At 2 to 4 lanes they differ
+in who pays the wider round:
 
 - `aggregate`, the default, runs the round extended when the drafts its asking
   requests are expected to take past position 7 exceed what the wider round
@@ -212,12 +212,16 @@ either policy. At 2 to 4 lanes they differ in who pays the wider round:
 
 The window and the ratios are provisional: the ratios were measured on the
 RTX 5090 at 1, 2 and 4 lanes before the extended round's cost levers, 3 lanes
-between them. Text the drafter predicts far ahead (a JSON answer, a long tool
-call's arguments) goes extended and stays there; free text rarely takes all
-7, so it stays at the base shape and decodes as at 7 drafts (a greedy answer
-can differ at a near-tie where the shape changes, below). A request evicted
-and restored keeps what it asked; its recent rounds for `aggregate` start
-again. `/metrics` counts the rounds at each shape
+between them. A request held to a grammar (`response_format`, a held tool's
+calls) asks as any other does: its rounds take the shape the rule and the
+policy give them, the grammar's check cuts each run at its first miss at that
+shape, and the rule and the policy count the drafts the model took, not the
+ones the check kept. Text the drafter predicts far ahead (a JSON answer, a
+long tool call's arguments) goes extended and stays there; free text rarely
+takes all 7, so it stays at the base shape and decodes as at 7 drafts (a
+greedy answer can differ at a near-tie where the shape changes, below). A
+request evicted and restored keeps what it asked; its recent rounds for
+`aggregate` start again. `/metrics` counts the rounds at each shape
 (`ignis_speculative_shape_rounds_total`) and, per position up to the window,
 the drafts proposed and taken.
 
@@ -228,6 +232,11 @@ outside it. The measurement switch `IGNIS_ROUND_SHAPE=base|extended`
 ([Testing](../contributing/testing.md)) forces every round to one shape over
 the rule and the policy. A load at 7 drafts or fewer has the one shape it had. The MTP head
 keeps 0 to 7.
+
+An extended round attends in chunks of 8 columns (6 over `bf16` KV), each
+reading what the one before appended: on ignis's own route where the load's
+rounds take it (an RTX 50 or RTX PRO card over `hq-e8-2b`), on the vendored
+chunked route elsewhere, the same bytes either way.
 
 The two shapes compute a column's logits up to rounding, not bit for bit:
 past 8 columns a lane the round takes other routes, and the extended round is

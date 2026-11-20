@@ -17,6 +17,7 @@
 #include "decode_graph_copies.h"
 #include "deferred_verify.h"
 #include "dflash2_drafter.h"
+#include "extended_attention.h"
 #include "gdn_gating_home.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
@@ -682,6 +683,14 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   }
   if (model->extended_shape != nullptr) {
     model->extended_shape->defer = shape->defer;
+  }
+  // GitHub #688: IGNIS_EXTENDED_ATTENTION, read at each capture of a load
+  // with an extended shape (kernel/src/extended_attention.h): the route of
+  // every extended round's chunks from here on, its graphs' and its eager
+  // rounds' alike. A load without one never reads it.
+  if (model->extended_shape != nullptr &&
+      !capture_switch(ignis::extended_attention::read_switch, model->extended_attention)) {
+    return -1;
   }
   const auto began = std::chrono::steady_clock::now();
   uint32_t ready_mask = 0;
