@@ -113,8 +113,9 @@ Why each:
   predictable ([past seven drafts](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   Served on this card against 7 drafts, one request at a time with the
   context pinned at 262,144: a JSON answer decoded 51% faster and a
-  `response_format` JSON-schema answer 64% faster, the same text; at the
-  model card's sampling 54% and 31%; an agent turn with strict tools 25%. A
+  `response_format` JSON-schema answer 64% faster, the latter writing the
+  same text; at the model card's sampling 54% and 31%; an agent turn with
+  strict tools 25%. A
   conversation, prose, code and an agent prompt stayed within 2% of 7 drafts
   or above it, plain decode, the context and the KV pages did not move, and a
   cold 16K prompt's first token came 8 ms (0.7%) later, at the edge of what

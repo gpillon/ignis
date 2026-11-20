@@ -254,7 +254,7 @@ alternated.
 | sum (span) | 14,928 (14,271) | 17,974 (16,952) | +3,045 (+2,681) | |
 
   The attention row is why the extended round runs on ignis's route in 8-column chunks (#688, -0.39 ms served);
-  the cost levers came from the FP8, drafter and GDN rows: together they took the 16-column round from 17.28 to
+  the cost levers came from the FP8 and drafter rows (the GDN row has none): together they took the 16-column round from 17.28 to
   16.70 ms (span: the FP8 tile -278 to -301 us, the drafter's small products -82 to -105; period: the append -111),
   and the JSON answer to 798 tok/s.
 - **Served, the prototype at 15 against main at 7** (one lane; 2 requests an arm on the greedy cells, 4 to 12 on the
@@ -287,8 +287,8 @@ Two offline replays of round records ranked rules, and both ranked them wrongly 
   code's (-2.6% against +19.6%) and the greedy agent turn's (+1.7% against +20.2%); on JSON-long at default sampling
   +2.2% +- 4.4 against +8.9% +- 2.3. The replay had it at +16.2% and +17.3% on code and the agent turn, and over the
   shipped rule by 0.8-2.2 points everywhere they differed; served, the shipped rule was ahead by 3-19 points on the
-  four gain cells other than the JSON answer. Its free-text cells stayed inside one standard error of main in both
-  arms.
+  four gain cells other than the JSON answer. None of its free-text cells fell below main by more than one standard
+  error, at 6 to 10 requests an arm.
 - **What the replays got wrong.** The extended share each rule's rounds would run, the replay had right (within 2
   points on every sampled cell). What an extended round then takes, it did not: a shape change is a text change (a
   greedy text differs from the round where its shape first differs), and acceptance depends on the shape history
