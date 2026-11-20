@@ -6,6 +6,11 @@ until the test suite is green.
 
 ## The gate
 
+- While working, run only the change's own tests: Rust ones through
+  `cargo test`'s filter (`cargo test -p <crate> --test <file> <name>`), GPU
+  ones through the profile's single-test mode (below). The whole suite runs
+  once, at the end, on CI: push the branch as `ci/<n>`, which needs no OK
+  (`docs/agents/orchestrated-builds.md` for a spec's build).
 - `cargo test` from the workspace root — every crate under `crates/`
   (`artifact`, `bench`, `core`, `grammar`, `logging`, `runtime`, `server`,
   `speech`, `vendor`). CI runs exactly this on
@@ -702,7 +707,8 @@ mk/cuda-build-check.sh --require '86;120a' <binary>...`.
 ## Done means
 
 1. every seam agreed for the change has its test (`/tdd`)
-2. `cargo test` passes workspace-wide (machine-local skips allowed)
+2. `cargo test` passes workspace-wide on CI, the `ci/<n>` run green on both
+   hosts (machine-local skips allowed)
 3. `cargo check --workspace --features cuda,logits-capture --tests` is
    clean (`make check CUDA=1`). The
    cuda-gated test targets (`#![cfg(feature = "cuda")]`) are the ones

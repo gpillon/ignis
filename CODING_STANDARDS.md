@@ -75,8 +75,9 @@ The download route tests waited for `on_disk` complete, then asserted
 
 ## After a merge or a rebase
 
-The checks are `make ci`, whose `check` step compiles the code behind the
-`cuda` feature unless it runs with `CUDA=0`; `cargo test` never does. The rest
+The checks are `make check`, which compiles the code behind the `cuda` feature
+unless it runs with `CUDA=0` (`cargo test` never does), and the suite's run on
+`ci/<n>`. The rest
 of what a change needs, a kernel change's GPU legs among it, is
 `docs/agents/testing.md`'s "Done means". Resolving a conflict reformats
 nothing.

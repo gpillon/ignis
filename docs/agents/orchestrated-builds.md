@@ -17,10 +17,11 @@ The notes the implementers share live in the coordinator's `.scratch/`.
 
 ## Checks
 
-Implementers run the CPU-side suites (`make ci`, or the narrower targets
-their brief names) and their own ticket's GPU tests, through the profile
-script's single-test mode (`-Test` / `--test`), which takes the GPU lock. The
-coordinator keeps the full profile, the bench runs and the gate legs. Both run
+Implementers run their own ticket's tests only: the Rust ones through
+`cargo test`'s filter, the GPU ones through the profile script's single-test
+mode (`-Test` / `--test`), which takes the GPU lock. The workspace suite runs
+on `ci/<spec>` at the end of the build (below); the coordinator keeps the full
+profile, the bench runs and the gate legs. Both run
 on the card under the GPU rule in `AGENTS.md`, Testing
 (`docs/agents/testing.md`, the GPU test profile): an agent whose own model is
 served from the card hands every GPU step to the user.
