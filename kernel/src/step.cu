@@ -2200,7 +2200,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
   const std::uint32_t k = verify.window;
   const std::uint32_t lane_columns = k + 1;
   // GitHub #689: whether the round is at its load's extended shape.
-  const bool extended = &verify == model->extended_shape.get();
+  const bool extended = verify.extended();
   // GitHub #687: the caller's arrays are strided by the load's window
   // (`speculative_window`), the round's buffers by its shape's: equal on a
   // load of one shape, and on a load of two at its extended shape; a base

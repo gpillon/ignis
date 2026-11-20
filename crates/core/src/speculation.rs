@@ -694,7 +694,7 @@ impl Speculation {
     /// the load's window could never keep a lane there, and is refused naming
     /// the threshold and the window; every other load never reads the rule.
     pub fn with_shape_rule(self, shape_rule: ShapeRule) -> Result<Self, String> {
-        if self.round_shapes(1).1.is_some() && shape_rule.stay_accepted > self.draft_tokens {
+        if self.has_extended_shape() && shape_rule.stay_accepted > self.draft_tokens {
             return Err(format!(
                 "the shape rule's stay threshold {} is past the window of {} drafts, which no extended round can take",
                 shape_rule.stay_accepted, self.draft_tokens
@@ -762,6 +762,13 @@ impl Speculation {
         draft_positions(self.draft_tokens)
     }
 
+    /// Whether a load of this option holds an extended round shape beside its
+    /// base shape ([`Speculation::round_shapes`]): DFlash2 past
+    /// [`BASE_SHAPE_DRAFT_TOKENS`] drafts, at every lane count.
+    pub fn has_extended_shape(&self) -> bool {
+        self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens > BASE_SHAPE_DRAFT_TOKENS
+    }
+
     /// The round shapes a load of `decode_lanes` lanes holds (GitHub #687,
     /// `plan_load_sizes`, `kernel/src/model.cu`): its base shape, and its
     /// extended shape where it has one. Up to [`BASE_SHAPE_DRAFT_TOKENS`], and
@@ -772,7 +779,7 @@ impl Speculation {
     /// hold one set of device buffers, each the larger of the two shapes', so
     /// the plan's lines take each buffer once.
     pub fn round_shapes(&self, decode_lanes: u32) -> (RoundShape, Option<RoundShape>) {
-        if self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens > BASE_SHAPE_DRAFT_TOKENS {
+        if self.has_extended_shape() {
             let extended = RoundShape { window: self.draft_tokens, lanes: decode_lanes.min(EXTENDED_SHAPE_MAX_LANES) };
             (RoundShape { window: BASE_SHAPE_DRAFT_TOKENS, lanes: decode_lanes }, Some(extended))
         } else {
