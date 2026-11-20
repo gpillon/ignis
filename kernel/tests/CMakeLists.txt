@@ -463,12 +463,16 @@ target_include_directories(ignis_kernel_one_lane_chunks_test PRIVATE ${CMAKE_CUR
 target_link_libraries(ignis_kernel_one_lane_chunks_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_one_lane_chunks_test COMMAND ignis_kernel_one_lane_chunks_test)
 
-# GitHub #689 (spec #684): OURS -- the shape rule and the shape policy `all` of
-# a DFlash2 load of two round shapes (kernel/src/round_shape.h), from tables:
+# GitHub #689, #690 (spec #684): OURS -- the shape rule and the shape policies
+# of a DFlash2 load of two round shapes (kernel/src/round_shape.h), from tables:
 # what a lane asks after each round (entry, stay, exit, a round its budget cut
 # short, no history) with its thresholds as parameters, the thresholds a load
-# refuses by name, a round extended only when every one of its 1..4 lanes asks,
-# and IGNIS_ROUND_SHAPE forcing a shape over them. Host-only.
+# refuses by name; what a lane's recent rounds leave for its expectations;
+# `all`, a round extended only when every one of its 1..4 lanes asks, and
+# `aggregate`, when the asking lanes' expected drafts past 7 exceed the wider
+# round's cost to every lane, a lane granted where its window holds no extended
+# round; the policy's options a load refuses by name; and IGNIS_ROUND_SHAPE
+# forcing a shape over them. Host-only.
 add_executable(ignis_kernel_round_shape_test test_round_shape.cpp)
 target_include_directories(ignis_kernel_round_shape_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_round_shape_test PRIVATE ignis_kernel ignis_vendor)

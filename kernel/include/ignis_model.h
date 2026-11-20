@@ -267,6 +267,26 @@ enum ignis_speculative_backend {
 #define IGNIS_BASE_SHAPE_DRAFT_TOKENS 7
 #define IGNIS_EXTENDED_SHAPE_MAX_LANES 4
 
+/* GitHub #690 (spec #684): the shape policy of such a load, how its lanes'
+ * asks of the shape rule become a verify round's shape (kernel/src/round_shape.h
+ * `runs_extended`). A round of 5..8 lanes is at the base shape under both. */
+enum ignis_shape_policy {
+  /* At one lane, the lane's ask. At 2..IGNIS_EXTENDED_SHAPE_MAX_LANES lanes,
+   * extended when the drafts the asking lanes are expected to take past
+   * IGNIS_BASE_SHAPE_DRAFT_TOKENS exceed what the wider round costs every
+   * lane in it, each lane's expectations read over its own recent rounds.
+   * The default: a zeroed option's. */
+  IGNIS_SHAPE_POLICY_AGGREGATE = 0,
+  /* Extended only when every lane in the round asks: no lane pays for
+   * another. */
+  IGNIS_SHAPE_POLICY_ALL = 1,
+};
+
+/* GitHub #690: the most verify rounds a lane's expectations under
+ * IGNIS_SHAPE_POLICY_AGGREGATE read over
+ * (`ignis_model_load_options::shape_estimate_rounds`). */
+#define IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS 64
+
 /* GitHub #335 (spec 27b-16gb/03 solution 6): how the 27B's prompt attention
  * multiplies its band pass over an hq-e8-2b prefill chunk
  * (ignis_hq_prompt_attention.h). */
@@ -561,6 +581,18 @@ struct ignis_model_load_options {
    * two words. */
   uint32_t shape_enter_accepted;
   uint32_t shape_stay_accepted;
+  /* GitHub #690 (spec #684): the shape policy on such a load, read only
+   * there: enum ignis_shape_policy; the verify rounds of its own a lane's
+   * expectations read over, 1..IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS (0 = 16); and
+   * the extended round's period over the base round's at 1..
+   * IGNIS_EXTENDED_SHAPE_MAX_LANES lanes, in thousandths, 1000..2000 each
+   * (0 = that lane count's default: 1150, 1230, 1270, 1310; the one-lane
+   * entry is not read, a lane alone running at the shape it asks). A value
+   * outside its range is refused, naming the field. Appended at the end: the
+   * struct grew by six words. */
+  uint32_t shape_policy;
+  uint32_t shape_estimate_rounds;
+  uint32_t shape_period_ratios[IGNIS_EXTENDED_SHAPE_MAX_LANES];
 };
 
 /* GitHub #576 (spec #574, ADR 0090): how a verify round's sampling lanes

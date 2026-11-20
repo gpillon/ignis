@@ -134,6 +134,14 @@ pub(crate) mod ffi {
         /// rule's default.
         pub shape_enter_accepted: u32,
         pub shape_stay_accepted: u32,
+        /// GitHub #690: the shape policy, read there alone
+        /// ([`crate::speculation::ShapePolicy::abi_code`], 0 = `aggregate`),
+        /// the rounds a lane's expectations read over and the period ratios
+        /// at 1..4 lanes in thousandths ([`crate::speculation::ShapeEstimate`]);
+        /// 0 is each's default.
+        pub shape_policy: u32,
+        pub shape_estimate_rounds: u32,
+        pub shape_period_ratios: [u32; 4],
     }
 
     /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
@@ -535,6 +543,9 @@ fn load_options(
             drafter_top_p: speculation.map_or(1.0, |s| s.drafter_sampling().top_p()),
             shape_enter_accepted: speculation.map_or(0, |s| s.shape_rule().enter_accepted()),
             shape_stay_accepted: speculation.map_or(0, |s| s.shape_rule().stay_accepted()),
+            shape_policy: speculation.map_or(0, |s| s.shape_policy().abi_code()),
+            shape_estimate_rounds: speculation.map_or(0, |s| s.shape_estimate().rounds()),
+            shape_period_ratios: speculation.map_or([0; 4], |s| s.shape_estimate().period_ratios_milli()),
         }
     })
 }
@@ -1168,9 +1179,12 @@ fn flash_next_options(
         draft_rule: 0,
         drafter_temperature_factor: 0.0,
         drafter_top_p: 1.0,
-        // GitHub #689: no round shapes of its own.
+        // GitHub #689, #690: no round shapes of its own.
         shape_enter_accepted: 0,
         shape_stay_accepted: 0,
+        shape_policy: 0,
+        shape_estimate_rounds: 0,
+        shape_period_ratios: [0; 4],
     }
 }
 
@@ -1759,6 +1773,15 @@ mod tests {
         let options = load_options(Some(wide), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
             .expect("options");
         assert_eq!((options.draft_tokens, options.shape_enter_accepted, options.shape_stay_accepted), (15, 5, 12));
+        // GitHub #690: and the shape policy, `aggregate` at its defaults unless named.
+        assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (0, 16, [1150, 1230, 1270, 1310]));
+        let all = wide.with_shape_policy(
+            crate::speculation::ShapePolicy::All,
+            crate::speculation::ShapeEstimate::new(8, [1000, 1200, 1300, 2000]).unwrap(),
+        );
+        let options = load_options(Some(all), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+            .expect("options");
+        assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (1, 8, [1000, 1200, 1300, 2000]));
     }
 
     #[test]
@@ -1844,7 +1867,12 @@ mod tests {
         // GitHub #576: then the uint32 draft rule, in that padding, and the
         // drafter's two float settings, appended at the end.
         // GitHub #689: then the shape rule's two uint32 thresholds.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 112);
+        // GitHub #690: then the shape policy, its estimate window and its
+        // four period ratios, six uint32.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 136);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_policy), 112);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_estimate_rounds), 116);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_period_ratios), 120);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_enter_accepted), 104);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_stay_accepted), 108);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, prefill_linear), 88);

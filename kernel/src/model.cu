@@ -67,6 +67,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -1312,6 +1313,8 @@ struct LoadOptions {
   float drafter_top_p = 1.0f;
   // GitHub #689: the shape rule's thresholds, on a load of two round shapes.
   ignis::round_shape::ShapeRule shape_rule{};
+  // GitHub #690: and the shape policy.
+  ignis::round_shape::ShapePolicy shape_policy{};
 };
 
 // The current device's compute capability major, which a load's route choices read: false (error
@@ -1611,6 +1614,9 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   float drafter_temperature_factor = 0.0f;
   float drafter_top_p = 1.0f;
   ignis::round_shape::ShapeRule shape_rule{};
+  std::uint32_t shape_policy = IGNIS_SHAPE_POLICY_AGGREGATE;
+  std::uint32_t shape_estimate_rounds = 0;
+  std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> shape_period_ratios{};
   ignis::RopeScaling rope_scaling{};
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
@@ -1641,6 +1647,10 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     if (options->shape_stay_accepted != 0) {
       shape_rule.stay_accepted = options->shape_stay_accepted;
     }
+    // GitHub #690: the shape policy's, 0 each's default.
+    shape_policy = options->shape_policy;
+    shape_estimate_rounds = options->shape_estimate_rounds;
+    std::copy_n(options->shape_period_ratios, shape_period_ratios.size(), shape_period_ratios.begin());
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
   // one of the three.
@@ -1761,6 +1771,27 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
                 std::to_string(enter ? shape_rule.enter_accepted : shape_rule.stay_accepted) + " must be in 1.." +
                 std::to_string(enter ? IGNIS_BASE_SHAPE_DRAFT_TOKENS : draft_tokens) +
                 (enter ? ", the drafts a base round takes" : ", the drafts this load's extended round takes"));
+      return nullptr;
+    }
+    // GitHub #690: and a shape policy it does not know, a window past the rounds a lane keeps or a
+    // period ratio outside 1..2, by name.
+    if (const char *field = ignis::round_shape::policy_of(shape_policy, shape_estimate_rounds,
+                                                          shape_period_ratios.data(), out.shape_policy)) {
+      const std::string name(field);
+      std::string value = name == "shape_policy" ? std::to_string(shape_policy)
+                          : name == "shape_estimate_rounds" ? std::to_string(shape_estimate_rounds)
+                                                            : std::string();
+      if (name == "shape_period_ratios") {
+        for (std::size_t i = 0; i < shape_period_ratios.size(); ++i) {
+          value += (i == 0 ? "" : ",") + std::to_string(shape_period_ratios[i]);
+        }
+      }
+      set_error("ignis_model_load: " + name + " " + value +
+                (name == "shape_policy" ? " is not 0 (aggregate) or 1 (all)"
+                 : name == "shape_estimate_rounds"
+                     ? " must be in 1.." + std::to_string(IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS) +
+                           " (0: the default), the rounds a lane keeps"
+                     : " must each be in 1000..2000 thousandths (0: that lane count's default)"));
       return nullptr;
     }
   }
@@ -3107,8 +3138,9 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       if (sizes.extended_window != 0) {
         model->extended_shape =
             build_extended_shape(*topology, sizes.extended_window, sizes.extended_lanes, *model->base_shape);
-        // GitHub #689: the thresholds its rounds' shape rule reads.
+        // GitHub #689, #690: the thresholds its rounds' shape rule reads, and their policy.
         model->shape_rule = load.shape_rule;
+        model->shape_policy = load.shape_policy;
       }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());
