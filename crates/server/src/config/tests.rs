@@ -1732,7 +1732,8 @@ fn known_models_come_from_repeated_flags_or_the_env_var_and_a_flag_replaces_the_
 
 #[test]
 fn spec_dflash2_with_a_window_in_range_parses() {
-    for n in 1..=7u32 {
+    // GitHub #687: DFlash2's range is 1..=15, two round shapes past 7.
+    for n in 1..=15u32 {
         let config = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", &n.to_string()]);
         let sampled = Speculation::new(SpeculativeBackend::Dflash2, n).unwrap().with_draft_rule(DraftRule::Sampled, DrafterSampling::default());
         assert_eq!(config.speculation, Some(sampled));
@@ -1740,15 +1741,48 @@ fn spec_dflash2_with_a_window_in_range_parses() {
 }
 
 #[test]
-fn a_draft_window_outside_1_to_7_is_refused_naming_the_flag_and_the_value() {
-    for raw in ["0", "8", "15", "-1", "seven"] {
+fn a_draft_window_outside_its_range_is_refused_naming_the_flag_and_the_value() {
+    for raw in ["0", "16", "-1", "seven"] {
         let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", raw]);
         assert!(err.contains("--spec-draft-tokens") && err.contains(raw), "{err}");
     }
-    // GitHub #623: the field takes 0..=7 (the 27B's MTP window of 0), and
-    // DFlash2 refuses 0 by name.
-    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "8"]).contains("0..=7"));
-    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]).contains("1..=7"));
+    // GitHub #623, #687: the field takes 0..=15 (0 the 27B's MTP window of 0,
+    // 15 DFlash2's widest), and DFlash2 refuses 0 by name, naming its own
+    // range.
+    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "16"]).contains("0..=15"));
+    assert!(refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]).contains("1..=15"));
+}
+
+/// GitHub #687: the widest window is the backend's own. DFlash2 takes 1 to
+/// 15; the MTP head keeps its 7 (0 to 7 on the 27B, where 0 loads no
+/// speculation), so a window of 8 or 15, which the field's 0..=15 lets
+/// through for DFlash2, is refused for the head naming the head's bound and
+/// never DFlash2's.
+#[test]
+fn the_widest_draft_window_is_each_backends_own() {
+    // Past the field's bound, whatever the backend: the flag, the value and
+    // the field's range.
+    for backend in ["dflash2", "mtp"] {
+        for raw in ["16", "17", "100"] {
+            let err = refused(&["--spec-backend", backend, "--spec-draft-tokens", raw]);
+            assert!(err.contains("--spec-draft-tokens") && err.contains(raw) && err.contains("0..=15"), "{backend} {raw}: {err}");
+        }
+    }
+    // DFlash2: every window of 1..=15 is a load at that window, on the 27B too.
+    for window in [1u32, 7, 8, 9, 14, 15] {
+        let loaded = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", &window.to_string()]);
+        let speculation = loaded.speculation.unwrap_or_else(|| panic!("dflash2 at {window} loads speculation"));
+        assert_eq!((speculation.backend(), speculation.draft_tokens()), (SpeculativeBackend::Dflash2, window));
+        let on_the_27b = loaded.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("dflash2 at {window} on the 27B: {e}"));
+        assert_eq!(on_the_27b.speculation.map(|s| s.draft_tokens()), Some(window), "the 27B keeps the window");
+    }
+    // The MTP head: a window inside the field's bound but past the head's is
+    // refused by the head's.
+    for raw in ["8", "9", "14", "15"] {
+        let err = refused(&["--spec-backend", "mtp", "--spec-draft-tokens", raw]);
+        assert!(err.contains("--spec-draft-tokens") && err.contains(raw), "mtp {raw}: {err}");
+        assert!(err.contains("..=7") && !err.contains("..=15"), "mtp {raw}: the head's bound, not DFlash2's: {err}");
+    }
 }
 
 #[test]
@@ -1787,7 +1821,8 @@ fn spec_mtp_spec_off_and_draft_rows_parse() {
 #[test]
 fn spec_without_a_draft_window_is_refused() {
     let err = refused(&["--spec-backend", "dflash2"]);
-    assert!(err.contains("--spec-draft-tokens") && err.contains("1..=7"), "{err}");
+    // GitHub #687: the window DFlash2 asks for is one of its own 1..=15.
+    assert!(err.contains("--spec-draft-tokens") && err.contains("1..=15"), "{err}");
 }
 
 #[test]
@@ -1956,8 +1991,10 @@ fn the_27b_takes_mtp_at_a_window_of_0_to_7_and_7_unnamed() {
     let env = env_map(&[("IGNIS_SPEC_BACKEND", "mtp"), ("IGNIS_SPEC_DRAFT_TOKENS", "0"), ("IGNIS_QWEN38_VISION_ENABLED", "false")]);
     let by_env = expect_config(resolve(&[], env).expect("resolve")).for_family(ModelFamily::Qwen38_27b).unwrap();
     assert_eq!(EngineShape::from(&by_env), EngineShape::from(&off), "by env var too");
+    // GitHub #687: the field takes 0..=15 for DFlash2; the head still refuses
+    // 8, by its own bound (`the_widest_draft_window_is_each_backends_own`).
     let err = refused(&["--spec-backend", "mtp", "--spec-draft-tokens", "8"]);
-    assert!(err.contains("--spec-draft-tokens") && err.contains("0..=7"), "{err}");
+    assert!(err.contains("--spec-draft-tokens") && err.contains("..=7") && !err.contains("..=15"), "{err}");
 }
 
 /// AC 1: the window a profile gives beside its own DFlash2 (every built-in
@@ -2015,7 +2052,7 @@ fn a_window_of_0_is_the_27bs_mtp_alone() {
     assert_eq!(own.for_family(ModelFamily::FlashNext).unwrap().speculation, Some(flash_next));
     assert!(own.for_family(ModelFamily::Qwen38_27b).unwrap().speculation_off);
     let err = refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]);
-    assert!(err.contains("--spec-draft-tokens 0") && err.contains("1..=7") && err.contains("dflash2"), "{err}");
+    assert!(err.contains("--spec-draft-tokens 0") && err.contains("1..=15") && err.contains("dflash2"), "{err}");
 }
 
 /// The two refusals of a window of 0, held whole: DFlash2's, on every model,
@@ -2024,7 +2061,7 @@ fn a_window_of_0_is_the_27bs_mtp_alone() {
 fn the_refusals_of_a_window_of_0_read_as_one_sentence() {
     assert_eq!(
         refused(&["--spec-backend", "dflash2", "--spec-draft-tokens", "0"]),
-        "`--spec-draft-tokens 0`: `--spec-backend dflash2` drafts 1..=7 tokens a round (a window of 0 is the 27B's MTP \
+        "`--spec-draft-tokens 0`: `--spec-backend dflash2` drafts 1..=15 tokens a round (a window of 0 is the 27B's MTP \
          head's, which then loads no speculation)"
     );
     let both = config(&["--spec-backend", "mtp", "--spec-draft-tokens", "0", "--qwen38-vision-enabled", "false"]);
@@ -2174,6 +2211,9 @@ fn the_27bs_mtp_setting_round_trips_and_its_scope_names_both_models() {
     assert!(text.contains("`mtp`") && text.contains("27B") && text.contains("Flash-Next"), "{text}");
     let window = schema::field("spec", "draft_tokens").unwrap().description_line();
     assert!(window.contains("0..=7") && window.contains("default 7") && window.contains("default 2"), "{window}");
+    // GitHub #687: and DFlash2's own range, since `help --fields`, `GET
+    // /v1/config/fields` and the guide's reference print it.
+    assert!(window.contains("1..=15"), "DFlash2's range: {window}");
 }
 
 #[test]

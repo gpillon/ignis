@@ -4,8 +4,8 @@
 //! Sampling, the verify round, the drafter's round, the lanes' state and the
 //! hq residual window, each a function of the lanes and the model's
 //! dimensions: the arithmetic `kernel/src/model.cu` sizes the load by
-//! (`LoadSizes::reservations`, `verify_round_bytes`,
-//! `dflash2_round_activation_bytes`) and the sequence pool's slot image, the
+//! (`LoadSizes::reservations`, `verify_round_sizes`,
+//! `dflash2_round_scratch_bytes`) and the sequence pool's slot image, the
 //! vendored layouts those ask included. So a load can be re-planned at fewer
 //! lanes on the CPU, and `cargo test` holds every line to its formula; the
 //! GPU plan test (`crates/runtime/tests/vram_plan_gpu.rs`) holds the
@@ -27,7 +27,7 @@
 use crate::arena::{aligned, ALIGN as ARENA_ALIGN};
 use crate::compute::{LayerKind, ModelConfig};
 use crate::kv_format::KvFormat;
-use crate::speculation::Speculation;
+use crate::speculation::{RoundShape, Speculation};
 
 /// `sizeof(ninfer::ops::SamplingConfig)` (`ninfer/ops/sampling.h`): a
 /// temperature, a top-k, the top-p and min-p, two penalties, a seed and a
@@ -114,24 +114,42 @@ pub fn sampling_bytes(config: &ModelConfig, lanes: u32) -> u64 {
 }
 
 /// The verify round's line at `lanes` lanes under `speculation`'s window `k`
-/// (`verify_round_bytes`, `kernel/src/model.cu`): its staging -- eight
+/// (`verify_round_sizes`, `kernel/src/model.cu`): its staging -- eight
 /// per-lane words, the drafts, four (five with vision's rope positions)
 /// words per column -- the logits and hidden of every column, each lane's
 /// selected hidden, the ReplaySSM records of every GDN layer and lane, and
 /// the greedy accept's workspace, never under one arena block. Its buffers
 /// are separate allocations, so only the records and the workspace are
 /// rounded.
+///
+/// GitHub #687: a load of two round shapes
+/// ([`Speculation::round_shapes`]) holds one set of these buffers, each the
+/// larger of the two shapes' (`larger_of`).
 pub fn verify_round_bytes(config: &ModelConfig, speculation: Speculation, vision: bool, lanes: u32) -> u64 {
-    let k = u64::from(speculation.draft_tokens());
-    if k == 0 {
+    if speculation.draft_tokens() == 0 {
         return 0;
     }
+    let (base, extended) = speculation.round_shapes(lanes);
+    let mut buffers = verify_round_buffers(config, base);
+    if let Some(extended) = extended {
+        for (bytes, extended) in buffers.iter_mut().zip(verify_round_buffers(config, extended)) {
+            *bytes = (*bytes).max(extended);
+        }
+    }
+    let [lane_words, drafts, column_words, logits, hidden, selected_hidden, records, accept] = buffers;
+    let staging = 8 * lane_words + drafts + if vision { 5 } else { 4 } * column_words;
+    staging + logits + hidden + selected_hidden + records + accept
+}
+
+/// The bytes of each buffer of the verify round at `shape`
+/// (`VerifyRoundSizes`, `kernel/src/model.cu`), in its order: a per-lane
+/// word buffer, the drafts, a per-column word buffer, the logits, the hidden,
+/// the selected hidden, the ReplaySSM records and the accept's workspace.
+fn verify_round_buffers(config: &ModelConfig, shape: RoundShape) -> [u64; 8] {
+    let k = u64::from(shape.window);
     let columns = k + 1;
-    let lanes = u64::from(lanes);
+    let lanes = u64::from(shape.lanes);
     let (i32, bf16, fp32) = (4, 2, 4);
-    let staging = 8 * lanes * i32 + k * lanes * i32 + if vision { 5 } else { 4 } * columns * lanes * i32;
-    let activations =
-        config.vocab * columns * lanes * bf16 + config.hidden * columns * lanes * bf16 + config.hidden * lanes * bf16;
     // `verify_record_spec`: one record row per GDN layer and lane, `k + 1`
     // wide, laid out by the vendored `plan_gdn_replay_records`.
     let outer = config.layer_kinds.iter().filter(|&&kind| kind == LayerKind::Gdn).count() as u64 * lanes;
@@ -146,7 +164,16 @@ pub fn verify_round_bytes(config: &ModelConfig, speculation: Speculation, vision
     // `speculative_accept_greedy_drafts_workspace_capacity_bytes`: one
     // sampler workspace of `k + 1` columns per lane.
     let accept = (sampling_workspace_capacity_bytes(config.vocab, columns, columns) * lanes).max(ARENA_ALIGN);
-    staging + activations + records + accept
+    [
+        lanes * i32,
+        k * lanes * i32,
+        columns * lanes * i32,
+        config.vocab * columns * lanes * bf16,
+        config.hidden * columns * lanes * bf16,
+        config.hidden * lanes * bf16,
+        records,
+        accept,
+    ]
 }
 
 /// `ninfer::ops::sampling_workspace_capacity_bytes`: the multi-block
@@ -214,6 +241,86 @@ mod tests {
         };
         assert_eq!(served(8, true), main);
         assert_eq!(served(8, false), LaneLines { verify_round: 152_139_232, ..main }, "vision's rope positions, 8 x 8 words");
+    }
+
+    /// GitHub #687: a DFlash2 load past 7 drafts holds two round shapes on one
+    /// set of buffers, each the larger of the two shapes'. At eight lanes both
+    /// top out at 64 columns (8 x 8 and 4 x 16), so the verify line is the
+    /// 7-draft load's plus the 16 bytes the extended shape's drafts take past
+    /// the base shape's (15 x 4 words against 7 x 8), and no other lane line
+    /// moves; under the sampled draft the drafter's line holds 512 bytes more
+    /// of draws. Below eight lanes the extended shape has the more columns and
+    /// sizes the line: at four lanes, its 4 x 16 columns to the byte.
+    #[test]
+    fn two_round_shapes_hold_the_seven_draft_loads_buffers_at_eight_lanes() {
+        let config = ModelConfig::qwen38_27b();
+        let at = |window: u32, lanes: u32, vision: bool| {
+            let speculation = Speculation::new(SpeculativeBackend::Dflash2, window).expect("dflash2");
+            lane_lines(&config, KvFormat::HqE8_2b, Some(speculation), vision, lanes, 2)
+        };
+        for vision in [false, true] {
+            let main = at(7, 8, vision);
+            assert_eq!(at(15, 8, vision), LaneLines { verify_round: main.verify_round + 16, ..main }, "vision {vision}");
+            // 4 x 10 columns and 4 x 9 drafts: under the base shape's on every buffer.
+            assert_eq!(at(9, 8, vision), main, "vision {vision}");
+        }
+        assert_eq!(at(15, 8, true).verify_round, 152_139_504);
+        let sampled = |window: u32| {
+            let speculation = Speculation::new(SpeculativeBackend::Dflash2, window).expect("dflash2");
+            let speculation = speculation.with_draft_rule(crate::DraftRule::Sampled, crate::DrafterSampling::default());
+            lane_lines(&config, KvFormat::HqE8_2b, Some(speculation), true, 8, 2)
+        };
+        assert_eq!(sampled(15), LaneLines { verify_round: sampled(7).verify_round + 16, drafter_round: 78_035_232, ..sampled(7) });
+        assert_eq!(sampled(7).drafter_round, 78_034_720);
+        // Four lanes: 4 x 16 columns against 4 x 8, so every buffer is the
+        // extended shape's, and the line what that shape takes alone.
+        let extended = verify_round_buffers(&config, RoundShape { window: 15, lanes: 4 });
+        let base = verify_round_buffers(&config, RoundShape { window: 7, lanes: 4 });
+        assert!(extended.iter().zip(base).all(|(&extended, base)| extended >= base));
+        assert_eq!(at(15, 4, true).verify_round, 152_093_296);
+        // An MTP load keeps its one shape at every window it takes.
+        for window in 1..=7 {
+            let mtp = Speculation::new(SpeculativeBackend::Mtp, window).expect("mtp");
+            let lines = lane_lines(&config, KvFormat::HqE8_2b, Some(mtp), true, 8, 2);
+            assert_eq!(lines.verify_round, verify_round_bytes(&config, mtp, true, 8), "mtp {window}");
+            let (shape, none) = mtp.round_shapes(8);
+            assert_eq!((shape, none), (RoundShape { window, lanes: 8 }, None), "mtp {window}");
+        }
+    }
+
+    /// GitHub #687 (the owner's requirement): a load past 7 drafts keeps a
+    /// 7-draft load's KV pages. At eight lanes, the `rtx5090` profile's, the
+    /// verify and drafter lines of every window 8..15 pass a 7-draft load's by
+    /// less than one KV page (589,824 B under hq-e8-2b), so the pool, the
+    /// whole pages left of the budget, loses none, or one where the remainder
+    /// sat on a page's edge. What the extended shape cannot share at 15 drafts
+    /// is its 60 draft columns against the base shape's 56: 16 B of drafts
+    /// and, under the sampled draft, 512 B of kept candidates and
+    /// probabilities. A plan that shared the buffers but summed the drafter's
+    /// scratch over both shapes' forwards would be 2,142,736 B and three pages
+    /// over.
+    #[test]
+    fn a_two_shape_load_at_eight_lanes_keeps_a_seven_draft_loads_kv_pages() {
+        let config = ModelConfig::qwen38_27b();
+        let page = KvFormat::HqE8_2b.page_bytes(config.kv_geometry());
+        assert_eq!(page, 589_824, "one KV page of the 27B under hq-e8-2b: 64 tokens of 9,216 B");
+        let drafting = |window: u32, vision: bool| {
+            let speculation = Speculation::new(SpeculativeBackend::Dflash2, window)
+                .expect("dflash2")
+                .with_draft_rule(crate::DraftRule::Sampled, crate::DrafterSampling::default());
+            lane_lines(&config, KvFormat::HqE8_2b, Some(speculation), vision, 8, 2)
+        };
+        for vision in [false, true] {
+            for window in 8..=15 {
+                let (extended, main) = (drafting(window, vision), drafting(7, vision));
+                let over = (extended.verify_round + extended.drafter_round) - (main.verify_round + main.drafter_round);
+                assert!(
+                    over < page,
+                    "window {window}, vision {vision}: the load reserves {over} B past a 7-draft load's verify and drafter lines, {} whole KV pages",
+                    over / page
+                );
+            }
+        }
     }
 
     /// The sampling and verify lines the leaf planned at one and two lanes

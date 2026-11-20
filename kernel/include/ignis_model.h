@@ -253,9 +253,19 @@ enum ignis_speculative_backend {
  * backend is refused past its own. DFlash2's is held inside the domains of
  * the vendored ops its verify round and its drafter call run
  * (kernel/src/draft_window.h), so a cap past them does not build. */
-#define IGNIS_DFLASH2_MAX_DRAFT_TOKENS 7
+#define IGNIS_DFLASH2_MAX_DRAFT_TOKENS 15
 #define IGNIS_MTP_MAX_DRAFT_TOKENS 7
 #define IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS 7
+
+/* GitHub #687 (spec #684): a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS
+ * drafts holds two round shapes on one set of buffers. Its base shape drafts
+ * that many tokens a lane (8 columns) at every lane count, the one shape of a
+ * load at that window or fewer; its extended shape drafts the load's window
+ * (the window + 1 columns a lane) at no more than
+ * IGNIS_EXTENDED_SHAPE_MAX_LANES lanes, so that neither shape's round passes
+ * the 64 columns of 8 lanes of 8. */
+#define IGNIS_BASE_SHAPE_DRAFT_TOKENS 7
+#define IGNIS_EXTENDED_SHAPE_MAX_LANES 4
 
 /* GitHub #335 (spec 27b-16gb/03 solution 6): how the 27B's prompt attention
  * multiplies its band pass over an hq-e8-2b prefill chunk
@@ -414,7 +424,10 @@ struct ignis_model_load_options {
    * 1..IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS under VERIFY_ONLY,
    * 1..IGNIS_MTP_MAX_DRAFT_TOKENS under MTP, 0 with no backend. Fixed for the
    * life of the load: it is the window the verify graphs are captured at, and the only
-   * `speculative_window` `ignis_program_decode` accepts besides 0. */
+   * `speculative_window` `ignis_program_decode` accepts besides 0. GitHub #687:
+   * under DFLASH2 past IGNIS_BASE_SHAPE_DRAFT_TOKENS it is the load's widest
+   * window, its extended shape's, beside its base shape's
+   * IGNIS_BASE_SHAPE_DRAFT_TOKENS. */
   uint32_t draft_tokens;
   /* The vision envelope in merged vision tokens per request (GitHub #177);
    * 0 = no vision. Nonzero binds every `vision/*` tensor and reserves, at

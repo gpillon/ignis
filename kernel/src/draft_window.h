@@ -40,15 +40,6 @@ inline constexpr const char *ignis_speculative_backend_name(int32_t backend) {
                                                     : "NONE";
 }
 
-// The widest window of any drafter: what sizes the trellis head's widest
-// verify call (kernel/src/model.cu).
-inline constexpr uint32_t kIgnisWidestDraftTokens =
-    IGNIS_DFLASH2_MAX_DRAFT_TOKENS > IGNIS_MTP_MAX_DRAFT_TOKENS
-        ? (IGNIS_DFLASH2_MAX_DRAFT_TOKENS > IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS ? IGNIS_DFLASH2_MAX_DRAFT_TOKENS
-                                                                               : IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS)
-        : (IGNIS_MTP_MAX_DRAFT_TOKENS > IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS ? IGNIS_MTP_MAX_DRAFT_TOKENS
-                                                                           : IGNIS_VERIFY_ONLY_MAX_DRAFT_TOKENS);
-
 // The vendored domains, in columns a lane (k + 1) unless named positions (k).
 // Each holds at two lanes or more where the op takes one lane wider; a round
 // takes the narrower bound at every lane count.

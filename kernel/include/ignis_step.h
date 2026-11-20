@@ -490,9 +490,10 @@ int32_t ignis_decode(struct ignis_model *model, const int32_t *token_ids, uint64
 const char *ignis_step_last_error(void);
 
 /* GitHub #686 (spec #684): the most round shapes a 27B load builds, each a
- * verify round with its own window, buffers and graphs: one, the load's base
- * shape. */
-#define IGNIS_ROUND_SHAPES_MAX 1
+ * verify round with its own window, buffers and graphs: GitHub #687, two, a
+ * DFlash2 load's base shape and, past IGNIS_BASE_SHAPE_DRAFT_TOKENS drafts,
+ * its extended shape. */
+#define IGNIS_ROUND_SHAPES_MAX 2
 
 /* GitHub #686: one round shape's verify round, as `ignis_program_stats`
  * reports it: the shape's draft window (a round at it is `window + 1` columns
@@ -500,7 +501,13 @@ const char *ignis_step_last_error(void);
  * drafter append graphs, by exact width as the fields of the same names in
  * `ignis_program_stats` say; its own device buffers (its verify substrate and
  * its drafter round buffers, a share of the program's `vram_bytes`); and its
- * rounds that returned with their fold in flight. */
+ * rounds that returned with their fold in flight.
+ *
+ * GitHub #687: and the most lanes a round at it runs, the widths its graphs
+ * are captured at (1..lanes: a clear bit among them is a width whose capture
+ * failed, whose rounds run eagerly); its verify rounds, and how many of them
+ * ran eagerly, with no graph. An extended shape holds the base shape's
+ * buffers and none of its own: its `vram_bytes` is 0. */
 struct ignis_round_shape_stats {
   uint32_t window;
   uint32_t verify_graph_ready_mask;
@@ -508,7 +515,10 @@ struct ignis_round_shape_stats {
   uint32_t verify_graph_nodes[IGNIS_DECODE_MAX_BATCH];
   uint32_t verify_graph_copy_nodes[IGNIS_DECODE_MAX_BATCH];
   uint32_t drafter_append_graph_ready_mask;
+  uint32_t lanes;
   uint64_t verify_folds_in_flight;
+  uint64_t verify_rounds;
+  uint64_t eager_verify_rounds;
 };
 
 /* Runtime counters for the real program entry points.  `kernel_count` is
@@ -563,10 +573,12 @@ struct ignis_program_stats {
    * input projection. */
   uint32_t gdn_gating;
   /* GitHub #686 (spec #684): the round shapes the load built -- 1 on a 27B
-   * load with a draft window, its base shape; 0 on one without and on
-   * Flash-Next, which keeps its own verify round -- and each one's verify
-   * round, the base shape first; an entry past `round_shapes` is zero. The
-   * verify fields above are the base shape's, `shapes[0]`'s. */
+   * load with a draft window, its base shape (GitHub #687: 2 on a DFlash2
+   * load past IGNIS_BASE_SHAPE_DRAFT_TOKENS drafts, with its extended shape);
+   * 0 on one without and on Flash-Next, which keeps its own verify round --
+   * and each one's verify round, the base shape first; an entry past
+   * `round_shapes` is zero. The verify fields above are the base shape's,
+   * `shapes[0]`'s. */
   uint32_t round_shapes;
   struct ignis_round_shape_stats shapes[IGNIS_ROUND_SHAPES_MAX];
 };

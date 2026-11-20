@@ -117,7 +117,7 @@ it.
 | Prefill | scratch for its taps in every chunk | the head runs over every prompt position, and every column the head reads is normalized |
 | A shared prefix | shared as on any load | each holder keeps its own copy of the prefix's last page, which the VRAM plan holds beside the context |
 | Draft rule | the sampled draft (default) or the fixed draft | the fixed draft only |
-| Draft tokens | 1 to 7, required | 0 to 7, default 7; 0 loads no speculation |
+| Draft tokens | 1 to 15 (1 to 7 before 0.11.0), required; past 7, [two round shapes](#past-seven-drafts-two-round-shapes) | 0 to 7, default 7; 0 loads no speculation |
 | Tokens a round, recorded agent turns at 7 drafts | 3.83 (sampled draft), 3.45 (fixed) | 3.90 (NVFP4), 3.88 (16 GB) |
 | Images | drafts after them | drafts after them |
 
@@ -131,7 +131,8 @@ a reload ([the VRAM plan](vram-plan.md) shows each one's lines).
 DFlash2 is a small drafter grafted into the 27B's artifact: five layers that
 read the target's own hidden states over a sliding window of the last 2,048
 positions. It is loaded when `--spec-backend dflash2` is set, together with
-`--spec-draft-tokens` (1 to 7), and costs no VRAM when speculation is off. The
+`--spec-draft-tokens` (1 to 15; from 0.11.0, 1 to 7 before), and costs no VRAM
+when speculation is off. The
 reference also keeps a rewrite checkpoint of the drafter's window, restored
 when a turn rewrites text past its chat template's rewrite boundary; ignis
 never read one and retired it (snapshot format 5), because a prompt checkpoint
@@ -152,6 +153,9 @@ taken at the opener already carries the window as it stood there.
   6000 it beat four in every cell measured but one, and was 1.6 to 3.3 times
   speculation off
   ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
+  From 0.11.0 a load can name up to 15
+  ([past seven drafts](#past-seven-drafts-two-round-shapes)), unmeasured for
+  speed: every profile keeps 7.
 - **The proposal head.** The drafter proposes with the target's own output head
   by default (`--spec-draft-head full`). `shortlist` uses a smaller 4-bit head
   over the 131,072 most frequent tokens, at +356 MB of VRAM; it accepted 7
@@ -160,6 +164,28 @@ taken at the opener already carries the window as it stood there.
 - **Variants.** The abliterated 27B uses the same drafter. It was fitted to the
   default weights, and since the target verifies every draft, a mismatch lowers
   acceptance and nothing else.
+
+### Past seven drafts: two round shapes
+
+From 0.11.0, `--spec-draft-tokens` takes 8 to 15 with DFlash2 (the 0.10
+releases refuse past 7). The number is still the widest window of the load,
+and such a load holds two **round shapes**, on one set of buffers:
+
+- the **base shape**, 8 columns a lane (the anchor and 7 drafts) at every
+  lane count: the round of a load at 7 drafts, token for token;
+- the **extended shape**, the window + 1 columns a lane (16 at 15 drafts), at
+  up to 4 lanes, so that a round never carries more than the 64 columns of 8
+  lanes of 8.
+
+A verify round takes one shape for all its lanes. In this build every round
+runs at the base shape: a load past 7 drafts decodes what a load at 7 does,
+and costs it what [the configuration reference](../configuration/context-and-speculation.md)
+states below 8 lanes (at 8 lanes, a few hundred bytes). The measurement switch
+`IGNIS_ROUND_SHAPE=extended` ([Testing](../contributing/testing.md)) runs
+every round of 4 lanes or fewer at the extended shape instead, a round with a
+lane held to a grammar excepted. The VRAM plan holds both shapes, and the
+extended shape's captured graphs hold about 20 MiB outside it. A load at 7
+drafts or fewer has the one shape it had. The MTP head keeps 0 to 7.
 
 ## MTP, for the 27B
 

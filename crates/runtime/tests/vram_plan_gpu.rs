@@ -643,3 +643,76 @@ fn the_sampled_draft_keeps_its_draws_on_the_drafters_line() {
         assert_eq!(ReservedBytes { drafter_round: at_fixed.drafter_round, ..at_sampled }, at_fixed, "{lanes} lanes: another line moved");
     }
 }
+
+/// GitHub #687: a DFlash2 load past seven drafts holds two round shapes on one
+/// set of buffers, and the leaf's plan for it is the CPU's lines
+/// (`ignis_core::lane_lines`) at the windows' ends and one between and at 1,
+/// 2, 4, 5 and 8 lanes: the verify round's and the drafter's lines, which hold
+/// both shapes, and sampling, the lanes' state and the hq window, which do
+/// not move. Against the plan of the same load at seven drafts, no line moves
+/// but those two and the decode round's scratch, which holds the extended
+/// round's traversal, and at eight lanes, where both shapes are 64 columns,
+/// not that one either. Each delta is printed: the configuration reference
+/// quotes them. Asked of the leaf's plan only, so nothing here touches the
+/// device.
+#[test]
+#[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
+fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
+    let path = Path::new(ARTIFACT);
+    if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {ARTIFACT}")) {
+        return;
+    }
+    let reader = Reader::open(path).unwrap_or_else(|e| panic!("open artifact: {e}"));
+    let at_window = |window: u32| {
+        Speculation::new(SpeculativeBackend::Dflash2, window)
+            .unwrap_or_else(|e| panic!("dflash2-{window}: {e}"))
+            .with_draft_rule(DraftRule::Sampled, DrafterSampling::default())
+    };
+    let seven = at_window(7);
+    let topology = ignis_core::ModelConfig::qwen38_27b();
+    let scope = model_load::model_scope(Some(seven), None, ExceptionWeights::Bf16);
+    let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
+    let planned = |speculation: Speculation, lanes: u32| {
+        let config = CudaLeafConfig {
+            max_context_tokens: 262_144,
+            kv_format: KvFormat::HqE8_2b,
+            slot_count: lanes,
+            prefill_chunk_tokens: 1024,
+            speculation: Some(speculation),
+            retained_device_slots: 2,
+            retained_host_slots: 16,
+            ..CudaLeafConfig::default()
+        };
+        config.plan_reservations(&reader, &plan, &handles).unwrap_or_else(|e| panic!("plan at {lanes} lanes: {e}")).reserved
+    };
+    for window in [8, 12, 15] {
+        let wide = at_window(window);
+        for lanes in [1, 2, 4, 5, N_DECODE_LANES as u32] {
+            let (at, base) = (planned(wide, lanes), planned(seven, lanes));
+            let lines = lane_lines(&topology, KvFormat::HqE8_2b, Some(wide), false, lanes, 2);
+            let what = format!("{window} drafts at {lanes} lanes");
+            assert_eq!(at.verify_round, lines.verify_round, "{what}: the leaf's verify line is the CPU's");
+            assert_eq!(at.drafter_round, lines.drafter_round, "{what}: the leaf's drafter line is the CPU's");
+            assert_eq!(
+                (at.sampling, at.lane_state, at.hq_residual_window),
+                (lines.sampling, lines.lane_state, lines.hq_residual_window),
+                "{what}: the lines that hold no round shape"
+            );
+            assert_eq!(
+                ReservedBytes { verify_round: base.verify_round, drafter_round: base.drafter_round, decode_graph: base.decode_graph, ..at },
+                base,
+                "{what}: a line moved from the seven-draft load's that holds no round shape"
+            );
+            assert!(at.decode_graph >= base.decode_graph, "{what}: the decode round's scratch holds the base shape");
+            if lanes == N_DECODE_LANES as u32 {
+                assert_eq!(at.decode_graph, base.decode_graph, "{what}: both shapes are 64 columns");
+            }
+            println!(
+                "vram_plan_gpu: {what}: past the seven-draft load, verify +{} B, drafter +{} B, decode round +{} B",
+                at.verify_round - base.verify_round,
+                at.drafter_round - base.drafter_round,
+                at.decode_graph - base.decode_graph
+            );
+        }
+    }
+}

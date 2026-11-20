@@ -452,6 +452,17 @@ target_include_directories(ignis_kernel_hq_decode_attention_route_test PRIVATE $
 target_link_libraries(ignis_kernel_hq_decode_attention_route_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_hq_decode_attention_route_test COMMAND ignis_kernel_hq_decode_attention_route_test)
 
+# GitHub #687: OURS -- which batch rounds run their one lane's attention in
+# chunks of the small-T tile (kernel/src/round_shape.h): no round of a load at
+# seven drafts or fewer and no base round, over hq-e8-2b or BF16 (the tile is
+# 6 columns there, and a one-lane round of 7 or 8 stays the vendored wrapper's
+# prompt route, as on main), and the one lane of an extended round alone.
+# Host-only.
+add_executable(ignis_kernel_one_lane_chunks_test test_one_lane_chunks.cpp)
+target_include_directories(ignis_kernel_one_lane_chunks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_one_lane_chunks_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_one_lane_chunks_test COMMAND ignis_kernel_one_lane_chunks_test)
+
 # GitHub #677, #680 (spec #672): OURS -- which decode and verify rounds of the
 # 27B run copy-free (kernel/src/decode_graph_copies.h): on a card of compute
 # capability 12 every width and the verify round unless
@@ -646,6 +657,18 @@ add_executable(ignis_kernel_sampled_draft_test test_sampled_draft.cu)
 target_include_directories(ignis_kernel_sampled_draft_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_link_libraries(ignis_kernel_sampled_draft_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_sampled_draft_test COMMAND ignis_kernel_sampled_draft_test)
+
+# GitHub #687: the same test at a window of 15, DFlash2's widest: 16 columns a
+# lane, exactly the vendored sampler's column cap (kSamplerMaxColumns). The
+# target distributions against the vendored builder bit for bit, the greedy and
+# extent-0 lanes against the vendored accept, the verdicts' host walk, the draw
+# and the teacher-forced mode, each at the last width the multi-block route
+# serves. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_sampled_draft_w15_test test_sampled_draft.cu)
+target_compile_definitions(ignis_kernel_sampled_draft_w15_test PRIVATE IGNIS_SAMPLED_DRAFT_TEST_WINDOW=15)
+target_include_directories(ignis_kernel_sampled_draft_w15_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_sampled_draft_w15_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_sampled_draft_w15_test COMMAND ignis_kernel_sampled_draft_w15_test)
 
 # GitHub #507: OURS, an adapted op -- the GDN prefill's split conv (kernel/src/gdn_conv_split.h,
 # leaf-internal) against what the layer body ran before it, the vendored causal conv and the three

@@ -220,6 +220,19 @@ both leaf-internal (ADR 0093).
   (`kernel/tests/test_hq_verify_exact.cu`), and as the route of every other card and call
   (`kernel/vendor/VENDOR.md`).
 
+### The extended round's one-lane attention in `kernel/src/gqa_layer.cu` (spec #684, GitHub #687)
+`run_gqa_layer_batch`'s loop over the small-T tile for the one lane of an extended verify round,
+which the vendored wrapper's resolver sends to its prompt route.
+- Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
+  (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
+  `src/ops/wrapper/gqa_attention.cpp`'s `launch_chunked_small_t` (per chunk of the tile a
+  workspace scope, the chunk's split capacity and `allocate_small_t_workspace`'s three partial
+  tensors in their order and shapes, then the launcher at the chunk's first column), restated at
+  one lane.
+- Called and not copied: `gqa_small_t_chunk_tokens`, `gqa_attention_split_capacity` and
+  `gqa_attention_small_t_launch` (`src/ops/launcher/gqa_attention.h`). Changed here: nothing but
+  the lane count the vendored resolver gives that loop.
+
 ### `kernel/src/prefill_swiglu.cuh` and `kernel/src/prefill_swiglu.cu` (spec #646, GitHub #651, #653)
 The 27B prefill's MLP gate and up product with SwiGLU in its epilogue
 (`ignis::prefill_swiglu::swiglu_tma_kernel`), and its launchers
