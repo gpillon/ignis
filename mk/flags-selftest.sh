@@ -136,11 +136,19 @@ case "$engine" in *"context=default"*) ;; *) fail "27B engine line: 'context=def
 out="$(flags MODEL=flash-next SPEC=off)"
 has "SPEC=off" "$out" "--spec-backend off"
 
-# The server refuses a window beside --spec-backend off, so the 27B's default
-# DRAFT_TOKENS=7 must not ride along when SPEC=off turns speculation off.
-out="$(flags SPEC=off)"
+# The server refuses a window beside --spec-backend off, so a window must not
+# ride along when SPEC=off turns speculation off (DRAFT_TOKENS is empty by
+# default: the profile decides; the guard holds for a named one too).
+out="$(flags SPEC=off DRAFT_TOKENS=9)"
 has "27B SPEC=off" "$out" "--spec-backend off"
 lacks "27B SPEC=off" "$out" "--spec-draft-tokens"
+
+# The 27B's window is the card profile's (15 on the RTX 5090, #696): left empty
+# the start passes no --spec-draft-tokens, named it is passed as named.
+out="$(flags)"
+lacks "27B default window" "$out" "--spec-draft-tokens"
+out="$(flags DRAFT_TOKENS=9)"
+has "27B DRAFT_TOKENS=9" "$out" "--spec-draft-tokens 9"
 
 # KV-disk (spec vram-budget/03): the knobs reach the server as named, the
 # server's defaults (4G on Flash-Next, off on the 27B) when they are not,

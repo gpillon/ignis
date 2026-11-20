@@ -138,7 +138,7 @@ changes code also publishes a rolling development build, **not a release**: the 
 
 ```
 ignis-server --model-max-context 524288 \
-  --spec-backend dflash2 --spec-draft-tokens 7 --vision-enabled
+  --spec-backend dflash2 --vision-enabled
 ```
 
 No model yet? It offers to fetch one. Those flags set the 512K context `make`
@@ -238,7 +238,8 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
 ### Speculative decoding (DFlash2)
 
 - The served artifact carries a **grafted DFlash2 drafter**; `--spec-backend dflash2
-  --spec-draft-tokens 7` runs draft-and-verify rounds against it.
+  --spec-draft-tokens <n>` runs draft-and-verify rounds against it, `<n>` the window the
+  profile sets (15 on the RTX 5090, 7 elsewhere) when the flag is left out.
 - The drafter's vendored top-k gave one warp to each of seven columns over a
   248k vocabulary and spent 3,145 µs — 16.4% of decode kernel time — to move
   2.0 µs of memory. **Our row-split replacement does it in 44 µs at a
