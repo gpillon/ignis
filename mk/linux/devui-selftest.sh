@@ -9,9 +9,11 @@
 # leader of a session of its own, as a terminal starts a job, and ends it the
 # way a user or make would: Ctrl+C to the process group, SIGTERM, SIGHUP,
 # kill -9 of a make or of the script, a child exiting on its own; then
-# nothing of that session may be left running. No build, no GPU, nothing beyond 127.0.0.1.
+# nothing of that session may be left running. With CUDA=1 the server holds
+# the GPU lock (mk/linux/gpulock.py) for the session, and a lock held by
+# another process refuses it at once. No build, no GPU, nothing beyond 127.0.0.1.
 # Linux only (/proc, process groups and sessions). It writes only under a
-# temporary directory it removes.
+# temporary directory it removes, the lock's included (IGNIS_GPU_LOCK_DIR).
 
 set -uo pipefail
 
@@ -78,9 +80,11 @@ run="$tmp/run"
 state="$tmp/state"
 mkdir -p "$bin" "$tree/mk/os" "$tree/mk/linux" "$tree/web/node_modules/vite/bin" "$run" "$state" "$tmp/empty"
 cp mk/os/linux.mk "$tree/mk/os/"
-cp mk/linux/devui.py mk/linux/server.py "$tree/mk/linux/"
+cp mk/linux/devui.py mk/linux/server.py mk/linux/gpulock.py "$tree/mk/linux/"
 : > "$tree/web/node_modules/vite/bin/vite.js"
-export STUB_DIR="$state"
+export STUB_DIR="$state" IGNIS_GPU_LOCK_DIR="$tmp/lock"
+unset IGNIS_GPU_CARD
+gpu_lock="$tmp/lock/gpu-0.lock"
 port="$(free_port)"
 url="http://127.0.0.1:$port"
 
@@ -257,6 +261,28 @@ else
     abort "sigterm"
 fi
 
+echo "devui-selftest: CUDA=1, the GPU lock"
+make_ui gpu-lock "CUDA=1"
+if wait_until 20 served; then
+    server_pid="$(field "$state/server.json" pid)"
+    [ "$(field "$gpu_lock" pid 2>/dev/null)" = "$server_pid" ] ||
+        fail "gpu-lock: the lock does not name the server (pid $server_pid): $(cat "$gpu_lock" 2>/dev/null)"
+    kill -INT -- "-$leader"
+    settle gpu-lock
+    [ ! -e "$gpu_lock" ] || fail "gpu-lock: the lock outlived the session: $(cat "$gpu_lock")"
+else
+    abort "gpu-lock"
+fi
+sleep 300 &
+holder=$!
+"$python" "$tree/mk/linux/gpulock.py" acquire --pid "$holder" --wait 0 --command "gpu-profile" > /dev/null
+make_ui gpu-lock-held "CUDA=1"
+settle gpu-lock-held
+has "gpu-lock-held" "$out" "the card is held ($gpu_lock) by pid $holder"
+[ ! -e "$state/server.json" ] || fail "gpu-lock-held: the server was started"
+kill "$holder" 2>/dev/null
+wait "$holder" 2>/dev/null
+
 echo "devui-selftest: the server dies"
 make_ui server-dies
 if wait_until 20 served; then
@@ -394,7 +420,7 @@ devui_args=(--pid "$tmp/refused.pid" --log "$tmp/refused.log" --url "$url" -- "$
 PATH="$tmp/empty" "$python" "$tree/mk/linux/devui.py" "${devui_args[@]}" > "$tmp/refused" 2>&1 && fail "no node: the script exited 0"
 has "no node" "$tmp/refused" "error: node not found on PATH"
 mkdir -p "$tmp/bare/mk/linux"
-cp mk/linux/devui.py mk/linux/server.py "$tmp/bare/mk/linux/"
+cp mk/linux/devui.py mk/linux/server.py mk/linux/gpulock.py "$tmp/bare/mk/linux/"
 "$python" "$tmp/bare/mk/linux/devui.py" "${devui_args[@]}" > "$tmp/refused" 2>&1 && fail "no vite.js: the script exited 0"
 has "no vite.js" "$tmp/refused" "$tmp/bare/web/node_modules/vite/bin/vite.js not found (make web-install)"
 [ ! -e "$tmp/refused.log" ] || fail "a refused session started a server"

@@ -145,6 +145,36 @@ before it could clean up loses its pass 30 minutes after its last test
 (GitHub #517).
 **This script is the normal, documented way to run the GPU profile.**
 
+**The GPU lock** (GitHub #707, ADR 0006) sits beside the marker and the
+process check: one lock per card, a record naming its holder (the pid and the
+process's start time, the worktree, the command, since when), kept in
+`%ProgramData%\ignis\gpu-lock\` on Windows and `/tmp/ignis-gpu-lock/` on Linux
+(`IGNIS_GPU_LOCK_DIR` moves it, as the selftests do). A holder that has
+exited, or whose pid now names another process, holds nothing, so a run killed
+before it could clean up leaves no lock behind. Every way onto the card takes
+it: the profile script for its whole run, `make start`, `run` and `run-ui` for
+the server they start (handed to the server's pid; `make stop` or a failed
+start frees it), `make kernel-test` and `make gpu-run`. `make start` and
+`make gpu-guard` refuse at once while someone else holds it, naming the holder;
+the profile, `make kernel-test` and `make gpu-run` wait for it up to
+`GPU_LOCK_WAIT` seconds (900; the script's `-WaitSeconds` / `--wait-seconds`),
+then fail naming it. The profile waits before its preflight, so a waiting run
+never touches a marker another run owns. The marker stays:
+`ignis_core::gpu_profile` reads it, and a worktree on an older commit knows
+only the marker and the process check. `make gpu-lock-selftest` tests the lock
+and the scripts around it on stand-ins.
+
+**One test or a few: the single-test mode.** `-Test a_test,b_test` on Windows
+(the names separated by commas, one argument, as `-File` and make pass it) or
+`--test a_test --test b_test` on Linux runs only those `#[ignore]`d tests, in
+place of the three stages: each alone, with stage 3's flags, under the profile
+(the lock, the preflight and the marker as for a full run), its wall time
+reported like a stage's. A name is the test's full name as
+`cargo test -- --list --ignored` prints it; one that names no ignored test
+fails the run before any test runs, since cargo would pass it with no test run.
+It is how an implementer runs its own ticket's GPU tests red before green
+(`make gpu-profile GPU_PROFILE_ARGS='-Test a_test,b_test'`).
+
 It runs three stages and reports each one's wall time at the end, so a slow
 run says where the time went without anyone adding up per-test output
 (GitHub #135):
@@ -197,8 +227,8 @@ some. That includes another agent session in another worktree: the
 worktrees are separate, the card is not. `nvidia-smi` (or
 `scripts/gpu-preflight.ps1`) plus `tasklist` for stray `*_gpu-*.exe`,
 `ignis-server`, `ignis-bench` and `ninfer*` processes answers it in one
-step; `make gpu-status` prints both, and `make gpu-guard` turns them into a
-pass/fail.
+step; `make gpu-status` prints both and the GPU lock's holder, and
+`make gpu-guard` turns them into a pass/fail.
 
 ### Who holds the card
 
@@ -215,6 +245,9 @@ runs:
 - **A hosted agent** (its model runs elsewhere). Whatever holds the card
   belongs to someone else: another session or worktree, a running ignis, the
   user's own work. Wait or ask; never stop a process you did not start.
+  The GPU lock names that holder (`make gpu-status`: its pid, worktree and
+  command), and the profile, `make kernel-test` and `make gpu-run` do the
+  waiting themselves, up to `GPU_LOCK_WAIT`.
 
 An agent that does not know which case it is in asks the user.
 
@@ -224,28 +257,37 @@ Runbook:
 # 0. Check nobody else is already running GPU work -- another agent session
 #    in another worktree counts. make gpu-status: nvidia-smi for held memory,
 #    tasklist for stray *_gpu-*.exe / ignis-server / ignis-bench / ninfer
-#    processes.
+#    processes, and the GPU lock's holder.
 # 1. A local agent: the user stops the engine that serves the agent and runs
 #    steps 2-3. A hosted agent: nothing is stopped; the card is free, or you
 #    wait or ask.
-# 2. Preflight + profile in one step: refuses to proceed while the GPU is
+# 2. Lock + preflight + profile in one step: waits for the GPU lock (up to
+#    -WaitSeconds, naming its holder), refuses to proceed while the GPU is
 #    held (and names the offending process); on a free GPU, runs the leaf's
 #    op tests and the #[ignore]d Rust GPU tests under IGNIS_GPU_PROFILE=1,
-#    then clears it.
+#    then clears it and frees the lock.
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/gpu-profile.ps1
 # -ThresholdMiB <n>    forwarded to gpu-preflight.ps1
 # -SkipKernelBuild     Rust tests only, skip kernel/build.ps1 -Test
 # -SkipCargoTests      kernel leaf only, skip both cargo stages
+# -Test a,b            only these #[ignore]d tests, each alone (a ticket's own)
+# -WaitSeconds <n>     how long to wait for the GPU lock (900)
+#    Any other GPU command (an example run in process, a server started by
+#    hand for a bench) runs under the same lock and guard:
+#    make gpu-run CMD='cargo run --release -p ignis-core --features cuda --example span_logits -- ...'
 # 3. A local agent: the user restarts the engine that serves the agent.
 ```
 
 `make gpu-profile` runs the same script; `GPU_PROFILE_ARGS` forwards its
 switches (`make gpu-profile GPU_PROFILE_ARGS=-SkipKernelBuild`). On Linux it
 runs `scripts/gpu-profile.sh` (#226): the same three stages and exit codes,
-`--skip-kernel-build`, `--skip-cargo-tests` and `--threshold-mib <n>`, the
-guard being `mk/linux/gpu.sh` and the marker `${TMPDIR:-/tmp}/ignis-gpu-preflight.ok`.
-Its selftest is `mk/linux/gpu-profile-selftest.sh`; no run on a real Linux
-card has happened yet.
+`--skip-kernel-build`, `--skip-cargo-tests`, `--threshold-mib <n>`,
+`--test <name>` (once per test) and `--wait-seconds <n>`, the
+guard being `mk/linux/gpu.sh`, the lock `mk/linux/gpulock.py` and the marker
+`${TMPDIR:-/tmp}/ignis-gpu-preflight.ok`.
+Its selftest is `mk/linux/gpu-profile-selftest.sh`, the lock's
+`mk/linux/gpu-lock-selftest.sh` (`mk/windows/gpu-lock-selftest.ps1` on
+Windows); no run on a real Linux card has happened yet.
 
 `scripts/gpu-preflight.ps1` still exists as the standalone check
 (`scripts/gpu-profile.ps1` calls it) for a quick "is the GPU free" query

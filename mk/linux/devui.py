@@ -25,7 +25,9 @@
 #
 # The pid record is server.py's, written with its helpers, so `make status`
 # and `make stop` see a dev-ui server as they see `make start`'s; the
-# refusals, the /ready wait and the kept logs are `make start`'s on Linux.
+# refusals, the /ready wait and the kept logs are `make start`'s on Linux, and
+# so is --gpu-lock (CUDA=1): the GPU lock taken before the server starts,
+# refused at once, handed to the server and freed when the session ends.
 import argparse
 import ctypes
 from datetime import datetime, timezone
@@ -47,6 +49,7 @@ import uuid
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from server import alive, control_lock, forget, identity, read_record  # noqa: E402
+import gpulock  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 VITE_GRACE = 5
@@ -175,6 +178,7 @@ def start_server(args, command):
             raise ValueError(f"ignis-server is already running (pid {record['pid']}); make stop first")
         if listening(args.url):
             raise ValueError(f"{args.url} is already listening; refusing to start a second server")
+        hold = gpulock.acquire(os.getpid(), "make run-ui: " + " ".join(command), 0) if args.gpu_lock else None
         args.pid.unlink(missing_ok=True)
         args.log.parent.mkdir(parents=True, exist_ok=True)
         stderr = Path(str(args.log) + ".err")
@@ -187,6 +191,8 @@ def start_server(args, command):
                                        preexec_fn=child_setup(own_group=True))
         record = identity(process.pid)
         if record is not None:
+            if hold is not None:
+                gpulock.hand(hold, record)
             temporary = Path(str(args.pid) + "." + uuid.uuid4().hex)
             temporary.write_text(json.dumps(record) + "\n")
             temporary.replace(args.pid)
@@ -263,6 +269,7 @@ def run(args, command):
         if record is not None:
             with control_lock(args.pid):
                 forget(args.pid, record)
+            gpulock.release(record)
 
 
 def end_code():
@@ -284,6 +291,7 @@ def main(argv=None):
     parser.add_argument("--url", required=True)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--stop-timeout", type=float, default=20)
+    parser.add_argument("--gpu-lock", action="store_true")
     args = parser.parse_args(argv[:split])
     command = argv[split + 1:]
     if not command:
@@ -293,6 +301,8 @@ def main(argv=None):
     try:
         return run(args, command)
     except (OSError, ValueError) as error:
+        # A start that failed before the server held the lock frees this script's hold.
+        gpulock.release(identity(os.getpid()))
         say(f"error: {error}", error=True)
         return 1
 

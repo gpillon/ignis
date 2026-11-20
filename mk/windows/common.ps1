@@ -9,6 +9,11 @@
 #   IGNIS_MK_URL            base URL probed for readiness (/v1/models)
 #   IGNIS_MK_READY_TIMEOUT  seconds to wait for readiness
 #   IGNIS_MK_FORCE          "1": stop also kills an ignis-server make did not start
+#   IGNIS_MK_GPU_LOCK       "1" (CUDA=1): the server takes the GPU lock
+#                           (gpulock.ps1) before it starts, refused at once,
+#                           and holds it until it stops
+#
+# The server's process is named after its executable (ignis-server).
 
 $ErrorActionPreference = 'Stop'
 
@@ -19,6 +24,9 @@ $LogFile = $env:IGNIS_MK_LOG
 $Url = $env:IGNIS_MK_URL
 $Timeout = if ($env:IGNIS_MK_READY_TIMEOUT) { [int]$env:IGNIS_MK_READY_TIMEOUT } else { 600 }
 $Force = $env:IGNIS_MK_FORCE -eq '1'
+$GpuLock = $env:IGNIS_MK_GPU_LOCK -eq '1'
+$ServerName = if ($Bin) { [IO.Path]::GetFileNameWithoutExtension($Bin) } else { 'ignis-server' }
+. (Join-Path $PSScriptRoot 'gpulock.ps1')
 
 # The server make started, if its pid file still names a live ignis-server.
 function Get-ManagedServer {
@@ -26,7 +34,7 @@ function Get-ManagedServer {
     $id = 0
     if (-not [int]::TryParse((Get-Content $PidFile -Raw).Trim(), [ref]$id)) { return $null }
     $p = Get-Process -Id $id -ErrorAction SilentlyContinue
-    if ($p -and $p.ProcessName -eq 'ignis-server') { return $p }
+    if ($p -and $p.ProcessName -eq $ServerName) { return $p }
     return $null
 }
 
@@ -76,7 +84,7 @@ function Assert-NoServer {
         Write-Host "error: ignis-server is already running (pid $($managed.Id)). make stop, or make restart"
         exit 1
     }
-    $stray = @(Get-Process -Name 'ignis-server' -ErrorAction SilentlyContinue)
+    $stray = @(Get-Process -Name $ServerName -ErrorAction SilentlyContinue)
     if ($stray.Count -gt 0) {
         $ids = ($stray | ForEach-Object { $_.Id }) -join ', '
         Write-Host "error: an ignis-server make did not start is running (pid $ids). make stop FORCE=1 stops it"
@@ -86,6 +94,27 @@ function Assert-NoServer {
         Write-Host "error: $Bin not found (make build)"
         exit 1
     }
+}
+
+# With IGNIS_MK_GPU_LOCK=1, the GPU lock for this script before the server
+# starts, refused at once naming its holder (exit 1); $null without it.
+function Lock-GpuForServer([string]$What) {
+    if (-not $GpuLock) { return $null }
+    try {
+        return Lock-Gpu -Command "$What`: $Bin $ServerArgs" -WaitSeconds 0
+    } catch {
+        Write-Host "error: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+# Hand the hold to the started server: the server's identity, which then
+# holds the lock, or $null (no hold, or the server is already gone).
+function Move-GpuLockToServer($Hold, $Process) {
+    if (-not $Hold) { return $null }
+    $to = Get-GpuLockIdentity $Process.Id
+    if ($to -and (Move-GpuLock $Hold $to)) { return $to }
+    return $null
 }
 
 # Start the server with its output in $LogFile and record its pid.

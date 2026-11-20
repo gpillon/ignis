@@ -229,7 +229,7 @@ config: ## Print the resolved knobs and paths
 	@echo "LOOP_GUARD      $(or $(LOOP_GUARD),(server default: rewind)) (rewind, log or off; a bench or a gate passes off)"
 	@echo "MESSAGES        system=$(or $(SYSTEM_MESSAGE_POLICY),(server default: merge)) developer=$(or $(DEVELOPER_MESSAGE_POLICY),(server default: inplace))"
 	@echo "ARGS            $(ARGS)"
-	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB)"
+	@echo "GPU_CHECK       $(GPU_CHECK)  (threshold $(GPU_THRESHOLD_MIB) MiB; a GPU test or gpu-run waits up to GPU_LOCK_WAIT=$(GPU_LOCK_WAIT)s for the GPU lock)"
 	@echo "server binary   $(SERVER_BIN)"
 	@echo "built backend   $(or $(BUILT_BACKEND),(unknown: not built by make))"
 	@echo "server flags    $(strip $(SERVER_FLAGS))"
@@ -305,9 +305,11 @@ release: ## Clean-slate release build: web + GPU server
 ##@ Run
 # ---------------------------------------------------------------------------
 
+# CUDA=1: the server takes the GPU lock before it starts and holds it until
+# it exits (SERVER_RUN, GitHub #707); a lock someone else holds refuses it.
 .PHONY: run
 run: _require-built $(if $(GPU_GUARDED),gpu-guard) ## Run the last build in the foreground (never builds)
-	$(SERVER_ENV) $(SERVER_BIN) $(SERVER_FLAGS)
+	$(if $(filter 1,$(CUDA)),$(SERVER_RUN),$(SERVER_ENV) $(SERVER_BIN) $(SERVER_FLAGS))
 
 .PHONY: dev
 dev: ## Build, then run in the foreground (stops at a build error)
@@ -648,25 +650,49 @@ doctor-selftest: ## Test make doctor's CUDA checks on Linux, mk/linux/doctor.sh
 test-shard-selftest: ## Test the CI test job's shard plan, mk/test-shard.sh
 	@bash mk/test-shard-selftest.sh
 
+# The GPU lock and the scripts around it on stand-ins under a temp directory
+# (GitHub #707): no card, no build, and neither the machine's lock nor the
+# profile's marker is touched. mk/windows/gpu-lock-selftest.ps1 on Windows,
+# mk/linux/gpu-lock-selftest.sh and the profile's on Linux; the release
+# workflow's test job runs them on both hosts.
+.PHONY: gpu-lock-selftest
+gpu-lock-selftest: ## Test the GPU lock: guard, start/stop, gpu-run, the profile (stand-ins, no card)
+	@$(GPU_LOCK_SELFTEST)
+
 # ---------------------------------------------------------------------------
 ##@ GPU (one run on the card at a time -- docs/agents/testing.md)
 # ---------------------------------------------------------------------------
 
+# The GPU lock (GitHub #707, ADR 0006): one per card, naming its holder (pid,
+# worktree, command). make start / run / run-ui take it for the server and
+# make stop frees it; the guard refuses at once while someone else holds it;
+# a GPU test, gpu-run and the profile wait for it up to GPU_LOCK_WAIT seconds.
+# It is added beside the preflight marker and the process check.
 .PHONY: gpu-status
-gpu-status: ## VRAM in use + every process that may hold the card
+gpu-status: ## VRAM in use + every process that may hold the card + the GPU lock's holder
 	@$(GPU_STATUS)
 
 .PHONY: gpu-guard
-gpu-guard: ## Refuse when the GPU is held (ninfer, another ignis, a GPU test)
+gpu-guard: ## Refuse when the GPU is held (the GPU lock, ninfer, another ignis, a GPU test)
 	@$(GPU_GUARD)
 
 .PHONY: gpu-profile
-gpu-profile: ## The explicit GPU test profile (GPU_PROFILE_ARGS: -SkipKernelBuild on Windows, --skip-kernel-build on Linux, ...)
+gpu-profile: ## The explicit GPU test profile under the GPU lock (GPU_PROFILE_ARGS: -Test a,b / --test a --test b, -SkipKernelBuild / --skip-kernel-build, ...)
 	$(GPU_PROFILE)
 
+# CMD is one sh line, passed as written ($HOME reaches sh, not make): an
+# in-process example (span_logits) or a server started by hand for a bench.
+# ignis-bench against a server make start started needs none: the server
+# holds the lock.
+.PHONY: gpu-run
+gpu-run: export IGNIS_MK_GPU_CMD = $(value CMD)
+gpu-run: ## Run CMD under the GPU lock: waits up to GPU_LOCK_WAIT s for it, runs the guard (make gpu-run CMD="cargo run ...")
+	@$(GPU_RUN)
+
 .PHONY: kernel-test
-kernel-test: gpu-guard ## Kernel leaf op tests via CTest (needs the GPU)
-	$(KERNEL_TEST)
+kernel-test: export IGNIS_MK_GPU_CMD = $(KERNEL_TEST)
+kernel-test: ## Kernel leaf op tests via CTest (needs the GPU; under the GPU lock, as gpu-run)
+	@$(GPU_RUN)
 
 # ---------------------------------------------------------------------------
 ##@ Clean

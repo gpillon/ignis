@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # Vendored from the RTX 5080 fork, github.com/xzzqqq/ignis-5080 at 9259978846 (GitHub #493);
-# patched: the readiness loop retries on any OSError (a reset or a slow answer mid-load), not only URLError.
+# patched: the readiness loop retries on any OSError (a reset or a slow answer mid-load), not only URLError;
+# start --gpu-lock takes the GPU lock (mk/linux/gpulock.py, GitHub #707), hands it to the server and frees it
+# if the start fails, and stop frees the lock a stopped server holds.
 """Linux daemon hooks for make; only the recorded process is stopped by default."""
 import argparse
 from contextlib import contextmanager
@@ -18,6 +20,10 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 import uuid
+
+# The GPU lock's helpers, imported without leaving a __pycache__ in the tree.
+sys.dont_write_bytecode = True
+import gpulock  # noqa: E402
 
 
 def identity(pid):
@@ -96,6 +102,7 @@ def stop(args):
             targets.extend(r for r in other_servers() if r not in targets)
         for target in targets:
             stop_process(target, args.stop_timeout)
+            gpulock.release(target)
             print(f"stopped server pid {target['pid']}")
         forget(args.pid, record)
         if not targets:
@@ -107,6 +114,7 @@ def start(args, command):
         raise ValueError("start requires -- server-binary [arguments ...]")
     process = None
     record = None
+    hold = None
     try:
         with control_lock(args.pid):
             if alive(read_record(args.pid)):
@@ -119,6 +127,9 @@ def start(args, command):
             else:
                 connection.close()
                 raise ValueError(f"{args.url} is already listening; refusing to start a second server")
+            if args.gpu_lock:
+                # Taken before the start, refused at once, handed to the server once it runs.
+                hold = gpulock.acquire(os.getpid(), "make start: " + " ".join(command), 0)
             args.pid.unlink(missing_ok=True)
             args.log.parent.mkdir(parents=True, exist_ok=True)
             stderr = Path(str(args.log) + ".err")
@@ -132,6 +143,8 @@ def start(args, command):
             record = identity(process.pid)
             if record is None:
                 raise ValueError(f"server exited {process.poll()} before its PID could be recorded; see {stderr}")
+            if hold is not None:
+                gpulock.hand(hold, record)
             temporary = Path(str(args.pid) + "." + uuid.uuid4().hex)
             temporary.write_text(json.dumps(record) + "\n")
             temporary.replace(args.pid)
@@ -157,6 +170,9 @@ def start(args, command):
             with control_lock(args.pid):
                 stop_process(record, args.stop_timeout)
                 forget(args.pid, record)
+                gpulock.release(record)
+        if hold is not None:
+            gpulock.release(hold)
         if process is not None:
             process.wait(timeout=args.stop_timeout)
         raise
@@ -173,6 +189,7 @@ def main(argv=None):
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--stop-timeout", type=float, default=30)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--gpu-lock", action="store_true")
     args = parser.parse_args(argv[:split])
     if args.timeout <= 0 or args.stop_timeout <= 0:
         parser.error("timeouts must be positive")

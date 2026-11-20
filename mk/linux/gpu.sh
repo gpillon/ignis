@@ -4,11 +4,22 @@
 # engine or GPU test at a time, and the loser of a race dies with no
 # diagnostic (docs/agents/testing.md), so:
 #
-#   status   VRAM in use, nvidia-smi's compute apps, and every process that
+#   status   VRAM in use, nvidia-smi's compute apps, every process that
 #            may hold the card (ninfer*, ignis-server, ignis-bench, *_gpu-*)
-#   guard    exit 1 while the card is held: an ignis GPU process anywhere on
+#            and the GPU lock's holder (mk/linux/gpulock.py)
+#   guard    exit 1 while the card is held: the GPU lock held by any process
+#            but the third argument's pid (a caller that holds it already), an
+#            ignis GPU process anywhere on
 #            the machine (any worktree counts), a standing profile marker, or
 #            more than IGNIS_GPU_THRESHOLD_MIB already resident.
+#   run      the command in IGNIS_MK_GPU_CMD under the GPU lock (make gpu-run,
+#            make kernel-test): waits up to the third argument's seconds for
+#            the lock, runs the guard, then becomes the command (exec), which
+#            holds the lock under this pid until it exits.
+#
+# The lock is added beside the marker and the process check, not in place of
+# them: ignis_core::gpu_profile reads the marker, and a worktree on an older
+# commit knows only those two.
 #
 # Unlike the Windows side there is no scripts/gpu-preflight.ps1 to delegate
 # the VRAM half to -- under Linux nvidia-smi reports real per-process VRAM, so
@@ -18,6 +29,8 @@ set -uo pipefail
 
 action="${1:-status}"
 threshold="${2:-8192}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lockctl() { "${PYTHON:-python3}" "$here/gpulock.py" "$@"; }
 
 # `pgrep -f` on the process name only: a full command line would match this
 # script itself, and `make` invoking it.
@@ -59,10 +72,20 @@ status)
     else
         echo "no ninfer / ignis-server / ignis-bench / *_gpu-* process running"
     fi
+    lockctl status || true
     exit 0
     ;;
 
 guard)
+    # The GPU lock first, refused at once naming its holder (GitHub #707). The
+    # third argument is a caller that holds it already (scripts/gpu-profile.sh,
+    # `run` below): its own hold is no refusal.
+    if ! held="$(lockctl status ${3:+--except "$3"} 2>&1)"; then
+        echo "GPU guard: refused -- $held"
+        echo "  wait or ask (docs/agents/testing.md, who holds the card); the lock is free once its holder exits"
+        exit 1
+    fi
+
     found="$(ignis_holders)"
     if [ -n "$found" ]; then
         echo "GPU guard: refused -- ignis GPU work is already running (another worktree or session counts):"
@@ -105,8 +128,24 @@ guard)
     exit 0
     ;;
 
+run)
+    # The lock first, waited for; then the guard, which this hold does not
+    # refuse; then the command, exec'd so that it holds the lock under this
+    # pid (and start time) until it exits, when the lock is free again.
+    if [ -z "${IGNIS_MK_GPU_CMD:-}" ]; then
+        echo "gpu.sh run: no command (make gpu-run CMD=\"...\")" >&2
+        exit 2
+    fi
+    lockctl acquire --pid $$ --wait "${3:-900}" --command "gpu-run: $IGNIS_MK_GPU_CMD" || exit 1
+    if ! bash "$here/gpu.sh" guard "$threshold" $$; then
+        lockctl release --pid $$
+        exit 1
+    fi
+    exec sh -c "$IGNIS_MK_GPU_CMD"
+    ;;
+
 *)
-    echo "usage: gpu.sh status|guard [threshold-mib]" >&2
+    echo "usage: gpu.sh status|guard [threshold-mib [holder-pid]]|run threshold-mib wait-seconds" >&2
     exit 2
     ;;
 esac
