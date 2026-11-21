@@ -151,18 +151,19 @@ reports. It tells artifacts of one family apart: `qwen3.8-27b` and
 operator's `--model-id`, or the family's default when none is named.
 
 The **catalog** is the set of models the server knows how to fetch
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Thirteen entries
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Fourteen entries
 (twelve in 0.10.0)
 are built into the binary, each pinned file by file at a fixed revision of its
-Hugging Face repository: nine text and image models, `qwen3.8-27b`,
+Hugging Face repository: ten text and image models, `qwen3.8-27b`,
 `qwen3.8-27b-16g`, `qwen3.8-27b-12g` (from 0.11.0), `qwen3.8-27b-abliterated`,
-`qwen3.8-27b-abliterated-16g`, `swift-1.5-27b`, `swift-1.5-27b-16g`,
-`qwen3.8-flash-next` and `ignis-image-2.1-turbo`, plus three speech models and
-a diarizer. Each of the nine states the smallest **card class** it loads on:
-32 GB for all but the three `-16g` entries, which load on 16 GB and answer to
-`qwen3.8-27b`, to `qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or
-24 GB card, and `qwen3.8-27b-12g`, which loads on 12 GB and answers to
-`qwen3.8-27b` on a 12 GB card
+`qwen3.8-27b-abliterated-16g`, `qwen3.8-27b-abliterated-12g` (from 0.11.0),
+`swift-1.5-27b`, `swift-1.5-27b-16g`, `qwen3.8-flash-next` and
+`ignis-image-2.1-turbo`, plus three speech models and a diarizer. Each of the
+ten states the smallest **card class** it loads on: 32 GB for all but the
+three `-16g` entries, which load on 16 GB and answer to `qwen3.8-27b`, to
+`qwen3.8-27b-abliterated` and to `swift-1.5-27b` on a 16 or 24 GB card, and
+the two `-12g` entries, which load on 12 GB and answer to `qwen3.8-27b` and to
+`qwen3.8-27b-abliterated` on a 12 GB card
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
 [ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md),
 [ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md))
@@ -193,7 +194,9 @@ is the same container: 1,255 of its 1,325 objects are byte-identical to the
 default artifact, and only the 70 matrices the abliteration changed are
 re-encoded. Memory use is therefore the same as the default 27B. On a 16 GB
 card it is served by `qwen3.8-27b-abliterated-16g`, the 16 GB artifact with the
-same 70 matrices re-quantized. It does not
+same 70 matrices re-quantized, and on a 12 GB card, from 0.11.0, by
+`qwen3.8-27b-abliterated-12g`, the 12 GB artifact with them re-quantized the
+same way. It does not
 refuse requests, so guardrails belong in the layer that executes tools. The
 DFlash2 drafter loads unchanged; it was fitted to the default weights, and
 because the target verifies every draft, a mismatch can only lower the

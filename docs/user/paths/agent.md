@@ -76,11 +76,13 @@ Ask before the install does anything large or visible:
 1. **Which model.** The default is `qwen3.8-27b`; on a 16 GB card, and on an
    RTX 30 or RTX 40 card, the server serves its 16 GB entry,
    `qwen3.8-27b-16g`, under that id, and on a 12 GB card, from 0.11.0, its
-   12 GB entry, `qwen3.8-27b-12g`, the only built-in text or image model such a card loads.
+   12 GB entry, `qwen3.8-27b-12g`; it and the uncensored variant's 12 GB
+   entry are the only built-in text or image models such a card loads.
    `qwen3.8-flash-next` needs the host RAM above.
    `qwen3.8-27b-abliterated` does not refuse anything:
    [its page](../guides/uncensored.md) comes first; on a 16 GB card its 16 GB
-   entry, `qwen3.8-27b-abliterated-16g`, serves it. `swift-1.5-27b` is a
+   entry, `qwen3.8-27b-abliterated-16g`, serves it, and on a 12 GB card, from
+   0.11.0, its 12 GB entry, `qwen3.8-27b-abliterated-12g`. `swift-1.5-27b` is a
    fine-tune of the 27B under a license that does not cover commercial use by
    an organization with US$1,000,000 or more of gross revenue in its last
    fiscal year ([its license](../guides/fine-tunes.md#its-license)); on a

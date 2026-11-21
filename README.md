@@ -599,9 +599,9 @@ box says what sending will do first:
 
 ### The weights
 
-Nine artifacts on Hugging Face (eight in 0.10.0): seven of the 27B, all carrying the DFlash2
+Ten artifacts on Hugging Face (eight in 0.10.0): eight of the 27B, all carrying the DFlash2
 drafter (the three NVFP4 ones 18.07-18.08 GiB, the three for 16 GB cards 12.46 GiB,
-the 12 GB card's 11.88 GiB from 0.11.0), Flash-Next, and the image model:
+the two for 12 GB cards 11.88 GiB from 0.11.0), Flash-Next, and the image model:
 
 | | Hugging Face | file |
 |---|---|---|
@@ -610,6 +610,7 @@ the 12 GB card's 11.88 GiB from 0.11.0), Flash-Next, and the image model:
 | **16 GB card** (trellis body, about 3 bits per weight) | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | `qwen3_8_27b_trellis_sc30-v2.ninfer` |
 | **Uncensored, 16 GB card** | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | `qwen3_8_27b_trellis_sc30-v2-huihui-abliterated.ninfer` |
 | **12 GB card**, from 0.11.0 (trellis body, about 2.8 bits per weight) | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis) | `qwen3_8_27b_trellis_ig28-v2.ninfer` |
+| **Uncensored, 12 GB card**, from 0.11.0 | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | `qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer` |
 | **Swift 1.5** (a fine-tune of the 27B; **commercial use above the license's US$1M revenue threshold is not licensed**) | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | `qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer` |
 | **Swift 1.5, 16 GB card** | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | `qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer` |
 | **Flash-Next** (125B MoE, 68.2 GiB with its MTP and vision companions) | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | `qwen3_8_flash_next_trellis_a25-v2.ninfer` |
@@ -625,6 +626,8 @@ ignis-server model download qwen3.8-27b
 ignis-server model download qwen3.8-27b-abliterated
 ignis-server model download qwen3.8-27b-16g
 ignis-server model download qwen3.8-27b-abliterated-16g
+ignis-server model download qwen3.8-27b-12g               # from 0.11.0
+ignis-server model download qwen3.8-27b-abliterated-12g   # from 0.11.0
 ignis-server model download swift-1.5-27b
 ignis-server model download swift-1.5-27b-16g
 ignis-server model download qwen3.8-flash-next
@@ -640,7 +643,10 @@ or `make dev UNCENSORED=1` from a checkout; it is served under that id, so a
 client can tell the two apart. On a 16 GB card the same id fetches and serves
 the 16 GB one, `qwen3.8-27b-abliterated-16g`: the 16 GB card's artifact with
 the same 70 matrices re-quantized from the abliterated weights, about as
-faithful to them as the 16 GB artifact is to the standard ones
+faithful to them as the 16 GB artifact is to the standard ones. On a 12 GB
+card, from 0.11.0, it fetches and serves the 12 GB one,
+`qwen3.8-27b-abliterated-12g`, made the same way from the 12 GB card's
+artifact and about as faithful
 ([the uncensored variant](https://gpillon.github.io/ignis/guides/uncensored/)).
 **It does not refuse**, so put the guardrails in the application or tool layer
 and do not expose it to untrusted users.

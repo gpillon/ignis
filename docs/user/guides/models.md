@@ -12,8 +12,8 @@ one container, verified against its provenance sidecar (`.graft.json` or
 ## The catalog
 
 The models the server knows how to fetch are its **catalog**
-([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Thirteen entries
-are built into the binary (twelve in 0.10.0), nine text and image models, three speech models and a
+([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Fourteen entries
+are built into the binary (twelve in 0.10.0), ten text and image models, three speech models and a
 diarizer, each pinned file by file — byte count and SHA-256 — at a fixed
 revision of its Hugging Face repository:
 
@@ -28,6 +28,7 @@ revision of its Hugging Face repository:
 | `swift-1.5-27b` | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | 18.1 GiB (Swift 1.5, a [fine-tune](fine-tunes.md) of the 27B; a license that restricts commercial use) |
 | `swift-1.5-27b-16g` | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB (Swift 1.5 for 16 GB cards) |
 | `qwen3.8-27b-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis) | 11.9 GiB (the 27B for 12 GB cards, about 2.8 bits per weight; from 0.11.0) |
+| `qwen3.8-27b-abliterated-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | 11.9 GiB (the [uncensored variant](uncensored.md) for 12 GB cards; from 0.11.0) |
 | `qwen3-asr-1.7b` | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB (the [speech model](../api/transcriptions.md), `speech.model: auto`: a Q4_K_M decoder and a Q8_0 audio encoder) |
 | `qwen3-asr-1.7b-q8` | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB (the same with a Q8_0 decoder) |
 | `qwen3-asr-0.6b` | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB (the smaller speech model, for a weak CPU) |
@@ -65,13 +66,15 @@ another, and `ignis-server model download <id>` fetches it like any entry.
 
 Each entry states the smallest **card class** it loads on
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)): 32 GB,
-the RTX 5090's class, 16 GB or, for `qwen3.8-27b-12g` (from 0.11.0), 12 GB
+the RTX 5090's class, 16 GB or, for `qwen3.8-27b-12g` and
+`qwen3.8-27b-abliterated-12g` (from 0.11.0), 12 GB
 for a built-in text or image model, none for the speech models and the
 diarizer;
 [Where each model loads](../reference/models.md#where-each-model-loads) gives
 each entry on every card, by its class and generation.
 On a card of a smaller class (16 or 24 GB, and from 0.11.0 the 12 GB class,
-below 14 GiB, where every built-in entry but `qwen3.8-27b-12g` is above it),
+below 14 GiB, where every built-in entry but the two `-12g` entries is above
+it),
 the server refuses an entry above it before unloading or fetching
 anything: a switch to it and a request naming it are answered
 `409 model_above_card_class`, naming both classes, while the loaded model
@@ -87,11 +90,13 @@ of another family is refused, naming both. Where two entries that answer to
 an id both fit, the one of the larger class does
 ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)):
 on a 16 GB card `qwen3.8-27b` is the 16 GB 27B's, and `qwen3.8-27b-12g`
-loads there, as on every larger card, by its own id. On a 12 GB card the
-uncensored variant and Swift 1.5 have no build of the class, and their ids
-and their 16 GB entries are refused there. An alias may also be another
+loads there, as on every larger card, by its own id. On a 12 GB card Swift
+1.5 has no build of the class, and its ids are refused there, as is every
+16 GB entry. An alias may also be another
 entry's id of the same family: `qwen3.8-27b-abliterated-16g` answers to
-`qwen3.8-27b-abliterated` on a 16 or 24 GB card, `swift-1.5-27b-16g` to
+`qwen3.8-27b-abliterated` on a 16 or 24 GB card, and from 0.11.0
+`qwen3.8-27b-abliterated-12g` on a 12 GB card
+([the uncensored variant](uncensored.md)), `swift-1.5-27b-16g` to
 `swift-1.5-27b` ([fine-tunes](fine-tunes.md)), and an [operator's catalog](operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)
 does the same with an entry's `family`. `GET /v1/models` lists the entry
 under its own id, never under an alias. A model loaded from a path named
@@ -109,8 +114,9 @@ The server reads the card's generation from its compute capability at start:
 An entry that states none loads on every generation the build runs on. On an
 RTX 3090 or RTX 4090, `qwen3.8-27b`, `qwen3.8-27b-abliterated` and
 `swift-1.5-27b` are served by their 16 GB entries through their aliases (on a
-12 GB RTX 30 or 40 card, from 0.11.0, `qwen3.8-27b` by its 12 GB entry, which
-states no generation either), and an entry no alias serves is refused as for the class, with
+12 GB RTX 30 or 40 card, from 0.11.0, `qwen3.8-27b` and
+`qwen3.8-27b-abliterated` by their 12 GB entries, which state no generation
+either), and an entry no alias serves is refused as for the class, with
 `409 model_above_gpu_generation`: a switch to it, a request naming it, a start
 with no artifact that would load it and its `model download`. The message
 names what the entry needs and the card: its name, compute capability and
@@ -170,7 +176,9 @@ only when every entry verified. It reads the same configuration a start does
 (config file, environment, flags). It is fitted to the card of the machine it
 runs on: an id an entry answers to there fetches that entry
 (`model download qwen3.8-27b` on an RTX 3090 fetches `qwen3.8-27b-16g`, and
-from 0.11.0 on a 12 GB card `qwen3.8-27b-12g`), and
+from 0.11.0 on a 12 GB card `qwen3.8-27b-12g`, as
+`model download qwen3.8-27b-abliterated` there fetches
+`qwen3.8-27b-abliterated-12g`), and
 an entry above the card's class or its generation refuses the whole command
 before anything is fetched — fetch it on the machine that will run it, or on
 one without a GPU.

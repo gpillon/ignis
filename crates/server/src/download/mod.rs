@@ -571,6 +571,60 @@ mod tests {
         }
     }
 
+    /// Spec #701 (GitHub #706), `main`'s start path end to end:
+    /// `--model-id qwen3.8-27b-abliterated` on a 12 GB card, an RTX 50, an
+    /// RTX 30 or an RTX 40, resolves `rtx-12gb` and starts the uncensored
+    /// variant's 12 GB build, which answers to it, under its own id, its
+    /// artifact and id over the start options, when its artifact's header
+    /// names the 27B's family, or fetches it when it is not on disk; a header
+    /// of another family refuses the start before it loads, naming both. A
+    /// start naming its 16 GB build is refused by name before anything is
+    /// fetched. On a 16 GB card the id is still the 16 GB build's, and a start
+    /// naming the 12 GB build serves it by its own id on every larger card.
+    #[test]
+    fn a_start_naming_the_uncensored_variant_on_a_12gb_card_serves_its_12gb_build_under_rtx_12gb() {
+        use crate::config::profile::{testing::reading, Card, CardClass};
+        let catalog = catalog::testing::built_in();
+        let dir = PathBuf::from(DIR);
+        let gib = |gib: f64| (gib * (1u64 << 30) as f64) as u64;
+        let cards = [
+            Card::blackwell(gib(11.9)),
+            Card::Read(reading(gib(11.8), "NVIDIA GeForce RTX 3060", 8, 6)),
+            Card::Read(reading(gib(11.6), "NVIDIA GeForce RTX 4070", 8, 9)),
+        ];
+        for card in cards {
+            let options = start_config_reading(&["--model-id", "qwen3.8-27b-abliterated"], card.clone());
+            assert_eq!((options.basis.sources().profile_name.as_str(), options.card_class()), ("rtx-12gb", Some(CardClass::Gb12)), "{card:?}");
+            let served = start_model(&catalog, &options.model, options.card()).unwrap();
+            assert_eq!(served, "qwen3.8-27b-abliterated-12g", "{card:?}");
+            let mut settings = settings(&served, &dir);
+            settings.catalog = &catalog;
+            let ArtifactSource::Use(path) = artifact_source(&settings, |_| true, never_asked) else { panic!("on disk") };
+            assert_eq!(path, dir.join("qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer"));
+            let serving = served_start_options(options.clone(), &served, Some(&path), &catalog, options.card(), &|_| Some(ModelFamily::Qwen38_27b)).unwrap();
+            assert_eq!((serving.model.as_str(), serving.artifact.as_deref()), ("qwen3.8-27b-abliterated-12g", Some(path.as_path())));
+            assert_eq!(serving.basis.sources().profile_name, "rtx-12gb");
+            let Err(StartRefusal::RefusedOnCard(refusal)) = served_start_options(options.clone(), &served, Some(&path), &catalog, options.card(), &|_| Some(ModelFamily::FlashNext)) else {
+                panic!("{card:?}: a header of another family refuses the start")
+            };
+            let said = refusal.to_string();
+            for named in ["qwen3.8-27b-abliterated-12g lists it as an alias", "Qwen3.8-Flash-Next", "Qwen3.8-27B", "one model family"] {
+                assert!(said.contains(named), "{named}: {said}");
+            }
+            let ArtifactSource::Download { entry, .. } = artifact_source(&settings, nothing_exists, |_, _| None) else { panic!("fetched") };
+            assert_eq!(entry.id, "qwen3.8-27b-abliterated-12g");
+
+            let options = start_config_reading(&["--model-id", "qwen3.8-27b-abliterated-16g"], card.clone());
+            let refusal = start_model(&catalog, &options.model, options.card()).unwrap_err();
+            let said = "qwen3.8-27b-abliterated-16g needs a 16 GB card or larger (its catalog entry's card_class), and this card is of the 12 GB class";
+            assert_eq!((refusal.code(), refusal.to_string().ends_with(said)), ("model_above_card_class", true), "{refusal}");
+        }
+        assert_eq!(start_model(&catalog, "qwen3.8-27b-abliterated", Some(&on(CardClass::Gb16))), Ok("qwen3.8-27b-abliterated-16g".to_owned()));
+        for card in [on(CardClass::Gb16), on(CardClass::Gb32), rtx_3090()] {
+            assert_eq!(start_model(&catalog, "qwen3.8-27b-abliterated-12g", Some(&card)), Ok("qwen3.8-27b-abliterated-12g".to_owned()), "{}: by its own id", card.name);
+        }
+    }
+
     /// ADR 0064 §2: an alias resolves only within one model family, by the
     /// artifact's header (ADR 0047). A start that has to fetch the entry
     /// answering to the default id knows the header only once the fetch has

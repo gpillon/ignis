@@ -988,20 +988,21 @@ mod tests {
     /// then each file's name, bytes and SHA-256 in the order listed). Every
     /// built-in entry states its card class (ADR 0064 §1: an operator's may
     /// leave it out, a built-in one never does), the 32 GB one for each but
-    /// the three 16 GB entries and the 12 GB one, and its generation by one
-    /// rule (spec #474, ADR 0079): `blackwell` for an NVFP4 artifact,
+    /// the three 16 GB entries and the two 12 GB ones, and its generation by
+    /// one rule (spec #474, ADR 0079): `blackwell` for an NVFP4 artifact,
     /// Flash-Next and the image model, none for the trellis builds (Swift
-    /// 1.5's since GitHub #529, the 12 GB 27B's by ADR 0098). The trellis
-    /// builds are the only ones with an alias: the 16 GB 27B's (GitHub #338,
-    /// spec 27b-16gb/01) and the 12 GB 27B's (spec #630) `qwen3.8-27b`, its
-    /// uncensored variant's build's (GitHub #423, ADR 0074)
-    /// `qwen3.8-27b-abliterated`, and Swift 1.5's (GitHub #473)
-    /// `swift-1.5-27b`, each the 32 GB entry's served id. Every
+    /// 1.5's since GitHub #529, the 12 GB 27B's by ADR 0098, and the
+    /// uncensored variant's 12 GB build's as the 12 GB 27B's, spec #701). The
+    /// trellis builds are the only ones with an alias: the 16 GB 27B's
+    /// (GitHub #338, spec 27b-16gb/01) and the 12 GB 27B's (spec #630)
+    /// `qwen3.8-27b`, its uncensored variant's two builds' (GitHub #423,
+    /// GitHub #706, ADR 0074) `qwen3.8-27b-abliterated`, and Swift 1.5's
+    /// (GitHub #473) `swift-1.5-27b`, each the 32 GB entry's served id. Every
     /// one is of a family the catalog tells (ADR 0074): its own id's, its
     /// alias's, or the one it states — the abliterated 27B's, Swift's and
-    /// their 16 GB builds', whose ids name none.
+    /// their trellis builds', whose ids name none.
     #[allow(clippy::type_complexity)]
-    const RELEASES: [(&str, &str, &str, &str, u32, Option<GpuGeneration>, ModelFamily, &[&str], &[(&str, u64, &str)]); 9] = [
+    const RELEASES: [(&str, &str, &str, &str, u32, Option<GpuGeneration>, ModelFamily, &[&str], &[(&str, u64, &str)]); 10] = [
         (
             "qwen3.8-27b",
             "gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer",
@@ -1176,6 +1177,31 @@ mod tests {
             &[
                 ("qwen3_8_27b_trellis_ig28-v2.ninfer.conversion.json", 309_831, "b19eb010025276cfb59f93db40e41d52db30e104fa89867218ebd6b789ea4ac9"),
                 ("qwen3_8_27b_trellis_ig28-v2.ninfer", 12_754_663_684, "fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5"),
+            ],
+        ),
+        // The 12 GB build of the uncensored variant (spec #701, GitHub #706):
+        // the 12 GB 27B's artifact with the 70 abliterated matrices
+        // re-quantized, the upload's hub commit.
+        (
+            "qwen3.8-27b-abliterated-12g",
+            "gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis",
+            "e8c856577476cedd7a0b762e8a13512bb4a2c089",
+            "qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer",
+            12,
+            None,
+            ModelFamily::Qwen38_27b,
+            &["qwen3.8-27b-abliterated"],
+            &[
+                (
+                    "qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer.conversion.json",
+                    340_043,
+                    "8538a616e669fd99f341e46f56ca33677984bd2b31f414e16f9c3dc0e326078d",
+                ),
+                (
+                    "qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer",
+                    12_754_663_684,
+                    "8075d0b73c367625b30b90a4d147182fd767ba76784f0080a784b3a0875fb329",
+                ),
             ],
         ),
     ];
@@ -1417,7 +1443,7 @@ mod tests {
         let json = serde_json::to_string(&Format::Yaml.read(OPERATOR).unwrap()).unwrap();
         let from_json = parse_operator(&json, Format::Json, "acme.catalog.json").expect("valid");
         assert_eq!(from_yaml, from_json);
-        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-qwen3.8-27b-ft"]);
+        assert_eq!(from_yaml.ids(), ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3.8-27b-abliterated-12g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", "acme-qwen3.8-27b-ft"]);
         let acme = from_yaml.entry("acme-qwen3.8-27b-ft").unwrap();
         assert_eq!(acme.layer, CatalogLayer::Operator);
         assert_eq!(acme.revision, "v1");
@@ -1603,6 +1629,7 @@ mod tests {
             ("swift-1.5-27b", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE"),
             ("swift-1.5-27b-16g", "swift-open-license-1.0", "https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE"),
             ("qwen3.8-27b-12g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis/blob/15333a0829f055e7ee25d6d5ef84fd8d521518c6/LICENSE"),
+            ("qwen3.8-27b-abliterated-12g", "apache-2.0", "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis/blob/e8c856577476cedd7a0b762e8a13512bb4a2c089/LICENSE"),
             ("qwen3-asr-1.7b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-1.7b-q8", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE"),
             ("qwen3-asr-0.6b", "apache-2.0", "https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE"),
@@ -1765,7 +1792,7 @@ mod tests {
     fn an_id_resolves_to_its_own_entry_when_the_card_class_fits() {
         use CardClass::*;
         let catalog = Catalog::built_in();
-        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32), ("qwen3.8-27b-16g", Gb24), ("qwen3.8-27b-abliterated-16g", Gb24), ("swift-1.5-27b-16g", Gb24), ("qwen3.8-27b-12g", Gb12), ("qwen3.8-27b-12g", Gb16), ("qwen3.8-27b-12g", Gb32)] {
+        for (id, card) in [("qwen3.8-27b", Gb32), ("qwen3.8-27b", Gb96), ("qwen3.8-flash-next", Gb32), ("ignis-image-2.1-turbo", Gb96), ("qwen3.8-27b-16g", Gb16), ("qwen3.8-27b-16g", Gb32), ("qwen3.8-27b-abliterated", Gb32), ("qwen3.8-27b-abliterated-16g", Gb16), ("swift-1.5-27b", Gb32), ("swift-1.5-27b", Gb96), ("swift-1.5-27b-16g", Gb16), ("swift-1.5-27b-16g", Gb32), ("qwen3.8-27b-16g", Gb24), ("qwen3.8-27b-abliterated-16g", Gb24), ("swift-1.5-27b-16g", Gb24), ("qwen3.8-27b-12g", Gb12), ("qwen3.8-27b-12g", Gb16), ("qwen3.8-27b-12g", Gb32), ("qwen3.8-27b-abliterated-12g", Gb12), ("qwen3.8-27b-abliterated-12g", Gb16), ("qwen3.8-27b-abliterated-12g", Gb32)] {
             assert_eq!(catalog.refusal_on(id, Some(&on(card))), None, "{id} on {card}");
             assert_eq!(catalog.answering(id, Some(&on(card))), Ok(None), "{id} on {card}: it stands as it is");
         }
@@ -1805,9 +1832,9 @@ mod tests {
     /// Spec #630 (GitHub #638): on a card below 14 GiB, the 12 GB class, the
     /// 27B's id is served by `qwen3.8-27b-12g`, the class's own entry, which
     /// stands as it is there; each 16 GB entry is refused by name, and so is
-    /// each id only a 16 GB entry answers to, the uncensored variant's and
-    /// Swift 1.5's. The listing says which entry serves the 27B's id, and
-    /// none for a 16 GB entry. An RTX 30 or 40 card of 12 GB is the class
+    /// Swift 1.5's id, which only a 16 GB entry answers to. The listing says
+    /// which entry serves the 27B's id, and none for a 16 GB entry. An RTX 30
+    /// or 40 card of 12 GB is the class
     /// too: the entry states no generation. A start on that card loads an
     /// artifact named by its path, which the catalog does not judge.
     #[test]
@@ -1833,11 +1860,39 @@ mod tests {
         assert_eq!(catalog.alias_holds("qwen3.8-27b", twelve, Some(ModelFamily::Qwen38_27b), Some(&card)), Ok(()));
         let other = catalog.alias_holds("qwen3.8-27b", twelve, Some(ModelFamily::FlashNext), Some(&card)).unwrap_err().to_string();
         assert!(other.contains("qwen3.8-27b-12g lists it as an alias") && other.contains("one model family"), "{other}");
-        for id in ["qwen3.8-27b-abliterated", "swift-1.5-27b"] {
-            let err = resolved(catalog, id, Some(&card)).unwrap_err();
-            assert!(err.starts_with(&format!("{id} needs a 32 GB card")) && err.ends_with("this card is of the 12 GB class"), "{id}: {err}");
-        }
+        let err = resolved(catalog, "swift-1.5-27b", Some(&card)).unwrap_err();
+        assert!(err.starts_with("swift-1.5-27b needs a 32 GB card") && err.ends_with("this card is of the 12 GB class"), "{err}");
         assert_eq!(catalog.refusal_on("some-other-model", Some(&card)), None, "an artifact the catalog has no entry for");
+    }
+
+    /// Spec #701 (GitHub #706, ADR 0074, ADR 0098): on a 12 GB card of each
+    /// generation the uncensored variant's id is served by
+    /// `qwen3.8-27b-abliterated-12g`, which stands as it is there, and the
+    /// listing names it as the entry that serves the 32 GB entry's id; the
+    /// 16 GB build is still refused by name, served by none. Its artifact
+    /// must be of the 27B's family by its header, else the alias is refused
+    /// naming both families.
+    #[test]
+    fn on_a_12gb_card_the_uncensored_variants_id_is_served_by_its_12gb_build() {
+        let catalog = Catalog::built_in();
+        let entry = catalog.entry("qwen3.8-27b-abliterated-12g").expect("listed");
+        assert_eq!((entry.card_class, entry.family, entry.aliases.as_slice()), (Some(CardClass::Gb12), Some(ModelFamily::Qwen38_27b), &["qwen3.8-27b-abliterated".to_owned()][..]));
+        for card in [on(CardClass::Gb12), reading(12 << 30, "NVIDIA GeForce RTX 3060", 8, 6), reading(12 << 30, "NVIDIA GeForce RTX 4070", 8, 9)] {
+            assert_eq!(card.class(), Some(CardClass::Gb12), "{}", card.name);
+            let card = Some(&card);
+            assert_eq!(resolved(catalog, "qwen3.8-27b-abliterated", card), Ok("qwen3.8-27b-abliterated-12g"), "{card:?}");
+            assert_eq!(catalog.answering("qwen3.8-27b-abliterated-12g", card), Ok(None), "{card:?}: it stands as it is");
+            let unavailable = catalog.unavailable("qwen3.8-27b-abliterated", card).expect("its own entry is above the class");
+            assert_eq!(unavailable.served_by.as_deref(), Some("qwen3.8-27b-abliterated-12g"), "{unavailable}");
+            assert!(unavailable.to_string().ends_with("; a request naming it is served by qwen3.8-27b-abliterated-12g"), "{unavailable}");
+            assert_eq!(catalog.unavailable("qwen3.8-27b-abliterated-16g", card).map(|unavailable| unavailable.served_by), Some(None), "{card:?}");
+        }
+        let card = on(CardClass::Gb12);
+        assert_eq!(catalog.alias_holds("qwen3.8-27b-abliterated", entry, Some(ModelFamily::Qwen38_27b), Some(&card)), Ok(()));
+        let other = catalog.alias_holds("qwen3.8-27b-abliterated", entry, Some(ModelFamily::FlashNext), Some(&card)).unwrap_err().to_string();
+        for named in ["qwen3.8-27b-abliterated needs a 32 GB card", "12 GB class", "qwen3.8-27b-abliterated-12g lists it as an alias", "one model family"] {
+            assert!(other.contains(named), "{named}: {other}");
+        }
     }
 
     /// Spec #630 (GitHub #638, ADR 0098): two entries answer to
@@ -1846,29 +1901,25 @@ mod tests {
     /// the 16 GB entry on a 16 or 24 GB card, an RTX 3090 or 4090 and an Ada
     /// card of no class, the 12 GB entry on a 12 GB card. On a 32 or 96 GB
     /// card the id is its own entry's, and on every class the 12 GB entry
-    /// loads by its own id.
+    /// loads by its own id. The uncensored variant's id has its two builds
+    /// answering to it the same way (spec #701, GitHub #706).
     #[test]
     fn of_the_entries_answering_to_an_id_the_one_of_the_largest_class_that_fits_answers() {
         use CardClass::*;
         let reversed = Catalog::from_entries(Catalog::built_in().entries().iter().rev().cloned().collect());
         for catalog in [Catalog::built_in(), &reversed] {
-            let ada = reading(48 << 30, "NVIDIA RTX (Ada)", 8, 9);
-            for (card, answering) in [
-                (on(Gb12), "qwen3.8-27b-12g"),
-                (on(Gb16), "qwen3.8-27b-16g"),
-                (on(Gb24), "qwen3.8-27b-16g"),
-                (rtx_3090(), "qwen3.8-27b-16g"),
-                (rtx_4090(), "qwen3.8-27b-16g"),
-                (ada, "qwen3.8-27b-16g"),
-            ] {
-                assert_eq!(resolved(catalog, "qwen3.8-27b", Some(&card)), Ok(answering), "{}", card.name);
-            }
-            for card in [on(Gb32), on(Gb96), rtx_5090()] {
-                assert_eq!(catalog.answering("qwen3.8-27b", Some(&card)), Ok(None), "{}: its own entry", card.name);
-            }
-            for card in [on(Gb12), on(Gb16), on(Gb24), on(Gb32), on(Gb96), rtx_3090(), rtx_4090(), rtx_5090()] {
-                assert_eq!(catalog.refusal_on("qwen3.8-27b-12g", Some(&card)), None, "{}", card.name);
-                assert_eq!(catalog.answering("qwen3.8-27b-12g", Some(&card)), Ok(None), "{}: by its own id", card.name);
+            for (id, twelve, sixteen) in [("qwen3.8-27b", "qwen3.8-27b-12g", "qwen3.8-27b-16g"), ("qwen3.8-27b-abliterated", "qwen3.8-27b-abliterated-12g", "qwen3.8-27b-abliterated-16g")] {
+                let ada = reading(48 << 30, "NVIDIA RTX (Ada)", 8, 9);
+                for (card, answering) in [(on(Gb12), twelve), (on(Gb16), sixteen), (on(Gb24), sixteen), (rtx_3090(), sixteen), (rtx_4090(), sixteen), (ada, sixteen)] {
+                    assert_eq!(resolved(catalog, id, Some(&card)), Ok(answering), "{id} on {}", card.name);
+                }
+                for card in [on(Gb32), on(Gb96), rtx_5090()] {
+                    assert_eq!(catalog.answering(id, Some(&card)), Ok(None), "{id} on {}: its own entry", card.name);
+                }
+                for card in [on(Gb12), on(Gb16), on(Gb24), on(Gb32), on(Gb96), rtx_3090(), rtx_4090(), rtx_5090()] {
+                    assert_eq!(catalog.refusal_on(twelve, Some(&card)), None, "{twelve} on {}", card.name);
+                    assert_eq!(catalog.answering(twelve, Some(&card)), Ok(None), "{twelve} on {}: by its own id", card.name);
+                }
             }
         }
     }
@@ -2067,7 +2118,7 @@ mod tests {
     #[test]
     fn an_unknown_card_class_refuses_nothing() {
         let catalog = Catalog::built_in();
-        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g"] {
+        for id in ["qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3.8-27b-abliterated-12g"] {
             assert_eq!(catalog.answering(id, None), Ok(None), "{id}: the id's own entry, never the one answering to it");
             assert_eq!(catalog.refusal_on(id, None), None, "{id}");
         }

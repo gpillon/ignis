@@ -188,6 +188,27 @@ models:
       - { name: qwen3_8_27b_trellis_ig28-v2.ninfer.conversion.json, bytes: 309831, sha256: "b19eb010025276cfb59f93db40e41d52db30e104fa89867218ebd6b789ea4ac9" }
       - { name: qwen3_8_27b_trellis_ig28-v2.ninfer, bytes: 12754663684, sha256: "fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5" }
 
+  # The uncensored variant for the 12 GB card class (spec #701, GitHub
+  # #706): the 12 GB 27B's artifact with the 70 matrices the huihui-ai
+  # abliteration changed re-quantized at the K `ig28a` gives each, every
+  # other object the same (weights id `trellis-ig28-abliterated`, admitted
+  # 2026-11-21). Its id and its alias name no family, so it states its own
+  # (ADR 0074); it answers to the 32 GB entry's served id on a 12 GB card; on
+  # a larger one the 16 GB build, of the larger class, does, and this one
+  # loads by its own id (ADR 0098). It states no generation, as the 12 GB
+  # 27B. Pinned to the upload's hub commit.
+  - id: qwen3.8-27b-abliterated-12g
+    repo: gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis
+    revision: "e8c856577476cedd7a0b762e8a13512bb4a2c089"
+    artifact: qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer
+    card_class: 12
+    family: qwen3.8-27b
+    aliases: [qwen3.8-27b-abliterated]
+    license: { id: apache-2.0, url: "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis/blob/e8c856577476cedd7a0b762e8a13512bb4a2c089/LICENSE" }
+    files:
+      - { name: qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer.conversion.json, bytes: 340043, sha256: "8538a616e669fd99f341e46f56ca33677984bd2b31f414e16f9c3dc0e326078d" }
+      - { name: qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer, bytes: 12754663684, sha256: "8075d0b73c367625b30b90a4d147182fd767ba76784f0080a784b3a0875fb329" }
+
   # The speech models (ADR 0067, spec speech/01 §6, GitHub #351): the
   # Qwen3-ASR decoder and its audio encoder as GGUFs, converted by the owner
   # (tools/speech-gguf/convert.sh) and run on the CPU beside the active model.

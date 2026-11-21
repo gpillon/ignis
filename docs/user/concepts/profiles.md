@@ -264,7 +264,10 @@ desktop leaves
 The profile names no model: a start with no artifact takes the catalog's
 12 GB entry of the default id, `qwen3.8-27b-12g`, the 27B at about 2.8 bits
 per weight under a ceiling of 9.2 GB of weights, which answers to
-`qwen3.8-27b` on such a card; a 16 GB entry is refused there by its class
+`qwen3.8-27b` on such a card, and `--model-id qwen3.8-27b-abliterated` takes
+its uncensored variant's, `qwen3.8-27b-abliterated-12g`, under the same
+profile ([the uncensored variant](../guides/uncensored.md#the-12-gb-artifact));
+a 16 GB entry is refused there by its class
 ([the catalog](../guides/models.md#the-catalog)). The artifact reads 0.0431
 in KLD against BF16 on the RTX 5090 (the 16 GB artifact, 0.0418, on the same
 set and shape) and decodes 294, 251 and 228 tokens a second at 8,192, 65,536

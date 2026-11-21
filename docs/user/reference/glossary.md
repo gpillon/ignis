@@ -8,7 +8,9 @@ sidebar:
 **Abliterated variant.** `qwen3.8-27b-abliterated`, the 27B with a published
 abliteration applied: the same container with 70 matrices re-encoded, it does not
 refuse requests. On a 16 GB card `qwen3.8-27b-abliterated-16g`, the 16 GB
-artifact with the same 70 matrices re-quantized, serves it. See [models and artifacts](../concepts/models-and-artifacts.md)
+artifact with the same 70 matrices re-quantized, serves it, and on a 12 GB
+card, from 0.11.0, `qwen3.8-27b-abliterated-12g`, the 12 GB artifact with
+them re-quantized the same way. See [models and artifacts](../concepts/models-and-artifacts.md)
 and [the uncensored variant](../guides/uncensored.md).
 
 **Acceptance.** How many of a round's drafted tokens the model agrees with, and so
@@ -58,8 +60,8 @@ one a catalog entry loads on. An entry above the card is refused before anything
 is unloaded or fetched. See [models and artifacts](../concepts/models-and-artifacts.md)
 and [profiles](../concepts/profiles.md).
 
-**Catalog.** The models the server knows how to fetch: thirteen entries built
-into the binary (twelve in 0.10.0), nine text and image models, three speech
+**Catalog.** The models the server knows how to fetch: fourteen entries built
+into the binary (twelve in 0.10.0), ten text and image models, three speech
 models and a diarizer,
 pinned file by file, plus any an operator adds. See
 [models and artifacts](../concepts/models-and-artifacts.md) and

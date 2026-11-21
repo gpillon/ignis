@@ -666,10 +666,18 @@ mod tests {
         assert_eq!(row("qwen3.8-27b-16g"), format!("| `qwen3.8-27b-16g` | loads | loads | loads | {class} | loads | {class} | loads | loads | {class} |"));
         assert_eq!(row("qwen3.8-27b-12g"), "| `qwen3.8-27b-12g` | loads | loads | loads | loads | loads | loads | loads | loads | loads |", "GitHub #638");
         let both = "refused (class, generation)";
-        let abliterated = "served by `qwen3.8-27b-abliterated-16g`";
+        let (abliterated, abliterated_12) = ("served by `qwen3.8-27b-abliterated-16g`", "served by `qwen3.8-27b-abliterated-12g`");
         assert_eq!(
             row("qwen3.8-27b-abliterated"),
-            format!("| `qwen3.8-27b-abliterated` | loads | loads | {abliterated} | {class} | {abliterated} | {both} | {abliterated} | {abliterated} | {both} |")
+            format!(
+                "| `qwen3.8-27b-abliterated` | loads | loads | {abliterated} | {abliterated_12} | {abliterated} | {abliterated_12} | {abliterated} | {abliterated} | {abliterated_12} |"
+            ),
+            "GitHub #706"
+        );
+        assert_eq!(
+            row("qwen3.8-27b-abliterated-12g"),
+            "| `qwen3.8-27b-abliterated-12g` | loads | loads | loads | loads | loads | loads | loads | loads | loads |",
+            "GitHub #706"
         );
         assert_eq!(
             row("qwen3.8-27b-abliterated-16g"),

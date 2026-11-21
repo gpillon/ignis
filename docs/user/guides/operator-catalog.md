@@ -131,7 +131,8 @@ on a card whose class is not known, by `acme-27b-ft` itself. `GET /v1/models`
 and `GET /v1/models/catalog` list `acme-27b-ft` as unavailable on the 16 GB
 card, the reason naming the entry that serves it there. The built-in `qwen3.8-27b-abliterated` and
 `qwen3.8-27b-abliterated-16g` are such a pair: both state `family: qwen3.8-27b`,
-and the 16 GB one answers to the other's id ([the uncensored variant](uncensored.md));
+and the 16 GB one answers to the other's id, as from 0.11.0
+`qwen3.8-27b-abliterated-12g` does on a 12 GB card ([the uncensored variant](uncensored.md));
 so are `swift-1.5-27b` and `swift-1.5-27b-16g` ([fine-tunes](fine-tunes.md)).
 
 - `family` is required only where an alias involves the entry and neither its

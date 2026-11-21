@@ -26,6 +26,7 @@ The models the server knows how to fetch without an operator catalog. Each is pi
 | [`swift-1.5-27b`](#swift-15-27b) | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | 18.1 GiB | [`swift-open-license-1.0`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis/blob/890d5744d116caff2ee6746285bf839da175a63e/LICENSE) | `qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer` |
 | [`swift-1.5-27b-16g`](#swift-15-27b-16g) | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB | [`swift-open-license-1.0`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis/blob/3fe94555a30b3df89a283bf61338281243642166/LICENSE) | `qwen3_8_27b_trellis_sc30-v2-ukisai-swift-1.5.ninfer` |
 | [`qwen3.8-27b-12g`](#qwen38-27b-12g) | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis) | 11.9 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis/blob/15333a0829f055e7ee25d6d5ef84fd8d521518c6/LICENSE) | `qwen3_8_27b_trellis_ig28-v2.ninfer` |
+| [`qwen3.8-27b-abliterated-12g`](#qwen38-27b-abliterated-12g) | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | 11.9 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis/blob/e8c856577476cedd7a0b762e8a13512bb4a2c089/LICENSE) | `qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer` |
 | [`qwen3-asr-1.7b`](#qwen3-asr-17b) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q4_K_M.gguf` |
 | [`qwen3-asr-1.7b-q8`](#qwen3-asr-17b-q8) | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis/blob/f8a5263e398c1b3606abedc6b9c74dcbced9f93f/LICENSE) | `Qwen3-ASR-1.7B-Q8_0.gguf` |
 | [`qwen3-asr-0.6b`](#qwen3-asr-06b) | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB | [`apache-2.0`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis/blob/af02916ea7a532a667a907c2a163b16a8c04b433/LICENSE) | `Qwen3-ASR-0.6B-Q8_0.gguf` |
@@ -39,7 +40,7 @@ Each built-in model on each card ignis runs on, as the server decides it from th
 |---|---|---|---|---|---|---|---|---|---|
 | *Generation, class* | Blackwell (12.0), 96 GB | Blackwell (12.0), 32 GB | Blackwell (12.0), 16 GB | Blackwell (12.0), 12 GB | Ampere (8.6), 24 GB | Ampere (8.6), 12 GB | Ada (8.9), 24 GB | Ada (8.9), 16 GB | Ada (8.9), 12 GB |
 | `qwen3.8-27b` | loads | loads | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-12g` | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-12g` | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-16g` | served by `qwen3.8-27b-12g` |
-| `qwen3.8-27b-abliterated` | loads | loads | served by `qwen3.8-27b-abliterated-16g` | refused (class) | served by `qwen3.8-27b-abliterated-16g` | refused (class, generation) | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-16g` | refused (class, generation) |
+| `qwen3.8-27b-abliterated` | loads | loads | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-12g` | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-12g` | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-16g` | served by `qwen3.8-27b-abliterated-12g` |
 | `qwen3.8-flash-next` | loads | loads | refused (class) | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) | refused (class, generation) | refused (class, generation) |
 | `ignis-image-2.1-turbo` | loads | loads | refused (class) | refused (class) | refused (class, generation) | refused (class, generation) | refused (class, generation) | refused (class, generation) | refused (class, generation) |
 | `qwen3.8-27b-16g` | loads | loads | loads | refused (class) | loads | refused (class) | loads | loads | refused (class) |
@@ -47,6 +48,7 @@ Each built-in model on each card ignis runs on, as the server decides it from th
 | `swift-1.5-27b` | loads | loads | served by `swift-1.5-27b-16g` | refused (class) | served by `swift-1.5-27b-16g` | refused (class, generation) | served by `swift-1.5-27b-16g` | served by `swift-1.5-27b-16g` | refused (class, generation) |
 | `swift-1.5-27b-16g` | loads | loads | loads | refused (class) | loads | refused (class) | loads | loads | refused (class) |
 | `qwen3.8-27b-12g` | loads | loads | loads | loads | loads | loads | loads | loads | loads |
+| `qwen3.8-27b-abliterated-12g` | loads | loads | loads | loads | loads | loads | loads | loads | loads |
 
 The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen3-asr-0.6b`, `nemotron-3-diarization`) run on the CPU, beside whichever model the card holds, on every card.
 
@@ -134,6 +136,15 @@ The speech models and the diarizer (`qwen3-asr-1.7b`, `qwen3-asr-1.7b-q8`, `qwen
 |---|---|---|
 | `qwen3_8_27b_trellis_ig28-v2.ninfer.conversion.json` | 309,831 | `b19eb010025276cfb59f93db40e41d52db30e104fa89867218ebd6b789ea4ac9` |
 | `qwen3_8_27b_trellis_ig28-v2.ninfer` | 12,754,663,684 | `fab06bea49ce114da99ca69588f00b10fb5081c564f9ce60ecbef8b3dbf6d6a5` |
+
+## qwen3.8-27b-abliterated-12g
+
+[`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) at revision `e8c856577476cedd7a0b762e8a13512bb4a2c089`, 12,755,003,727 bytes in 2 files.
+
+| File | Bytes | SHA-256 |
+|---|---|---|
+| `qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer.conversion.json` | 340,043 | `8538a616e669fd99f341e46f56ca33677984bd2b31f414e16f9c3dc0e326078d` |
+| `qwen3_8_27b_trellis_ig28-v2-huihui-abliterated.ninfer` | 12,754,663,684 | `8075d0b73c367625b30b90a4d147182fd767ba76784f0080a784b3a0875fb329` |
 
 ## qwen3-asr-1.7b
 

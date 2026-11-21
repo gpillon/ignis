@@ -138,7 +138,7 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!(
         ids,
         [
-            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", // the built-in catalog, then the operator's
+            "qwen3.8-27b", "qwen3.8-27b-abliterated", "qwen3.8-flash-next", "ignis-image-2.1-turbo", "qwen3.8-27b-16g", "qwen3.8-27b-abliterated-16g", "swift-1.5-27b", "swift-1.5-27b-16g", "qwen3.8-27b-12g", "qwen3.8-27b-abliterated-12g", "qwen3-asr-1.7b", "qwen3-asr-1.7b-q8", "qwen3-asr-0.6b", "nemotron-3-diarization", // the built-in catalog, then the operator's
             "acme-full", "acme-part", "acme-none",
             "mock-a", "mock-gone", "mock-k", // the known models that are not entries, the start model among them
         ]
@@ -167,6 +167,12 @@ async fn the_catalog_lists_every_entry_then_every_known_model_with_its_state_on_
     assert_eq!(
         row(&rows, "qwen3.8-27b-12g")["license"],
         json!({ "id": "apache-2.0", "url": "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis/blob/15333a0829f055e7ee25d6d5ef84fd8d521518c6/LICENSE" })
+    );
+    // And the uncensored variant's 12 GB build (GitHub #706): the same, in
+    // its own repo at its pinned revision.
+    assert_eq!(
+        row(&rows, "qwen3.8-27b-abliterated-12g")["license"],
+        json!({ "id": "apache-2.0", "url": "https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis/blob/e8c856577476cedd7a0b762e8a13512bb4a2c089/LICENSE" })
     );
 
     let full = row(&rows, "acme-full");
@@ -325,6 +331,7 @@ async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_cat
         ("swift-1.5-27b", Some("text"), "the family it states"),
         ("swift-1.5-27b-16g", Some("text"), "the family it states"),
         ("qwen3.8-27b-12g", Some("text"), "its alias, a family's own id"),
+        ("qwen3.8-27b-abliterated-12g", Some("text"), "the family it states"),
         ("ignis-image-2.1-turbo", Some("image"), "a family's own id"),
         ("qwen3-asr-1.7b", Some("speech"), "the kind it states"),
         ("nemotron-3-diarization", Some("diarizer"), "the kind it states"),

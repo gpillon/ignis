@@ -19,9 +19,9 @@ that built it. How that works is in
 
 ## What it serves
 
-Thirteen entries are built into the server's [catalog](../guides/models.md#the-catalog)
-(twelve in 0.10.0): the nine text and image models below, three speech models
-and a diarizer. It loads one of the nine at a time and switches between them
+Fourteen entries are built into the server's [catalog](../guides/models.md#the-catalog)
+(twelve in 0.10.0): the ten text and image models below, three speech models
+and a diarizer. It loads one of the ten at a time and switches between them
 without a restart.
 
 | Model | Id | What it is | Size on disk |
@@ -31,6 +31,7 @@ without a restart.
 | Qwen3.8-27B for 12 GB cards | `qwen3.8-27b-12g` | From 0.11.0. The same 27B with a trellis body of about 2.8 bits per weight, for the 12 GB class; it answers to `qwen3.8-27b` on a 12 GB card. | 11.9 GiB |
 | Qwen3.8-27B, uncensored | `qwen3.8-27b-abliterated` | The same weights with an abliteration applied. It does not refuse, so [read its page](../guides/uncensored.md) before exposing it. | 18.1 GiB |
 | Qwen3.8-27B, uncensored, for 16 GB cards | `qwen3.8-27b-abliterated-16g` | The 16 GB artifact with the same abliteration; it answers to `qwen3.8-27b-abliterated` on a 16 GB card. | 12.5 GiB |
+| Qwen3.8-27B, uncensored, for 12 GB cards | `qwen3.8-27b-abliterated-12g` | From 0.11.0. The 12 GB artifact with the same abliteration; it answers to `qwen3.8-27b-abliterated` on a 12 GB card. | 11.9 GiB |
 | Swift 1.5 | `swift-1.5-27b` | UkisAI's post-training of the 27B, a [fine-tune](../guides/fine-tunes.md). Its license does not cover commercial use by an organization whose gross revenue was US$1,000,000 or more in its last fiscal year: [read its page](../guides/fine-tunes.md#its-license). | 18.1 GiB |
 | Swift 1.5 for 16 GB cards | `swift-1.5-27b-16g` | Swift 1.5 with a 3-bit trellis body; it answers to `swift-1.5-27b` on a 16 GB card. | 12.5 GiB |
 | Qwen3.8-Flash-Next | `qwen3.8-flash-next` | A 125B mixture-of-experts model with 6B active parameters, its experts re-quantized to 2.5 bits per weight on average. A VRAM cache holds the hot experts and the rest stream from host RAM. Image input from 0.11.0. | 68.2 GiB with its MTP and vision companions (from 0.11.0; 67.8 GiB with its MTP companion in 0.10.0) |
@@ -79,9 +80,12 @@ You can add models of your own with an
     on the RTX 5090 at the class's shape. On an RTX 30 or 40 card it runs the
     prefill routes the 16 GB entries run there; the RTX 5090, running those
     routes, reads 0.0435, 1.01 times its reading on Blackwell's, and no RTX 30
-    or 40 card has measured it yet. The uncensored variant and Swift 1.5 have no build
-    of the class: on a 12 GB card the server refuses them and every 16 GB
-    entry, by name, before it unloads or fetches anything. A card of 10 or
+    or 40 card has measured it yet. The uncensored variant has an entry of
+    the class too, `qwen3.8-27b-abliterated-12g`, which answers to
+    `qwen3.8-27b-abliterated` there
+    ([the uncensored variant](../guides/uncensored.md#the-12-gb-artifact)).
+    Swift 1.5 has no build of the class: on a 12 GB card the server refuses
+    it and every 16 GB entry, by name, before it unloads or fetches anything. A card of 10 or
     11 GB is read as the class and refused by its VRAM plan, which names the
     bytes it misses. In 0.10.0 a 12 GB card is read as the 16 GB class, whose
     entries do not fit it.
@@ -89,7 +93,8 @@ You can add models of your own with an
     Swift 1.5), Flash-Next and the image model, which also need a card of
     32 GB or more, by their card class. On an RTX 30 or RTX 40 card the server
     refuses them, and the NVFP4 builds' ids are served by their 16 GB entries
-    (on a 12 GB card, from 0.11.0, the 27B's by its 12 GB entry).
+    (on a 12 GB card, from 0.11.0, the 27B's and its uncensored variant's by
+    their 12 GB entries).
   - *The prefill on an RTX 30 or RTX 40 card.* Unset, the 27B reads a prompt
     through the **dense prefill** (each trellis matrix decoded once per chunk
     and multiplied on the integer MMA), the **integer band** of the prompt
@@ -175,7 +180,7 @@ These are choices, not gaps:
   planned for. Classification goes through `/v1/decide`.
 - No `/v1/completions` and no `/v1/batches`.
 - No audio out (speech is transcribed, never spoken), and no LoRA adapters.
-- No second model on the card: one of the nine holds it at a time. The
+- No second model on the card: one of the ten holds it at a time. The
   speech model is the exception: it runs beside it, on the CPU
   ([Speech to text](../api/transcriptions.md)).
 - Not a general engine: other model families are not served.
