@@ -619,15 +619,15 @@ the two for 12 GB cards 11.88 GiB from 0.11.0), Flash-Next, and the image model:
 The server fetches the standard one by itself the first time it starts without
 a model (on a 16 GB card, the 16 GB one; on a 12 GB card, from 0.11.0, the 12 GB one), and checks every file's size and SHA-256 before using it. To download
 any of them ahead of time — no GPU needed, `--out <dir>` for a machine with no
-network:
+network (the two `-12g` entries from 0.11.0):
 
 ```
 ignis-server model download qwen3.8-27b
 ignis-server model download qwen3.8-27b-abliterated
 ignis-server model download qwen3.8-27b-16g
 ignis-server model download qwen3.8-27b-abliterated-16g
-ignis-server model download qwen3.8-27b-12g               # from 0.11.0
-ignis-server model download qwen3.8-27b-abliterated-12g   # from 0.11.0
+ignis-server model download qwen3.8-27b-12g
+ignis-server model download qwen3.8-27b-abliterated-12g
 ignis-server model download swift-1.5-27b
 ignis-server model download swift-1.5-27b-16g
 ignis-server model download qwen3.8-flash-next
