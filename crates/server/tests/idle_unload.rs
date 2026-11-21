@@ -1053,3 +1053,93 @@ async fn the_catalog_offers_the_unloaded_model_to_load() {
     let (_, catalog) = send(&app, Method::GET, "/v1/models/catalog", None).await;
     assert_eq!((row(&catalog)["loaded"].clone(), row(&catalog)["switchable"].clone()), (json!(false), json!(true)), "{catalog}");
 }
+
+
+/// Manual lifecycle calls reuse the idle teardown and reload machinery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_unload_is_idempotent_and_load_warms_without_generation() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[]);
+    let app = server.app();
+    for _ in 0..2 {
+        let (status, body) = send(&app, Method::POST, "/v1/ignis/models/unload", Some(json!({"model":"mock-a"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "unloaded");
+        assert_eq!(loader.resident(), 0);
+    }
+    let (status, entry) = send(&app, Method::GET, "/v1/models/mock-a", None).await;
+    assert_eq!(status, StatusCode::OK, "{entry}");
+    assert_eq!(entry["id"], "mock-a");
+    assert!(loader.loads().is_empty(), "metadata must not reload");
+    for _ in 0..2 {
+        let (status, body) = send(&app, Method::POST, "/v1/ignis/models/load", Some(json!({"model":"mock-a"}))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "serving");
+        assert_eq!(*server.status(), ModelStatus::Serving);
+    }
+    assert_eq!(loader.loads(), vec!["mock-a"]);
+    let (status, body) = send(&app, Method::POST, "/v1/chat/completions", Some(chat(None))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn explicit_unload_refuses_an_admitted_request_and_unknown_ids() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[]);
+    let app = server.app();
+    let in_use = server.usage.admit();
+    let (status, body) = send(&app, Method::POST, "/v1/ignis/models/unload", Some(json!({"model":"mock-a"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    drop(in_use);
+    for path in ["/v1/ignis/models/load", "/v1/ignis/models/unload"] {
+        let (status, body) = send(&app, Method::POST, path, Some(json!({"model":"wrong"}))).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    let (status, body) = send(&app, Method::GET, "/v1/models/wrong", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(loader.resident(), 1);
+}
+
+#[tokio::test]
+async fn lifecycle_requires_authentication_and_rejects_unknown_body_fields() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[])
+        .with_api_key(ignis_server::config::ApiKey::new("sk-test"));
+    let app = server.app();
+    for path in ["/v1/ignis/models/load", "/v1/ignis/models/unload"] {
+        let (status, body) = send(&app, Method::POST, path, Some(json!({"model":"mock-a"}))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        let (status, body) = send_keyed(&app, Method::POST, path, Some(json!({"model":"mock-a","force":true})), Some("sk-test")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    let (status, body) = send(&app, Method::GET, "/v1/models/mock-a", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(loader.resident(), 1);
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_unload_never_cancels_a_running_stream() {
+    let loader = MockLoader::new();
+    let (model, gated, gate) = loader.gated_model("mock-a");
+    gated.arm();
+    drop(gated);
+    let server = idle_server(&loader, model, Duration::ZERO, &[]);
+    let app = server.app();
+    let mut body = chat(None);
+    body["stream"] = json!(true);
+    let streaming = tokio::spawn({
+        let app = app.clone();
+        async move { send(&app, Method::POST, "/v1/chat/completions", Some(body)).await }
+    });
+    let gate = tokio::task::spawn_blocking(move || { gate.wait_entered(); gate }).await.unwrap();
+    let (status, body) = send(&app, Method::POST, "/v1/ignis/models/unload", Some(json!({"model":"mock-a"}))).await;
+    // Release the held work before assertions, so a failed check cannot strand the test.
+    tokio::task::spawn_blocking(move || gate.release()).await.unwrap();
+    let (stream_status, stream_body) = streaming.await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(stream_status, StatusCode::OK);
+    assert!(stream_body.as_str().unwrap().contains("[DONE]"));
+    assert_eq!(*server.status(), ModelStatus::Serving);
+}

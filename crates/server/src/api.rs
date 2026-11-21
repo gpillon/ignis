@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{Request, State};
+use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -221,6 +222,9 @@ pub fn router(state: Arc<Server>) -> Router {
 fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
     let (router, mut document) = OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
         .routes(routes!(list_models))
+        .routes(routes!(retrieve_model))
+        .routes(routes!(load_model))
+        .routes(routes!(unload_model))
         // Spec model-switch/01: replace the loaded model.
         .routes(routes!(switch_model))
         // Spec playground/05: the models a switch can go to or fetch.
@@ -281,6 +285,9 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         // harness's side.
         .routes(routes!(crate::connector::skill::skill))
         .route("/v1/models", options(cors_preflight))
+        .route("/v1/models/{model}", options(cors_preflight))
+        .route("/v1/ignis/models/load", options(cors_preflight))
+        .route("/v1/ignis/models/unload", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/models/catalog", options(cors_preflight))
         .route("/v1/models/remove", options(cors_preflight))
@@ -789,8 +796,9 @@ pub(crate) fn implicit_switch_refused(refusal: crate::model_switch::ImplicitRefu
 /// loaded model: a download begun before the switch is stopped during it.
 fn reports_or_drives_the_switch(method: &axum::http::Method, path: &str) -> bool {
     (method == axum::http::Method::GET
-        && matches!(path, "/v1/models" | "/v1/models/catalog" | "/v1/config" | "/v1/config/fields" | "/v1/config/origins"))
-        || (method == axum::http::Method::POST && matches!(path, "/v1/models/switch" | "/v1/models/download/cancel"))
+        && (matches!(path, "/v1/models" | "/v1/models/catalog" | "/v1/config" | "/v1/config/fields" | "/v1/config/origins")
+            || path.starts_with("/v1/models/")))
+        || (method == axum::http::Method::POST && matches!(path, "/v1/models/switch" | "/v1/models/download/cancel" | "/v1/ignis/models/load" | "/v1/ignis/models/unload"))
 }
 
 async fn require_api_key(State(server): State<Arc<Server>>, req: Request, next: Next) -> Response {
@@ -2790,6 +2798,88 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
     // `GET /v1/models/catalog` lists.
     let list = tokio::task::spawn_blocking(move || models_now(&server)).await.expect("listing the models does not panic");
     Json(list)
+}
+
+/// Retrieve the same entry listed by the discovery endpoint without loading it.
+#[utoipa::path(
+    get, path = "/v1/models/{model}", tag = "models",
+    operation_id = "retrieve_model", summary = "Retrieve one servable model",
+    params(("model" = String, Path, description = "An exact model id from GET /v1/models")),
+    responses((status = 200, body = ModelInfo), (status = 404, body = ApiError)),
+)]
+async fn retrieve_model(State(server): State<Arc<Server>>, axum::extract::Path(model): axum::extract::Path<String>) -> Response {
+    let entry = tokio::task::spawn_blocking(move || models_now(&server).data.into_iter().find(|entry| entry.id == model))
+        .await.expect("listing the models does not panic");
+    match entry {
+        Some(entry) => Json(entry).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "invalid_request_error", "model_not_found", "the model is not listed by GET /v1/models"),
+    }
+}
+
+/// Ignis lifecycle extensions operate on the current model, never files on disk.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ModelLifecycleRequest {
+    /// Exact id of the current text or image model, even while unloaded.
+    model: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ModelLifecycleResponse {
+    model: String,
+    status: &'static str,
+}
+
+#[utoipa::path(
+    post, path = "/v1/ignis/models/load", tag = "models",
+    operation_id = "ignis_load_model", summary = "Load the current model without generating tokens",
+    description = "Ignis extension, not an OpenAI operation. Reloads the current unloaded model and waits until ready. Already serving is a no-op. Does not switch models; use POST /v1/models/switch for that. Concurrent loads share the existing loader.",
+    request_body = ModelLifecycleRequest,
+    responses((status = 200, body = ModelLifecycleResponse), (status = 404, body = ApiError), (status = 409, body = ApiError), (status = 503, body = ApiError)),
+)]
+async fn load_model(State(server): State<Arc<Server>>, body: Result<Json<ModelLifecycleRequest>, JsonRejection>) -> Response {
+    let Json(body) = match body { Ok(body) => body, Err(error) => return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "invalid_json", error.body_text()) };
+    // Count this explicit use through the load, so the idle clock cannot reclaim it.
+    let _using = server.usage.admit();
+    if server.active().model_id() != body.model {
+        return error_response(StatusCode::NOT_FOUND, "invalid_request_error", "model_not_found", "name the current model; use /v1/models/switch to select another");
+    }
+    if let Err(error) = crate::model_switch::ensure_loaded(&server, None).await {
+        return load_refused(&server, error);
+    }
+    if !matches!(*server.status(), ModelStatus::Serving) || server.active().model_id() != body.model {
+        return error_response(StatusCode::CONFLICT, "invalid_request_error", "model_busy", "the model is not serving; another lifecycle operation may be running");
+    }
+    Json(ModelLifecycleResponse { model: body.model, status: "serving" }).into_response()
+}
+
+#[utoipa::path(
+    post, path = "/v1/ignis/models/unload", tag = "models",
+    operation_id = "ignis_unload_model", summary = "Release the idle current model from memory",
+    description = "Ignis extension, not OpenAI model deletion. Waits for teardown; never deletes artifact files or cancels requests. Refuses 409 while work is queued, admitted or running, while switching, or if no reloadable artifact exists. Already unloaded is a no-op. The next model request automatically reloads it.",
+    request_body = ModelLifecycleRequest,
+    responses((status = 200, body = ModelLifecycleResponse), (status = 404, body = ApiError), (status = 409, body = ApiError)),
+)]
+async fn unload_model(State(server): State<Arc<Server>>, body: Result<Json<ModelLifecycleRequest>, JsonRejection>) -> Response {
+    let Json(body) = match body { Ok(body) => body, Err(error) => return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "invalid_json", error.body_text()) };
+    if server.active().model_id() != body.model {
+        return error_response(StatusCode::NOT_FOUND, "invalid_request_error", "model_not_found", "name the current model");
+    }
+    // Hold the same admission lock as idle unload: no accepted request can race teardown.
+    let unloading = server.usage.when_idle(std::time::Duration::ZERO, |_| {
+        let active = server.active();
+        if active.model_id() != body.model || !active.in_flight().is_idle() {
+            return None;
+        }
+        crate::model_switch::claim_unload(&server)
+    });
+    if let Some(unloading) = unloading {
+        crate::model_switch::unload(&server, unloading, crate::model_switch::UnloadCause::Requested).await;
+    } else if !matches!(*server.status(), ModelStatus::Unloaded)
+        || server.switcher.as_ref().is_some_and(|switcher| switcher.running().is_some()) {
+        return error_response(StatusCode::CONFLICT, "invalid_request_error", "model_busy", "the model is in use, changing state, or has no reloadable artifact");
+    }
+    Json(ModelLifecycleResponse { model: body.model, status: "unloaded" }).into_response()
 }
 
 /// What `GET /v1/models` answers now.
@@ -4792,6 +4882,9 @@ mod tests {
             // They report state: a page polling them must neither keep the
             // model loaded nor load it again (AC 5).
             ("GET", "/v1/models"),
+            ("GET", "/v1/models/{model}"),
+            ("POST", "/v1/ignis/models/load"),
+            ("POST", "/v1/ignis/models/unload"),
             ("GET", "/v1/models/catalog"),
             ("GET", "/v1/config"),
             ("GET", "/v1/config/fields"),

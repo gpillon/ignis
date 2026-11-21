@@ -46,3 +46,39 @@ still a switch or a reload, and is recorded in `last_switch` like any other.
 change. A measurement should not meet a cold reload: the Makefile's
 `IDLE_UNLOAD=0` passes `--model-idle-unload 0`, and the A/B and TTFT session
 scripts do so themselves.
+
+
+## Load and unload on demand
+
+`GET /v1/models/{model}` retrieves one entry from `GET /v1/models` without
+loading it or extending the idle timer. An unknown id returns `404 model_not_found`.
+
+The lifecycle routes below are Ignis extensions, not OpenAI model deletion.
+They use the same API key as generation requests and operate on the exact id
+of the current text or image model. They never delete artifact files or unload
+the separate CPU speech model.
+
+```bash
+curl http://localhost:8000/v1/models/qwen3.8-27b-16g \
+  -H 'Authorization: Bearer YOUR_API_KEY'
+curl -X POST http://localhost:8000/v1/ignis/models/unload \
+  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b-16g"}'
+curl -X POST http://localhost:8000/v1/ignis/models/load \
+  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.8-27b-16g"}'
+```
+
+Unload waits for teardown and answers `200` with
+`{"model":"qwen3.8-27b-16g","status":"unloaded"}`. If a request is admitted,
+queued or running, a switch or reload holds the model, or the model has no
+reloadable artifact, it answers `409 model_busy` without cancelling work.
+Already unloaded is a successful no-op. A later generation request automatically
+loads the model again; this route does not lock it out of service.
+
+Load waits until the current model is warm and answers `200` with
+`{"model":"qwen3.8-27b-16g","status":"serving"}`. Already serving is a no-op.
+It does not generate tokens. A failed reload returns `503 model_load_failed`;
+concurrent loads share the same reload. Use [model switching](model-switching.md)
+to select another model: a different id on either lifecycle route returns `404`.
+These are full unloads and cold reloads, not a VRAM-only suspension retaining KV.

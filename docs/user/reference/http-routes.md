@@ -61,12 +61,15 @@ The routes as the server's own OpenAPI document lists them: a route cannot exist
 
 | Method | Path | What it does |
 |---|---|---|
+| POST | `/v1/ignis/models/load` | Load the current model without generating tokens |
+| POST | `/v1/ignis/models/unload` | Release the idle current model from memory |
 | GET | `/v1/models` | The servable models, the loaded one first |
 | GET | `/v1/models/catalog` | The models this server can switch to or fetch |
 | POST | `/v1/models/download` | Download a catalog entry in the background |
 | POST | `/v1/models/download/cancel` | Stop the running download, keeping its partial files |
 | POST | `/v1/models/remove` | Remove a catalog entry's files from the models folder |
 | POST | `/v1/models/switch` | Replace the loaded model |
+| GET | `/v1/models/{model}` | Retrieve one servable model |
 
 ## responses
 

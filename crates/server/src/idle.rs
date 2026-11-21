@@ -84,7 +84,7 @@ impl Usage {
     /// model from being unloaded or finds the status `unloaded` already
     /// stored, and loads the model again — it never reaches an engine being
     /// torn down.
-    fn when_idle<T>(&self, after: Duration, unload: impl FnOnce(Duration) -> Option<T>) -> Option<T> {
+    pub(crate) fn when_idle<T>(&self, after: Duration, unload: impl FnOnce(Duration) -> Option<T>) -> Option<T> {
         let state = self.state.lock().expect("usage lock");
         let idle = state.last_use.elapsed();
         if state.in_flight > 0 || idle < after {

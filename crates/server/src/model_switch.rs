@@ -1685,6 +1685,8 @@ fn claim_unload_if(server: &Server, meant: impl FnOnce(&ActiveModel) -> bool) ->
 pub(crate) enum UnloadCause {
     /// Nobody used it for this long (`model.idle_unload`).
     Idle(Duration),
+    /// An authenticated operator explicitly released an idle model.
+    Requested,
     /// It failed while it served, for this reason ([`unload_failed`]).
     Failed(String),
 }
@@ -1719,6 +1721,12 @@ pub(crate) async fn unload(server: &Server, unloading: Unloading, cause: UnloadC
                 idle_secs = idle.as_secs(),
                 teardown_ms,
                 "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
+            ),
+            UnloadCause::Requested => tracing::info!(
+                name: "ignis.model.unloaded",
+                model = %model.model_id(),
+                teardown_ms,
+                "the operator unloaded the model; the next request that needs it loads it again"
             ),
             UnloadCause::Failed(reason) => tracing::warn!(
                 name: "ignis.model.unloaded",
