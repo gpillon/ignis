@@ -9,7 +9,7 @@ import container
 import convert
 import exl3
 import recipe
-from conftest import BF16_REVISION, REVISION, make_sources, write_container
+from conftest import BF16_REVISION, REVISION, edit_json, file_sha256, make_sources, write_container
 
 
 def _errors(value=0.25):
@@ -27,11 +27,6 @@ def _run(src, out, **kw):
 def _json(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
-
-
-def _sha(path):
-    with open(path, "rb") as f:
-        return hashlib.sha256(f.read()).hexdigest()
 
 
 def _never(*args, **kw):
@@ -72,7 +67,7 @@ def test_run_writes_a_work_tree_the_packer_takes(tmp_path):
         d = os.path.join(work, unit)
         done = _json(os.path.join(d, "DONE"))["files"]
         for name, entry in done.items():
-            assert entry == {"bytes": os.path.getsize(os.path.join(d, name)), "sha256": _sha(os.path.join(d, name))}
+            assert entry == {"bytes": os.path.getsize(os.path.join(d, name)), "sha256": file_sha256(os.path.join(d, name))}
         if unit == "frontend":
             assert sorted(done) == ["chat_template.jinja", "tokenizer.json"]
             continue
@@ -98,19 +93,19 @@ def test_converter_json_carries_the_provenance(tmp_path):
     assert (s["repo"], s["branch"], s["revision"]) == ("turboderp/Qwen3.8-27B-exl3", "SC_3.00bpw_H4", REVISION)
     for name, pin in s["files"].items():
         assert pin == {"bytes": os.path.getsize(os.path.join(src["quant"], name)),
-                       "sha256": _sha(os.path.join(src["quant"], name))}
+                       "sha256": file_sha256(os.path.join(src["quant"], name))}
     assert sorted(s["files"]) == ["config.json", "model-00001-of-00002.safetensors",
                                   "model-00002-of-00002.safetensors", "model.safetensors.index.json",
                                   "quantization_config.json"]
-    assert record["served"]["sha256"] == _sha(src["served"])
+    assert record["served"]["sha256"] == file_sha256(src["served"])
     ref = record["reference"]
     assert (ref["repo"], ref["revision"]) == ("Qwen/Qwen3.8-27B", BF16_REVISION)
     for name, pin in ref["files"].items():
         assert pin == {"bytes": os.path.getsize(os.path.join(src["bf16"], name)),
-                       "sha256": _sha(os.path.join(src["bf16"], name))}
+                       "sha256": file_sha256(os.path.join(src["bf16"], name))}
     assert sorted(ref["files"]) == ["model-00001-of-00001.safetensors", "model.safetensors.index.json"]
     assert record["graft"]["how"].startswith("the 2 dflash2/* objects")
-    assert record["served"]["graft_sidecar"]["sha256"] == _sha(src["served"] + ".graft.json")
+    assert record["served"]["graft_sidecar"]["sha256"] == file_sha256(src["served"] + ".graft.json")
     assert record["graft"]["grafted_from"]["repository"] == "someone/base"
     # only the copied drafter's NVFP4 record survives: the body plane it named is gone
     assert list(record["local_nvfp4"]["parents"]) == ["dflash2/feature_projection"]
@@ -133,8 +128,8 @@ def test_the_same_inputs_give_the_same_work_tree(tmp_path):
     _run(src, a)
     _run(src, b)
     for unit in ("frontend", "text", "mtp", "vision", "dflash2"):
-        assert _sha(os.path.join(a, unit, "DONE")) == _sha(os.path.join(b, unit, "DONE"))
-    assert _sha(os.path.join(a, "converter.json")) == _sha(os.path.join(b, "converter.json"))
+        assert file_sha256(os.path.join(a, unit, "DONE")) == file_sha256(os.path.join(b, unit, "DONE"))
+    assert file_sha256(os.path.join(a, "converter.json")) == file_sha256(os.path.join(b, "converter.json"))
 
 
 def test_a_reconstruction_error_above_the_bound_fails_the_conversion(tmp_path):
@@ -319,7 +314,7 @@ def test_the_conversion_record_names_the_override_and_its_reference(tmp_path):
                                   "quantization_config.json", "replay.json"]
     for name, pin in o["files"].items():
         assert pin == {"bytes": os.path.getsize(os.path.join(ov["override"], name)),
-                       "sha256": _sha(os.path.join(ov["override"], name))}
+                       "sha256": file_sha256(os.path.join(ov["override"], name))}
     ref = o["reference"]
     assert (ref["repo"], ref["revision"]) == (OVERRIDE_REPO, OVERRIDE_REVISION)
     assert sorted(ref["files"]) == ["fetch.json", "model.safetensors.index.json"]
@@ -343,14 +338,6 @@ def test_a_dry_run_with_an_override_pins_its_reference_and_measures_nothing(tmp_
     assert record["override"]["revision"] == OVERRIDE_REVISION
     assert sorted(record["override"]["reference"]["tensors"]) == [k + ".weight" for k in ov["keys"]]
     assert record["reference"] is None
-
-
-def _edit_json(path, change):
-    with open(path, encoding="utf-8") as f:
-        value = json.load(f)
-    change(value)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(value, f)
 
 
 def _refused(tmp_path, src, ov, message, **kw):
@@ -395,7 +382,7 @@ def test_both_commands_refuse_an_override_they_cannot_load_alike(tmp_path, capsy
 def test_a_provenance_missing_what_the_pin_needs_is_refused(tmp_path, change, message):
     src = make_sources(str(tmp_path))
     ov = make_override(str(tmp_path), src)
-    _edit_json(os.path.join(ov["override"], "replay.json"), change)
+    edit_json(os.path.join(ov["override"], "replay.json"), change)
     with pytest.raises(ValueError, match="replay.json lacks .*" + message):
         _override(ov)
 
@@ -403,7 +390,7 @@ def test_a_provenance_missing_what_the_pin_needs_is_refused(tmp_path, change, me
 def test_a_record_that_is_not_the_one_the_replay_made_is_refused(tmp_path):
     src = make_sources(str(tmp_path))
     ov = make_override(str(tmp_path), src)
-    _edit_json(os.path.join(ov["override"], "replay.json"),
+    edit_json(os.path.join(ov["override"], "replay.json"),
                lambda r: r["matrices"][ov["keys"][0]].update(record_sha256="0" * 64))
     _refused(tmp_path, src, ov, r"layers.2.mlp.gate_proj: the record's sha256 is not replay.json's")
 
@@ -411,7 +398,7 @@ def test_a_record_that_is_not_the_one_the_replay_made_is_refused(tmp_path):
 def test_an_override_made_against_another_quant_revision_is_refused(tmp_path):
     src = make_sources(str(tmp_path))
     ov = make_override(str(tmp_path), src)
-    _edit_json(os.path.join(ov["override"], "replay.json"),
+    edit_json(os.path.join(ov["override"], "replay.json"),
                lambda r: r["sources"]["quant"].update(revision="b" * 40))
     _refused(tmp_path, src, ov, "made against the quant at b{40}")
 
@@ -438,7 +425,7 @@ def test_a_tampered_tensor_in_the_partial_reference_is_refused(tmp_path):
 def test_a_reference_that_is_not_the_one_the_replay_used_is_refused(tmp_path, change, message):
     src = make_sources(str(tmp_path))
     ov = make_override(str(tmp_path), src)
-    _edit_json(os.path.join(ov["bf16"], "fetch.json"), change)
+    edit_json(os.path.join(ov["bf16"], "fetch.json"), change)
     _refused(tmp_path, src, ov, message)
 
 
@@ -597,22 +584,18 @@ def test_the_verify_command_takes_a_baseline(tmp_path):
 
 # --- the override the replay writes, of a downloaded quant or a local one (#703) ---
 
-import replay  # noqa: E402
 import work as work_mod  # noqa: E402
-from conftest import ReplayExllamav3, frozen, make_replay_sources, pin_dir, replay_argv  # noqa: E402
+from conftest import flip_last_byte, frozen, pin_dir, replayed  # noqa: E402
 
 REPLAYED = ["text/layers/1/gdn/output", "text/layers/1/mlp/down", "text/layers/2/gdn/output", "text/layers/2/mlp/down",
             "text/layers/3/attention/output", "text/layers/3/mlp/down"]
 
 
 def _replay(tmp_path, monkeypatch, local=False, name="src"):
-    """The replay's records of the reduced sources (`make_replay_sources`), written by `replay.py run` on
-    the CPU (`ReplayExllamav3`): (sources, the records directory)."""
-    src = make_replay_sources(str(tmp_path / name), local=local)
-    ReplayExllamav3(src).install(monkeypatch)
-    out = str(tmp_path / name / "override")
-    extra = ("--recipe", src["recipe"], "--quant-pins", src["pins"], "--trace", src["trace"]) if local else ()
-    assert replay.main(replay_argv(src, out, *extra), recipes=src["recipes"]) == 0
+    """The replay's records of the reduced sources, written by `replay.py run` on the CPU (`replayed`),
+    which passed: (sources, the records directory)."""
+    src, _, code, out = replayed(tmp_path, monkeypatch, local=local, name=name)
+    assert code == 0
     return src, out
 
 
@@ -651,7 +634,7 @@ def test_an_override_made_against_a_local_quant_converts_and_verifies_on_that_qu
     # the quant it was made against is named by its pins, as the record's source names the quant
     assert o["quant_revision"] is None
     assert o["quant_pins"] == record["source"]["pins"] == {"file": "quant.pins.json", "bytes": os.path.getsize(src["pins"]),
-                                                          "sha256": _sha(src["pins"])}
+                                                          "sha256": file_sha256(src["pins"])}
     assert sorted(o) == ["files", "matrices", "quant_pins", "quant_revision", "reference", "repo", "revision"]
     assert o["matrices"] == REPLAYED
     assert (o["repo"], o["revision"]) == (OVERRIDE_REPO, OVERRIDE_REVISION)
@@ -662,24 +645,19 @@ def test_an_override_made_against_a_local_quant_converts_and_verifies_on_that_qu
 
 def _another_local_quant(src):
     """`src`'s local quant with one byte changed, and its pins taken again: the same matrices, another quant."""
-    shard = os.path.join(src["quant"], "model-00002-of-00002.safetensors")
-    with open(shard, "r+b") as f:
-        f.seek(-1, os.SEEK_END)
-        last = f.read(1)
-        f.seek(-1, os.SEEK_END)
-        f.write(bytes([last[0] ^ 1]))
+    flip_last_byte(os.path.join(src["quant"], "model-00002-of-00002.safetensors"))
     with open(src["pins"], "w", encoding="utf-8", newline="\n") as f:
         json.dump({"files": pin_dir(src["quant"])}, f)
 
 
 def test_an_override_made_against_a_local_quant_is_refused_on_another(tmp_path, monkeypatch):
     src, out = _replay(tmp_path, monkeypatch, local=True)
-    made = _sha(src["pins"])
+    made = file_sha256(src["pins"])
     _another_local_quant(src)
     work = tmp_path / "work"
     with pytest.raises(convert.Refused, match=(
             rf"^the override was made against the quant pinned by quant\.pins\.json \(\d+ bytes, sha256 {made}\), "
-            rf"this quant's pins are quant\.pins\.json \(\d+ bytes, sha256 {_sha(src['pins'])}\)$")):
+            rf"this quant's pins are quant\.pins\.json \(\d+ bytes, sha256 {file_sha256(src['pins'])}\)$")):
         _run_local(src, str(work), override_mod.Override(out, src["abliterated"]))
     assert not work.exists()
 
@@ -691,13 +669,13 @@ def test_an_override_is_refused_on_a_quant_of_the_other_kind(tmp_path, monkeypat
     # made against a local quant, on the downloaded one
     with pytest.raises(convert.Refused, match=(
             rf"^the override was made against a quant converted locally, pinned by quant\.pins\.json \(sha256 "
-            rf"{_sha(local['pins'])}\), this quant is downloaded at {QUANT_REVISION}$")):
+            rf"{file_sha256(local['pins'])}\), this quant is downloaded at {QUANT_REVISION}$")):
         _run(down, str(work), override=override_mod.Override(local_out, local["abliterated"]), errors_fn=_never,
              weights_id=VARIANT)
     # made against the downloaded quant, on a local one
     with pytest.raises(convert.Refused, match=(
             rf"^the override was made against the quant downloaded at {QUANT_REVISION}, this quant is converted "
-            rf"locally, pinned by quant\.pins\.json \(sha256 {_sha(local['pins'])}\)$")):
+            rf"locally, pinned by quant\.pins\.json \(sha256 {file_sha256(local['pins'])}\)$")):
         _run_local(local, str(work), override_mod.Override(down_out, down["abliterated"]))
     assert not work.exists()
 
@@ -711,7 +689,7 @@ def test_an_override_is_refused_on_a_quant_of_the_other_kind(tmp_path, monkeypat
 def test_a_record_naming_its_quant_by_neither_or_both_or_by_half_its_pins_is_refused(tmp_path, monkeypatch, change,
                                                                                      message):
     src, out = _replay(tmp_path, monkeypatch, local=True)
-    _edit_json(os.path.join(out, "replay.json"), lambda r: change(r["sources"]["quant"]))
+    edit_json(os.path.join(out, "replay.json"), lambda r: change(r["sources"]["quant"]))
     with pytest.raises(ValueError, match=r"replay\.json " + message):
         override_mod.Override(out, src["abliterated"])
 
@@ -739,7 +717,7 @@ def test_without_the_fine_tune_arguments_the_work_tree_and_the_record_are_todays
     src = make_sources(str(tmp_path))
     work = str(tmp_path / "work")
     record = _run(src, work)
-    assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
+    assert {unit: file_sha256(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
     assert _record_digest(record) == TODAY_RECORD
     assert sorted(record) == ["converter", "copied", "dropped", "graft", "identity", "local_nvfp4", "objects",
                               "quant_unused", "recipe", "reference", "schema", "served", "source", "status",
@@ -782,7 +760,7 @@ def test_a_served_artifact_whose_sidecar_is_a_conversion_record_is_taken(tmp_pat
     assert record["local_nvfp4"]["encoder_profile"] == "NVFP4_MAXABS_DIVISOR_RNE_V1"
     assert record["served"]["conversion_sidecar"] == {
         "file": "qwen3_8_27b_nvfp4full-v2-ukisai-swift-1.5.ninfer.conversion.json",
-        "sha256": _sha(src["served"] + ".conversion.json"), "recipe_id": "qwen3_8_27b_nvfp4full-v2-local"}
+        "sha256": file_sha256(src["served"] + ".conversion.json"), "recipe_id": "qwen3_8_27b_nvfp4full-v2-local"}
     # no graft to describe, and nothing else of the served record is carried: the NVFP4 build's source,
     # revision and license are read through the sidecar pinned above, the record's own are the labels'
     assert "graft" not in record and "graft_sidecar" not in record["served"]
@@ -841,13 +819,13 @@ def test_a_locally_converted_quant_is_pinned_by_its_files_bytes_and_sha256(tmp_p
     record = _run(src, work, quant_pins=pins, labels=LABELS)
     s = record["source"]
     assert s["revision"] is None, "a local conversion has no hub revision"
-    assert s["pins"] == {"file": "quant.pins.json", "bytes": os.path.getsize(pins), "sha256": _sha(pins)}
+    assert s["pins"] == {"file": "quant.pins.json", "bytes": os.path.getsize(pins), "sha256": file_sha256(pins)}
     assert sorted(s["files"]) == QUANT_FILES
     for name, pin in s["files"].items():
         assert pin == {"bytes": os.path.getsize(os.path.join(src["quant"], name)),
-                       "sha256": _sha(os.path.join(src["quant"], name))}
+                       "sha256": file_sha256(os.path.join(src["quant"], name))}
     # the same quant files give the same work tree as the downloaded quant's
-    assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
+    assert {unit: file_sha256(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
 
 
 def test_a_local_quant_file_whose_hash_is_not_its_pin_is_refused_naming_it(tmp_path):
@@ -859,7 +837,7 @@ def test_a_local_quant_file_whose_hash_is_not_its_pin_is_refused_naming_it(tmp_p
         last = f.read(1)
         f.seek(-1, 2)
         f.write(bytes([last[0] ^ 1]))
-    with pytest.raises(convert.Refused, match=f"model-00002-of-00002.safetensors hashes to {_sha(path)}, its pin is "):
+    with pytest.raises(convert.Refused, match=f"model-00002-of-00002.safetensors hashes to {file_sha256(path)}, its pin is "):
         _run(src, str(tmp_path / "work"), quant_pins=pins, labels=LABELS)
     assert not (tmp_path / "work").exists()
 
@@ -873,7 +851,7 @@ def test_a_local_quant_file_whose_hash_is_not_its_pin_is_refused_naming_it(tmp_p
 def test_a_local_quant_its_pins_do_not_cover_is_refused_before_the_gpu_step(tmp_path, change, message):
     src = make_sources(str(tmp_path))
     pins = make_local_quant(src)
-    _edit_json(pins, change)
+    edit_json(pins, change)
     with pytest.raises(convert.Refused, match=message):
         _run(src, str(tmp_path / "work"), quant_pins=pins, labels=LABELS, errors_fn=_never)
     assert not (tmp_path / "work").exists()
@@ -950,10 +928,10 @@ def test_a_named_recipe_converts_its_quant_under_its_own_weights_id_and_the_reco
     assert convert.main(_argv(src, work, "--skip-errors", "--recipe", "tandem25"), recipes=src["recipes"]) == 0
     record = _json(os.path.join(work, "converter.json"))
     assert record["identity"] == {"model_id": "qwen3.8-27b", "weights_id": "trellis-tandem25"}
-    assert (record["recipe"]["name"], record["recipe"]["sha256"]) == ("tandem25", _sha(path))
+    assert (record["recipe"]["name"], record["recipe"]["sha256"]) == ("tandem25", file_sha256(path))
     assert record["source"]["quantization_config"] == {k: TANDEM[k] for k in STATED}
     # the work tree is the default recipe's: the same records, the same objects
-    assert {unit: _sha(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
+    assert {unit: file_sha256(os.path.join(work, unit, "DONE")) for unit in UNITS} == TODAY_DONE
 
 
 def test_the_record_names_the_recipe_its_ceiling_and_its_bits_per_weight(tmp_path):
@@ -968,7 +946,7 @@ def test_the_record_names_the_recipe_its_ceiling_and_its_bits_per_weight(tmp_pat
                and o["name"] not in ("text/token_embedding", "text/draft_head", "text/draft_head_token_ids"))
     # the body's bits per weight: three GDN layers at 475,136 bits and the GQA layer's 540,672 over
     # 671,744 weights, 120/41; the head apart, as exllamav3 counts its `bits`
-    assert record["recipe"] == {"name": "sc30", "sha256": _sha(os.path.join(src["recipes"], "sc30.json")),
+    assert record["recipe"] == {"name": "sc30", "sha256": file_sha256(os.path.join(src["recipes"], "sc30.json")),
                                 "ceiling_bytes": 1 << 30, "text_scope_bytes": text, "bpw": 2.9268}
 
 

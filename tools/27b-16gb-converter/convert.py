@@ -206,6 +206,17 @@ def text_matrices(quant):
     return matrices, unused
 
 
+def recipe_matrices(quant, named):
+    """`text_matrices(quant)` once the quant is the recipe `named`'s (`recipe.load`'s): its configuration
+    and every matrix at the recipe's K, the conversion's check and the replay's. Refused names what is not."""
+    check_quant_config(quant.config, named["quantization_config"])
+    matrices, unused = text_matrices(quant)
+    problems = recipe_mod.mismatches(named, {key: m.k2 / 2 for key, m in matrices.items()})
+    if problems:
+        raise Refused(f"the quant is not the recipe {named['name']}'s:\n  " + "\n  ".join(problems))
+    return matrices, unused
+
+
 def file_name(p):
     """The work file of object `p` inside its unit: the name past the unit, '/' -> '.'."""
     rest = p.name[len(p.unit) + 1:]
@@ -287,12 +298,7 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     with open(sidecar_path, encoding="utf-8") as f:
         sidecar = json.load(f)
     quant = exl3.Quant(quant_root)
-    check_quant_config(quant.config, named["quantization_config"])
-
-    matrices, unused = text_matrices(quant)
-    problems = recipe_mod.mismatches(named, {key: m.k2 / 2 for key, m in matrices.items()})
-    if problems:
-        raise Refused(f"the quant is not the recipe {named['name']}'s:\n  " + "\n  ".join(problems))
+    matrices, unused = recipe_matrices(quant, named)
     if override is not None:
         refuse_override(override, matrices)
     objects, dropped = plan.plan(served.objects, matrices)
@@ -319,7 +325,7 @@ def convert(served_path, quant_root, bf16_root, out_work, skip_errors=False, err
     ov_files, ov_reference = [], None
     if override is not None:
         # Made against this quant: a downloaded one's revision, a local one's pins (#703).
-        unlike = override.made_against(quant_revision, pinned_by)
+        unlike = override.mismatch_with(quant_revision, pinned_by)
         if unlike:
             raise Refused(unlike)
         ov_files = list(override.quant.shards) + list(OVERRIDE_META)

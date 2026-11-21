@@ -141,7 +141,7 @@ class Override:
         self.quant = exl3.Quant(self.root)
         self.matrices = {key: self.quant.matrix(key) for key in self.quant.keys()}
 
-    def made_against(self, revision, pins):
+    def mismatch_with(self, revision, pins):
         """The line naming how the quant at hand, downloaded at `revision` or converted locally and pinned
         by `pins` (`convert.pins_file`'s), is not the one this override was made against; None when it
         is. A downloaded quant is compared by its revision, a local one by its pins file."""

@@ -659,3 +659,39 @@ def replay_argv(src, out, *extra):
     """`replay.py run`'s arguments for the sources `src` of `make_replay_sources`, into `out`."""
     return ["run", "--quant", src["quant"], "--bf16", src["bf16"], "--abliterated", src["abliterated"],
             "--out", out, *extra]
+
+
+def replayed(tmp_path, monkeypatch, local=False, name="src"):
+    """`replay.py run` on the reduced sources (downloaded, or `local` at its recipe with its pins and trace),
+    on the CPU: (sources, stub, exit code, the records directory)."""
+    import replay
+    src = make_replay_sources(str(tmp_path / name), local=local)
+    stub = ReplayExllamav3(src).install(monkeypatch)
+    out = str(tmp_path / name / "override")
+    extra = ("--recipe", src["recipe"], "--quant-pins", src["pins"], "--trace", src["trace"]) if local else ()
+    code = replay.main(replay_argv(src, out, *extra), recipes=src["recipes"])
+    return src, stub, code, out
+
+
+def file_sha256(path):
+    """The sha256 of the file `path`, read whole: the tests' own, not the converter's `work.file_digest`."""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def edit_json(path, change):
+    """Rewrites the JSON file `path` after `change` (a function of its value) edits the value in place."""
+    with open(path, encoding="utf-8") as f:
+        value = json.load(f)
+    change(value)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(value, f)
+
+
+def flip_last_byte(path):
+    """Changes the last byte of the file `path`: the same size, other bytes."""
+    with open(path, "r+b") as f:
+        f.seek(-1, os.SEEK_END)
+        last = f.read(1)
+        f.seek(-1, os.SEEK_END)
+        f.write(bytes([last[0] ^ 1]))

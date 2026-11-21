@@ -286,11 +286,7 @@ def prepare(quant_root, bf16_root, abliterated, out, first=FIRST_LAYER, last=LAS
             raise convert.Refused(f"a downloaded quant is named {convert.REPO} {convert.BRANCH}, the recipe "
                                   f"{recipe_mod.DEFAULT}'s: the recipe {named['name']} is replayed from a quant "
                                   f"converted locally (--quant-pins, --trace)")
-        convert.check_quant_config(quant.config, named["quantization_config"])
-        matrices, _ = convert.text_matrices(quant)
-        problems = recipe_mod.mismatches(named, {key: m.k2 / 2 for key, m in matrices.items()})
-        if problems:
-            raise convert.Refused(f"the quant is not the recipe {named['name']}'s:\n  " + "\n  ".join(problems))
+        convert.recipe_matrices(quant, named)
         planned = plan(quant, first, last)
         quant_files = list(quant.shards) + list(convert.QUANT_META)
         if local:
