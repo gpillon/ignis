@@ -82,6 +82,9 @@ fn the_document_lists_exactly_the_v1_surface() {
     // was removed.
     let expected: BTreeSet<String> = [
         "get /v1/models",
+        "get /v1/models/{model}",
+        "post /v1/ignis/models/load",
+        "post /v1/ignis/models/unload",
         // Spec model-switch/01: replace the loaded model.
         "post /v1/models/switch",
         // Spec playground/05: the models a switch can go to or fetch, and
