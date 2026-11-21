@@ -136,18 +136,18 @@ same session:
 
 All four pass. It is about as faithful to the abliterated weights as the
 12 GB artifact is to the standard ones (0.99x, CI 0.96-1.02), with a top-1
-agreement of 93.34% against 93.35%. One reading of the KLD gate needed the
-owner's word: the two cross terms
-([ADR 0082](../../adr/0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md)),
-each artifact against the other's BF16, sit 7% to 10% above the matched pair
-on average but below it in one window of 16 each, where the rule asks every
-window. The rule was written for a full fine-tune; an override of 70 matrices
-sits closer than that, and the 16 GB abliterated artifact would stop the
-same way. The owner accepted the leg on those numbers.
+agreement of 93.34% against 93.35%. The KLD gate's two cross terms
+([ADR 0082](../../adr/0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md))
+sit above the matched pair on average but not in every window, as for the
+16 GB abliterated artifact:
+[the finding](../../findings/2026-11-20-the-uncensored-12-gb-artifacts-gate.md)
+says how that leg was read.
 
-It decodes as fast as the 12 GB artifact or faster (1.00x to 1.08x under MTP,
-against one launch of the 12 GB artifact), and its first token comes within 1% of the 12 GB artifact's: about 2.5 s after
-an 8,192-token prompt, 20.9 s after 65,536 and 46 s after 130,560. DFlash2
+Under MTP it decodes 0.99x to 1.08x the 12 GB artifact (against one launch
+of it; the one cell below 1, a cold 8,192-token prompt, is inside that cell's
+spread), and its first token comes within 1.2% of the 12 GB artifact's:
+about 2.5 s after an 8,192-token prompt, 20.9 s after 65,536 and 46 s after
+130,560. DFlash2
 loads in the same 12 GiB with the same context and a smaller KV pool (150,720
 tokens against MTP's 214,144), and decodes 1.31x to 1.47x MTP; the profile
 keeps MTP, as for the 12 GB artifact.
