@@ -705,10 +705,7 @@ mod tests {
     #[test]
     fn model_download_of_the_uncensored_variant_on_a_12gb_card_fetches_its_12gb_build() {
         let files = MemFiles::default();
-        let reading = super::super::profile::testing::reading;
-        let rtx_3060 = Card::Read(reading(11 << 30, "NVIDIA GeForce RTX 3060", 8, 6));
-        let rtx_4070 = Card::Read(reading(11 << 30, "NVIDIA GeForce RTX 4070", 8, 9));
-        for card in [Card::blackwell(12 << 30), rtx_3060, rtx_4070] {
+        for card in super::super::profile::testing::twelve_gb_cards().map(Card::Read) {
             let (ids, ..) = download_of(run_on(&["model", "download", "qwen3.8-27b-abliterated"], &files, card.clone()).unwrap());
             assert_eq!(ids, ["qwen3.8-27b-abliterated-12g"], "{card:?}");
             let err = run_on(&["model", "download", "qwen3.8-27b-abliterated-16g"], &files, card.clone()).unwrap_err().0;

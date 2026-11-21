@@ -583,16 +583,10 @@ mod tests {
     /// naming the 12 GB build serves it by its own id on every larger card.
     #[test]
     fn a_start_naming_the_uncensored_variant_on_a_12gb_card_serves_its_12gb_build_under_rtx_12gb() {
-        use crate::config::profile::{testing::reading, Card, CardClass};
+        use crate::config::profile::{testing::twelve_gb_cards, Card, CardClass};
         let catalog = catalog::testing::built_in();
         let dir = PathBuf::from(DIR);
-        let gib = |gib: f64| (gib * (1u64 << 30) as f64) as u64;
-        let cards = [
-            Card::blackwell(gib(11.9)),
-            Card::Read(reading(gib(11.8), "NVIDIA GeForce RTX 3060", 8, 6)),
-            Card::Read(reading(gib(11.6), "NVIDIA GeForce RTX 4070", 8, 9)),
-        ];
-        for card in cards {
+        for card in twelve_gb_cards().map(Card::Read) {
             let options = start_config_reading(&["--model-id", "qwen3.8-27b-abliterated"], card.clone());
             assert_eq!((options.basis.sources().profile_name.as_str(), options.card_class()), ("rtx-12gb", Some(CardClass::Gb12)), "{card:?}");
             let served = start_model(&catalog, &options.model, options.card()).unwrap();

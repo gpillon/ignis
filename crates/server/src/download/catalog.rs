@@ -980,7 +980,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{sixteen_over_thirty_two, thirty_two, SIXTEEN};
     use super::*;
-    use crate::config::profile::testing::{on, reading, rtx_3090, rtx_4090, rtx_5090};
+    use crate::config::profile::testing::{on, reading, rtx_3090, rtx_4090, rtx_5090, twelve_gb_cards};
 
     /// The spec's table, written out again: what the built-in catalog must
     /// hold, value for value (`id`, `repo`, `revision`, `artifact`, its
@@ -1841,7 +1841,7 @@ mod tests {
     fn on_a_12gb_card_the_27bs_id_is_served_by_the_12gb_entry_and_a_16gb_entry_is_refused_by_name() {
         let catalog = Catalog::built_in();
         let refused = |refusal: CardRefusal| (refusal.code(), refusal.to_string());
-        for card in [on(CardClass::Gb12), reading(12 << 30, "NVIDIA GeForce RTX 3060", 8, 6), reading(12 << 30, "NVIDIA GeForce RTX 4070", 8, 9)] {
+        for card in twelve_gb_cards() {
             assert_eq!(card.class(), Some(CardClass::Gb12), "{}", card.name);
             let card = Some(&card);
             assert_eq!(resolved(catalog, "qwen3.8-27b", card), Ok("qwen3.8-27b-12g"), "{card:?}");
@@ -1877,7 +1877,7 @@ mod tests {
         let catalog = Catalog::built_in();
         let entry = catalog.entry("qwen3.8-27b-abliterated-12g").expect("listed");
         assert_eq!((entry.card_class, entry.family, entry.aliases.as_slice()), (Some(CardClass::Gb12), Some(ModelFamily::Qwen38_27b), &["qwen3.8-27b-abliterated".to_owned()][..]));
-        for card in [on(CardClass::Gb12), reading(12 << 30, "NVIDIA GeForce RTX 3060", 8, 6), reading(12 << 30, "NVIDIA GeForce RTX 4070", 8, 9)] {
+        for card in twelve_gb_cards() {
             assert_eq!(card.class(), Some(CardClass::Gb12), "{}", card.name);
             let card = Some(&card);
             assert_eq!(resolved(catalog, "qwen3.8-27b-abliterated", card), Ok("qwen3.8-27b-abliterated-12g"), "{card:?}");

@@ -480,7 +480,7 @@ pub async fn run(command: ModelCommand, out: &mut dyn Write, progress: Arc<dyn F
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::profile::testing::{on, rtx_3090};
+    use crate::config::profile::testing::{on, rtx_3090, twelve_gb_cards};
     use crate::config::profile::CardClass;
     use std::collections::BTreeMap;
 
@@ -618,23 +618,32 @@ mod tests {
 
         let text = render_list(&rows, ListFormat::Text, &|_| None);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 16, "{text}");
+        assert_eq!(lines.len(), rows.len() + 1, "the header, then a line a row: {text}");
+        // A row's line by its entry's id, the whole first column.
+        let line = |id: &str| *lines.iter().find(|line| line.split_whitespace().next() == Some(id)).unwrap_or_else(|| panic!("no line for {id}: {text}"));
         assert!(lines[0].starts_with("ID") && lines[0].contains("REPO@REVISION") && lines[0].contains("FAMILY"), "{text}");
-        assert!(lines[1].contains("built-in") && lines[1].contains("gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer@e961b419b672e183aa55df8c4b975abc82006e8a"), "{text}");
-        assert!(lines[1].contains("18.1 GiB") && lines[1].contains("complete") && lines[1].contains("Qwen3.8-27B"), "{text}");
-        assert!(lines[3].contains("68.2 GiB") && lines[3].contains("absent") && lines[3].contains('—'), "{text}");
-        assert!(lines[5].contains("built-in") && lines[5].contains("gpillon/Qwen3.8-27B-trellis-3bpw-ignis@f5bbd2cc") && lines[5].contains("12.5 GiB"), "{text}");
-        assert!(lines[6].contains("built-in") && lines[6].contains("gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis@94a8bfc0") && lines[6].contains("12.5 GiB"), "{text}");
-        assert!(lines[7].contains("built-in") && lines[7].contains("gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis@890d5744d116caff2ee6746285bf839da175a63e") && lines[7].contains("18.1 GiB"), "{text}");
-        assert!(lines[8].contains("built-in") && lines[8].contains("gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis@3fe94555a30b3df89a283bf61338281243642166") && lines[8].contains("12.5 GiB"), "{text}");
-        assert!(lines[9].contains("built-in") && lines[9].contains("gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis@15333a0829f055e7ee25d6d5ef84fd8d521518c6") && lines[9].contains("11.9 GiB"), "{text}");
+        let (first, flash_next) = (line("qwen3.8-27b"), line("qwen3.8-flash-next"));
+        assert!(first.contains("built-in") && first.contains("gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer@e961b419b672e183aa55df8c4b975abc82006e8a"), "{text}");
+        assert!(first.contains("18.1 GiB") && first.contains("complete") && first.contains("Qwen3.8-27B"), "{text}");
+        assert!(flash_next.contains("68.2 GiB") && flash_next.contains("absent") && flash_next.contains('—'), "{text}");
+        let sixteen = line("qwen3.8-27b-16g");
+        assert!(sixteen.contains("built-in") && sixteen.contains("gpillon/Qwen3.8-27B-trellis-3bpw-ignis@f5bbd2cc") && sixteen.contains("12.5 GiB"), "{text}");
+        let abliterated_16 = line("qwen3.8-27b-abliterated-16g");
+        assert!(abliterated_16.contains("built-in") && abliterated_16.contains("gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis@94a8bfc0") && abliterated_16.contains("12.5 GiB"), "{text}");
+        let (swift, swift_16) = (line("swift-1.5-27b"), line("swift-1.5-27b-16g"));
+        assert!(swift.contains("built-in") && swift.contains("gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis@890d5744d116caff2ee6746285bf839da175a63e") && swift.contains("18.1 GiB"), "{text}");
+        assert!(swift_16.contains("built-in") && swift_16.contains("gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis@3fe94555a30b3df89a283bf61338281243642166") && swift_16.contains("12.5 GiB"), "{text}");
+        let (twelve, abliterated_12) = (line("qwen3.8-27b-12g"), line("qwen3.8-27b-abliterated-12g"));
+        assert!(twelve.contains("built-in") && twelve.contains("gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis@15333a0829f055e7ee25d6d5ef84fd8d521518c6") && twelve.contains("11.9 GiB"), "{text}");
         assert!(
-            lines[10].contains("built-in") && lines[10].contains("gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis@e8c856577476cedd7a0b762e8a13512bb4a2c089") && lines[10].contains("11.9 GiB"),
+            abliterated_12.contains("built-in") && abliterated_12.contains("gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis@e8c856577476cedd7a0b762e8a13512bb4a2c089") && abliterated_12.contains("11.9 GiB"),
             "{text}"
         );
-        assert!(lines[14].contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && lines[14].contains("absent"), "{text}");
-        assert!(lines[15].contains("operator") && lines[15].contains("acme/ft@v1") && lines[15].contains("partial"), "{text}");
-        assert!(lines[11].contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && lines[11].contains("1.5 GiB") && lines[11].contains("absent"), "{text}");
+        let (diarization, acme) = (line("nemotron-3-diarization"), line("acme-ft"));
+        assert!(diarization.contains("gpillon/Nemotron-3-Diarization-GGUF-ignis@d46d59d0") && diarization.contains("absent"), "{text}");
+        assert!(acme.contains("operator") && acme.contains("acme/ft@v1") && acme.contains("partial"), "{text}");
+        let asr = line("qwen3-asr-1.7b");
+        assert!(asr.contains("gpillon/Qwen3-ASR-1.7B-GGUF-ignis@f8a5263e") && asr.contains("1.5 GiB") && asr.contains("absent"), "{text}");
 
         let json: Vec<Value> = serde_json::from_str(&render_list(&rows, ListFormat::Json, &|_| None)).unwrap();
         assert_eq!(json[0]["id"], "qwen3.8-27b");
@@ -643,15 +652,16 @@ mod tests {
         assert_eq!(json[0]["bytes"], entry.total_bytes());
         assert_eq!(json[0]["on_disk"], "complete");
         assert_eq!(json[0]["family"], "Qwen3.8-27B");
-        assert_eq!(json[14]["layer"], "operator");
-        assert_eq!(json[14]["family"], Value::Null);
+        let acme_json = json.iter().find(|row| row["id"] == "acme-ft").expect("the operator's entry");
+        assert_eq!(acme_json["layer"], "operator");
+        assert_eq!(acme_json["family"], Value::Null);
         // ADR 0078: the identifier beside each entry, `—` where none is stated.
-        assert!(lines[0].ends_with("LICENSE") && lines[1].ends_with("apache-2.0"), "{text}");
-        assert!(lines[3].ends_with("qwen-community-1.0") && lines[4].ends_with("qwen-research"), "{text}");
-        assert!(lines[7].ends_with("swift-open-license-1.0") && lines[8].ends_with("swift-open-license-1.0") && lines[9].ends_with("apache-2.0") && lines[10].ends_with("apache-2.0"), "{text}");
-        assert!(lines[14].ends_with("openmdw-1.1") && lines[15].ends_with('—'), "{text}");
+        assert!(lines[0].ends_with("LICENSE") && first.ends_with("apache-2.0"), "{text}");
+        assert!(flash_next.ends_with("qwen-community-1.0") && line("ignis-image-2.1-turbo").ends_with("qwen-research"), "{text}");
+        assert!(swift.ends_with("swift-open-license-1.0") && swift_16.ends_with("swift-open-license-1.0") && twelve.ends_with("apache-2.0") && abliterated_12.ends_with("apache-2.0"), "{text}");
+        assert!(diarization.ends_with("openmdw-1.1") && acme.ends_with('—'), "{text}");
         assert_eq!(json[0]["license"], serde_json::json!({ "id": "apache-2.0", "url": "https://www.apache.org/licenses/LICENSE-2.0" }));
-        assert_eq!(json[14]["license"], Value::Null);
+        assert_eq!(acme_json["license"], Value::Null);
     }
 
     fn fetched(catalog: &Catalog, ids: &[&str], all: bool, card: Option<&CardReading>) -> Result<Vec<String>, String> {
@@ -700,8 +710,7 @@ mod tests {
     fn a_download_of_the_uncensored_variant_fetches_its_12gb_build_on_a_12gb_card() {
         let catalog = super::super::catalog::testing::built_in();
         let twelve = || Ok(vec!["qwen3.8-27b-abliterated-12g".to_owned()]);
-        let reading = crate::config::profile::testing::reading;
-        for card in [on(CardClass::Gb12), reading(12 << 30, "NVIDIA GeForce RTX 3060", 8, 6), reading(12 << 30, "NVIDIA GeForce RTX 4070", 8, 9)] {
+        for card in twelve_gb_cards() {
             let card = Some(&card);
             assert_eq!(fetched(&catalog, &["qwen3.8-27b-abliterated"], false, card), twelve(), "{card:?}");
             assert_eq!(fetched(&catalog, &["qwen3.8-27b-abliterated-12g", "qwen3.8-27b-abliterated"], false, card), twelve(), "each entry once");

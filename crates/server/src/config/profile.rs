@@ -610,6 +610,12 @@ pub(crate) mod testing {
         reading(24 << 30, "NVIDIA GeForce RTX 4090", 8, 9)
     }
 
+    /// A 12 GB card of each generation (spec #630, ADR 0098), 12 GiB each:
+    /// an RTX 50 (Blackwell), an RTX 3060 (Ampere) and an RTX 4070 (Ada).
+    pub(crate) fn twelve_gb_cards() -> [CardReading; 3] {
+        [on(CardClass::Gb12), reading(12 << 30, "NVIDIA GeForce RTX 3060", 8, 6), reading(12 << 30, "NVIDIA GeForce RTX 4070", 8, 9)]
+    }
+
     /// An RTX 5090, at the total NVML reports for it.
     pub(crate) fn rtx_5090() -> CardReading {
         reading(RTX_5090_TOTAL_BYTES, "NVIDIA GeForce RTX 5090", 12, 0)
