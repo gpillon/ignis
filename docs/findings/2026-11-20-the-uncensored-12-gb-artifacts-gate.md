@@ -75,9 +75,9 @@ the hidden states of both BF16 references, read by `gate1.py` with ADR 0082's fo
   in window 0, code: 0.05773 against 0.05965; the cross reference in window 11, chat: 0.06097 against
   0.06671), and #449's rule wants every window, so `gate1.py` stopped the work and sent the numbers to the
   owner. The rule was written for a full fine-tune. Two artifacts that differ in 70 matrices of 401 sit closer
-  than that: the shipped 16 GB uncensored artifact (#422, the same route) would stop the same way, in window
-  11, chat, as `tools/kld-gate/test_gate1.py` records. The owner accepted the KLD leg on 2026-11-20
-  (`decisions.md` D1).
+  than that: the shipped 16 GB uncensored artifact (#422, the same route) would stop the same way, its cross
+  terms above the matched pair in 15 of 16 windows each, as `tools/kld-gate/test_gate1.py` holds on #422's
+  results. The owner accepted the KLD leg on 2026-11-20 (`decisions.md` D1).
 
 ### MTP on against off, DFlash2 beside
 
@@ -102,11 +102,12 @@ ABBA order (on, off, off, on) and two DFlash2 launches after them (`gate/decode_
   12,798,517,248) with the same 131,072-token context and a KV pool of 150,720 tokens against MTP's 214,144,
   and decodes 1.31x to 1.47x MTP. The figures are the 12 GB artifact's of #635 within 1.2% (its card: 409.4,
   347.6, 320.6).
-- **Against the 12 GB artifact** (one MTP launch, not binding): the same or faster, 1.00x to 1.08x. On the
-  canary, MTP accepted 62.0% of its drafts (412 of 664) against the 12 GB artifact's 51.3% (392 of 764); the
+- **Against the 12 GB artifact** (one MTP launch, not binding): 0.99x to 1.08x, below 1 only in the 8,192 cold
+  cell (0.991x), inside that cell's spread of 54.0, and faster in the other five. On the canary, MTP accepted 62.0% of its drafts (412 of 664) against the 12 GB artifact's 51.3% (392 of 764); the
   texts differ, so this is a reading, not a comparison.
-- **First token**, cold, MTP: 2.49 s, 20.89 s and 46.09 s at 8,192, 65,536 and 130,560 tokens, the 12 GB
-  artifact's within 1% (2.46, 20.75, 46.11).
+- **First token**, cold, MTP: 2.49 s, 20.89 s and 46.09 s at 8,192, 65,536 and 130,560 tokens, against the
+  12 GB artifact's 2.46, 20.75 and 46.11: 1.2% and 0.7% later at the first two, the same (0.04% earlier) at
+  the third.
 
 ### Loop rate: #340's loop set, 32 requests (4 bodies x 8 seeds)
 
@@ -149,8 +150,8 @@ Observed:
    median 0.150728 against 0.150719, 0.9995x to 1.0005x matrix by matrix.
 2. On the RTX 5090 as a 12 GB card, the artifact's KLD against its own BF16 is 0.04275, 0.992x the 12 GB
    artifact's against the base, under the 0.0517 limit with its CI.
-3. MTP decodes 2.81x to 3.34x no speculation in every cell, and the artifact decodes as fast as the 12 GB
-   artifact or faster.
+3. MTP decodes 2.81x to 3.34x no speculation in every cell, and the artifact 0.99x to 1.08x the 12 GB
+   artifact, the one cell below 1 inside its spread.
 4. Its loop count, 9 of 32, is not significantly above the 12 GB artifact's 6 of 32 (p 0.278).
 5. The refusal flips on both probes and the control is unchanged.
 6. #449's every-window cross-term rule stops a 70-matrix fine-tune: the cross terms sit 7% to 10% above the
@@ -164,8 +165,7 @@ exclude zero), but the every-window form of the rule is too strict for an overri
 
 - Every binding leg passed and the owner admitted the artifact (2026-11-21): the upload and the catalog entry
   `qwen3.8-27b-abliterated-12g` follow (#706).
-- A later small override gated under ADR 0082 will meet the same stop: the rule could read the cross terms'
-  mean and interval for an override, and keep every window for a full fine-tune.
+- A later small override gated under ADR 0082 will meet the same stop.
 - On `rtx-12gb`, DFlash2 fits the same budget and context and decodes about 1.4x MTP, at a KV pool 30%
   smaller, on this artifact as on the 12 GB one; the profile keeps MTP.
 
@@ -184,5 +184,5 @@ exclude zero), but the every-window form of the rule is too strict for an overri
 ## Follow-ups
 
 - #706: the public upload, the built-in entry and the guide.
-- Whether ADR 0082's every-window rule should read differently for a small override is the owner's call; no
-  ticket is open for it.
+- An owner question, raised on #705: should ADR 0082's cross terms be read by their mean and interval for an
+  override, keeping every window for a full fine-tune?
