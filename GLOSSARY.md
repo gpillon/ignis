@@ -1183,7 +1183,10 @@ group), at 2..7 lanes and 64 columns or fewer, one of twelve: (1,1)..(1,6),
 and its outputs go back in the caller's order, nothing moved on the device;
 the base group's columns start where the extended group's end. Ops that see
 only columns run once over the round's columns, ops that see lanes once a
-group, the base group on a branch beside the extended one. Each group's GDN
+group, the base group on a branch beside the extended one (#718: the extended
+group on a branch of its own at the card's greatest stream priority, the
+round's graph one root and no memset node, unless `IGNIS_MIXED_GRAPH_BUILD=0`).
+Each group's GDN
 records lie in its shape's records over the backing both share, base lane `s`
 at row `2w + s`, and its fold runs behind `2w` leading rows that commit
 nothing; only at 15 drafts are a group's record rows its columns, so a load

@@ -352,6 +352,26 @@ the other. They are no configuration fields: `GET /v1/config` and
   graph nodes and the device memory its capture took. A load at another
   window, a trellis artifact, an MTP load and Flash-Next capture none. Any
   other value refuses the load, naming the variable.
+- `IGNIS_MIXED_GRAPH_BUILD=0` (from 0.11.0) gives the 27B's mixed rounds,
+  at each capture of the decode graphs of a DFlash2 load past 7 draft tokens,
+  their graphs as `IGNIS_MIXED_ROUNDS` first captured them, the comparison a
+  speed measurement of the mixed graph's build needs. Unset, or `1`, a mixed
+  round takes the build: its first op runs one group after the other, so its
+  graph starts from one root where a branch forked at its start began a
+  second; its target argmax zeroes its output by a kernel of ignis's own,
+  adapted from the vendored tiled argmax and its answer bit for bit
+  (`ignis_kernel_tiled_argmax_test`), where the vendored op's memset node
+  waited behind the output head; and its extended group runs on a branch at
+  the card's greatest stream priority, the graphs instantiated with their
+  nodes' priorities. Under `0` the round runs on the vendored argmax and
+  its extended group on the round's stream, as before. The tokens are the
+  same either way (the round identity test below, arm `mixed-graph-build-off`),
+  and so are the graphs' node counts; the program's stats report each mix's
+  graphs' root nodes and memset nodes (one root and none under the build, on
+  the hq-e8-2b KV cache). The eager mixed rounds follow the latest capture's
+  reading; before a load's first capture they take the build's first op and
+  argmax, the extended group on the round's stream. Any other value refuses
+  the load, naming the variable.
 
 ### The round identity test
 
@@ -428,6 +448,22 @@ and `n` at the uniform base shape, so that the round timing prints a `verify
 extended`, a `verify mixed` and a `verify` line (`n` of 257 or more) for the
 three at two lanes; the test prints each lane's tokens a round and how far
 each lane's text at the mix follows its text at its own shape's uniform round.
+From #718 every capture that asks for the mixed graphs is also held to their
+form: one root and no memset node in each graph of each mix under the mixed
+graph's build, and in the `mixed-graph-build-off` arm (`IGNIS_MIXED_ROUNDS=1`,
+`IGNIS_MIXED_GRAPH_BUILD=0`, `IGNIS_ROUND_TIMING=1`) two roots and one memset
+node in each verify graph, the graphs as they were, whose rounds are held to
+the reference too. That arm times as `mixed-round-timing` does, and under
+`IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` each of the two arms then rides `n`
+greedy rounds at each of the mixes 1+3, 2+2 and 1+5 on fresh lanes, each after
+a capture again that starts the timing's blocks afresh, so that each prints
+`verify mixed` lines of its own; every ride prints its lanes' tokens a round
+and a digest of their text. One run of one of the two arms is a leg of the
+build's comparison, the arms' runs alternated:
+
+```sh
+make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2-w15 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
+```
 
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the
 three is everything. The second test runs the 15-draft loads the loads filter

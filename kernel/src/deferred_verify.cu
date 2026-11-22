@@ -5,6 +5,7 @@
 #include "deferred_verify.h"
 
 #include "dflash2_drafter.h"
+#include "graph_nodes.h"
 #include "process_environment.h"
 
 #include <atomic>
@@ -202,7 +203,7 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream) {
 
 int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
                        const ignis::round_layout::Layout &layout, cudaGraphExec_t *out_exec, std::uint32_t *out_nodes,
-                       std::string *error) {
+                       std::string *error, std::uint32_t *out_roots, std::uint32_t *out_memsets) {
   *out_exec = nullptr;
   *out_nodes = 0;
   cudaError_t err = cudaStreamBeginCapture(model->stream, cudaStreamCaptureModeThreadLocal);
@@ -231,8 +232,13 @@ int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVeri
     (void)cudaGetLastError();
     nodes = 0;
   }
+  const std::uint32_t roots = out_roots != nullptr ? ignis::graph_nodes::roots(graph) : 0;
+  const std::uint32_t memsets =
+      out_memsets != nullptr ? ignis::graph_nodes::of_type(graph, cudaGraphNodeTypeMemset) : 0;
+  const unsigned long long flags =
+      ignis_mixed_priorities(*model, layout) ? static_cast<unsigned long long>(cudaGraphInstantiateFlagUseNodePriority) : 0ULL;
   cudaGraphExec_t exec = nullptr;
-  err = cudaGraphInstantiate(&exec, graph, 0);
+  err = cudaGraphInstantiate(&exec, graph, flags);
   cudaGraphDestroy(graph);
   if (err != cudaSuccess) {
     *error = std::string("cudaGraphInstantiate failed: ") + cudaGetErrorString(err);
@@ -241,6 +247,12 @@ int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVeri
   }
   *out_exec = exec;
   *out_nodes = static_cast<std::uint32_t>(nodes);
+  if (out_roots != nullptr) {
+    *out_roots = roots;
+  }
+  if (out_memsets != nullptr) {
+    *out_memsets = memsets;
+  }
   return 0;
 }
 

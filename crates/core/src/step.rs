@@ -193,6 +193,12 @@ pub(crate) mod ffi {
         pub mixed_graph_failed_mask: u32,
         pub mixed_graph_bytes: [u64; IGNIS_ROUND_MIXES],
         pub mixed_fallback_rounds: [u64; IGNIS_MIXED_FALLBACK_REASONS],
+        /// GitHub #718: each mix's verify and drafter append graph's root
+        /// nodes and memset nodes.
+        pub mixed_verify_graph_roots: [u32; IGNIS_ROUND_MIXES],
+        pub mixed_verify_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
+        pub mixed_append_graph_roots: [u32; IGNIS_ROUND_MIXES],
+        pub mixed_append_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
     }
 
     unsafe extern "C" {
@@ -583,6 +589,16 @@ pub struct ProgramStats {
     /// them, that ran at the uniform round shape `aggregate` would choose,
     /// by [`MixedFallback`].
     pub mixed_fallback_rounds: [u64; ffi::IGNIS_MIXED_FALLBACK_REASONS],
+    /// GitHub #718 (spec #711): entry `m` the root nodes and the memset nodes
+    /// of mix `m`'s verify graph and of its drafter append graph, as the
+    /// latest [`capture_decode_graphs`] made them: one root and no memset
+    /// node each under the mixed graph's build (`IGNIS_MIXED_GRAPH_BUILD`
+    /// unset or `1`) on a load whose KV cache is hq-e8-2b; 0 for a mix with
+    /// no graph.
+    pub mixed_verify_graph_roots: [u32; ffi::IGNIS_ROUND_MIXES],
+    pub mixed_verify_graph_memset_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
+    pub mixed_append_graph_roots: [u32; ffi::IGNIS_ROUND_MIXES],
+    pub mixed_append_graph_memset_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
 }
 
 /// GitHub #714 (spec #711): why a round at a mix ran at the uniform choice,
@@ -2745,6 +2761,10 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         mixed_graph_failed_mask: stats.mixed_graph_failed_mask,
         mixed_graph_bytes: stats.mixed_graph_bytes,
         mixed_fallback_rounds: stats.mixed_fallback_rounds,
+        mixed_verify_graph_roots: stats.mixed_verify_graph_roots,
+        mixed_verify_graph_memset_nodes: stats.mixed_verify_graph_memset_nodes,
+        mixed_append_graph_roots: stats.mixed_append_graph_roots,
+        mixed_append_graph_memset_nodes: stats.mixed_append_graph_memset_nodes,
     })
 }
 

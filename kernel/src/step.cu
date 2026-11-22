@@ -4111,6 +4111,11 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
     out_stats->mixed_append_graph_nodes[i] = model->mixed_append_nodes[i];
     // GitHub #714: and their bytes.
     out_stats->mixed_graph_bytes[i] = model->mixed_graph_bytes[i];
+    // GitHub #718: and their roots and memset nodes.
+    out_stats->mixed_verify_graph_roots[i] = model->mixed_verify_roots[i];
+    out_stats->mixed_verify_graph_memset_nodes[i] = model->mixed_verify_memsets[i];
+    out_stats->mixed_append_graph_roots[i] = model->mixed_append_roots[i];
+    out_stats->mixed_append_graph_memset_nodes[i] = model->mixed_append_memsets[i];
   }
   // GitHub #714: what the latest capture asked and could not capture, and the rounds that ran at
   // the uniform choice for a mix with no graph.
