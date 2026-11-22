@@ -737,7 +737,9 @@ config_group! {
         /// default cost levers, about 3.5-5K tokens of context; the ratio
         /// grows with context, and the card's power limit puts 3 lanes above
         /// 4); the other mixes are derived from its measured base rounds of
-        /// the same columns; all pending a measurement of this build.
+        /// the same columns (those of 64 columns, where no base round was
+        /// measured, one step past 56); all pending a measurement of this
+        /// build.
         /// Unmeasured on other cards. The one-lane entry is not read: a lane
         /// alone runs at the shape it asks. A speed setting only.
         shape_period_ratios: PeriodRatios = ignis_core::PeriodTable::NVFP4, NO_RULE, QWEN38_ONLY,

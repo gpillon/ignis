@@ -325,7 +325,8 @@ fn mixed_graphs_captured(model: &Model, pool: &SeqPool, spec: Speculation, failu
 /// at the uniform shape `aggregate` gives them, both extended.
 fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], failures: &mut Vec<String>) {
     const ROUNDS: usize = 6;
-    let (granted, refused) = ([true, false], [false, false]);
+    // Lane 1 asks beside lane 0, so the granted round's rows are not the caller's order.
+    let (granted, refused) = ([false, true], [false, false]);
     let courses: [(&str, u32, [[bool; 2]; ROUNDS]); 2] = [
         ("a high expected gain", WINDOW, [refused, granted, granted, granted, granted, granted]),
         ("a low expected gain", BASE_WINDOW, [refused, granted, refused, refused, refused, refused]),
@@ -342,7 +343,7 @@ fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], fa
         let [a, b] = &mut lanes[..] else { unreachable!("two lanes") };
         for (at, want) in shapes.iter().enumerate() {
             let what = format!("part 6, `mixed`, {case} beside a lane that takes 2: round {at}");
-            let got = forced_lane_shapes(model, pool, &mut [&mut *a, &mut *b], &[agree, 2], prompt, 5 * at, failures, &what);
+            let got = forced_lane_shapes(model, pool, &mut [&mut *a, &mut *b], &[2, agree], prompt, 5 * at, failures, &what);
             println!("dflash2_round_shape_gpu {what}: {got:?}");
             if got != want {
                 failures.push(format!("{what}: ran {got:?} where the grant gives {want:?}"));
@@ -359,7 +360,7 @@ fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], fa
             let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
             let got: Vec<(bool, u32)> = runs.iter().map(|run| (run.extended, run.extent)).collect();
             println!("dflash2_round_shape_gpu {what}: {got:?}, graph launches {}", stats.graph_launches);
-            if got != [(true, WINDOW), (false, BASE_WINDOW)] || stats.graph_launches != 1 {
+            if got != [(false, BASE_WINDOW), (true, WINDOW)] || stats.graph_launches != 1 {
                 failures.push(format!(
                     "{what}: ran {got:?} with {} graph launches, not the 1+1 round from its graph",
                     stats.graph_launches

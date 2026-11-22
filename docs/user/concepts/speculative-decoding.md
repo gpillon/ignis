@@ -247,7 +247,8 @@ the RTX 5090's: the uniform entries measured with the extended round's cost
 levers on, at about 3.5-5K tokens of context, 1.128, 1.29, 1.363 and 1.344 at
 1 to 4 lanes; of the mixed entries 1+1, 1+3, 2+2 and 1+5 measured (1.155,
 1.138, 1.222, 1.093) and the other eight derived from its base rounds of the
-same columns, all pending a measurement of this build. The ratio grows with
+same columns (the three of 64 columns, where no base round was measured, one
+8-column step past 56), all pending a measurement of this build. The ratio grows with
 context, and at 3 and 4 lanes the card's power limit lowers the extended
 round's clock, so 3 lanes reads above 4. On other cards they are unmeasured,
 and the window is provisional. A request held to a
