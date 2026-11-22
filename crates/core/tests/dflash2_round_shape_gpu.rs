@@ -63,8 +63,9 @@
 //! 6. **The grant on forced accepts** (#715): the same two courses under
 //!    `mixed`. The lane's first round asking is granted beside the base one,
 //!    a 1+1 mixed round; the high gain stays 1+1, and a live round after it
-//!    replays the 1+1 graph; the low gain is refused from then on; no round
-//!    falls back. Captured again under
+//!    replays the 1+1 graph (#716: with the granted lane held to a grammar,
+//!    its run handed to the host, which keeps it whole); the low gain is
+//!    refused from then on; no round falls back. Captured again under
 //!    `IGNIS_MIXED_ROUNDS=0`, the load holds no mixed graph and a fresh
 //!    pair's granted round runs at the uniform shape `aggregate` gives it.
 //!
@@ -318,7 +319,10 @@ fn mixed_graphs_captured(model: &Model, pool: &SeqPool, spec: Speculation, failu
 /// has no estimate and is granted its extended round beside the base one, a
 /// mixed round of 1+1; with a high expected gain (every draft) every round
 /// after stays 1+1, and a live round after them is the 1+1 replayed from its
-/// graph (a teacher-forced round runs eagerly); with a low one (7, nothing
+/// graph (a teacher-forced round runs eagerly), #716: the granted lane held to
+/// a grammar, the host handed its run alone, by its caller's index, and
+/// keeping it whole, so the round is the one it would be without the host
+/// (a held lane is granted as any other); with a low one (7, nothing
 /// past them) the grant refuses it from then on. No round falls back to the uniform
 /// choice. Then the mixed graphs are captured again under
 /// `IGNIS_MIXED_ROUNDS=0` and none is left: the same lanes' next round runs
@@ -352,20 +356,29 @@ fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], fa
         }
         // A teacher-forced round runs eagerly: a live round of the same lanes, the
         // asking lane's estimate paying its grant and the other not asking, is the
-        // grant's 1+1 replayed from its graph.
+        // grant's 1+1 replayed from its graph. #716: the granted lane held to a
+        // grammar, whose run the host keeps whole.
         if shapes[ROUNDS - 1] == granted {
-            let what = format!("part 6, `mixed`, {case}: a live round");
+            let what = format!("part 6, `mixed`, {case}: a live round, lane 1 held to a grammar");
             let lanes = vec![VerifyLane::greedy(&[]); 2];
-            let runs = decode_program_verify_runs(model, pool, &mut [&mut *a, &mut *b], &lanes, WINDOW)
+            let mut handed = Vec::new();
+            let mut cut = |lane: usize, run: &[i32]| -> usize {
+                handed.push(lane);
+                run.len()
+            };
+            let runs = decode_program_verify_cut(model, pool, &mut [&mut *a, &mut *b], &lanes, WINDOW, &[false, true], &mut cut)
                 .unwrap_or_else(|e| panic!("{what}: {e}"));
             let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
             let got: Vec<(bool, u32)> = runs.iter().map(|run| (run.extended, run.extent)).collect();
-            println!("dflash2_round_shape_gpu {what}: {got:?}, graph launches {}", stats.graph_launches);
+            println!("dflash2_round_shape_gpu {what}: {got:?}, graph launches {}, the host handed lanes {handed:?}", stats.graph_launches);
             if got != [(false, BASE_WINDOW), (true, WINDOW)] || stats.graph_launches != 1 {
                 failures.push(format!(
                     "{what}: ran {got:?} with {} graph launches, not the 1+1 round from its graph",
                     stats.graph_launches
                 ));
+            }
+            if handed != [1] {
+                failures.push(format!("{what}: the host was handed lanes {handed:?}, not the held lane 1 alone"));
             }
         }
     }

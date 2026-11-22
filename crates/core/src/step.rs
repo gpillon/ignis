@@ -1902,9 +1902,50 @@ pub fn decode_program_verify_cut(
     host_cut_lanes: &[bool],
     cut: &mut dyn FnMut(usize, &[i32]) -> usize,
 ) -> Result<Vec<LaneVerifyRun>, String> {
+    verify_cut_round(model, pool, sequences, lanes, window, ForcedOptions::NONE, host_cut_lanes, cut, "decode_program_verify_cut")
+}
+
+/// GitHub #716 (spec #711, test-only): [`decode_program_verify_cut`] at the
+/// round shapes [`decode_program_verify_mixed`] forces, so that a mixed round
+/// carries lanes held to a grammar in either group: `cut(lane, run)` sees each
+/// marked lane's run at its own shape's window, `lane` the caller's index
+/// whatever the lane's row in the round, and each kept pending token keeps the
+/// scores of its own group's column, which [`repair_program`] draws again from.
+/// No serving path calls it.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_program_verify_mixed_cut(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    extended: &[bool],
+    host_cut_lanes: &[bool],
+    cut: &mut dyn FnMut(usize, &[i32]) -> usize,
+) -> Result<Vec<LaneVerifyRun>, String> {
+    let shapes = lane_shape_flags(extended, sequences.len(), "decode_program_verify_mixed_cut")?;
+    let forced = ForcedOptions { lane_shapes: shapes.as_ptr(), ..ForcedOptions::NONE };
+    verify_cut_round(model, pool, sequences, lanes, window, forced, host_cut_lanes, cut, "decode_program_verify_mixed_cut")
+}
+
+/// GitHub #590: a verify round, at the shapes `forced` names (GitHub #716),
+/// whose cut the host decides on every lane `host_cut_lanes` marks; a panic in
+/// `cut` resumes once the leaf has returned. `what` names the caller.
+#[allow(clippy::too_many_arguments)]
+fn verify_cut_round(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    forced: ForcedOptions,
+    host_cut_lanes: &[bool],
+    cut: &mut dyn FnMut(usize, &[i32]) -> usize,
+    what: &str,
+) -> Result<Vec<LaneVerifyRun>, String> {
     if host_cut_lanes.len() != sequences.len() {
         return Err(format!(
-            "decode_program_verify_cut: {} host-cut flags for {} sequences",
+            "{what}: {} host-cut flags for {} sequences",
             host_cut_lanes.len(),
             sequences.len()
         ));
@@ -1919,7 +1960,7 @@ pub fn decode_program_verify_cut(
         window,
         std::ptr::null(),
         std::ptr::null_mut(),
-        ForcedOptions::NONE,
+        forced,
         Some((&flags, &mut context)),
     );
     if let Some(payload) = context.panic.take() {

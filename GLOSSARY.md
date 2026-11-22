@@ -1191,7 +1191,9 @@ Each group's GDN
 records lie in its shape's records over the backing both share, base lane `s`
 at row `2w + s`, and its fold runs behind `2w` leading rows that commit
 nothing; only at 15 drafts are a group's record rows its columns, so a load
-at another window holds no mix. The **shape policy** `mixed` grants one
+at another window holds no mix. A lane held to a grammar rides one as any
+lane does (#716): the host cut reads its run, and the repair after it the
+scores it kept, at its own group's columns. The **shape policy** `mixed` grants one
 (#715); a test forces a round's mix (`forced_lane_shapes`), from the mix's
 graphs where a capture made them and eagerly where no capture asked for them.
 A load that asks (`mixed`, or `IGNIS_MIXED_ROUNDS=1`) captures every mix its lanes and its pool's GDN slots
@@ -1242,9 +1244,9 @@ a **mixed round**. The **cost table** (`spec.shape_period_ratios`) holds each
 round's period over the base round's by lane count (1..7) and extended lanes;
 `aggregate` reads its uniform entries. `mixed` runs on the NVFP4 body at 15
 drafts alone (any other load runs `aggregate`) and asks for the mixed graphs
-there (`IGNIS_MIXED_ROUNDS` unset); a round with a lane held to a grammar, or
-whose mix the load holds no graph of, runs the uniform shape `aggregate` gives
-it. Every profile defaults to `aggregate`.
+there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
+other (#716), and a round whose mix the load holds no graph of runs the uniform
+shape `aggregate` gives it. Every profile defaults to `aggregate`.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify

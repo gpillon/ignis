@@ -344,6 +344,8 @@ std::uint64_t stamp_kept_column(ignis_model *model, std::int32_t column) {
 // verify round is the latest of either shape's (`ignis_latest_verify_shape`);
 // a record's column is the buffer's own, at the stride of the round that
 // wrote it. A verify round's record carries its round's stamp, never 0.
+// GitHub #716: a mixed round writes the same buffer at each group's stride
+// and stamps the base shape, so a record is current across mixed rounds too.
 bool kept_scores_current(const ignis_model *model, const ignis_kept_scores &kept) {
   if (kept.source == IgnisKeptSource::kVerifyLogits) {
     const IgnisVerifyRound *latest = ignis_latest_verify_shape(*model);
@@ -2217,13 +2219,10 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
               " lanes at its round shape's " + std::to_string(k) + " drafts");
     return -1;
   }
+  // GitHub #716: a lane held to a grammar rides it as any lane does, its run cut at its group's columns.
   if (mixed) {
     if (const char *refusal = ignis_mixed_round_refusal(*model, pool->gdn_pool.slot_count(), layout)) {
       set_error(std::string("ignis_program_decode: a mixed round of this load: ") + refusal);
-      return -1;
-    }
-    if (options.host_cut != nullptr) {
-      set_error("ignis_program_decode: a mixed round takes no host cut");
       return -1;
     }
   }
@@ -2988,7 +2987,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       // reads -- but (#590) a lane whose cut the host decided keeps its pending
       // token's: the verify logits' column the cut ended at, `committed - 1`,
       // whose draw it is (none for a redirected `</think>`). Its penalty count
-      // is the accept kernel's, kept by the rollback above.
+      // is the accept kernel's, kept by the rollback above. GitHub #716: in a
+      // mixed round its own group's column, under the round's stamp, the base
+      // shape's, whose buffers the round ran on (`kept_scores_current`).
       sequences[i]->kept = ignis_kept_scores{};
       if (host_cut_lanes != nullptr && host_cut_lanes[i] != 0 && !redirected[i]) {
         ignis_kept_scores &kept = sequences[i]->kept;
@@ -3119,6 +3120,38 @@ int32_t run_mixed_fallback(ignis_model *model, ignis_seq_pool *pool, ignis_seq *
   return rc;
 }
 
+// GitHub #716 (spec #711): the host cut of a mixed round, whose lanes run in the round's rows while the
+// host knows them by the caller's index: its lanes' flags in row order, and the host's callback handed
+// the caller's lane for each row, so that the host checks each run against its own lane's grammar.
+struct RowHostCut {
+  std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> lanes{};
+  const std::uint32_t *rows = nullptr;
+  int32_t (*cut)(void *context, uint64_t lane, const int32_t *run, int32_t run_count) = nullptr;
+  void *context = nullptr;
+
+  // `row_options`' host cut, row r the caller's lane `row_lanes[r]`: `options`' own, or none where it has none.
+  void hand(const ignis_decode_options &options, const std::uint32_t *row_lanes, uint64_t batch_size,
+            ignis_decode_options &row_options) {
+    if (options.host_cut == nullptr) {
+      return;
+    }
+    rows = row_lanes;
+    cut = options.host_cut;
+    context = options.host_cut_context;
+    for (uint64_t r = 0; r < batch_size; ++r) {
+      lanes[r] = options.host_cut_lanes[rows[r]];
+    }
+    row_options.host_cut_lanes = lanes.data();
+    row_options.host_cut = &RowHostCut::in_row;
+    row_options.host_cut_context = this;
+  }
+
+  static int32_t in_row(void *self, uint64_t row, const int32_t *run, int32_t run_count) {
+    const auto *host = static_cast<const RowHostCut *>(self);
+    return host->cut(host->context, host->rows[row], run, run_count);
+  }
+};
+
 int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *const *sequences, uint64_t batch_size,
                         const ignis_sampling_params *sampling, const ignis_decode_options &options,
                         int32_t *out_token_ids, const std::uint8_t *extended,
@@ -3175,7 +3208,8 @@ int32_t run_forced_mix(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
 // input is read and every output written back at the caller's index, and nothing moves on the
 // device (a lane's KV pages, GDN slot and drafter window follow its pool slot). It runs from its
 // mix's graph where the latest capture made one and eagerly otherwise, on the branch its base group
-// runs on, made here before its first round where no capture made it.
+// runs on, made here before its first round where no capture made it. GitHub #716: a lane the host
+// cuts rides it in its row (`RowHostCut`).
 int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *const *sequences, uint64_t batch_size,
                         const ignis_sampling_params *sampling, const ignis_decode_options &options,
                         int32_t *out_token_ids, const std::uint8_t *extended,
@@ -3230,6 +3264,9 @@ int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *con
   row_options.forced_tokens = forced_tokens.empty() ? nullptr : forced_tokens.data();
   row_options.forced_drafts = forced_drafts.empty() ? nullptr : forced_drafts.data();
   row_options.forced_lane_shapes = nullptr;
+  // GitHub #716: a lane held to a grammar, cut in its row and known to the host by the caller's index.
+  RowHostCut row_cut;
+  row_cut.hand(options, rows.data(), batch_size, row_options);
   const int32_t rc = run_verify_round(model, pool, base, layout, row_sequences.data(), batch_size,
                                       row_sampling.data(), row_options, row_tokens.data());
   if (rc != 0) {
@@ -3255,23 +3292,14 @@ int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *con
   return 0;
 }
 
-// GitHub #715 (spec #711): whether the round of `batch_size` lanes takes each lane's shape from the
-// shape policy `mixed`'s grant (`run_granted_round`): on a load that runs `mixed` (kernel/src/model.cu
-// resolves it to `aggregate` on a load that holds no mixed round) whose latest capture asked for the
-// mixed graphs (a capture under IGNIS_MIXED_ROUNDS=0 turns them off), IGNIS_ROUND_SHAPE unset
-// (`named`). The one place a lane held to a grammar keeps its round uniform: a round with a lane the
-// host cuts runs the uniform choice `aggregate` makes, as no mixed round takes a host cut yet.
-bool round_is_granted(const ignis_model &model, const ignis_decode_options &options, uint64_t batch_size,
-                      ignis::round_shape::Named named) {
-  if (model.extended_shape == nullptr || named != ignis::round_shape::Named::kRule ||
-      model.shape_policy.policy != ignis::round_shape::Policy::kMixed || !model.mixed_capture_asked) {
-    return false;
-  }
-  if (options.host_cut_lanes != nullptr &&
-      std::any_of(options.host_cut_lanes, options.host_cut_lanes + batch_size, [](std::uint8_t at) { return at != 0; })) {
-    return false;
-  }
-  return true;
+// GitHub #715 (spec #711): whether a round takes each lane's shape from the shape policy `mixed`'s
+// grant (`run_granted_round`): on a load that runs `mixed` (kernel/src/model.cu resolves it to
+// `aggregate` on a load that holds no mixed round) whose latest capture asked for the mixed graphs (a
+// capture under IGNIS_MIXED_ROUNDS=0 turns them off), IGNIS_ROUND_SHAPE unset (`named`). GitHub #716:
+// a round with a lane the host cuts, held to a grammar, is granted as any other.
+bool round_is_granted(const ignis_model &model, ignis::round_shape::Named named) {
+  return model.extended_shape != nullptr && named == ignis::round_shape::Named::kRule &&
+         model.shape_policy.policy == ignis::round_shape::Policy::kMixed && model.mixed_capture_asked;
 }
 
 // GitHub #715: a verify round of `sequences` at the shapes the grant gives its lanes from their asks,
@@ -3507,7 +3535,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           return -1;
         }
         // GitHub #715 (spec #711): under `mixed`, each lane's shape from the grant.
-        if (round_is_granted(*model, *options, batch_size, named)) {
+        if (round_is_granted(*model, named)) {
           const auto began = std::chrono::steady_clock::now();
           const int32_t rc = run_granted_round(model, pool, sequences, batch_size, sampling, *options, out_token_ids);
           if (rc != 0) {
