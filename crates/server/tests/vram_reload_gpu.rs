@@ -33,6 +33,14 @@
 //! more of what the process holds left un-added than the 7-draft reload left,
 //! within [`UNDER_SLACK_BYTES`], so the two-shape reload loses only what the
 //! 7-draft one does.
+//!
+//! GitHub #714 (spec #711): then the same two-shape load with its mixed
+//! rounds' graphs asked ([`MIXED_ROUNDS`]`=1`: the twelve mixes at the default
+//! 8 lanes), and its reload, held as the two-shape ones are; and, on Windows,
+//! while each two-shape load is in, what the process holds past its plan: the
+//! mixed load no more past its plan than the two-shape load without them,
+//! within [`UNDER_SLACK_BYTES`], so the graphs are a line of the plan and do
+//! not come out of the headroom.
 
 #![cfg(feature = "cuda")]
 
@@ -46,6 +54,10 @@ const MODEL_27B: &str = "qwen3.8-27b";
 
 /// The two-shape load's draft window (GitHub #687).
 const TWO_SHAPE_DRAFT_TOKENS: u32 = 15;
+
+/// The switch that asks for the mixed rounds' graphs, read at the plan, the
+/// load and its capture (GitHub #714).
+const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
 
 /// The one-shape load's draft window, named since the `rtx5090` profile's
 /// default became 15 (GitHub #696): the load the reload was first held at.
@@ -87,8 +99,16 @@ const UNDER_SLACK_BYTES: u64 = 4 << 20;
 /// One load of `artifact` at `draft_tokens` ([`options`]), torn down before
 /// it returns: its KV pool's pages and the free memory NVML reads once it is
 /// in; `None` when the GPU profile says to skip. Its plan's `cuda_context`
-/// line is printed.
+/// line is printed, and (GitHub #714) its `mixed_graphs` line and, on
+/// Windows, what the process holds past the plan while it is in.
 fn one_load(artifact: &Path, draft_tokens: u32) -> Option<(u32, u64)> {
+    one_load_held(artifact, draft_tokens).map(|(pages, free, _)| (pages, free))
+}
+
+/// [`one_load`], and on Windows what the process holds past the load's plan
+/// while it is in (GitHub #714): its WDDM dedicated usage less every line of
+/// the plan and its KV pool's pages, a signed figure.
+fn one_load_held(artifact: &Path, draft_tokens: u32) -> Option<(u32, u64, Option<i64>)> {
     let loaded = match ignis_server::load::prepare_model(&options(draft_tokens), artifact).and_then(ignis_server::load::load_model) {
         Ok(loaded) => loaded,
         Err(e) => {
@@ -103,9 +123,25 @@ fn one_load(artifact: &Path, draft_tokens: u32) -> Option<(u32, u64)> {
     );
     let pages = reservations.kv_pool_pages;
     let (free_after_load, _) = CudaDevice::nvml_memory(0).expect("NVML once the load is in");
+    let planned = reservations.lines.total() + u64::from(pages) * reservations.kv_page_bytes;
+    #[cfg(windows)]
+    let past_plan = {
+        let held = process_dedicated_bytes();
+        let past = held as i64 - planned as i64;
+        println!(
+            "27B load at {draft_tokens} drafts: mixed_graphs {} B; the process holds {held} B in, {past} B past the plan's {planned} B",
+            reservations.lines.mixed_graphs
+        );
+        Some(past)
+    };
+    #[cfg(not(windows))]
+    let past_plan = {
+        println!("27B load at {draft_tokens} drafts: mixed_graphs {} B, plan {planned} B", reservations.lines.mixed_graphs);
+        None
+    };
     loaded.model.shut_down();
     drop(loaded);
-    Some((pages, free_after_load))
+    Some((pages, free_after_load, past_plan))
 }
 
 /// This process's dedicated device memory, as WDDM counts it
@@ -187,7 +223,8 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
 
     // GitHub #687: a two-shape load, planned on what the 7-draft loads left,
     // then torn down, and its reload.
-    let (two_shape, _) = one_load(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("a two-shape load after the 7-draft ones");
+    let (two_shape, _, two_shape_past) =
+        one_load_held(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("a two-shape load after the 7-draft ones");
     let (two_shape_added_back, two_shape_held) = added_back_and_held(context, &reading.to_string(), "the two-shape load");
     let (two_shape_reload, _) = one_load(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("the two-shape load's reload");
     println!(
@@ -206,6 +243,44 @@ fn a_reload_plans_the_kv_pool_its_cold_start_planned() {
             two_shape_under <= seven_under + UNDER_SLACK_BYTES,
             "the two-shape reload leaves {two_shape_under} B the process holds un-added, the 7-draft reload {seven_under} B: \
              more than {UNDER_SLACK_BYTES} B more"
+        );
+    }
+
+    // GitHub #714: the two-shape load with its mixed graphs, then torn down,
+    // and its reload.
+    // SAFETY (test-only): this binary's one test reads and writes the
+    // environment on its own thread, where the leaf reads it too.
+    unsafe { std::env::set_var(MIXED_ROUNDS, "1") };
+    let (mixed, _, mixed_past) = one_load_held(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("a mixed load after the two-shape ones");
+    let (mixed_added_back, mixed_held) = added_back_and_held(context, &reading.to_string(), "the mixed load");
+    let (mixed_reload, _) = one_load(artifact, TWO_SHAPE_DRAFT_TOKENS).expect("the mixed load's reload");
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(MIXED_ROUNDS) };
+    println!("27B KV pool at {TWO_SHAPE_DRAFT_TOKENS} drafts with the mixed graphs: {mixed} pages, reload {mixed_reload} pages");
+    assert!(
+        mixed.abs_diff(mixed_reload) <= mixed / 100,
+        "the mixed reload planned {mixed_reload} pages against the mixed load's {mixed}: more than 1% apart"
+    );
+    if let (Some(two_shape_held), Some(mixed_held)) = (two_shape_held, mixed_held) {
+        let two_shape_under = two_shape_held.saturating_sub(two_shape_added_back);
+        let mixed_under = mixed_held.saturating_sub(mixed_added_back);
+        println!(
+            "left un-added: {two_shape_under} B after the two-shape load, {mixed_under} B after the mixed load; \
+             the mixed load's teardown left {} B more than the two-shape load's",
+            mixed_held as i64 - two_shape_held as i64
+        );
+        #[cfg(windows)]
+        assert!(
+            mixed_under <= two_shape_under + UNDER_SLACK_BYTES,
+            "the mixed reload leaves {mixed_under} B the process holds un-added, the two-shape reload {two_shape_under} B: \
+             more than {UNDER_SLACK_BYTES} B more"
+        );
+    }
+    if let (Some(two_shape_past), Some(mixed_past)) = (two_shape_past, mixed_past) {
+        println!("past the plan while in: {two_shape_past} B at the two-shape load, {mixed_past} B at the mixed load");
+        assert!(
+            mixed_past <= two_shape_past + UNDER_SLACK_BYTES as i64,
+            "the mixed load holds {mixed_past} B past its plan, the two-shape load {two_shape_past} B: its graphs came out of the headroom"
         );
     }
 }

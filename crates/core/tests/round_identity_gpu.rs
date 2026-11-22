@@ -190,10 +190,23 @@
 //! reference's included. So the arms that capture the mixed graphs again, time
 //! them and run them synchronized hold the graph's rounds to the reference's
 //! eager ones, and every other arm holds its eager mixed rounds; each arm's
-//! capture reports the (1,1) graphs' nodes where it asks for them and none
-//! where it does not ([`mixed_graph_nodes`]), and the reference prints a digest
-//! of its tokens before those rounds, which a build that leaves the uniform
-//! rounds as they were keeps. With `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS` set,
+//! capture reports the graphs' nodes of every mix the load holds where it asks
+//! for them and none where it does not ([`mixed_graph_nodes`], #714: all twelve
+//! at 8 lanes, each mix's measured bytes within the plan's line), and the
+//! reference prints a digest of its tokens before those rounds, which a build
+//! that leaves the uniform rounds as they were keeps.
+//!
+//! #714: then every lane is released, the load's lanes are prefilled afresh
+//! and they ride [`MIX_RIDES`]: each of the twelve mixes once, lane 0 (the
+//! vision load's image lane, under its rope delta) at both shapes; three lanes
+//! from a mix to the uniform base round, the uniform extended round and
+//! another mix; a teacher-forced mix of five lanes; and a mix of five lanes, a
+//! snapshot and a restore of each of them right after it, and the same mix
+//! again. Every arm holds those rounds to the reference's too. The
+//! `mixed-capture-failure` arm is not held to the reference: the test seam
+//! fails one mix's capture, and that mix's forced round runs at the uniform
+//! shape `aggregate` gives its lanes, from that shape's graph, counted in the
+//! program's stats ([`capture_failure`]). With `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS` set,
 //! the round-timing arm of the mixed rounds first rides two lanes that many
 //! rounds at the uniform extended shape, as many at the mix and as many at the
 //! uniform base shape ([`time_mixed_rounds`]), so that the leaf's round timing
@@ -235,12 +248,12 @@ use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
 use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_permitted, decode_program_batch_sampled, decode_program_verify_cut,
     decode_program_verify_forced, decode_program_verify_forced_with, decode_program_verify_mixed, decode_program_verify_runs,
-    prefill_program_multimodal, prefill_program_sampled, program_stats, MultimodalPrefill, PermittedLane, Redirect,
-    SamplingParams, TeacherForcing, VerifyLane,
+    fail_mixed_capture, prefill_program_multimodal, prefill_program_sampled, program_stats, MixedFallback, MultimodalPrefill,
+    PermittedLane, Redirect, SamplingParams, TeacherForcing, VerifyLane,
 };
 use ignis_core::{
     DraftRule, DrafterSampling, ExceptionWeights, HqDecodeAttention, KvFormat, PrefillAttention, PrefillLinear,
-    RopeScaling, Speculation, SpeculativeBackend, Vision,
+    RopeScaling, ShapePolicy, Speculation, SpeculativeBackend, Vision,
 };
 
 /// One arm of the round: the measurement switches it sets (every other switch
@@ -323,6 +336,12 @@ const ARMS: &[Arm] = &[
     Arm { name: "mixed-rounds", switches: &[(MIXED_ROUNDS, "1")], graphs: true },
     Arm { name: "mixed-round-timing", switches: &[(MIXED_ROUNDS, "1"), ("IGNIS_ROUND_TIMING", "1")], graphs: true },
     Arm { name: "mixed-sync-verify", switches: &[(MIXED_ROUNDS, "1"), ("IGNIS_DEFER_VERIFY", "0")], graphs: true },
+
+    // #714's arms, below this line.
+    // Not held to the reference: on a load of [`MIXED_LOADS`], the capture of one mix fails at the
+    // test seam's ask, and its forced rounds run at the uniform round shape `aggregate` chooses,
+    // counted ([`capture_failure`]).
+    Arm { name: CAPTURE_FAILURE_ARM, switches: &[(MIXED_ROUNDS, "1")], graphs: true },
 ];
 
 /// #713: the switch that captures the mixed rounds' graphs, read at capture;
@@ -330,9 +349,49 @@ const ARMS: &[Arm] = &[
 /// each a kind of round and the shapes of its two riders, extended where
 /// `true`.
 const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
-const MIXED_LOADS: [&str; 1] = ["nvfp4-dflash2-w15"];
-const MIXED_RIDES: [(Round, [bool; 2]); 3] =
-    [(Round::Verify, [false, true]), (Round::Forced, [true, false]), (Round::Verify, [true, false])];
+const MIXED_LOADS: [&str; 2] = ["nvfp4-dflash2-w15", "nvfp4-vision-w15"];
+const MIXED_RIDES: [(Round, &[bool]); 3] =
+    [(Round::Verify, &[false, true]), (Round::Forced, &[true, false]), (Round::Verify, &[true, false])];
+
+/// #714: on the same loads, after [`MIXED_RIDES`], every lane is released and
+/// the load's lanes are prefilled afresh (so the context the session reserves
+/// is the build's before mixed rounds), and they ride every mix of the leaf's
+/// table once, each a live round of the lanes named, extended where `true`,
+/// lane 0 (the vision load's image lane) at both shapes and the rows mostly
+/// not the caller's; then three lanes from a mix to the uniform base round, the
+/// uniform extended round and another mix; then a teacher-forced mix of five
+/// lanes; then a mix of five lanes, a snapshot and a restore of each of them
+/// right after it ([`MIX_SNAPSHOT_AFTER`]), and the same mix again.
+const MIX_RIDES: &[(Round, &[usize], &[bool])] = &[
+    (Round::Verify, &[1, 0], &[false, true]),
+    (Round::Verify, &[0, 1, 2], &[false, false, true]),
+    (Round::Verify, &[0, 1, 2, 3], &[true, false, false, false]),
+    (Round::Verify, &[0, 1, 2, 3, 4], &[false, false, false, false, true]),
+    (Round::Verify, &[0, 1, 2, 3, 4, 5], &[false, false, true, false, false, false]),
+    (Round::Verify, &[0, 1, 2, 3, 4, 5, 6], &[true, false, false, false, false, false, false]),
+    (Round::Verify, &[0, 1, 2], &[true, false, true]),
+    (Round::Verify, &[0, 1, 2, 3], &[false, true, false, true]),
+    (Round::Verify, &[0, 1, 2, 3, 4], &[true, false, false, false, true]),
+    (Round::Verify, &[0, 1, 2, 3, 4, 5], &[false, false, false, true, true, false]),
+    (Round::Verify, &[0, 1, 2, 3], &[true, true, false, true]),
+    (Round::Verify, &[0, 1, 2, 3, 4], &[false, true, true, false, true]),
+    (Round::Verify, &[0, 1, 2], &[true, false, false]),
+    (Round::Verify, &[0, 1, 2], &[false, false, false]),
+    (Round::Verify, &[0, 1, 2], &[true, true, true]),
+    (Round::Verify, &[0, 1, 2], &[false, true, true]),
+    (Round::Forced, &[0, 1, 2, 3, 4], &[true, false, true, false, true]),
+    (Round::Verify, &[0, 1, 2, 3, 4], &[false, true, false, true, false]),
+    (Round::Verify, &[0, 1, 2, 3, 4], &[false, true, false, true, false]),
+];
+/// #714: the ride of [`MIX_RIDES`] whose lanes are snapshotted and restored right after it.
+const MIX_SNAPSHOT_AFTER: usize = 17;
+/// #714: the token the session writes in each lane's stream where its mixed
+/// rounds begin, which no round commits: what [`before_mixed_rides`] cuts at.
+const MIXED_MARK: i32 = -2;
+/// #714: the arm that fails one mix's capture, and that mix: two extended
+/// lanes beside one base lane.
+const CAPTURE_FAILURE_ARM: &str = "mixed-capture-failure";
+const FAILED_MIX: (u32, u32) = (2, 1);
 
 /// #687: the switch that names a two-shape load's round shape, read at each
 /// verify round; the base shape's drafts a lane, and the most lanes a round
@@ -696,19 +755,12 @@ impl Load {
         tokens.div_ceil(128) * 128
     }
 
-    /// #713: whether the load's sessions end with [`MIXED_RIDES`]: a load of
-    /// [`MIXED_LOADS`] under [`ROUND_SHAPE`]`=extended` (not the second test's
-    /// twins of it, at the base shape or at 7 drafts).
+    /// #713: whether the load's sessions end with [`MIXED_RIDES`] (#714: and
+    /// [`MIX_RIDES`]): a load of [`MIXED_LOADS`] under
+    /// [`ROUND_SHAPE`]`=extended` (not the second test's twins of it, at the
+    /// base shape or at 7 drafts).
     fn mixes(&self) -> bool {
         self.two_shapes() && self.round_shape == Some("extended") && MIXED_LOADS.contains(&self.name) && self.lanes > 2
-    }
-
-    /// #713: whether the load holds the mixed round of one extended lane
-    /// beside one base lane, whose graphs `IGNIS_MIXED_ROUNDS=1` captures:
-    /// the NVFP4 body with DFlash2 at 15 drafts, the one window at which a
-    /// mixed round's records are its columns.
-    fn holds_a_mix(&self) -> bool {
-        self.two_shapes() && self.window == 15 && self.artifact == NVFP4 && self.lanes >= 2
     }
 
     /// #689: whether the load's rounds take the shape the shape rule gives
@@ -947,22 +999,50 @@ fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
 }
 
 /// #713: the mixed graphs the arm's capture made: under
-/// `IGNIS_MIXED_ROUNDS=1`, on a load that holds it ([`Load::holds_a_mix`]),
-/// the (1,1) mix's verify graph and, where the arm's rounds defer, its
-/// drafter append graph, and no other mix's; none anywhere else.
+/// `IGNIS_MIXED_ROUNDS=1`, a verify graph and, where the arm's rounds defer,
+/// a drafter append graph for each mix the load holds (#714: every mix the
+/// plan's rule picks, `ignis_core::lane_lines::mixed_graphs`, on this pool of
+/// the load's lanes and no retained slot: all twelve at 8 lanes on the NVFP4
+/// body at 15 drafts), and no other mix's; none anywhere else. The captured
+/// mixes' graphs took no more than the plan's line, as the device's free
+/// memory reads them (an arm's capture after another's may take less, where
+/// the driver reuses what the earlier graphs left it).
 fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
     let (verify, append) = (stats.mixed_verify_graph_nodes, stats.mixed_append_graph_nodes);
-    let captures = arm.switches.contains(&(MIXED_ROUNDS, "1")) && load.holds_a_mix();
-    if captures {
-        println!(
-            "round_identity_gpu {label}: arm `{}`: the 1+1 mixed round's verify graph {} nodes, append graph {} nodes",
-            arm.name, verify[0], append[0]
-        );
+    let asked = arm.switches.contains(&(MIXED_ROUNDS, "1"));
+    let held = mixes_held(load);
+    assert_eq!(stats.mixed_graphs_asked, asked && arm.graphs && load.two_shapes(), "{label}: arm `{}`: the mixed graphs asked", arm.name);
+    let failed = if arm.name == CAPTURE_FAILURE_ARM { held.iter().position(|&mix| mix == FAILED_MIX) } else { None };
+    for (at, &mix) in ignis_core::lane_lines::MIXES.iter().enumerate() {
+        let captured = asked && held.contains(&mix) && failed != Some(at);
+        let what = format!("{label}: arm `{}`: the {}+{} mixed", arm.name, mix.0, mix.1);
+        assert_eq!(verify[at] > 0, captured, "{what} verify graph");
+        assert_eq!(append[at] > 0, captured && defers_verify(load, arm), "{what} append graph");
+        // A mix with no graph took none; a captured one took what the driver had to add, none where
+        // it reused what an earlier capture's graphs left it.
+        assert!(captured || stats.mixed_graph_bytes[at] == 0, "{what} graphs' bytes, with no graph");
     }
-    assert_eq!(verify[0] > 0, captures, "{label}: arm `{}`: the 1+1 mixed verify graph", arm.name);
-    assert_eq!(append[0] > 0, captures && defers_verify(load, arm), "{label}: arm `{}`: the 1+1 mixed append graph", arm.name);
-    assert!(verify[1..].iter().chain(&append[1..]).all(|&nodes| nodes == 0), "{label}: arm `{}`: another mix's graphs", arm.name);
+    let measured: u64 = stats.mixed_graph_bytes.iter().sum();
+    if asked && !held.is_empty() {
+        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), false, true, load.lanes, 0);
+        println!(
+            "round_identity_gpu {label}: arm `{}`: the mixed graphs of {} mixes, verify nodes {verify:?}, append nodes {append:?}, \
+             bytes {:?}: {measured} B measured, {} B planned",
+            arm.name,
+            held.len(),
+            stats.mixed_graph_bytes,
+            planned.bytes
+        );
+        assert!(measured <= planned.bytes, "{label}: arm `{}`: the mixed graphs took {measured} B, past the plan's {} B", arm.name, planned.bytes);
+    }
+}
+
+/// #714: the mixes whose graphs a capture asking for them makes on the load
+/// and the test's pool (its lanes, no retained slot): the plan's rule
+/// (`ignis_core::lane_lines::mixed_graphs`), on the NVFP4 body.
+fn mixes_held(load: &Load) -> Vec<(u32, u32)> {
+    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), load.artifact != NVFP4, true, load.lanes, 0).mixes
 }
 
 /// #712: a digest of a session's tokens, every lane's in order (FNV-1a over
@@ -1189,7 +1269,9 @@ fn ride(
 /// `round` says: each lane drafts its own shape's whole window and reports
 /// its shape, and the round replays the mix's graph where the arm captured it
 /// (`mixed`), a teacher-forced round of sampling lanes eagerly whatever it
-/// captured, as every such round runs.
+/// captured, as every such round runs. #714: every lane at one shape is that
+/// uniform round, which replays its graph wherever the arm captured graphs
+/// (`graphs`).
 #[allow(clippy::too_many_arguments)]
 fn ride_mixed(
     model: &Model,
@@ -1199,8 +1281,8 @@ fn ride_mixed(
     seqs: &mut [Option<Seq<'_>>],
     riding: &[usize],
     sampling: fn(usize) -> SamplingParams,
-    mixed: bool,
-    (round, extended): (Round, [bool; 2]),
+    (graphs, mixed): (bool, bool),
+    (round, extended): (Round, &[bool]),
     committed: &mut Committed,
     mirror: &mut [shape_policy::Lane],
     label: &str,
@@ -1212,7 +1294,7 @@ fn ride_mixed(
         Round::Verify => {
             let lanes: Vec<VerifyLane<'_>> =
                 riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
-            (decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &extended), false)
+            (decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, extended), false)
         }
         Round::Forced => {
             let lanes: Vec<VerifyLane<'_>> =
@@ -1222,15 +1304,16 @@ fn ride_mixed(
                 .map(|&lane| (0..=load.window as usize).map(|at| script.permitted[(lane + at) % script.permitted.len()]).collect())
                 .collect();
             let forced: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
-            let forcing = TeacherForcing { shape_window: None, drafts: None, lane_shapes: Some(&extended) };
+            let forcing = TeacherForcing { shape_window: None, drafts: None, lane_shapes: Some(extended) };
             let on_device = lanes.iter().any(|lane| lane.sampling.temperature > 0.0);
             (decode_program_verify_forced_with(model, pool, &mut refs, &lanes, load.window, &forced, forcing), on_device)
         }
         _ => unreachable!("a mixed round is a verify round, live or teacher-forced"),
     };
     let runs = runs.unwrap_or_else(|e| panic!("{what}: {e}"));
-    expect_replay(model, pool, mixed && !on_device, &what);
-    for ((&lane, run), &at_extended) in riding.iter().zip(runs).zip(&extended) {
+    let uniform = extended.iter().all(|&at| at == extended[0]);
+    expect_replay(model, pool, if uniform { graphs } else { mixed } && !on_device, &what);
+    for ((&lane, run), &at_extended) in riding.iter().zip(runs).zip(extended) {
         let drafts = if at_extended { load.window } else { BASE_WINDOW };
         assert_eq!((run.extent, run.extended), (drafts, at_extended), "{what}: lane {lane} drafts its own shape's whole window");
         mirror[lane].after(rule, run.extended, run.extent, run.tokens.len() as u32 - 1);
@@ -1239,26 +1322,17 @@ fn ride_mixed(
     }
 }
 
-/// #713: each lane's tokens before the session's [`MIXED_RIDES`], which its
-/// two riders' last runs are: the session of a build before mixed rounds.
-/// Each run ends at its -1; the first one follows the [`PLAIN_ROUNDS`] plain
-/// tokens after the last verify run before it, which stay.
-fn before_mixed_rides(load: &Load, sessions: &[Committed]) -> Vec<Committed> {
+/// #713: each lane's tokens before the session's [`MIXED_RIDES`] (#714: and
+/// [`MIX_RIDES`]): the session of a build before mixed rounds. #714: each
+/// lane's stream up to the [`MIXED_MARK`] the session wrote where they begin.
+fn before_mixed_rides(sessions: &[Committed]) -> Vec<Committed> {
     sessions
         .iter()
         .map(|session| {
-            let mut lanes = session.clone();
-            if load.mixes() {
-                for lane in mixed_riders(load) {
-                    for ride in 0..MIXED_RIDES.len() {
-                        lanes[lane].pop();
-                        let end = lanes[lane].iter().rposition(|&token| token == -1).map_or(0, |at| at + 1);
-                        let plain = if ride + 1 == MIXED_RIDES.len() { PLAIN_ROUNDS as usize } else { 0 };
-                        lanes[lane].truncate(end + plain);
-                    }
-                }
-            }
-            lanes
+            session
+                .iter()
+                .map(|lane| lane.iter().copied().take_while(|&token| token != MIXED_MARK).collect())
+                .collect()
         })
         .collect()
 }
@@ -1334,6 +1408,84 @@ fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script
     }
 }
 
+/// #714: on a load of [`MIXED_LOADS`], the test seam fails [`FAILED_MIX`]'s
+/// capture and the arm captures the mixed graphs: that mix has neither graph,
+/// its bit is the capture's failed mask and every other mix the load holds
+/// is captured ([`mixed_graph_nodes`]). Three lanes prefilled afresh ride two
+/// uniform verify rounds, then the failed mix, live: every lane runs at the
+/// uniform round shape the shape rule and `aggregate` give them (the mirror's,
+/// with `IGNIS_ROUND_SHAPE` read by no mix), from that shape's graph, never
+/// eagerly, and the program counts one round under
+/// [`MixedFallback::CaptureFailed`]; then another mix of the same lanes runs
+/// as that mix from its graph, and counts none. The arms compared: 1, or 0 on
+/// any other load.
+fn capture_failure(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, label: &str) -> usize {
+    if !load.mixes() {
+        println!("round_identity_gpu {label}: arm `{}`: no mixed round on this load", arm.name);
+        return 0;
+    }
+    apply(arm, load.round_shape);
+    fail_mixed_capture(model, FAILED_MIX.0, FAILED_MIX.1).unwrap_or_else(|e| panic!("{label}: the seam: {e}"));
+    capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: {}: capture: {e}", arm.name));
+    let stats = || program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    let failed = ignis_core::lane_lines::MIXES.iter().position(|&mix| mix == FAILED_MIX).expect("a mix");
+    assert_eq!(stats().mixed_graph_failed_mask, 1 << failed, "{label}: {}: the failed mix", arm.name);
+    mixed_graph_nodes(model, pool, load, arm, label);
+    let spec = load.speculation();
+    let rule = spec.shape_rule();
+    let riding = [0usize, 1, 2];
+    let mut seqs: Vec<Option<Seq<'_>>> = riding
+        .iter()
+        .map(|&lane| {
+            let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: alloc lane {lane}: {e}"));
+            prefill(model, pool, &mut seq, &script.prompts[lane], greedy(lane), load.vision && lane == 0, &format!("{label}: lane {lane}"));
+            Some(seq)
+        })
+        .collect();
+    let mut mirror = vec![shape_policy::Lane::default(); riding.len()];
+    let lanes: Vec<VerifyLane<'_>> = riding.iter().map(|_| VerifyLane::greedy(&[])).collect();
+    for round in 0..2 {
+        let mut refs = riders(&mut seqs, &riding);
+        let runs = decode_program_verify_runs(model, pool, &mut refs, &lanes, load.window).unwrap_or_else(|e| panic!("{label}: round {round}: {e}"));
+        for (lane, run) in riding.iter().zip(runs) {
+            mirror[*lane].after(rule, run.extended, run.extent, run.tokens.len() as u32 - 1);
+        }
+    }
+    let counted = || stats().mixed_fallback_rounds;
+    let before = counted();
+    let mirrors: Vec<&shape_policy::Lane> = mirror.iter().collect();
+    let want = shape_policy::extends(ShapePolicy::Aggregate, spec.shape_estimate(), &mirrors);
+    let mut refs = riders(&mut seqs, &riding);
+    let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &[true, false, true])
+        .unwrap_or_else(|e| panic!("{label}: the failed mix: {e}"));
+    expect_replay(model, pool, true, &format!("{label}: the failed mix's round"));
+    let drafts = if want { load.window } else { BASE_WINDOW };
+    for (lane, run) in riding.iter().zip(&runs) {
+        assert_eq!((run.extent, run.extended), (drafts, want), "{label}: lane {lane} at the failed mix runs aggregate's uniform shape");
+        mirror[*lane].after(rule, run.extended, run.extent, run.tokens.len() as u32 - 1);
+    }
+    let after = counted();
+    assert_eq!(after[MixedFallback::CaptureFailed as usize], before[MixedFallback::CaptureFailed as usize] + 1, "{label}: the fallback counted");
+    assert_eq!(after[MixedFallback::NotCaptured as usize], before[MixedFallback::NotCaptured as usize], "{label}: no other reason");
+    let mut refs = riders(&mut seqs, &riding);
+    let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &[true, false, false])
+        .unwrap_or_else(|e| panic!("{label}: a captured mix: {e}"));
+    expect_replay(model, pool, true, &format!("{label}: a captured mix's round"));
+    for ((lane, run), extended) in riding.iter().zip(&runs).zip([true, false, false]) {
+        assert_eq!(run.extended, extended, "{label}: lane {lane} at a captured mix keeps its own shape");
+    }
+    assert_eq!(counted(), after, "{label}: a captured mix counts no fallback");
+    println!(
+        "round_identity_gpu {label}: arm `{}`: the {}+{} mix failed to capture and its round ran at the uniform {} shape, counted; the 1+2 mix ran from its graph",
+        arm.name,
+        FAILED_MIX.0,
+        FAILED_MIX.1,
+        if want { "extended" } else { "base" }
+    );
+    apply(&REFERENCE, None);
+    1
+}
+
 /// The session (see the module's note) on `pool`, under the arm's graphs or
 /// eagerly. #713: `mixed`, whether the arm captured the mixed rounds' graphs.
 #[allow(clippy::too_many_arguments)]
@@ -1400,9 +1552,35 @@ fn session(
     }
     // #713: two of the lanes left, at forced mixes.
     if load.mixes() {
+        for lane in committed.iter_mut() {
+            lane.push(MIXED_MARK);
+        }
         let riding = mixed_riders(load);
         for ride in MIXED_RIDES {
-            ride_mixed(model, pool, load, script, &mut seqs, &riding, sampling, graphs && mixed, ride, &mut committed, &mut mirror, label);
+            ride_mixed(model, pool, load, script, &mut seqs, &riding, sampling, (graphs, graphs && mixed), ride, &mut committed, &mut mirror, label);
+        }
+        // #714: every mix, on lanes prefilled afresh.
+        for seq in seqs.iter_mut() {
+            *seq = None;
+        }
+        for (lane, seq) in seqs.iter_mut().enumerate() {
+            let mut fresh = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: alloc lane {lane} again: {e}"));
+            prefill(model, pool, &mut fresh, &script.prompts[lane], sampling(lane), load.vision && lane == 0, &format!("{label}: lane {lane} again"));
+            *seq = Some(fresh);
+            mirror[lane] = shape_policy::Lane::default();
+        }
+        for (at, &(round, riding, extended)) in MIX_RIDES.iter().enumerate() {
+            ride_mixed(model, pool, load, script, &mut seqs, riding, sampling, (graphs, graphs && mixed), (round, extended), &mut committed, &mut mirror, label);
+            if at == MIX_SNAPSHOT_AFTER {
+                // A snapshot right after a mixed round, its fold in flight where the arm defers, and back.
+                for &lane in riding {
+                    let seq = seqs[lane].as_mut().expect("a riding lane");
+                    let blob = seq.snapshot().unwrap_or_else(|e| panic!("{label}: snapshot lane {lane} after a mixed round: {e}"));
+                    seq.restore(&blob).unwrap_or_else(|e| panic!("{label}: restore lane {lane} after a mixed round: {e}"));
+                    let asks = mirror[lane].asks;
+                    mirror[lane].restored(asks);
+                }
+            }
         }
     }
     assert!(cuts > 0, "{label}: no verify run of two or more was cut, so no cut took a count back");
@@ -1566,7 +1744,7 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
         if load.mixes() {
             println!(
                 "round_identity_gpu {label}: the reference's tokens before its mixed rounds: digest {:016x}",
-                digest(&before_mixed_rides(load, &reference))
+                digest(&before_mixed_rides(&reference))
             );
         }
         let mut compared = 0;
@@ -1594,11 +1772,17 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
         for (arm, sessions) in eager {
             hold_arm(arm, sessions);
         }
+        // #714: held to its own expectation, not to the reference's tokens.
+        let mut failures = 0;
         for &arm in arms.iter().filter(|arm| arm.graphs) {
+            if arm.name == CAPTURE_FAILURE_ARM {
+                failures += capture_failure(model, pool, load, script, arm, label);
+                continue;
+            }
             let sessions = run(model, pool, load, script, arm, label);
             hold_arm(arm, sessions);
         }
-        compared
+        compared + failures
     })
 }
 

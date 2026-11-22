@@ -708,6 +708,7 @@ const LINE_LABEL: Record<VramLine, string> = {
   decode_graph: "Decode graph",
   verify_round: "Verify round",
   drafter_round: "Drafter round",
+  mixed_graphs: "Mixed round graphs",
   lane_state: "Lane state",
   retained_slots: "Retained slots",
   hq_residual_window: "hq residual window",

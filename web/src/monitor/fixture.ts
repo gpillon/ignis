@@ -89,6 +89,7 @@ ignis_vram_reserved_bytes{line="sampling"} 33554432
 ignis_vram_reserved_bytes{line="decode_graph"} 16777216
 ignis_vram_reserved_bytes{line="verify_round"} 268435456
 ignis_vram_reserved_bytes{line="drafter_round"} 134217728
+ignis_vram_reserved_bytes{line="mixed_graphs"} 0
 ignis_vram_reserved_bytes{line="lane_state"} 1073741824
 ignis_vram_reserved_bytes{line="retained_slots"} 1845491712
 ignis_vram_reserved_bytes{line="hq_residual_window"} 570427392

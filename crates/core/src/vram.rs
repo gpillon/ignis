@@ -175,6 +175,12 @@ pub struct VramLines {
     pub verify_round: u64,
     /// The drafter's round buffers (0 without the DFlash2 drafter).
     pub drafter_round: u64,
+    /// The mixed rounds' graphs (GitHub #714, spec #711): a verify graph and
+    /// a drafter append graph for each mix of extended and base lanes the
+    /// load captures when mixed rounds are asked, at one mix's measured
+    /// bytes. 0 but on a DFlash2 load of the 27B's NVFP4 body at 15 drafts
+    /// with mixed rounds asked.
+    pub mixed_graphs: u64,
     /// Every lane's mutable state in the sequence pool: GDN recurrent and
     /// conv state, penalty counts, the drafter's window.
     pub lane_state: u64,
@@ -198,7 +204,7 @@ pub struct VramLines {
 impl VramLines {
     /// How many lines a plan has. The arity of [`VramLines::entries`], named
     /// so a reader of the plan does not have to write the number out again.
-    pub const LINES: usize = 15;
+    pub const LINES: usize = 16;
 
     /// `(name, bytes)` in plan order; the names are the `*_bytes` fields of
     /// `ignis.runtime.vram_plan` without the suffix.
@@ -215,6 +221,7 @@ impl VramLines {
             ("decode_graph", self.decode_graph),
             ("verify_round", self.verify_round),
             ("drafter_round", self.drafter_round),
+            ("mixed_graphs", self.mixed_graphs),
             ("lane_state", self.lane_state),
             ("retained_slots", self.retained_slots),
             ("hq_residual_window", self.hq_residual_window),
@@ -674,6 +681,7 @@ mod tests {
             decode_graph: 200 * MIB,
             verify_round: 100 * MIB,
             drafter_round: 150 * MIB,
+            mixed_graphs: 0,
             lane_state: 1800 * MIB,
             retained_slots: 1800 * MIB,
             hq_residual_window: 272 * MIB,
@@ -1318,6 +1326,7 @@ mod tests {
                 "decode_graph",
                 "verify_round",
                 "drafter_round",
+                "mixed_graphs",
                 "lane_state",
                 "retained_slots",
                 "hq_residual_window",

@@ -299,7 +299,7 @@ impl CudaLeafConfig {
         plan: &MaterializationPlan,
         handles: &[ObjectHandle],
     ) -> Result<PlannedReservations, String> {
-        let model = model_load::plan_qwen38_27b_reservations(
+        let model = model_load::plan_qwen38_27b_reservations_with_pool_slots(
             reader,
             plan,
             handles,
@@ -312,6 +312,7 @@ impl CudaLeafConfig {
             self.prefill_attention,
             self.prefill_linear,
             self.slot_count,
+            self.retained_device_slots,
         )?;
         let pool = self.pool_plan(1)?;
         Ok(PlannedReservations {
@@ -371,6 +372,7 @@ fn reserved_bytes(
         decode_graph: model.decode_graph_bytes,
         verify_round: model.verify_round_bytes,
         drafter_round: model.drafter_round_bytes,
+        mixed_graphs: model.mixed_graphs_bytes,
         lane_state,
         retained_slots,
         hq_residual_window,
@@ -452,6 +454,25 @@ fn round_shapes_without_graphs(stats: &step::ProgramStats) -> Vec<(u32, &'static
                 .filter(|(_, widths)| !widths.is_empty())
                 .map(|(graph, widths)| (shape.window, graph, widths))
         })
+        .collect()
+}
+
+/// GitHub #714 (spec #711): the mixes whose graphs a capture that asked for
+/// them could not make, each as `w+n` (`w` extended lanes beside `n` base
+/// lanes), in the leaf's order. A round at such a mix runs at the uniform
+/// round shape `aggregate` would choose (the same tokens a round of that
+/// shape commits, without the mix's gain, never a refusal), which the load
+/// says in a structured event rather than leave to a silent fallback; the
+/// program's stats count those rounds.
+fn mixes_without_graphs(stats: &step::ProgramStats) -> Vec<String> {
+    if !stats.mixed_graphs_asked {
+        return Vec::new();
+    }
+    ignis_core::lane_lines::MIXES
+        .iter()
+        .enumerate()
+        .filter(|&(at, _)| stats.mixed_graph_failed_mask >> at & 1 != 0)
+        .map(|(_, (extended, base))| format!("{extended}+{base}"))
         .collect()
 }
 
@@ -720,7 +741,7 @@ impl StepLeaf for CudaLeaf {
         // GitHub #177: the vision reservation is taken inside this load, so it
         // is on the device before the pool below is built.
         // GitHub #336: the model's rounds as wide as the pool's slots.
-        let model = model_load::load_qwen38_27b_with_decode_lanes(
+        let model = model_load::load_qwen38_27b_with_pool_slots(
             &self.reader,
             &self.artifact,
             &self.handles,
@@ -733,6 +754,7 @@ impl StepLeaf for CudaLeaf {
             self.config.prefill_attention,
             self.config.prefill_linear,
             self.config.slot_count,
+            self.config.retained_device_slots,
         )
         .map_err(|e| leaf_error("model load", e))?;
         // The review of spec #503: the prefill routes this load runs, the
@@ -863,6 +885,17 @@ impl StepLeaf for CudaLeaf {
                 widths = ?widths,
                 error = %step::last_decode_graph_error(),
                 "verify graph capture: these widths of the round shape run this graph's part of their verify rounds eagerly"
+            );
+        }
+        // GitHub #714: and each mix of extended and base lanes it could not capture.
+        let mixes = mixes_without_graphs(&graphs);
+        if !mixes.is_empty() {
+            // hotpath-lint-allow: same model-load-time call as above.
+            tracing::warn!(
+                name: "ignis.runtime.mixed_graph_capture_incomplete",
+                mixes = ?mixes,
+                error = %step::last_decode_graph_error(),
+                "mixed graph capture: rounds at these mixes run at the uniform round shape aggregate chooses"
             );
         }
         if !capture_complete(capture.ready_count(), self.config.slot_count) {
@@ -1419,6 +1452,23 @@ mod tests {
             vec![(15, "verify", vec![2]), (15, "drafter_append", vec![1, 2])],
             "the extended shape's verify graph at width 2 and its every append"
         );
+    }
+
+    /// GitHub #714 (spec #711): a capture that asked for the mixed graphs and
+    /// could not make some is named mix by mix, as `w+n`, in the leaf's
+    /// order; one that made every mix it tried, or asked for none, names
+    /// nothing.
+    #[test]
+    fn the_capture_names_each_mix_it_could_not_capture() {
+        let stats = |asked, failed| step::ProgramStats {
+            mixed_graphs_asked: asked,
+            mixed_graph_failed_mask: failed,
+            ..step::ProgramStats::default()
+        };
+        assert!(mixes_without_graphs(&stats(false, 0)).is_empty(), "no mixed graph asked");
+        assert!(mixes_without_graphs(&stats(true, 0)).is_empty(), "every mix captured");
+        assert_eq!(mixes_without_graphs(&stats(true, 1 << 6)), ["2+1"], "the seventh mix, two extended lanes beside one");
+        assert_eq!(mixes_without_graphs(&stats(true, 1 | (1 << 11))), ["1+1", "3+2"]);
     }
 
     #[test]

@@ -3059,14 +3059,73 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
   return 0;
 }
 
+// GitHub #690: whether the round of `sequences` runs at the load's extended shape under the shape
+// rule and `policy`, from its lanes' asks and their recent rounds, as IGNIS_ROUND_SHAPE's `named`
+// allows (kernel/src/round_shape.h `runs_extended`). A load of one shape never does.
+bool round_runs_extended(const ignis_model &model, ignis_seq *const *sequences, uint64_t batch_size,
+                         ignis::round_shape::Named named, const ignis::round_shape::ShapePolicy &policy) {
+  if (model.extended_shape == nullptr) {
+    return false;
+  }
+  std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> asks{};
+  std::array<ignis::round_shape::LaneEstimate, IGNIS_DECODE_MAX_BATCH> estimates{};
+  for (uint64_t i = 0; i < batch_size; ++i) {
+    asks[i] = sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
+    if (sequences[i] != nullptr) {
+      estimates[i] = ignis::round_shape::estimate_of(sequences[i]->shape_rounds, sequences[i]->shape_rounds_recorded,
+                                                     policy.estimate_rounds);
+    }
+  }
+  return ignis::round_shape::runs_extended(named, asks.data(), batch_size, model.extended_shape->lanes, policy,
+                                           estimates.data());
+}
+
+// GitHub #714 (spec #711): why a round at `layout`'s mix runs at the uniform choice instead
+// (IGNIS_MIXED_FALLBACK_*), or -1 where it runs as the mix: where the latest capture asked for the
+// mixed graphs and the mix has no graph, its capture having failed or made none of it. A mix
+// without a graph never runs eagerly once its graphs were asked; where no capture asked for them,
+// a forced mix runs eagerly (the test seam's reference).
+int mixed_fallback_reason(const ignis_model &model, const ignis::round_layout::Layout &layout) {
+  const int mix = ignis::round_layout::mix_index(layout);
+  if (mix < 0 || !model.mixed_capture_asked || model.mixed_verify_exec[static_cast<std::size_t>(mix)] != nullptr) {
+    return -1;
+  }
+  return ((model.mixed_failed_mask >> mix) & 1u) != 0 ? IGNIS_MIXED_FALLBACK_CAPTURE_FAILED
+                                                       : IGNIS_MIXED_FALLBACK_NOT_CAPTURED;
+}
+
+// GitHub #714: a round of `sequences` whose mix has no graph, at the uniform round shape the shape
+// policy `aggregate` would choose for them under the shape rule (IGNIS_ROUND_SHAPE does not reach a
+// mix's round), counted under `reason` in the program's stats.
+int32_t run_mixed_fallback(ignis_model *model, ignis_seq_pool *pool, ignis_seq *const *sequences, uint64_t batch_size,
+                           const ignis_sampling_params *sampling, const ignis_decode_options &options,
+                           int32_t *out_token_ids, int reason) {
+  ignis::round_shape::ShapePolicy aggregate = model->shape_policy;
+  aggregate.policy = ignis::round_shape::Policy::kAggregate;
+  IgnisVerifyRound &shape =
+      round_runs_extended(*model, sequences, batch_size, ignis::round_shape::Named::kRule, aggregate)
+          ? *model->extended_shape
+          : *model->base_shape;
+  const int32_t rc =
+      run_verify_round(model, pool, shape,
+                       ignis::round_layout::uniform(static_cast<std::uint32_t>(batch_size), shape.window, shape.extended()),
+                       sequences, batch_size, sampling, options, out_token_ids);
+  if (rc == 0) {
+    ++model->mixed_fallback_rounds[static_cast<std::size_t>(reason)];
+  }
+  return rc;
+}
+
 // GitHub #713 (spec #711, test-only): a verify round at the shapes `options.forced_lane_shapes` names,
 // lane i at the extended shape where its entry is nonzero and at the base shape otherwise. Every lane
 // at one shape is that uniform round. Lanes of both are a mixed round, its extended lanes first in
 // the round's rows and its base lanes after them, each group in the caller's order: every per-lane
 // input is read and every output written back at the caller's index, and nothing moves on the
 // device (a lane's KV pages, GDN slot and drafter window follow its pool slot). It runs from its
-// mix's graph where the latest capture made one and eagerly otherwise, on the branch its base
-// group runs on, made here before its first round where no capture made it.
+// mix's graph where the latest capture made one and eagerly where no capture asked for the mixed
+// graphs, on the branch its base group runs on, made here before its first round where no capture
+// made it; GitHub #714: where the latest capture asked for them and made none of this mix, at the
+// uniform choice (`run_mixed_fallback`).
 int32_t run_forced_mix(ignis_model *model, ignis_seq_pool *pool, ignis_seq *const *sequences, uint64_t batch_size,
                        const ignis_sampling_params *sampling, const ignis_decode_options &options,
                        int32_t *out_token_ids) {
@@ -3110,6 +3169,9 @@ int32_t run_forced_mix(ignis_model *model, ignis_seq_pool *pool, ignis_seq *cons
   if (const char *refusal = ignis_mixed_round_refusal(*model, pool->gdn_pool.slot_count(), layout)) {
     set_error(std::string("ignis_program_decode: a mixed round of this load: ") + refusal);
     return -1;
+  }
+  if (const int reason = mixed_fallback_reason(*model, layout); reason >= 0) {
+    return run_mixed_fallback(model, pool, sequences, batch_size, sampling, options, out_token_ids, reason);
   }
   std::string branch_error;
   if (model->mixed_branch.stream == nullptr && !model->mixed_branch.create(&branch_error)) {
@@ -3361,18 +3423,8 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           set_error(std::string("ignis_program_decode: ") + e.what());
           return -1;
         }
-        std::array<std::uint8_t, IGNIS_DECODE_MAX_BATCH> asks{};
-        // GitHub #690: and what each lane's recent rounds say, which `aggregate` reads.
-        std::array<ignis::round_shape::LaneEstimate, IGNIS_DECODE_MAX_BATCH> estimates{};
-        for (uint64_t i = 0; i < batch_size; ++i) {
-          asks[i] = sequences[i] != nullptr && sequences[i]->asks_extended_shape ? 1 : 0;
-          if (sequences[i] != nullptr) {
-            estimates[i] = ignis::round_shape::estimate_of(sequences[i]->shape_rounds, sequences[i]->shape_rounds_recorded,
-                                                           model->shape_policy.estimate_rounds);
-          }
-        }
-        if (ignis::round_shape::runs_extended(named, asks.data(), batch_size, model->extended_shape->lanes,
-                                              model->shape_policy, estimates.data())) {
+        // GitHub #690: from each lane's ask and what its recent rounds say, which `aggregate` reads.
+        if (round_runs_extended(*model, sequences, batch_size, named, model->shape_policy)) {
           shape = model->extended_shape.get();
         }
       }
@@ -4055,6 +4107,15 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
   for (std::uint32_t i = 0; i < IGNIS_ROUND_MIXES; ++i) {
     out_stats->mixed_verify_graph_nodes[i] = model->mixed_verify_nodes[i];
     out_stats->mixed_append_graph_nodes[i] = model->mixed_append_nodes[i];
+    // GitHub #714: and their bytes.
+    out_stats->mixed_graph_bytes[i] = model->mixed_graph_bytes[i];
+  }
+  // GitHub #714: what the latest capture asked and could not capture, and the rounds that ran at
+  // the uniform choice for a mix with no graph.
+  out_stats->mixed_graphs_asked = model->mixed_capture_asked ? 1 : 0;
+  out_stats->mixed_graph_failed_mask = model->mixed_failed_mask;
+  for (std::uint32_t reason = 0; reason < IGNIS_MIXED_FALLBACK_REASONS; ++reason) {
+    out_stats->mixed_fallback_rounds[reason] = model->mixed_fallback_rounds[reason];
   }
   return 0;
 }

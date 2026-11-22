@@ -501,6 +501,19 @@ const char *ignis_step_last_error(void);
  * `kMixTable`). */
 #define IGNIS_ROUND_MIXES 12
 
+/* GitHub #714 (spec #711): why a round at a mix ran at the uniform choice
+ * instead, where the latest capture asked for the mixed graphs and the mix has
+ * none: `ignis_program_stats::mixed_fallback_rounds`' entries. */
+enum ignis_mixed_fallback {
+  /* The capture tried the mix's graphs and failed (its error is the capture's,
+   * `ignis_decode_graph_last_error`). */
+  IGNIS_MIXED_FALLBACK_CAPTURE_FAILED = 0,
+  /* The capture made no graph of the mix: the load's lanes or its pool's GDN
+   * slots do not hold it (kernel/src/mixed_graphs.h `planned`). */
+  IGNIS_MIXED_FALLBACK_NOT_CAPTURED = 1,
+};
+#define IGNIS_MIXED_FALLBACK_REASONS 2
+
 /* GitHub #686: one round shape's verify round, as `ignis_program_stats`
  * reports it: the shape's draft window (a round at it is `window + 1` columns
  * a lane); its verify graphs, their node counts and their copy nodes, and its
@@ -592,11 +605,28 @@ struct ignis_program_stats {
   struct ignis_round_shape_stats shapes[IGNIS_ROUND_SHAPES_MAX];
   /* GitHub #713 (spec #711): entry m the node count of the verify graph and
    * of the drafter append graph of mix m (IGNIS_ROUND_MIXES' order) as the
-   * latest capture made them under IGNIS_MIXED_ROUNDS=1; 0 for a mix with no
-   * graph, under the switch unset or `0`, and on every load but a DFlash2
+   * latest capture made them under IGNIS_MIXED_ROUNDS=1 (GitHub #714: every
+   * mix the load holds, kernel/src/mixed_graphs.h `planned`); 0 for a mix with
+   * no graph, under the switch unset or `0`, and on every load but a DFlash2
    * load of two round shapes. */
   uint32_t mixed_verify_graph_nodes[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_nodes[IGNIS_ROUND_MIXES];
+  /* GitHub #714 (spec #711): whether the latest capture asked for the mixed
+   * graphs (IGNIS_MIXED_ROUNDS=1); bit m set for a mix whose graphs it tried
+   * and could not capture (a mix is its verify graph and, where the rounds
+   * defer, its append graph: a failure of either leaves the mix neither);
+   * entry m the device memory mix m's graphs took, the free memory before its
+   * capture less after it (0 for a mix with no graph; a capture after another
+   * in one process may read less, where the driver reuses what the earlier
+   * graphs left it); and the rounds at a mix
+   * with no graph, after a capture that asked for them, that ran at the
+   * uniform round shape `aggregate` would choose, by reason (enum
+   * ignis_mixed_fallback). All 0 on every load but a DFlash2 load of two round
+   * shapes. */
+  uint32_t mixed_graphs_asked;
+  uint32_t mixed_graph_failed_mask;
+  uint64_t mixed_graph_bytes[IGNIS_ROUND_MIXES];
+  uint64_t mixed_fallback_rounds[IGNIS_MIXED_FALLBACK_REASONS];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
@@ -673,6 +703,18 @@ int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_p
  * separate from ignis_step_last_error -- each ABI surface owns its own).
  * Never NULL; empty if every width captured, or before the first call. */
 const char *ignis_decode_graph_last_error(void);
+
+/* GitHub #714 (spec #711) -- test-only, the seam a test fails one mix's
+ * capture by; no serving caller calls it. The next ignis_decode_graph_capture
+ * that asks for the mixed graphs fails the mix of `extended_lanes` extended
+ * lanes beside `base_lanes` base lanes where it would capture it, as a capture
+ * CUDA refused would (the mix has no graph, its bit is set in
+ * `ignis_program_stats::mixed_graph_failed_mask`, the capture's error names
+ * it), and then forgets the fault. 0 for a mix of IGNIS_ROUND_MIXES, a pair
+ * that is none of them clearing the fault; -1 (ignis_decode_graph_last_error
+ * says why) on a null model or a Flash-Next load. */
+int32_t ignis_decode_graph_fail_mixed_capture(struct ignis_model *model, uint32_t extended_lanes,
+                                              uint32_t base_lanes);
 
 /* Run the complete 64-layer program for every token in a prompt span.  The
  * span starts exactly at `start_position`; it advances the sequence's KV,
@@ -895,7 +937,12 @@ struct ignis_decode_options {
    * lanes first in the round's rows (the caller's order within each group)
    * and every output written back at the caller's index: from its mix's
    * graphs where IGNIS_MIXED_ROUNDS=1 captured them and the round is not
-   * forced on the device, eagerly otherwise. It rides a live or a
+   * forced on the device; GitHub #714: where the latest capture asked for the
+   * mixed graphs and made none of the mix (its capture failed), at the uniform
+   * round shape `aggregate` would choose for these lanes, counted by reason
+   * (`ignis_program_stats::mixed_fallback_rounds`), never eagerly; where no
+   * capture asked for them, eagerly, the reference a test holds the graphs
+   * to. It rides a live or a
    * teacher-forced round (its forced tokens and drafts read at each lane's
    * own shape); a load of one shape, a host cut, `forced_shape_window`, a
    * trellis body (#720), a window but 15 and a pool without the base fold's

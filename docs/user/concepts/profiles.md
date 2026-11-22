@@ -122,6 +122,11 @@ Why each:
   the run resolves. At eight lanes both shapes are 64 columns, so the plan is
   528 bytes over a 7-draft load's, within one KV page
   ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
+  From 0.11.0 a load that asks for mixed rounds (for now the measurement
+  switch `IGNIS_MIXED_ROUNDS=1`) holds the graphs of all twelve mixes at these
+  eight lanes, with or without a device retained slot: 62 MiB, at most 111 KV
+  pages (7,104 tokens) of the pool
+  ([the VRAM plan](vram-plan.md#what-the-plan-counts)).
   `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
   to measure a window past 7, so `rtxpro6000` keeps 7.
 - **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
@@ -239,7 +244,9 @@ Why each:
   at its test's 8 lanes and 262,144-token context, not at this profile's
   shape; whether it is faster on a 16 GB card is not measured, so the
   default stays 7. Off compute capability 12.0 the extended round attends on
-  the vendored chunked route.
+  the vendored chunked route. A mixed round's graphs cost nothing here: the
+  trellis artifact runs no mixed round yet, and two lanes with no device
+  retained slot hold no mix.
 - **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
   2,048 would cost about 0.4 GB of KV pool. The solo width is pinned to it for
   the same reason: on an RTX 40 card in a 16 GiB budget less 1 GiB, `auto`
@@ -390,7 +397,8 @@ Why each:
   at its test's 262,144-token context, not this profile's million;
   whether it is faster on a 24 GB card is not measured, so the default stays
   7, and off compute capability 12.0 the extended round attends on the
-  vendored chunked route.
+  vendored chunked route. The trellis artifact runs no mixed round yet, so
+  its load holds no mixed round's graphs.
 - **A million tokens of context.** Measured as the 16 GB numbers were: the
   16 GB entry on the RTX 5090 held to a 24 GiB budget, on the routes a card
   below compute capability 12.0 runs (the dense prefill with its 89 MB buffer,

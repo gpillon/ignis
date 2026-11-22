@@ -521,6 +521,8 @@ fn the_round_lines_follow_the_loads_lanes() {
         decode_graph,
         verify_round,
         drafter_round: 78_027_552,
+        // GitHub #714: a 7-draft load holds no mixed graph.
+        mixed_graphs: 0,
         lane_state: 1_575_043_072,
         retained_slots: 393_760_768,
         hq_residual_window: 356_516_480,
@@ -659,6 +661,17 @@ fn the_sampled_draft_keeps_its_draws_on_the_drafters_line() {
 /// loads' lines differ by one lane's token staging alone. Each delta is
 /// printed: the configuration reference quotes them. Asked of the leaf's
 /// plan only, so nothing here touches the device.
+///
+/// GitHub #714 (spec #711): and with mixed rounds asked
+/// ([`MIXED_ROUNDS`]`=1`), the leaf's `mixed_graphs` line is the CPU's
+/// (`ignis_core::lane_lines::mixed_graphs`) at each of those lanes and at 0,
+/// 1 and 2 device retained slots -- the twelve mixes' graphs at 15 drafts
+/// and eight lanes, (1,1)'s alone at two lanes beside one retained slot, none
+/// at two lanes without one, at one lane, or at 8 and 12 drafts -- and no
+/// other line moves; with the switch unset every load plans none. The line
+/// prints in bytes and in the KV pages it takes from a pool the budget sizes
+/// (at most, rounded up): the configuration reference and the profiles page
+/// quote them.
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
@@ -676,19 +689,63 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
     let topology = ignis_core::ModelConfig::qwen38_27b();
     let scope = model_load::model_scope(Some(seven), None, ExceptionWeights::Bf16);
     let (plan, handles) = bind_model_scope_27b_with(&reader, scope).unwrap_or_else(|e| panic!("bind: {e}"));
-    let planned = |speculation: Speculation, lanes: u32| {
+    let planned_with = |speculation: Speculation, lanes: u32, retained_device_slots: u32| {
         let config = CudaLeafConfig {
             max_context_tokens: 262_144,
             kv_format: KvFormat::HqE8_2b,
             slot_count: lanes,
             prefill_chunk_tokens: 1024,
             speculation: Some(speculation),
-            retained_device_slots: 2,
+            retained_device_slots,
             retained_host_slots: 16,
             ..CudaLeafConfig::default()
         };
         config.plan_reservations(&reader, &plan, &handles).unwrap_or_else(|e| panic!("plan at {lanes} lanes: {e}")).reserved
     };
+    let planned = |speculation: Speculation, lanes: u32| planned_with(speculation, lanes, 2);
+    // GitHub #714: the mixed graphs, asked by the switch the plan reads.
+    let page_bytes =
+        KvFormat::HqE8_2b.page_bytes(ignis_core::seq::kv_geometry(&topology, Some(SpeculativeBackend::Dflash2)));
+    let asking = |asked: bool| {
+        // SAFETY (test-only): the leaf reads the switch on this thread, during the plan.
+        unsafe {
+            if asked {
+                std::env::set_var(MIXED_ROUNDS, "1");
+            } else {
+                std::env::remove_var(MIXED_ROUNDS);
+            }
+        }
+    };
+    for window in [8, 12, 15] {
+        let wide = at_window(window);
+        for lanes in [1, 2, 4, 5, N_DECODE_LANES as u32] {
+            for retained in [0, 1, 2] {
+                let unasked = planned_with(wide, lanes, retained);
+                asking(true);
+                let asked = planned_with(wide, lanes, retained);
+                asking(false);
+                let mirror = ignis_core::lane_lines::mixed_graphs(Some(wide), false, true, lanes, retained);
+                let what = format!("{window} drafts at {lanes} lanes and {retained} device retained slots");
+                assert_eq!(unasked.mixed_graphs, 0, "{what}: no mixed graph unasked");
+                assert_eq!(asked.mixed_graphs, mirror.bytes, "{what}: the leaf's mixed graphs line is the CPU's {:?}", mirror.mixes);
+                assert_eq!(ReservedBytes { mixed_graphs: 0, ..asked }, unasked, "{what}: another line moved with the mixed graphs");
+                if !mirror.mixes.is_empty() {
+                    println!(
+                        "vram_plan_gpu: {what}: the mixed graphs of {} mixes {:?}: {} B, at most {} KV pages of {page_bytes} B",
+                        mirror.mixes.len(),
+                        mirror.mixes,
+                        asked.mixed_graphs,
+                        asked.mixed_graphs.div_ceil(page_bytes)
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), false, true, N_DECODE_LANES as u32, 0).mixes.len(),
+        12,
+        "the `rtx5090` profile's lanes hold every mix"
+    );
     for window in [8, 12, 15] {
         let wide = at_window(window);
         let mut decode_round = std::collections::BTreeMap::new();
@@ -727,6 +784,10 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
         );
     }
 }
+
+/// GitHub #714: the switch that asks for the mixed rounds' graphs, read at the
+/// plan (and at the load and its capture).
+const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
 
 /// A decode round's token staging a lane (`decode_graph_token_ids` and
 /// `decode_graph_slots`, `kernel/src/model.cu`), in 4-byte words: a load with
@@ -824,6 +885,12 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
         let planned = |speculation: Speculation| planned_at(speculation, profile.lanes);
         let base = planned(seven);
         assert!(base.trellis_workspace > 0, "{}: a trellis body plans its workspace", profile.label);
+        // GitHub #714: the trellis body runs no mixed round yet, so it plans no mixed graph when asked.
+        // SAFETY (test-only): as in the NVFP4 body's test.
+        unsafe { std::env::set_var(MIXED_ROUNDS, "1") };
+        let asked = planned(at_window(15));
+        unsafe { std::env::remove_var(MIXED_ROUNDS) };
+        assert_eq!(asked.mixed_graphs, 0, "{}: the trellis body's mixed graphs", profile.label);
         for (window, two_lane_decode_round) in [(8, 331_776), (12, 1_658_880), (15, 2_654_208)] {
             let wide = at_window(window);
             let at = planned(wide);

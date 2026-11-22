@@ -1015,6 +1015,19 @@ struct ignis_model {
   std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_verify_nodes{};
   std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_append_nodes{};
   ignis::flash_next::SideBranch mixed_branch;
+  // GitHub #714 (spec #711): the mixes whose graphs the load planned (kernel/src/mixed_graphs.h
+  // `planned`, bit m for kMixTable[m]), the plan's `mixed_graphs` line; whether the latest capture
+  // asked for the mixed graphs, the mixes it tried and could not capture (a mix is its verify graph
+  // and, where the rounds defer, its append graph: a failure of either leaves it neither), the
+  // device bytes each captured mix's graphs took (the free memory before its capture less after);
+  // the rounds of a mix with no graph that ran at the uniform choice instead, by reason
+  // (IGNIS_MIXED_FALLBACK_*); and the test seam's mix whose next capture fails, -1 for none.
+  std::uint32_t mixed_planned_mask = 0;
+  bool mixed_capture_asked = false;
+  std::uint32_t mixed_failed_mask = 0;
+  std::array<std::uint64_t, ignis::round_layout::kMixes> mixed_graph_bytes{};
+  std::array<std::uint64_t, IGNIS_MIXED_FALLBACK_REASONS> mixed_fallback_rounds{};
+  int mixed_capture_fault = -1;
   // The kept-scores stamp (`IgnisVerifyRound::kept_epoch`) of the latest mixed round, which ran on
   // the base shape's buffers at each group's stride, so that a read of them at one stride refuses.
   std::uint64_t mixed_kept_epoch = 0;
