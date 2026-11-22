@@ -214,6 +214,17 @@
 //! and how far its text at the mix follows its text at its own shape; nothing
 //! is compared there.
 //!
+//! #718: under the mixed graph's build (the switch `IGNIS_MIXED_GRAPH_BUILD`
+//! unset) every captured mix's graphs have one root and no memset node; the
+//! `mixed-graph-build-off` arm captures them without it (`0`), two roots and
+//! the vendored argmax's memset node in each verify graph
+//! ([`mixed_graph_nodes`]), and holds their rounds to the reference's. It times
+//! as `mixed-round-timing` does, and with
+//! `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS` set each of the two then also rides
+//! that many rounds at 1+3, 2+2 and 1+5 ([`TIMED_MIXES`]), each after a capture
+//! again, so that each mix prints `verify mixed` blocks of its own and a
+//! digest of its text: one leg of the build's timing against its comparison.
+//!
 //! # Narrow runs
 //!
 //! `IGNIS_ROUND_IDENTITY_LOADS` (a comma list of load names),
@@ -350,6 +361,12 @@ const ARMS: &[Arm] = &[
     // #717's arms, below this line.
 
     // #718's arms, below this line.
+    // The mixed graphs built without the mixed graph's build (two roots, the argmax zeroed by a
+    // memset node, no stream priority), captured again on the same load and timed as the
+    // `mixed-round-timing` arm's are (with the build), so that IGNIS_ROUND_IDENTITY_TIMING_ROUNDS
+    // times both builds' mixes ([`time_mixed_rounds`]); held to the reference's eager rounds, which
+    // take the build, and to the old graphs' form ([`mixed_graph_nodes`]).
+    Arm { name: MIXED_GRAPH_BUILD_OFF_ARM, switches: &[(MIXED_ROUNDS, "1"), (MIXED_GRAPH_BUILD, "0"), ("IGNIS_ROUND_TIMING", "1")], graphs: true },
 
     // #719's arms, below this line.
 
@@ -404,6 +421,15 @@ const MIXED_MARK: i32 = -2;
 /// lanes beside one base lane.
 const CAPTURE_FAILURE_ARM: &str = "mixed-capture-failure";
 const FAILED_MIX: (u32, u32) = (2, 1);
+
+/// #718: the switch that builds the mixed graphs without the mixed graph's
+/// build, read at capture, and its arm; and the mixes [`time_mixed_rounds`]
+/// times beside the two-lane one, each lane extended where `true`: 1+3, 2+2
+/// and 1+5.
+const MIXED_GRAPH_BUILD: &str = "IGNIS_MIXED_GRAPH_BUILD";
+const MIXED_GRAPH_BUILD_OFF_ARM: &str = "mixed-graph-build-off";
+const TIMED_MIXES: [&[bool]; 3] =
+    [&[true, false, false, false], &[true, true, false, false], &[true, false, false, false, false, false]];
 
 /// #687: the switch that names a two-shape load's round shape, read at each
 /// verify round; the base shape's drafts a lane, and the most lanes a round
@@ -1020,11 +1046,16 @@ fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
 /// beside the plan's line, held to nothing: the reading moves with anything
 /// else on the card, and an arm's capture after another's may read none,
 /// where the driver reuses what the earlier graphs left it (`vram_reload_gpu`
-/// holds the line on the process's own counter).
+/// holds the line on the process's own counter). #718: each captured mix's
+/// graphs have one root and no memset node under the mixed graph's build, and
+/// under [`MIXED_GRAPH_BUILD`]`=0` the verify graph has two roots (a branch
+/// forked at the capture's start) and one memset node (the vendored argmax's),
+/// the append graph one root and none, on these loads' hq-e8-2b KV cache.
 fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
     let (verify, append) = (stats.mixed_verify_graph_nodes, stats.mixed_append_graph_nodes);
     let asked = arm.switches.contains(&(MIXED_ROUNDS, "1"));
+    let built = !arm.switches.contains(&(MIXED_GRAPH_BUILD, "0"));
     let held = mixes_held(load);
     assert_eq!(stats.mixed_graphs_asked, asked && arm.graphs && load.two_shapes(), "{label}: arm `{}`: the mixed graphs asked", arm.name);
     let failed = if arm.name == CAPTURE_FAILURE_ARM { held.iter().position(|&mix| mix == FAILED_MIX) } else { None };
@@ -1033,6 +1064,12 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
         let what = format!("{label}: arm `{}`: the {}+{} mixed", arm.name, mix.0, mix.1);
         assert_eq!(verify[at] > 0, captured, "{what} verify graph");
         assert_eq!(append[at] > 0, captured && defers_verify(load, arm), "{what} append graph");
+        let verify_form = (stats.mixed_verify_graph_roots[at], stats.mixed_verify_graph_memset_nodes[at]);
+        let append_form = (stats.mixed_append_graph_roots[at], stats.mixed_append_graph_memset_nodes[at]);
+        let want = if !captured { (0, 0) } else if built { (1, 0) } else { (2, 1) };
+        assert_eq!(verify_form, want, "{what} verify graph's roots and memset nodes");
+        let want = if append[at] > 0 { (1, 0) } else { (0, 0) };
+        assert_eq!(append_form, want, "{what} append graph's roots and memset nodes");
         // A mix with no graph took none; a captured one took what the driver had to add, none where
         // it reused what an earlier capture's graphs left it.
         assert!(captured || stats.mixed_graph_bytes[at] == 0, "{what} graphs' bytes, with no graph");
@@ -1042,11 +1079,13 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
         let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), false, true, load.lanes, 0);
         println!(
             "round_identity_gpu {label}: arm `{}`: the mixed graphs of {} mixes, verify nodes {verify:?}, append nodes {append:?}, \
-             bytes {:?}: {measured} B measured, {} B planned",
+             bytes {:?}: {measured} B measured, {} B planned; verify roots {:?}, memset nodes {:?}",
             arm.name,
             held.len(),
             stats.mixed_graph_bytes,
-            planned.bytes
+            planned.bytes,
+            stats.mixed_verify_graph_roots,
+            stats.mixed_verify_graph_memset_nodes
         );
     }
 }
@@ -1366,27 +1405,36 @@ fn mixed_riders(load: &Load) -> Vec<usize> {
 /// the first pair's text of each lane at the mix first leaves its text at its
 /// own shape's uniform round (a greedy lane commits the target's text at
 /// either shape, but for a near tie the two rounds' widths rank apart).
-/// Nothing is compared.
+/// #718: then, after a capture again under the arm's switches, which starts
+/// the timing's blocks afresh, as many rounds at each mix of [`TIMED_MIXES`]
+/// on as many fresh lanes, so that each prints `verify mixed` blocks of its
+/// own; each ride prints a digest of its first lanes' text, so that two arms'
+/// rides say whether they commit one text. Nothing is compared.
 fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, label: &str) {
-    let lanes = [VerifyLane::greedy(&[]), VerifyLane::greedy(&[])];
-    let mut texts: Vec<[Vec<i32>; 2]> = Vec::new();
-    for extended in [[true, true], [true, false], [false, false]] {
+    let mut texts: Vec<Committed> = Vec::new();
+    let rides = [&[true, true][..], &[true, false], &[false, false]].into_iter().chain(TIMED_MIXES);
+    for (at, extended) in rides.enumerate() {
+        if at >= 3 {
+            capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
+        }
+        let width = extended.len();
+        let lanes = vec![VerifyLane::greedy(&[]); width];
         let mut ridden = 0;
-        let mut tokens = [0u64; 2];
-        let mut first: Option<[Vec<i32>; 2]> = None;
+        let mut tokens = vec![0u64; width];
+        let mut first: Option<Committed> = None;
         while ridden < rounds {
-            let mut pair: Vec<Seq<'_>> = (0..2)
+            let mut riders: Vec<Seq<'_>> = (0..width)
                 .map(|lane| {
                     let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: timing alloc: {e}"));
                     prefill(model, pool, &mut seq, &script.prompts[lane], greedy(lane), false, label);
                     seq
                 })
                 .collect();
-            let mut text: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
-            let mut used = script.prompts[0].len().max(script.prompts[1].len()) as u32;
+            let mut text: Committed = vec![Vec::new(); width];
+            let mut used = (0..width).map(|lane| script.prompts[lane].len()).max().unwrap_or(0) as u32;
             while ridden < rounds && used + 2 * (load.window + 1) <= load.context() {
-                let mut refs: Vec<&mut Seq<'_>> = pair.iter_mut().collect();
-                let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &extended)
+                let mut refs: Vec<&mut Seq<'_>> = riders.iter_mut().collect();
+                let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, extended)
                     .unwrap_or_else(|e| panic!("{label}: timing at {extended:?}: {e}"));
                 used += runs.iter().map(|run| run.tokens.len() as u32).max().unwrap_or(0);
                 for (lane, run) in runs.iter().enumerate() {
@@ -1397,14 +1445,17 @@ fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script
             }
             first.get_or_insert(text);
         }
-        let per_round = tokens.map(|lane| lane as f64 / f64::from(ridden.max(1)));
+        let per_round: Vec<String> = tokens.iter().map(|&lane| format!("{:.2}", lane as f64 / f64::from(ridden.max(1)))).collect();
+        let first = first.unwrap_or_default();
         println!(
-            "round_identity_gpu {label}: {ridden} timed rounds of two lanes at {extended:?}, {:.2} and {:.2} tokens a round",
-            per_round[0], per_round[1]
+            "round_identity_gpu {label}: {ridden} timed rounds of {width} lanes at {extended:?}, {} tokens a round, \
+             digest {:016x} of the first lanes' text",
+            per_round.join(" and "),
+            digest(std::slice::from_ref(&first))
         );
-        texts.push(first.unwrap_or_default());
+        texts.push(first);
     }
-    // Each lane's text at each pair of the three rounds.
+    // Each lane's text at each pair of the two-lane rounds.
     let names = ["uniform extended", "mixed", "uniform base"];
     for lane in 0..2 {
         for (a, b) in [(1, 0), (1, 2), (0, 2)] {

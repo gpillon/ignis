@@ -178,7 +178,7 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerify
   // (the invalid tail repeats the last valid position).
   ninfer::Tensor ids       = arena.alloc(ninfer::DType::I32, {1, columns, 1, 1});
   ninfer::Tensor positions = arena.alloc(ninfer::DType::I32, {1, columns, 1, 1});
-  ignis_each_group(*model, layout, [&](const Group &group, cudaStream_t on) {
+  const auto masked_block = [&](const Group &group, cudaStream_t on) {
     const auto block = static_cast<std::int32_t>(group.lane_columns());
     const auto lanes = static_cast<std::int32_t>(group.lanes);
     ninfer::Tensor group_ids       = from(ids, group.first_column, {block, lanes, 1, 1});
@@ -186,7 +186,17 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerify
     ninfer::ops::prepare_masked_block(lane_rows(*verify.anchors, group), lane_rows(*verify.base_positions, group),
                                       lane_rows(*verify.valid_columns, group), kDflash2MaskToken, group_ids,
                                       group_positions, on);
-  });
+  };
+  // GitHub #718: the round's first op; a mixed round's under the mixed graph's build one group after
+  // the other on the round's stream, so that its graph has one root where a branch forked at the
+  // capture's start would begin a second one.
+  if (!layout.uniform() && model->mixed_graph_build) {
+    for (const Group &group : layout.groups) {
+      masked_block(group, stream);
+    }
+  } else {
+    ignis_each_group(*model, layout, masked_block);
+  }
   ninfer::Tensor residual = arena.alloc(ninfer::DType::BF16, {hidden, columns, 1, 1});
   ninfer::ops::embedding(ids.view({columns}), model->token_embedding, residual, stream);
 
