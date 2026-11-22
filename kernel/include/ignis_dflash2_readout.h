@@ -137,6 +137,23 @@ int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis_seq_pool *
 int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32_t lanes, uint32_t window,
                                     uint16_t *out_logits);
 
+/* GitHub #717 (spec #711, test-only): the most recent verify round's target
+ * logits where it was a mixed round of `extended_lanes` lanes at the extended
+ * shape beside `base_lanes` at the base shape, BF16 `[columns][vocab]` in the
+ * round's rows: its extended lanes first, `window + 1` rows each, then its
+ * base lanes, IGNIS_BASE_SHAPE_DRAFT_TOKENS + 1 rows each, each group's lanes
+ * in the order the round took them (a mix the caller forced,
+ * `forced_lane_shapes`: the caller's order within each group), `columns`
+ * their sum. Row `j` of a lane is the target's distribution after its column
+ * `j`, as the round's accept read it. `window` is the load's draft window,
+ * which with the mix sizes `out_logits`. Refused unless the most recent
+ * verify round was mixed and of that mix; `ignis_verify_readout_logits`
+ * refuses after it, its lanes' rows not being at one shape's stride. Valid
+ * until the next verify round on this model. Synchronous. Returns 0, or -1
+ * with `ignis_dflash2_readout_last_error()` set. */
+int32_t ignis_verify_readout_mixed_logits(struct ignis_model *model, uint32_t window, uint32_t extended_lanes,
+                                          uint32_t base_lanes, uint16_t *out_logits);
+
 /* GitHub #692 (spec #684, test-only): the most recent plain round's logits,
  * BF16 `[lanes][vocab]` for its first `lanes` lanes -- lane `i`'s
  * distribution of its successor, as the round's draw read it (a lane held to

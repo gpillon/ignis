@@ -76,7 +76,8 @@ Flash-Next). The lines include:
   as the RTX 5090 measured them (62 MiB for the twelve at capture, a page more
   on the process's own counter): all twelve at 8 lanes, 64 MiB, at most 114
   KV pages. 0 on every other load. The driver keeps their pages once the load
-  is gone, so a reload adds them back as it adds back the CUDA context;
+  is gone, so a reload adds them back as it adds back the CUDA context
+  ([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md));
 - the **drafter**, when one is loaded: DFlash2's weights, its window in every
   lane and retained slot (40 MiB each) and its round, or the 27B's MTP head's
   weights (0.45 GB), one call over the widest round in the decode graph's line,

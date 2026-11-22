@@ -1034,6 +1034,9 @@ struct ignis_model {
   // The kept-scores stamp (`IgnisVerifyRound::kept_epoch`) of the latest mixed round, which ran on
   // the base shape's buffers at each group's stride, so that a read of them at one stride refuses.
   std::uint64_t mixed_kept_epoch = 0;
+  // GitHub #717: and its mix, its extended lanes and its base lanes, which a read of its rows names
+  // (`ignis_verify_readout_mixed_logits`).
+  std::array<std::uint32_t, 2> mixed_kept_mix{};
   // GitHub #718 (spec #711): the mixed graph's build, as the latest capture read it from
   // IGNIS_MIXED_GRAPH_BUILD (kernel/src/mixed_graphs.h `built`; on before a load's first capture):
   // a mixed round's first op runs one group after the other on the round's stream, so that its

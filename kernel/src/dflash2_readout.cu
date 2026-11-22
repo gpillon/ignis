@@ -242,6 +242,47 @@ extern "C" int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32
   return 0;
 }
 
+extern "C" int32_t ignis_verify_readout_mixed_logits(struct ignis_model *model, uint32_t window,
+                                                     uint32_t extended_lanes, uint32_t base_lanes,
+                                                     uint16_t *out_logits) {
+  if (model == nullptr || out_logits == nullptr) {
+    return fail("ignis_verify_readout_mixed_logits: null argument");
+  }
+  if (model->base_shape == nullptr || model->extended_shape == nullptr) {
+    return fail("ignis_verify_readout_mixed_logits: a mixed round runs on a DFlash2 load of two round shapes");
+  }
+  if (window != model->extended_shape->window) {
+    return fail("ignis_verify_readout_mixed_logits: window " + std::to_string(window) +
+                " is not the load's draft window " + std::to_string(model->extended_shape->window));
+  }
+  // GitHub #717: the rows of the latest verify round where it was a mixed round, on the base shape's
+  // handle, whose logits both shapes write: each group's lanes at its own stride, its columns where
+  // the round's layout put them (kernel/src/round_layout.h), the extended group's from column 0 and
+  // the base group's after them, so that the round's columns are one contiguous prefix.
+  const IgnisVerifyRound *const latest = ignis_latest_verify_shape(*model);
+  if (latest == nullptr || model->mixed_kept_epoch == 0 || latest->kept_epoch != model->mixed_kept_epoch) {
+    return fail("ignis_verify_readout_mixed_logits: the latest verify round was not mixed");
+  }
+  if (model->mixed_kept_mix[0] != extended_lanes || model->mixed_kept_mix[1] != base_lanes) {
+    return fail("ignis_verify_readout_mixed_logits: the latest mixed round was the mix " +
+                std::to_string(model->mixed_kept_mix[0]) + "+" + std::to_string(model->mixed_kept_mix[1]) + ", not " +
+                std::to_string(extended_lanes) + "+" + std::to_string(base_lanes));
+  }
+  const ignis::round_layout::Layout layout = ignis::round_layout::layout_of(
+      extended_lanes, model->extended_shape->window, base_lanes, model->base_shape->window);
+  const std::size_t bytes = static_cast<std::size_t>(model->vocab) * layout.columns() * sizeof(std::uint16_t);
+  cudaError_t err = cudaMemcpyAsync(out_logits, model->base_shape->logits->p, bytes, cudaMemcpyDeviceToHost,
+                                    model->stream);
+  if (err == cudaSuccess) {
+    err = cudaStreamSynchronize(model->stream);
+  }
+  if (err != cudaSuccess) {
+    return fail(std::string("ignis_verify_readout_mixed_logits: cudaMemcpyAsync failed: ") +
+                cudaGetErrorString(err));
+  }
+  return 0;
+}
+
 extern "C" int32_t ignis_decode_readout_logits(struct ignis_model *model, uint32_t lanes, uint16_t *out_logits) {
   if (model == nullptr || out_logits == nullptr) {
     return fail("ignis_decode_readout_logits: null argument");

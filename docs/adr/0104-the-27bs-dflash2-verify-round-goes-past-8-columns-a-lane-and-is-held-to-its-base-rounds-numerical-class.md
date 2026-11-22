@@ -1,6 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0056, ADR-0090, ADR-0095]
+amended-by: [ADR-0106]
 ---
 
 # The 27B's DFlash2 verify round goes past 8 columns a lane, and is held to its base round's numerical class

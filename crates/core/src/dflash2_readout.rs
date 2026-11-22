@@ -143,6 +143,13 @@ mod ffi {
             readout: *const IgnisDflash2Readout,
         ) -> i32;
         pub fn ignis_verify_readout_logits(model: *mut IgnisModel, lanes: u32, window: u32, out_logits: *mut u16) -> i32;
+        pub fn ignis_verify_readout_mixed_logits(
+            model: *mut IgnisModel,
+            window: u32,
+            extended_lanes: u32,
+            base_lanes: u32,
+            out_logits: *mut u16,
+        ) -> i32;
         pub fn ignis_decode_readout_logits(model: *mut IgnisModel, lanes: u32, out_logits: *mut u16) -> i32;
         pub fn ignis_dflash2_readout_last_error() -> *const c_char;
     }
@@ -266,6 +273,53 @@ pub fn verify_logits(model: &crate::model_load::Model, lanes: u32, window: u32) 
         return Err(last_error());
     }
     Ok(logits)
+}
+
+/// GitHub #717 (spec #711, test-only): the most recent verify round's target
+/// logits where it was a mixed round whose mix the caller forced, `extended[i]`
+/// lane `i`'s round shape as [`crate::step::TeacherForcing::lane_shapes`] or
+/// [`crate::step::decode_program_verify_mixed`] named it: each lane's rows in
+/// the caller's order, BF16 `[its shape's window + 1][vocab]`, row `j` the
+/// target's distribution after its column `j`, as the round's accept read it.
+/// The leaf gives the round's rows, its extended lanes first and its base
+/// lanes after them, each group in the caller's order, as a forced mix lays
+/// them out (`kernel/include/ignis_dflash2_readout.h`); it refuses unless the
+/// most recent verify round was mixed and of the mix `extended` makes.
+/// `window` is the load's draft window, the extended shape's. Valid until the
+/// model's next verify round.
+#[cfg(feature = "cuda")]
+pub fn mixed_verify_logits(model: &crate::model_load::Model, window: u32, extended: &[bool]) -> Result<Vec<Vec<u16>>, String> {
+    let vocab = crate::compute::ModelConfig::qwen38_27b().vocab as usize;
+    let rows_of = |lane_extended: bool| {
+        if lane_extended { window as usize + 1 } else { crate::speculation::BASE_SHAPE_DRAFT_TOKENS as usize + 1 }
+    };
+    let extended_lanes = extended.iter().filter(|&&lane| lane).count();
+    let base_lanes = extended.len() - extended_lanes;
+    let columns: usize = extended.iter().map(|&lane| rows_of(lane)).sum();
+    let mut logits = vec![0u16; columns * vocab];
+    let rc = unsafe {
+        ffi::ignis_verify_readout_mixed_logits(
+            model.handle(),
+            window,
+            extended_lanes as u32,
+            base_lanes as u32,
+            logits.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(last_error());
+    }
+    // The round's rows: the extended lanes in the caller's order, then the
+    // base lanes in it.
+    let order = (0..extended.len()).filter(|&i| extended[i]).chain((0..extended.len()).filter(|&i| !extended[i]));
+    let mut lanes: Vec<Vec<u16>> = vec![Vec::new(); extended.len()];
+    let mut row = 0;
+    for i in order {
+        let count = rows_of(extended[i]);
+        lanes[i] = logits[row * vocab..(row + count) * vocab].to_vec();
+        row += count;
+    }
+    Ok(lanes)
 }
 
 /// GitHub #692 (test-only): the most recent plain round's logits for its first
