@@ -34,78 +34,112 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
 - **The grant** (`spec.shape_policy: mixed`, #715). The shape rule is unchanged: it says what each lane asks. At one
   lane the lane's ask decides, as under `aggregate`. At 2 to 7 lanes the round starts from the uniform base round and
   the asking lanes are granted the extended shape one by one: the highest expected extra tokens first, at a tie the
-  lane refused longest; a lane that asks with no extended round among its recent rounds after those with an estimate,
-  granted when the columns allow, so that its estimate has a round to read. A lane is granted while the round with it
-  extended too stays within 64 columns, and when its expected extra tokens exceed (that round's period ratio over the
-  current round's, less one) times the tokens every lane of the round is expected to take, each lane's expectations
-  read over its own last `spec.shape_estimate_rounds` verify rounds as under `aggregate`. A lane under a grammar is
-  granted like any other. `all` and `aggregate` are unchanged and never run a mixed round. Granting every ask in the
-  caller's order, as the prototype did, bought nothing on a moderately predictable answer beside a conversation (+0.6%,
-  inside the spread, the conversation 5.0% slower): the grant has to refuse such a lane.
+  lane refused longest, then the caller's order; a lane that asks with no extended round among its recent rounds after
+  those with an estimate, granted when the columns allow, so that its estimate has a round to read. A lane is granted
+  while the round with it extended too stays within 64 columns, and when its expected extra tokens exceed (that round's
+  period ratio over the current round's, less one) times the tokens every lane of the round is expected to take, each
+  lane's expectations read over its own last `spec.shape_estimate_rounds` verify rounds as under `aggregate`; a step to
+  a round the cost table says costs less is granted. A refused lane does not end the grant, only the columns do, so a
+  round of 8 lanes is at the base shape. A lane under a grammar is granted like any other (#716). The grant is a pure
+  function in the core, held to tables, and the leaf runs its twin each round, held to the same rows. `all` and
+  `aggregate` are unchanged and never run a mixed round. Granting every ask in the caller's order, as the prototype
+  did, bought nothing on a moderately predictable answer beside a conversation (+0.6%, inside the spread, the
+  conversation 5.0% slower): the grant has to refuse such a lane.
 - **Its default.** `aggregate` on every profile. The `rtx5090` profile's becomes `mixed` only in the commit that
   records the served gate's pass (#722: a JSON answer beside three conversations at four lanes at least 10% faster
   together than the build of #684, no conversation lane more than 15% below it). The trellis bodies keep `aggregate`
-  until a run on a 16 GB or 24 GB card. `mixed` on a load without a mix (7 drafts or fewer, 8 to 14, the MTP head,
-  Flash-Next) is accepted and runs as `aggregate`.
+  until a run on a 16 GB or 24 GB card. A load given `mixed` that holds no mix, of DFlash2 at 8 to 14 drafts or of a
+  trellis body, runs `aggregate`, and its startup line names both; at 7 drafts or fewer `mixed` is taken and changes
+  nothing, the load holding one shape; the 27B's MTP head refuses it by name, as it refuses every shape policy (#690).
+  A load whose latest capture ran under `IGNIS_MIXED_ROUNDS=0` takes `aggregate`'s uniform choice too.
 - **The cost table.** `spec.shape_period_ratios` becomes a table by lane count (1 to 7) and extended lanes, each entry
   the period of the round with that many lanes extended over the base round at the same lane count; `aggregate` reads
   its uniform entries at 1 to 4 lanes, today's measured 1.128, 1.290, 1.363 and 1.344, and `mixed` reads every entry.
   Its defaults are each body's, measured on the RTX 5090 with the final build, the NVFP4 body's (#721) and the trellis
   body's (#720; indicatively a trellis body's extended round costs 1.35 to 1.40 times its base round at one lane,
-  against 1.13 on the NVFP4 body); until those land the mixed entries are the prototype's measured mixes. Every entry is
-  measured against measured rounds, never read off a line between lane counts: the base round's cost rises in steps
-  with its columns (5 lanes 24,668 us and 7 lanes 29,770, where a line between lane counts said 23.9 and 27.7 ms). The
-  four-value form stays accepted as the uniform entries.
+  against 1.13 on the NVFP4 body). Until #721 lands the one default is the NVFP4 body's: four of its mixed entries, 1+1,
+  1+3, 2+2 and 1+5, are those mixes' periods measured with their graph build (#718), and each of the other eight is the
+  measured base round of the mix's columns over the base round at its lane count, a mixed round with its graph build
+  having been measured to cost what a base round of its columns costs; the three mixes of 64 columns, where no base
+  round of 8 lanes was measured, are one 8-column step past 56. Every entry is measured against measured rounds, never
+  read off a line between lane counts: the base round's cost rises in steps with its columns (5 lanes 24,668 us and 7
+  lanes 29,770, where a line between lane counts said 23.9 and 27.7 ms). The four-value form stays accepted as the
+  uniform entries.
 - **The mixed graphs, a sixteenth line of the VRAM plan** (#714). A mixed round replays a verify graph and a drafter
   append graph of its mix, both or neither, captured at load for every mix the load holds where mixed rounds are asked;
   a mix with no graph runs its rounds at the uniform shape `aggregate` would choose, counted and logged, never eagerly
   and never refused. The graphs are the plan's line `mixed_graphs`, in the leaf's reservations and their mirror in the
   core: 5 MiB a mix and 4 MiB beside them, in whole 2 MiB pages, as the RTX 5090 measured them at capture and on the
   process's WDDM counter, 64 MiB for the twelve (at most 114 KV pages fewer at the `rtx5090` default) and 0 on a load
-  that captures none. The driver keeps the graphs' pages after a teardown, so a reload adds the line back. This amends
+  that captures none. The driver keeps the graphs' pages after a teardown, so a reload adds the line back. Measured
+  again with the mixed graph build (#718), the device's free memory fell by 69,206,016 B over the twelve's captures,
+  2 MiB past the line's 67,108,864 (60,817,408 without the build), while the process's counter at a reload stayed
+  within the plan; the line stands as #714 measured it, that page left to the owner. This amends
   [ADR 0030](0030-device-memory-reserved-at-load.md) as
   [ADR 0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)
   did for the fifteenth line, by a new ADR rather than an edit in place, which only the owner decides.
 
-**A mixed round is held to its base round's numerical class, with ADR 0104's method and margins.** Each group runs its
-own shape's routes on its slice and the ops that see only columns run once over all `16w + 8n` of them, so a mixed
-lane's rows are its base round's up to summation order, as an extended round's are. The test
-(`crates/core/tests/extended_round_class_gpu.rs`, on ADR 0104's NVFP4 load, its graphs captured again with the
-mixes') offers speculation off's own greedy text as each mixed round's drafts, placed by group, and replays each mix's
-captured graph on the drafter's own drafts, both teacher-forced to the text, and holds every mixed row, of either group,
-to the base row at the same text index and lane count by ADR 0104's bounds: a row within 256 BF16 ulps at the base
-row's largest magnitude, a lane's median row within 32, each lane's mean log-probability of the text within 0.02 nats
-a token, the class at each lane count and over a kind's lane counts together (1.25 at the median and the 90th
-percentile, 1.5 at the widest row, no more moved picks than 1.25 times the base rows' plus 2), the class's near tie
-and the control one index off over a kind's lane counts together. Every one of the twelve mixes runs in both kinds of
-round, its last lanes extended so that the round's rows are not the caller's order, its lanes on seven prompts of their
-own, and its leg rides the mix while every lane's text holds a whole round of its shape, so that every row is a round's
-at that mix and lane count. Measured on the RTX 5090 (NVFP4 body, FP8 exception weights, hq-e8-2b) on 2026-11-22, over
-8,040 forced and 8,060 graph mixed rows at 2 to 7 lanes:
+**A mixed round is held to its base round's numerical class as ADR 0104 holds the extended round: its method, its
+margins and its window.** Each group runs its own shape's routes on its slice and the ops that see only columns run once
+over all `16w + 8n` of them, so a mixed lane's rows are its base round's up to summation order, as an extended round's
+are. The test (`crates/core/tests/extended_round_class_gpu.rs`, on ADR 0104's NVFP4 load, its graphs captured again with
+the mixes') offers speculation off's own greedy text as each mixed round's drafts, placed by group, and replays each
+mix's captured graph on the drafter's own drafts, both teacher-forced to the text, and holds every mixed row, of either
+group, to the base row at the same text index and lane count by ADR 0104's bounds: a row within 256 BF16 ulps at the
+base row's largest magnitude, a lane's median row within 32, each lane's mean log-probability of the text within 0.02
+nats a token, the class at each lane count and over a kind's lane counts together (1.25 at the median and the 90th
+percentile, 1.5 at the widest row, no more moved picks than 1.25 times the base rows' plus 2), the class's near tie and
+the control one index off over a kind's lane counts together. Every one of the twelve mixes runs in both kinds of round,
+its last lanes extended so that the round's rows are not the caller's order, its lanes on seven prompts of their own.
+How the rows are read is the owner's decision of 2026-11-22 (#717), after a first reading failed on one lane:
+
+- **A lane is held over a uniform cell's window.** A mixed lane holds the rows after its text's first 224 tokens, as a
+  uniform cell's lane does, against the base rows a leg of base rounds at its lane count gives over the same window, at
+  least 64 of them. Its leg rides at its mix, every round at the mix and the lane count, until every lane holds the rows
+  its base leg gave it: a lane that commits more a round rides on past them on its text, its rows there not read, and
+  a lane whose text runs out first fails. Speculation off writes each text's rows over the window one lane at a time,
+  and the text past it the lanes together.
+- **The near tie is read the way ADR 0104 reads it**, over the base rows of the kind's uniform cells at 1 to 4 lanes
+  (both kinds' widest moved gap 12.0 ulps, so 24), not over the mixed cells' own base rows.
+- **The margins are ADR 0104's**, unchanged.
+
+The first reading rode each mixed leg while every lane's text, at most 224 tokens, held a whole round of its shape, so a
+lane beside a faster one held 51 to 85 rows on prose. On graph rounds the prose prompt's lane extended at the mix 3+2
+read its text 0.0256 nats a token below the base rows' over 79 rows, past 0.02. A diagnostic found the mix adds nothing
+to it: over the same 79 rows that prompt's lane of the uniform extended graph cell reads 0.0257 at 4 lanes and 0.0201
+at one, its rows bit-identical to the mixed lane's over the first 54, where the two legs' rounds pair, and the excess
+sits in a few near-tie rows, one of them 0.78 nats of the lane's 2.02. A mean over a short window of prose moves so in
+the uniform cells too: that lane of the uniform extended graph cell reads 0.0348 below its base rows over its first 32
+rows at one lane and 0.0303 at four, 0.0242 and 0.0177 over 64, inside 0.02 for good only from row 87 at one lane and
+from row 180 at four, and 0.0015 and 0.0124 apart over its 210, the window over which ADR 0104 measured and confirmed its
+bounds. A longer leg (texts of 512 tokens, the other lanes on essays) brought the 3+2 lane inside, 0.0130 over 324 rows;
+the near tie read over the mixed cells' own base rows (9.0, so 18) then refused a pick moved 22.0 ulps apart, a move the
+uniform extended graph rows make too and ADR 0104's reading over its kind's base rows passes. So the mixed lane is read
+over the window, and against the near tie, that the extended round is: rows past that window would hold the mixed round
+to bounds the extended round was never read against, the base round's own near tie widening on longer texts (to 42 ulps
+on the long answers, ADR 0104).
+
+Measured on the RTX 5090 (NVFP4 body, FP8 exception weights, hq-e8-2b) on 2026-11-22, over 12,096 forced and 11,887
+graph mixed rows at 2 to 7 lanes (224 a lane forced, 217 to 223 on graph rounds), each leg 28 forced rounds or 45 to 88
+graph rounds at its mix:
 
 | bound | margin | forced mixed rounds | graph mixed rounds |
 |---|---|---|---|
-| widest row, mixed against base | 256 ulps | 1.0 | 115.2 |
-| a lane's median row | 32 ulps | 0.0-0.5 | 0.0-15.0 |
-| mean log-probability, apart | 0.02 nats | 0.0010 | **0.0256** on one lane (below) |
-| class ratio, median / 90th percentile / widest | 1.25 / 1.25 / 1.5 | 1.00 / 1.00 / 1.00 | 1.01 / 1.00 / 1.00 |
-| the same, by lane count | | 1.00 / 1.00 / 1.00 | 1.00-1.03 / 0.97-1.01 / 1.00-1.13 |
-| picks moved from the plain rows, mixed and base | 1.25 x + 2 | 248 and 248 | 108 and 97 (30 and 25 at 6 lanes, bound 33) |
-| widest moved gap, mixed over base; between them | 2 x, floor 16 | 12.0 over 12.0; none | 9.0 over 9.0; 11.0 |
-| control's median, over the right rows' and the typical bound | 2 x | 13.5x, 5.0x | 14.4x, 5.2x |
+| widest row, mixed against base | 256 ulps | 1.0 | 110.8 |
+| a lane's median row | 32 ulps | 0.0-0.5 | 0.0-14.9 |
+| mean log-probability, apart | 0.02 nats | 0.0005 | 0.0158 (0.0229 over its first 64 rows) |
+| class ratio, median / 90th percentile / widest | 1.25 / 1.25 / 1.5 | 1.00 / 1.00 / 1.00 | 1.00 / 0.99 / 1.00 |
+| the same, by lane count | | 1.00 / 1.00 / 1.00 | 0.99-1.01 / 0.95-1.02 / 0.89-1.00 |
+| picks moved from the plain rows, mixed and base | 1.25 x + 2 | 385 and 385 | 311 and 286 (70 and 57 at 4 lanes, bound 73) |
+| widest moved gap, mixed over the mixed cells' base; between them | 2 x the uniform cells' 12.0, so 24 | 9.0 over 9.0; none | 10.0 over 10.0; 12.0 |
+| control's median, over the right rows' and the typical bound | 2 x | 14.0x, 5.0x | 14.0x, 5.0x |
 
 Forced, every mixed row is its base row within 1 ulp, both groups' (the uniform shapes' forced rows already agree so at
 2 to 4 lanes); on graph rounds a lane's row at one text index can stand at another column of its round in the mixed leg
-than in the base leg, each leg's drafts and accepted counts its own, as between a uniform graph cell's two shapes. One
-bound fails, on one lane, in both runs of 2026-11-22: on graph rounds the prose prompt's lane, extended at the mix 3+2,
-reads its text's mean log-probability 0.0256 nats a token below the base rows', over 79 rows (its leg ended with the
-table prompt's text); the next furthest is the same lane at 2+1 and 3+1, 0.0194 over 51. Measured over the first 64
-rows: that lane 0.0177; the same prompt's lane of ADR 0104's uniform extended graph cell at 4 lanes 0.0177 too (0.0124
-over its 210 rows); that cell's lane at one lane 0.0242. The uniform lane over the same 79 rows was not read. So the
-excess looks like the extended round's on a short window of an uncertain text, which a mixed lane's shorter leg reads
-whole, rather than the mix's: an inference from those readings, not a measurement of it. How a short lane's likelihood
-is held is the owner's to decide with this ADR; the test holds 0.02, as ADR 0104 confirmed it, and fails on that lane
-until then.
+than in the base leg, each leg's drafts and accepted counts its own, as between a uniform graph cell's two shapes. The
+furthest likelihood is the essay prompt's lane extended at the mix 3+2, 0.0158 over its 218 rows, which reads 0.0229
+over its first 64: the short window's excess again, inside the bound over the window. The same run's uniform cells print
+what the first reading's did, line for line.
 
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class
 reaches the mixed round; "lanes of both shapes in one round" is built, the only way to an extended shape past 4 lanes.
@@ -123,6 +157,13 @@ In ADR 0030, the plan's sixteenth line, `mixed_graphs`.
   could not capture; the uniform choice is a round the load already replays.
 - **Capturing a mix's graphs when a round first needs it**: the KV pool is fixed at load, and VRAM taken later under
   WDDM risks the decode collapse; the plan holds them from the start.
+- **A mixed lane held on the rows its leg reaches while every text holds a round**, the first reading: a lane beside a
+  faster one read its likelihood over 51 to 85 rows, where the uniform cells' own lanes sit past 0.02 too.
+- **A looser likelihood margin for a short lane**: a margin set by a window the extended round was never held on.
+- **Every row a long leg reaches**: bounds read on texts ADR 0104 did not measure them over, and gigabytes of rows on the
+  host.
+- **The near tie over the mixed cells' own base rows**: on the longer leg they moved a pick at 9.0 where the uniform
+  cells' move one at 12.0, so the extended round's own move at 22.0 failed there.
 
 ## Consequences
 
@@ -132,8 +173,8 @@ In ADR 0030, the plan's sixteenth line, `mixed_graphs`.
   `forced_lane_shapes`, `TeacherForcing::lane_shapes`), which no serving path sets, and the verify logits readout of a
   mixed round (`ignis_verify_readout_mixed_logits`, `dflash2_readout::mixed_verify_logits`) reads each lane's rows at
   its group's stride and refuses after any other round, as the readout of one shape refuses after a mixed one.
-- The mixed checks add no load: they ride the NVFP4 cell's load after its uniform ones, three to four minutes more. A
-  mixed cell's lane is held on at least 32 rows where a uniform cell's is on 64, its leg ending with its fastest lane's
-  text (the fewest measured: 104 rows forced, 51 on graph rounds).
+- The mixed checks add no load: they ride the NVFP4 cell's load after its uniform ones, five to six minutes more (323 s
+  on 2026-11-22, 36 s of it speculation off's texts; the NVFP4 test 431 s, where the first reading's took 304 to 314). A
+  mixed prompt must run past the 1,408 tokens a leg may ride on, or the test fails before its legs.
 - The bounds are the RTX 5090's on the NVFP4 body under FP8 exception weights over hq-e8-2b. A trellis body's mixed
   rounds are held by #720 before they run there.

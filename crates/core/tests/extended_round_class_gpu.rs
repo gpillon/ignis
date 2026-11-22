@@ -167,8 +167,10 @@ use logit_drift::{row_drift, within, RowDrift};
 // rows sit a median 1 ulp from speculation off's where the NVFP4 body's sit
 // about 12 in this test, so it is far inside every bound below. "The mixed
 // rounds" (#717): this test's run of 2026-11-22 on the NVFP4 cell, the twelve
-// mixes at 2 to 7 lanes, forced rounds over 8,040 mixed rows and graph rounds
-// over 8,060, each against the base rows at the same lane count.
+// mixes at 2 to 7 lanes on the seven prompts of their own, each lane held over
+// the uniform cells' window, forced rounds over 12,096 mixed rows (224 a lane)
+// and graph rounds over 11,887 (217 to 223 a lane), each against the base rows
+// at the same lane count.
 
 /// The extended row against the base row after the same tokens: no logit
 /// further than this, in BF16 ulps at the base row's largest magnitude.
@@ -177,7 +179,7 @@ use logit_drift::{row_drift, within, RowDrift};
 /// and four, graph rounds 114.1 at one lane and 115.2 at two to four; the
 /// trellis body, forced rounds 66.6, 43.9 and 0.0 at one, two and three or
 /// four lanes, graph rounds 64.0, 88.7, 41.1 and 39.8 at one to four; the
-/// mixed rounds, forced 1.0, graph 115.2; 256 is the next power of two above,
+/// mixed rounds, forced 1.0, graph 110.8; 256 is the next power of two above,
 /// ADR 0056's rule for its own tolerance.
 const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 
@@ -187,8 +189,8 @@ const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 /// at two to four, graph rounds 13.6 to 16.0 at one lane and 11.8 to 14.2 at
 /// two to four but for the code prompt's 0.0 there (neither split is
 /// explained); the trellis body, 1.0 but for forced rounds' 0.0 at three and
-/// four lanes; the mixed rounds, forced 0.0 to 0.5, graph 0.0 to 15.0 (the
-/// extended lanes 0.0 to 14.6, the base lanes 0.0 to 15.0); 32 is the next
+/// four lanes; the mixed rounds, forced 0.0 to 0.5, graph 0.0 to 14.9 (the
+/// extended lanes 0.0 to 14.9, the base lanes 0.0 to 13.0); 32 is the next
 /// power of two above.
 const EXTENDED_VS_BASE_TYPICAL_ULPS: f32 = 32.0;
 
@@ -203,21 +205,21 @@ const PICK_GAP_ULPS: f32 = logit_drift::PICK_GAP_ULPS;
 /// 1.01, 1.00, 1.01, 1.01; this test, forced rounds 1.00 (0.99 to 1.00 by lane
 /// count), graph rounds 1.02 (0.99 to 1.03); the trellis body, 1.00 for both
 /// kinds at every lane count; the mixed rounds, forced 1.00 at every lane
-/// count, graph 1.01 (1.00 to 1.03). Held at each lane count too.
+/// count, graph 1.00 (0.99 to 1.01). Held at each lane count too.
 const CLASS_MEDIAN_MARGIN: f32 = 1.25;
 
 /// The class, 90th percentile. Measured ratios: prototype 0.86, 1.03, 1.02,
 /// 1.00, 1.02, 0.87; this test, forced rounds 1.00 (0.98 to 1.01), graph
 /// rounds 0.99 (0.94 to 1.02); the trellis body, forced rounds 0.95 (0.75 to
 /// 1.08), graph rounds 1.01 (1.00 to 1.04); the mixed rounds, forced 1.00,
-/// graph 1.00 (0.97 to 1.01).
+/// graph 0.99 (0.95 to 1.02).
 const CLASS_P90_MARGIN: f32 = 1.25;
 
 /// The class, widest row: one tail logit each, so the loosest of the three.
 /// Measured ratios: prototype 1.02, 1.20, 0.97, 1.07, 1.25, 1.02; this test,
 /// forced rounds 1.00 (1.00 to 1.02), graph rounds 1.03 (1.03 to 1.06); the
 /// trellis body, forced rounds 0.69 (0.59 to 1.00), graph rounds 0.49 (0.42 to
-/// 0.53); the mixed rounds, forced 1.00, graph 1.00 (1.00 to 1.13).
+/// 0.53); the mixed rounds, forced 1.00, graph 1.00 (0.89 to 1.00).
 const CLASS_WIDEST_MARGIN: f32 = 1.5;
 
 /// The class, moved picks: the extended rows may move this many times the
@@ -229,8 +231,8 @@ const CLASS_WIDEST_MARGIN: f32 = 1.5;
 /// rounds 76 and 73 (19 and 20, 19 and 21, 12 and 11, 26 and 21: 26 against a
 /// bound of 28 at 4 lanes); the trellis body, forced rounds 8 and 8 (2 and 2 at
 /// each lane count), graph rounds 11 and 12 (3 and 2, 3 and 3, 2 and 3, 3 and
-/// 4); the mixed rounds, forced 248 and 248 (the same at each lane count),
-/// graph 108 and 97 (30 against a bound of 33 at 6 lanes the closest).
+/// 4); the mixed rounds, forced 385 and 385 (the same at each lane count),
+/// graph 311 and 286 (70 against a bound of 73 at 4 lanes the closest).
 const CLASS_MOVED_PICKS_MARGIN: f32 = 1.25;
 const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 
@@ -252,9 +254,14 @@ const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 /// 0056's 16 alone, the bound between the shapes before this one, failed the
 /// test's first run. The trellis body: from spec-off 1.0 over 1.0 for both
 /// kinds, so its near tie is ADR 0056's 16; between the shapes none moved on
-/// forced rounds, 1.0 on graph rounds. The mixed rounds: from spec-off, forced
-/// 12.0 over 12.0, graph 9.0 over 9.0; against the base rows, none moved on
-/// forced rounds, 11.0 on graph rounds.
+/// forced rounds, 1.0 on graph rounds. The mixed rounds (#717, ADR 0106): their
+/// near tie is the extended rows' of the same kind, read over the uniform
+/// cells' base rows (12.0 for both kinds, so 24): a mixed lane's extended rows
+/// are the extended round's, whose own 22.0 that bound passes, where a longer
+/// leg's mixed base rows alone read 9.0, a bound of 18 that the same move
+/// failed (#717's diagnostic). From spec-off, forced 9.0 over 9.0, graph 10.0
+/// over 10.0 (the mixed cells' own base rows); against the base rows, none
+/// moved on forced rounds, 12.0 on graph rounds.
 const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 
 /// A lane's mean log-probability of the text under the extended rows against
@@ -262,16 +269,15 @@ const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 /// 0.0074, 0.0031, 0.0001, 0.0040, 0.0001, and 0.0089 at the furthest of the
 /// three prompts; this test, forced rounds at most 0.0089, graph rounds at
 /// most 0.0124; the trellis body, forced rounds at most 0.0025, graph rounds
-/// at most 0.0016; 0.02 is ADR 0056's bound for its own pair. The mixed
-/// rounds: forced at most 0.0010; graph 0.0256 on one lane, past it, the
-/// prose prompt's extended lane at the mix 3+2 over 79 rows (its leg ends
-/// with the table prompt's text), the next 0.0194 over 51 (the same lane at
-/// 2+1 and 3+1). Over the first 64 rows that lane reads 0.0177, the same
-/// prompt's lane of the uniform extended graph cell at 4 lanes 0.0177 too
-/// (0.0124 over its 210), and that cell's lane at one lane 0.0242 (the uniform
-/// lane over the same 79 rows was not read): the excess looks like the
-/// extended round's on a short window, which a mixed lane's shorter leg reads
-/// whole, an inference, not a measurement. ADR 0106 leaves it to the owner.
+/// at most 0.0016; 0.02 is ADR 0056's bound for its own pair. It is a mean
+/// over a uniform cell's window of about 210 rows, which a few near-tie rows
+/// of prose move on a short one: the prose prompt's uniform extended graph
+/// lane reads 0.0348 over its first 32 rows at one lane and 0.0303 at four,
+/// 0.0242 and 0.0177 over 64, inside 0.02 for good only from row 87 and 180
+/// (#717). So a mixed lane is held over the same window (ADR 0106, the owner's
+/// decision of 2026-11-22): the mixed rounds, forced at most 0.0005, graph at
+/// most 0.0158, the essay prompt's extended lane at the mix 3+2 over 218 rows,
+/// which reads 0.0229 over its first 64.
 const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 
 /// The control's median, one index off, over the right rows' median and over
@@ -281,8 +287,8 @@ const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 /// test, forced rounds 166.0 (14.0 times the right rows', 5.2 times the
 /// typical bound), graph rounds 165.0 (13.8, 5.2); the trellis body, forced
 /// rounds 167.5 (167.5 times the right rows' 1.0, 5.2 times the typical
-/// bound), graph rounds 168.1 (168.1, 5.3); the mixed rounds, forced 160.0
-/// (13.5, 5.0), graph 166.8 (14.4, 5.2); 2 is far inside both and far
+/// bound), graph rounds 168.1 (168.1, 5.3); the mixed rounds, forced 160.5
+/// (14.0, 5.0), graph 160.8 (14.0, 5.0); 2 is far inside both and far
 /// outside a right pair's margins above.
 const CONTROL_MARGIN: f32 = 2.0;
 
@@ -320,10 +326,12 @@ const MIN_ROWS: usize = 64;
 /// #717: the text speculation off writes for each of [`MIXED_PROMPTS`], at
 /// most: a mixed leg rides every lane at its mix until each holds the rows of
 /// a uniform cell's lane ([`MAX_TOKENS`]), so a lane that commits more a round
-/// rides past them on its text. Sized on the 2026-11-22 run: a prose lane
+/// rides past them on its text. Sized on #717's diagnostic: a prose lane
 /// commits about 3 tokens a graph round, so a leg beside one rides about 78
 /// rounds, and an extended lane on structured text about 13.5 a round, 1,050
-/// tokens; this holds a third more.
+/// tokens; this holds a third more. Measured on 2026-11-22: legs of 28 forced
+/// rounds and of 45 to 88 graph rounds (1+6 the most), no lane short of its
+/// rows.
 const MIXED_TEXT_TOKENS: usize = 1408;
 /// #717: a mixed leg's sequence's context: its prompt, its text and a round
 /// past it.
