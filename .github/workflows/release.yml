@@ -345,8 +345,9 @@ jobs:
   # network, downloading the speech catalog's smallest entry (about 1 GB) from
   # huggingface.co and checking every file against its pin. The other ignored
   # tests need the card, the owner's disks or hours alone on a machine. It
-  # stays `#[ignore]`d, so the shards and the GPU profile leave it out; it runs
-  # here, beside them, on the dependencies shard 1 caches, and it gates what
+  # stays `#[ignore]`d, so the shards leave it out, and the GPU profile skips
+  # it by name ($NotGpuLegs); it runs here, beside the shards, on the
+  # dependencies shard 1 caches, and it gates what
   # they gate: every job that publishes needs it. A test holds it to this
   # shape (crates/server/tests/ci_pipeline.rs).
   network:

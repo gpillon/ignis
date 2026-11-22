@@ -58,6 +58,7 @@ echo "running 1 test"
 echo "skip: F:/ai/q38/model.ninfer does not exist"
 exit "$STUB_EXIT"
 EOF
+chmod +x "$dir/cargo"
 run() {
     STUB_DIR="$dir" STUB_EXIT=$1 IGNIS_TEST_CUDA=1 CARGO="$dir/cargo" IGNIS_MACHINE_LOCAL_LIST="$dir/list" \
         bash "$script" --target x86_64-unknown-linux-gnu >"$dir/out" 2>&1

@@ -76,8 +76,7 @@ The download route tests waited for `on_disk` complete, then asserted
 ## A test CI cannot have
 
 A new test that reads a fixture only the owner's machine holds says, in its
-doc comment, why CI cannot have it, since a small committed fixture would let
-CI run it (`docs/agents/testing.md`, "The gate").
+doc comment, why CI cannot have it (`docs/agents/testing.md`, "The gate").
 
 ## After a merge or a rebase
 

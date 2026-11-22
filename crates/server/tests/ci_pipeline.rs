@@ -110,8 +110,8 @@ fn the_builds_run_beside_the_tests_and_whatever_publishes_waits_for_them() {
     publishing.sort();
     assert_eq!(publishing, ["image", "prerelease", "release"], "the jobs that publish");
     for name in publishing {
-        for tests in ["test", "network"] {
-            assert!(needs(job(jobs, name)).iter().any(|need| need == tests), "job `{name}` publishes without waiting for the `{tests}` job");
+        for tests_job in ["test", "network"] {
+            assert!(needs(job(jobs, name)).iter().any(|need| need == tests_job), "job `{name}` publishes without waiting for the `{tests_job}` job");
         }
     }
     // The image pushed is the one the `linux` job built, from its archive.

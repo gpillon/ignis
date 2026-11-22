@@ -10,7 +10,9 @@
 //! `crates/*/tests/` that is not `cuda`-gated and prints a skip is either on
 //! the list or exempt through a line that names its reason (a fixture CI
 //! provides, a CPU CI runners do not have, tests that are all `#[ignore]`d),
-//! and every line names a target that exists and still prints a skip.
+//! and every line names a target that exists. A listed target that no longer
+//! prints a skip stays listed: a reworded message would otherwise take it out
+//! of the release's run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -38,7 +40,7 @@ fn cuda_gated(source: &str) -> bool {
 
 /// Whether a target prints a skip: a print macro (`print!`, `println!`,
 /// `eprint!`, `eprintln!`) whose string starts with "skip", in any case
-/// (`skip:`, `SKIP:`, `skipped:`), on the macro's line or the next.
+/// (`skip:`, `SKIP:`, `skipped:`), after any whitespace or line break.
 fn prints_a_skip(source: &str) -> bool {
     source.match_indices("!(").any(|(at, _)| {
         let before = &source[..at];
@@ -117,9 +119,6 @@ fn every_machine_local_target_is_listed_or_exempt_and_every_line_names_one() {
          holds, and exempt with its reason one that skips for another cause:\n  {}",
         unlisted.join("\n  ")
     );
-    let stale: Vec<&str> = named.iter().copied().filter(|path| !machine_local.contains(path)).collect();
-    assert!(stale.is_empty(), "{LIST} names targets that print no skip, or are cuda-gated: take them off\n  {}", stale.join("\n  "));
-
     // `--test <name>` selects that name in every crate, so a listed target's
     // name must be its own.
     for path in &list.listed {
