@@ -670,6 +670,8 @@ fn cuda_scheduler_for(
 ) -> Result<(Box<dyn ignis_core::Scheduler>, crate::metrics::LoadReservations, EngineShape, String), LoadError> {
     let second_tail_cut = crate::config::arch::second_tail_cut_for_load().map_err(LoadError::LoadFailed)?;
     let shape = load_shape(config, vision_item_bound).with_second_tail_cut(config.basis.family(), second_tail_cut);
+    // GitHub #715: whether the 27B's artifact is a trellis body, which runs no mixed round yet.
+    let mut trellis = false;
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
         ModelFamily::FlashNext => crate::runtime::flash_next_load(
@@ -687,6 +689,7 @@ fn cuda_scheduler_for(
             // An artifact whose body cannot be read fails its load below.
             if let Ok(body) = crate::loader::body_27b(artifact) {
                 log_exception_weights(config, &shape, body);
+                trellis = body != ignis_artifact::Body27b::Nvfp4;
             }
             crate::runtime::qwen27b_load(
                 artifact,
@@ -724,7 +727,7 @@ fn cuda_scheduler_for(
         // GitHub #336: the 27B's are a load setting too.
         decode_lanes = shape.decode_lanes_for(family),
         kv_format = shape.kv_format.as_str(),
-        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation)),
+        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation), trellis),
         vision = %shape.vision.map_or_else(
             || "off".to_owned(),
             |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
@@ -775,9 +778,11 @@ impl LoadSpeculation {
 /// and its window of 0 is `off` saying so; Flash-Next's line is what it was.
 /// GitHub #690: a load of two round shapes then names the shape rule's
 /// thresholds and the shape policy with its window and its period ratios,
-/// which no other load reads.
+/// which no other load reads. GitHub #715: the policy is the one the load
+/// runs on its body (`trellis` for the trellis artifacts), with the one it was
+/// given beside it where they differ.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String {
+fn speculation_text(family: ModelFamily, speculation: LoadSpeculation, trellis: bool) -> String {
     let speculation = match speculation {
         LoadSpeculation::MtpWindowZero => return "off (mtp draft_tokens=0)".to_owned(),
         LoadSpeculation::Runs(Some(s)) if crate::config::the_27bs_mtp(Some(family), Some(s.backend())) => {
@@ -802,13 +807,17 @@ fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String
                 return line;
             }
             let (rule, estimate) = (s.shape_rule(), s.shape_estimate());
+            // GitHub #715: the policy the load runs, and the one it was given where they differ
+            // (`mixed` on a load that runs no mixed round runs `aggregate`).
+            let runs = s.shape_policy_runs(trellis);
+            let given = if runs == s.shape_policy() { String::new() } else { format!(" shape_policy_given={}", s.shape_policy().as_str()) };
             format!(
-                "{line} shape_enter_accepted={} shape_stay_accepted={} shape_policy={} shape_estimate_rounds={} shape_period_ratios={}",
+                "{line} shape_enter_accepted={} shape_stay_accepted={} shape_policy={}{given} shape_estimate_rounds={} shape_period_ratios={}",
                 rule.enter_accepted(),
                 rule.stay_accepted(),
-                s.shape_policy().as_str(),
+                runs.as_str(),
                 estimate.rounds(),
-                crate::config::ratios_text(estimate.period_ratios_milli())
+                crate::config::ratios_text(estimate.period_table())
             )
         },
     )
@@ -1092,47 +1101,67 @@ mod tests {
         let the_27b = ModelFamily::Qwen38_27b;
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec))),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec)), false),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let sampled = spec.with_draft_rule(DraftRule::Sampled, DrafterSampling { temperature_factor_milli: 1000, top_p_milli: 875 });
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled))),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled)), false),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=sampled drafter_temperature_factor=1 drafter_top_p=0.875"
         );
-        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None)), "off");
+        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None), false), "off");
     }
 
     /// GitHub #690 (spec #684, user story 25): a load of two round shapes
     /// names after them the shape rule's thresholds and the shape policy it
     /// resolved, with the policy's window and period ratios; a load at 7
     /// drafts or fewer reads none of them, and its line is what it was.
+    /// GitHub #715: the cost table's seven rows, and the policy the load runs:
+    /// `mixed` where it runs mixed rounds, `aggregate` with the `mixed` it was
+    /// given beside it on the trellis body or at 8 to 14 drafts.
     #[test]
     fn the_load_log_names_a_two_shape_loads_shape_rule_and_shape_policy() {
-        use ignis_core::{ShapeEstimate, ShapePolicy, ShapeRule, Speculation, SpeculativeBackend};
+        use ignis_core::{PeriodTable, ShapeEstimate, ShapePolicy, ShapeRule, Speculation, SpeculativeBackend};
         let the_27b = ModelFamily::Qwen38_27b;
+        let table = |uniform| PeriodTable::with_uniform(uniform).unwrap();
         let wide = Speculation::new(SpeculativeBackend::Dflash2, 15).unwrap();
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide))),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide)), false),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=7 shape_stay_accepted=6 shape_policy=aggregate shape_estimate_rounds=16 \
-             shape_period_ratios=1.128,1.29,1.363,1.344"
+             shape_period_ratios=1.128/1.155,1.29/1.12,1.285,1.363/1.138,1.222,1.384,1.344/1.077,1.207,1.336/1.093,1.241/1.107"
         );
         let all = wide
             .with_shape_rule(ShapeRule::new(5, 12).unwrap())
             .unwrap()
-            .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, [1000, 1200, 1250, 2000]).unwrap());
+            .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, table([1000, 1200, 1250, 2000])).unwrap());
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(all))),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(all)), false),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=5 shape_stay_accepted=12 shape_policy=all shape_estimate_rounds=8 \
-             shape_period_ratios=1,1.2,1.25,2"
+             shape_period_ratios=1/1.155,1.2/1.12,1.285,1.25/1.138,1.222,1.384,2/1.077,1.207,1.336/1.093,1.241/1.107"
         );
+        let line = |draft_tokens: u32, trellis: bool| {
+            let mixed = Speculation::new(SpeculativeBackend::Dflash2, draft_tokens)
+                .unwrap()
+                .with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::new(16, table([1100, 1200, 1300, 1400])).unwrap());
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(mixed)), trellis)
+        };
+        let shapes = |draft_tokens: u32, policy: &str| {
+            format!(
+                "dflash2 draft_tokens={draft_tokens} draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
+                 shape_enter_accepted=7 shape_stay_accepted=6 shape_policy={policy} shape_estimate_rounds=16 \
+                 shape_period_ratios=1.1/1.155,1.2/1.12,1.285,1.3/1.138,1.222,1.384,1.4/1.077,1.207,1.336/1.093,1.241/1.107"
+            )
+        };
+        assert_eq!(line(15, false), shapes(15, "mixed"), "the NVFP4 body at 15 drafts runs `mixed`");
+        assert_eq!(line(15, true), shapes(15, "aggregate shape_policy_given=mixed"), "the trellis body runs `aggregate`");
+        assert_eq!(line(10, false), shapes(10, "aggregate shape_policy_given=mixed"), "10 drafts run `aggregate`");
         let seven = Speculation::new(SpeculativeBackend::Dflash2, 7)
             .unwrap()
-            .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, [1000, 1200, 1250, 2000]).unwrap());
+            .with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::new(8, table([1000, 1200, 1250, 2000])).unwrap());
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven))),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven)), false),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
     }
@@ -1144,10 +1173,10 @@ mod tests {
     fn the_load_log_names_the_27bs_mtp_drafter_and_its_window() {
         use ignis_core::{DraftRule, DrafterSampling, Speculation, SpeculativeBackend};
         let mtp = Speculation::new(SpeculativeBackend::Mtp, 5).unwrap().with_draft_rule(DraftRule::Fixed, DrafterSampling::default());
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp))), "mtp draft_tokens=5");
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero), "off (mtp draft_tokens=0)");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp)), false), "mtp draft_tokens=5");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero, false), "off (mtp draft_tokens=0)");
         assert_eq!(
-            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp))),
+            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp)), false),
             "mtp draft_tokens=5 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let config = |flags: &[&str]| {

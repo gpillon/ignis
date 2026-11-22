@@ -133,6 +133,15 @@ pub struct MixedGraphs {
     pub bytes: u64,
 }
 
+/// GitHub #715 (spec #711): whether a load of `speculation` asks for its mixed
+/// graphs, at its plan, its load and each capture (`kernel/src/mixed_graphs.h`
+/// `asked`): as the measurement switch `IGNIS_MIXED_ROUNDS` says where it is
+/// set (`switch`, `Some(true)` for `1`), and otherwise where the shape policy
+/// is `mixed`, never under `aggregate` or `all`.
+pub fn mixed_rounds_asked(switch: Option<bool>, speculation: Option<Speculation>) -> bool {
+    switch.unwrap_or_else(|| speculation.is_some_and(|speculation| speculation.shape_policy() == crate::speculation::ShapePolicy::Mixed))
+}
+
 /// The mixed graphs a 27B load of `speculation` at `lanes` decode lanes over a
 /// pool with `retained_device_slots` device retained slots captures when
 /// mixed rounds are asked (`mixed`; `kernel/src/mixed_graphs.h` `planned`): on a
@@ -140,7 +149,8 @@ pub struct MixedGraphs {
 /// mixed round yet) at [`MIXED_ROUND_WINDOW`] drafts, every mix whose `w + n`
 /// lanes fit the load's and whose base group's fold, behind its `2w` leading
 /// rows that commit nothing, fits the pool's GDN slots, the lanes' and the
-/// device retained slots'. None anywhere else.
+/// device retained slots'. None anywhere else. GitHub #715: `mixed` as
+/// [`mixed_rounds_asked`] gives it.
 pub fn mixed_graphs(
     speculation: Option<Speculation>,
     trellis: bool,
@@ -148,11 +158,7 @@ pub fn mixed_graphs(
     lanes: u32,
     retained_device_slots: u32,
 ) -> MixedGraphs {
-    let captures = speculation.is_some_and(|speculation| {
-        speculation.backend() == crate::speculation::SpeculativeBackend::Dflash2
-            && speculation.draft_tokens() == MIXED_ROUND_WINDOW
-    }) && mixed
-        && !trellis;
+    let captures = speculation.is_some_and(|speculation| speculation.holds_mixed_rounds(trellis)) && mixed;
     let slots = lanes + retained_device_slots;
     let mixes: Vec<(u32, u32)> = MIXES
         .into_iter()

@@ -668,7 +668,9 @@ fn the_sampled_draft_keeps_its_draws_on_the_drafters_line() {
 /// 1 and 2 device retained slots -- the twelve mixes' graphs at 15 drafts
 /// and eight lanes, (1,1)'s alone at two lanes beside one retained slot, none
 /// at two lanes without one, at one lane, or at 8 and 12 drafts -- and no
-/// other line moves; with the switch unset every load plans none. The line
+/// other line moves; with the switch unset (GitHub #715) a load under the
+/// shape policy `mixed` plans the same line and one under `aggregate` or `all`
+/// none. The line
 /// prints in bytes and in the KV pages it takes from a pool the budget sizes
 /// (at most, rounded up): the configuration reference and the profiles page
 /// quote them.
@@ -730,6 +732,18 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
                 let what = format!("{window} drafts at {lanes} lanes and {retained} device retained slots");
                 assert_eq!(unasked.mixed_graphs, 0, "{what}: no mixed graph unasked");
                 assert_eq!(asked.mixed_graphs, mirror.bytes, "{what}: the leaf's mixed graphs line is the CPU's {:?}", mirror.mixes);
+                // GitHub #715: with the switch unset the shape policy asks: `mixed` plans the same
+                // line, `all` (and `aggregate`, `wide`'s own, above) none.
+                for policy in [ignis_core::ShapePolicy::Mixed, ignis_core::ShapePolicy::All] {
+                    let by_policy = wide.with_shape_policy(policy, ignis_core::ShapeEstimate::default());
+                    let asks = ignis_core::lane_lines::mixed_rounds_asked(None, Some(by_policy));
+                    assert_eq!(
+                        planned_with(by_policy, lanes, retained),
+                        if asks { asked } else { unasked },
+                        "{what}: the shape policy `{}`",
+                        policy.as_str()
+                    );
+                }
                 assert_eq!(ReservedBytes { mixed_graphs: 0, ..asked }, unasked, "{what}: another line moved with the mixed graphs");
                 if !mirror.mixes.is_empty() {
                     println!(

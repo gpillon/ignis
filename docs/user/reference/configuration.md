@@ -1108,7 +1108,7 @@ Under `sampled`, the drafter's top-p over its candidates: the smallest set of th
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The shape rule's entry: past 7 drafts, where each of the 27B's DFlash2 verify rounds runs at the base shape (8 columns a lane) or the extended one (the window + 1), the drafts of a base round's full 7 a lane must have taken to ask the extended shape for its next round, 1..=7. A round of 1 to 4 lanes takes its shape from its lanes' asks by `shape_policy`; one of 5 to 8 lanes is never extended. A speed setting only: either shape commits the target's text.
+The shape rule's entry: past 7 drafts, where each of the 27B's DFlash2 verify rounds runs at the base shape (8 columns a lane) or the extended one (the window + 1), the drafts of a base round's full 7 a lane must have taken to ask the extended shape for its next round, 1..=7. Each lane takes its shape from the lanes' asks by `shape_policy`; a round of 8 lanes is never extended. A speed setting only: either shape commits the target's text.
 
 ### `spec.shape_stay_accepted`
 
@@ -1132,11 +1132,11 @@ The shape rule's stay: the drafts an extended round must take for its lane to ke
 | Env var | `IGNIS_SPEC_SHAPE_POLICY` |
 | Kind | `shape policy` |
 | Default | `aggregate` |
-| Rule | one of aggregate, all |
+| Rule | one of aggregate, all, mixed |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The shape policy, which turns the lanes' asks into a round's shape past 7 drafts: `aggregate` runs a round of 2 to 4 lanes extended when the drafts its asking lanes are expected to take past position 7 exceed what the wider round costs every lane in it, so a lane that does not ask pays for its neighbour when the round as a whole gains; `all` only when every lane asks, so no lane pays for another. A lane alone runs at the shape it asks under either. A speed setting only.
+The shape policy, which turns the lanes' asks into a round's shape past 7 drafts: `aggregate` runs a round of 2 to 4 lanes extended when the drafts its asking lanes are expected to take past position 7 exceed what the wider round costs every lane in it, so a lane that does not ask pays for its neighbour when the round as a whole gains; `all` only when every lane asks, so no lane pays for another; `mixed` grants the extended shape lane by lane, at 2 to 7 lanes, the highest expected gain first, each when the drafts the lane is expected to take past position 7 exceed what its 8 more columns cost every lane, within 64 columns, so a round may mix both shapes (only at 15 drafts on the NVFP4 artifact: any other load runs `aggregate`, as its load log says). A lane alone runs at the shape it asks under each. Every profile gives `aggregate`. A speed setting only.
 
 ### `spec.shape_estimate_rounds`
 
@@ -1150,7 +1150,7 @@ The shape policy, which turns the lanes' asks into a round's shape past 7 drafts
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Under `aggregate`, the verify rounds of its own, the most recent, a lane's expectations are read over: the tokens it takes a base round, and the drafts past position 7 its extended rounds take. A lane that asks with no extended round among them is granted one. Provisional. A speed setting only.
+Under `aggregate` and `mixed`, the verify rounds of its own, the most recent, a lane's expectations are read over: the tokens it takes a base round, and the drafts past position 7 its extended rounds take. A lane that asks with no extended round among them is granted one. Provisional. A speed setting only.
 
 ### `spec.shape_period_ratios`
 
@@ -1158,12 +1158,12 @@ Under `aggregate`, the verify rounds of its own, the most recent, a lane's expec
 |---|---|
 | Flag | `--spec-shape-period-ratios` |
 | Env var | `IGNIS_SPEC_SHAPE_PERIOD_RATIOS` |
-| Kind | `ratio,ratio,ratio,ratio` |
-| Default | `[1.128,1.29,1.363,1.344]` |
+| Kind | `cost table` |
+| Default | `[[1.128],[1.155,1.29],[1.12,1.285,1.363],[1.138,1.222,1.384,1.344],[1.077,1.207,1.336],[1.093,1.241],[1.107]]` |
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-Under `aggregate`, an extended round's period over a base round's at 1, 2, 3 and 4 lanes, each 1 to 2: what the wider round costs every lane in it. Measured on the RTX 5090 with FP8 exception weights and the default cost levers, at about 3.5-5K tokens of context (the ratio grows with context); at 3 and 4 lanes the card's power limit lowers the extended round's clock, so 3 lanes reads above 4. Unmeasured on other cards. The one-lane entry is not read: a lane alone runs at the shape it asks. A speed setting only.
+The cost table: at 1 to 7 lanes, the period of the round with 1, 2, ... of them extended over the base round's, each 1 to 2, seven rows of 1, 2, 3, 4, 3, 2 and 1 ratios (as many extended lanes as 64 columns hold), `/` between rows: what the wider round costs every lane in it. `aggregate` reads the uniform entries (every lane extended, at 1 to 4 lanes), `mixed` every one. Four ratios alone, the form before the table, are the uniform entries, the rest their defaults. The uniform entries and the mixes 1+1, 1+3, 2+2 and 1+5 are the RTX 5090's measured values (FP8 exception weights, the default cost levers, about 3.5-5K tokens of context; the ratio grows with context, and the card's power limit puts 3 lanes above 4); the other mixes are derived from its measured base rounds of the same columns; all pending a measurement of this build. Unmeasured on other cards. The one-lane entry is not read: a lane alone runs at the shape it asks. A speed setting only.
 
 ## vision
 
