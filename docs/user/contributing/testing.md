@@ -8,7 +8,10 @@ sidebar:
 Every change ships with a test, and a task is not complete until the test
 suite is green. While a change is worked on only its own tests run; the whole
 suite runs once, at the end, on CI, with the branch pushed as `ci/<n>`, and
-the task is done when that run is green on Linux and on Windows. The full
+the task is done when that run is green on Linux and on Windows. A change that
+touches the GPU, by the rule in "Done means" of
+[`docs/agents/testing.md`](../../agents/testing.md), also needs
+[the GPU profile](#the-gpu-profile) green on the commit `main` moves to. The full
 runbook — fixtures, the GPU profile's script, the measurement instruments — is
 [`docs/agents/testing.md`](../../agents/testing.md) and the per-area files it
 links; this page is the map.
@@ -20,12 +23,17 @@ cargo test          # workspace-wide; make test is the same
 ```
 
 It is CPU-only and never touches the GPU, which is what lets CI run it on
-Linux and on Windows runners with no card; the release builds start only when
-both legs are green ([ADR 0032](../../adr/0032-release-through-the-container-build.md)).
+Linux and on Windows runners with no card; the release builds run beside it,
+and nothing is published until both legs are green
+([ADR 0086](../../adr/0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md)).
 A machine-local smoke test whose fixture is absent skips, and a skip counts as
 green — except for compute work: a test on the forward pass that skips on a
 busy GPU or a kernel error proves nothing, so those tests live in the GPU
-profile instead.
+profile instead. On CI every machine-local test skips, so from 0.11.0 they run
+for real once per release, on the owner's machine before the tag
+(`make test-machine-local`, [Cutting a release](releases.md)); their targets
+are listed in `mk/machine-local-tests.txt`, and `cargo test` fails on a test
+that skips and is neither listed there nor exempt with its reason.
 
 `cargo test` also holds two things that are not Rust behaviour:
 

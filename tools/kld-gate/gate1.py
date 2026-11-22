@@ -18,9 +18,9 @@ The KLD is the mean over every position of every window; its 95% CI is the windo
 #422's gate 1 (the windows resampled 20,000 times, each weighted by its positions, as the mean is).
 
 The cross terms (spec #449): each must sit above the matched pair, or the gate measured the base and not
-the fine-tune. One holds when it is above the matched pair in every window and the 95% CI of its difference
-from the matched pair (same resamples) is above 0. The ratios and differences are printed whatever the rule
-says.
+the fine-tune. One holds when the 95% CI of its difference from the matched pair (same resamples) is above 0
+(#725). The windows it is above in, the ratios and the differences are printed whatever the rule says. #449's
+rule also wanted every window above, which a change of a few matrices misses by chance (#422's data, #705).
 
 The controls, each of which voids the gate: the two terms of one dump carry the same engine NLL per position
 and the two terms of one reference the same reference NLL (the files are wired as stated); the references'
@@ -148,14 +148,14 @@ def main(argv=None):
         x = {"kld": float(c.sum() / n.sum()), "ci95": boot_ci(c, n, idx), "ratio": float(c.sum() / m.sum()),
              "ratio_ci95": boot_ci(c, m, idx), "diff": float((c.sum() - m.sum()) / n.sum()),
              "diff_ci95": [float(v) for v in np.percentile(diff_b, [2.5, 97.5])], "above_windows": above}
-        x["above"] = above == nw and x["diff_ci95"][0] > 0
+        x["above"] = x["diff_ci95"][0] > 0
         cross[term] = x
         print(f"  {term:16s} KLD({TITLES[term]}) = {x['kld']:.5f}, CI [{x['ci95'][0]:.5f}, {x['ci95'][1]:.5f}]; "
               f"/ matched {x['ratio']:.3f}, CI [{x['ratio_ci95'][0]:.3f}, {x['ratio_ci95'][1]:.3f}]; - matched "
               f"{x['diff']:.5f}, CI [{x['diff_ci95'][0]:.5f}, {x['diff_ci95'][1]:.5f}]; above in {above}/{nw} "
-              f"windows: {'yes' if x['above'] else 'NO'}")
+              f"windows; holds: {'yes' if x['above'] else 'NO'}")
     stop = not all(x["above"] for x in cross.values())
-    rule = "above in every window, the CI of the difference above 0"
+    rule = "the CI of the difference above 0"
     print(f"  the rule: {rule}")
 
     print("\ncontrols (each voids the gate if it fails):")

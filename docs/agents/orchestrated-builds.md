@@ -21,7 +21,8 @@ Implementers run their own ticket's tests only: the Rust ones through
 `cargo test`'s filter, the GPU ones through the profile script's single-test
 mode (`-Test` / `--test`), which takes the GPU lock. The workspace suite runs
 on `ci/<spec>` at the end of the build (below); the coordinator keeps the full
-profile, the bench runs and the gate legs. Both run
+profile, which runs before `main` moves on a spec that touches the GPU
+(below), the bench runs and the gate legs. Both run
 on the card under the GPU rule in `AGENTS.md`, Testing
 (`docs/agents/testing.md`, the GPU test profile): an agent whose own model is
 served from the card hands every GPU step to the user.
@@ -45,10 +46,17 @@ asking:
    flaky: the coordinator opens an issue labelled `bug` and `needs-triage`
    that names the test, the job and its failing lines, and the green rerun
    counts. A test that fails its rerun too is a real failure.
-3. With every job of the run green, `main` moves to that commit by fast-forward and is
+3. When the spec touches the GPU (`docs/agents/testing.md`, "Done means",
+   item 4: paths and a pattern read off `git diff --name-only main...`), the
+   full GPU profile runs on that tip, `make gpu-profile`, and must be green; a
+   spec that touches no GPU file skips this step. When step 1 runs again
+   because `main` moved, the profile runs again if the commits it merged in
+   touch the GPU too.
+4. With every job of the run green, and the profile where step 3 runs it,
+   `main` moves to that commit by fast-forward and is
    pushed by its SHA, which publishes the `develop` image and prerelease. If
    `main` moved meanwhile, step 1 runs again.
-4. `ci/<spec>` is deleted, with its Actions caches.
+5. `ci/<spec>` is deleted, with its Actions caches.
 
 An implementer's merge of the integration branch into its own takes a message
 its brief gives it, such as `Merge 374-integration into the T2 branch before

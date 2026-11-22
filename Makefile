@@ -425,20 +425,20 @@ vite = cd web && $1 exec node node_modules/vite/bin/vite.js $2
 # The Swagger UI the API reference serves (ADR 0036) is vendored under
 # crates/server/assets, but its *version* lives where every other frontend
 # dependency's does: web/package.json. Bump it there, run
-# `make swagger-ui-sync`, commit the copied files. `swagger-ui-check` (in
-# `make ci`) fails when the two disagree, so a bump cannot be forgotten
-# half-done.
+# `make swagger-ui-sync`, commit the copied files. `swagger-ui-check`
+# (mk/swagger-ui-check.sh, which the release workflow's test job runs) fails
+# when the two disagree, so a bump cannot be forgotten half-done. The script
+# holds the list of vendored files; the sync reads it from `--files`.
 SWAGGER_SRC := web/node_modules/swagger-ui-dist
 SWAGGER_DST := crates/server/assets/swagger-ui
-SWAGGER_FILES := swagger-ui-bundle.js swagger-ui.css   swagger-ui-bundle.js.LICENSE.txt LICENSE NOTICE
 
 .PHONY: swagger-ui-sync
 swagger-ui-sync: $(WEB_DEPS) ## Re-vendor Swagger UI from web/node_modules (after bumping it in web/package.json)
-	@v=$$(node -p "require('./$(SWAGGER_SRC)/package.json').version"); 	for f in $(SWAGGER_FILES); do cp "$(SWAGGER_SRC)/$$f" "$(SWAGGER_DST)/$$f" || exit 1; done; 	sed -i "s/^\`swagger-ui-dist\` \*\*.*\*\*, from npm/\`swagger-ui-dist\` **$$v**, from npm/" "$(SWAGGER_DST)/IGNIS-VENDOR.md"; 	echo "vendored swagger-ui-dist $$v -- commit $(SWAGGER_DST) and rebuild the server"
+	@v=$$(node -p "require('./$(SWAGGER_SRC)/package.json').version"); 	for f in $$(bash mk/swagger-ui-check.sh --files); do cp "$(SWAGGER_SRC)/$$f" "$(SWAGGER_DST)/$$f" || exit 1; done; 	sed -i "s/^\`swagger-ui-dist\` \*\*.*\*\*, from npm/\`swagger-ui-dist\` **$$v**, from npm/" "$(SWAGGER_DST)/IGNIS-VENDOR.md"; 	echo "vendored swagger-ui-dist $$v -- commit $(SWAGGER_DST) and rebuild the server"
 
 .PHONY: swagger-ui-check
 swagger-ui-check: $(WEB_DEPS) ## Fail when the vendored Swagger UI is not the version web/package.json pins
-	@for f in $(SWAGGER_FILES); do 	  cmp -s "$(SWAGGER_SRC)/$$f" "$(SWAGGER_DST)/$$f" || { 	    echo "error: vendored Swagger UI differs from web/package.json's pin ($$f)"; 	    echo "  fix: make swagger-ui-sync, then commit $(SWAGGER_DST)"; 	    exit 1; }; 	done
+	@bash mk/swagger-ui-check.sh
 
 .PHONY: web-dev
 web-dev: $(WEB_DEPS) ## Vite with hot reload, proxying /v1 to the server on BIND
@@ -551,6 +551,14 @@ $(DOCS_DEPS): docs/site/package.json docs/site/package-lock.json
 test: ## cargo test, workspace-wide (CPU only, never touches the GPU)
 	$(CARGO) test --workspace $(CARGO_TARGET)
 
+# The test targets that read a fixture only the owner's machine holds, listed
+# in mk/machine-local-tests.txt (GitHub #709): on CI they print a skip and
+# pass, here they run for real. Once per release, before the tag
+# (docs/user/contributing/releases.md); CPU only, so it takes no GPU lock.
+.PHONY: test-machine-local
+test-machine-local: ## The machine-local test targets, run for real: once per release, before the tag (CPU only)
+	@CARGO='$(CARGO)' bash mk/test-machine-local.sh $(CARGO_TARGET)
+
 .PHONY: test-web
 test-web: $(WEB_DEPS) ## Playground unit tests (vitest)
 	$(NPM) --prefix web run test
@@ -642,6 +650,12 @@ changelog-selftest: ## Test the changelog draft -- a throwaway repo, a stubbed g
 commit-msg-selftest: ## Test the commit-message hook, .githooks/commit-msg
 	@bash mk/commit-msg-selftest.sh
 
+# Two temp directories stand in for the installed pin and the vendored copy,
+# so it needs no npm; the release workflow's test job runs it on both hosts.
+.PHONY: swagger-ui-check-selftest
+swagger-ui-check-selftest: ## Test the vendored Swagger UI check, mk/swagger-ui-check.sh
+	@bash mk/swagger-ui-check-selftest.sh
+
 # The release builds' CUDA check reads only the files it is handed, so its
 # test is temp files too; the release workflow's Linux test job runs it.
 .PHONY: cuda-build-check-selftest
@@ -660,6 +674,12 @@ doctor-selftest: ## Test make doctor's CUDA checks on Linux, mk/linux/doctor.sh
 .PHONY: test-shard-selftest
 test-shard-selftest: ## Test the CI test job's shard plan, mk/test-shard.sh
 	@bash mk/test-shard-selftest.sh
+
+# A temp list and a stand-in cargo, so it builds nothing; the release
+# workflow's test job runs it on both hosts.
+.PHONY: test-machine-local-selftest
+test-machine-local-selftest: ## Test make test-machine-local's script, mk/test-machine-local.sh
+	@bash mk/test-machine-local-selftest.sh
 
 # The GPU lock and the scripts around it on stand-ins under a temp directory
 # (GitHub #707): no card, no build, and neither the machine's lock nor the

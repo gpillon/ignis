@@ -84,12 +84,14 @@ pages under `docs/user/reference/` are generated: change the code, then run
   that names the issue. While working only the change's own tests run; the
   whole suite runs once, at the end, on CI: the branch is pushed as `ci/<n>`,
   which needs no OK, and the work is done when that run is green on both hosts
-  ([Testing](testing.md)).
+  ([Testing](testing.md)) and, for a change that touches the GPU, the full GPU
+  profile is green on the commit `main` moves to.
 - A spec whose tickets agents build in parallel goes through an integration
   branch, with no pull request: each implementer runs its own ticket's tests,
   the GPU ones under the GPU lock, the coordinating session keeps the full GPU
   profile, the benches and the gate legs, and fast-forwards `main` to the
-  branch once CI is green on `ci/<spec>`
+  branch once CI is green on `ci/<spec>` and, for a spec that touches the GPU,
+  the full GPU profile is green on it too
   ([`docs/agents/orchestrated-builds.md`](../../agents/orchestrated-builds.md)).
 - A commit message says what the change does and why, in full sentences, and
   ends with the issue it belongs to, `(#347)`.
