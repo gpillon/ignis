@@ -8,7 +8,10 @@ sidebar:
 Every change ships with a test, and a task is not complete until the test
 suite is green. While a change is worked on only its own tests run; the whole
 suite runs once, at the end, on CI, with the branch pushed as `ci/<n>`, and
-the task is done when that run is green on Linux and on Windows. The full
+the task is done when that run is green on Linux and on Windows. A change that
+touches the GPU (a file under `kernel/`, a `*_gpu.rs` test, Rust code behind
+the `cuda` feature) also needs [the GPU profile](#the-gpu-profile) green on the
+commit `main` moves to. The full
 runbook — fixtures, the GPU profile's script, the measurement instruments — is
 [`docs/agents/testing.md`](../../agents/testing.md) and the per-area files it
 links; this page is the map.

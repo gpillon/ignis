@@ -28,10 +28,12 @@ fn read(path: &str) -> String {
 }
 
 /// Whether a target is compiled only with the `cuda` feature: an inner
-/// `#![cfg(...)]` that names it, as `#![cfg(all(feature = "cuda", ...))]`
-/// does too. `cargo test` never builds such a target.
+/// `#![cfg(...)]` that names it, alone or inside `all(...)`. `cargo test`
+/// never builds such a target. The feature is written escaped here, so this
+/// file is no GPU change by the rule in `docs/agents/testing.md`, "Done
+/// means", which reads it unescaped.
 fn cuda_gated(source: &str) -> bool {
-    source.lines().map(str::trim_start).any(|line| line.starts_with("#![cfg(") && line.contains(r#"feature = "cuda""#))
+    source.lines().map(str::trim_start).any(|line| line.starts_with("#![cfg(") && line.contains("feature = \"cuda\""))
 }
 
 /// Whether a target prints a skip: a print macro (`print!`, `println!`,

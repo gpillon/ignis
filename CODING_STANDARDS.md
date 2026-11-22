@@ -84,7 +84,8 @@ CI run it (`docs/agents/testing.md`, "The gate").
 The checks are `make check`, which compiles the code behind the `cuda` feature
 unless it runs with `CUDA=0` (`cargo test` never does), and the suite's run on
 `ci/<n>`. The rest
-of what a change needs, a kernel change's GPU legs among it, is
+of what a change needs, the GPU profile of a change that touches the GPU
+among it, is
 `docs/agents/testing.md`'s "Done means". Resolving a conflict reformats
 nothing.
 

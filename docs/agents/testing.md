@@ -755,6 +755,20 @@ mk/cuda-build-check.sh --require '86;120a' <binary>...`.
    `logits-capture` adds the one GPU test the profile never builds
    (`flash_next_rope_logits_gpu.rs`, bit-exact on the card that recorded
    its capture, ADR 0059), which nothing else would compile.
-4. kernel changes: `kernel/build.ps1` clean + the leaf's op tests green +
-   the GPU profile green on a free 5090 (`scripts/gpu-profile.ps1` —
-   preflight passed, `IGNIS_GPU_PROFILE=1` for the run — never a skip)
+4. a change that touches the GPU: the full GPU profile green on the commit
+   `main` moves to, beside the green `ci/<n>` run (`make gpu-profile`, which
+   takes the GPU lock and waits for it — preflight passed,
+   `IGNIS_GPU_PROFILE=1` for the run — never a skip); a kernel change also
+   needs `kernel/build.ps1` clean and the leaf's op tests green. A change
+   touches the GPU when one of its changed files is under `kernel/`, is a
+   `*_gpu.rs` test, or is a Rust file that contains `feature = "cuda"`, so
+   whoever lands it reads the answer off the diff, with no judgement: any
+   line of output means the profile runs, none means it does not (#709).
+
+   ```sh
+   git diff --name-only main... | grep -E '^kernel/|_gpu\.rs$'
+   git diff --name-only --diff-filter=d main... -- '*.rs' | xargs -r grep -l 'feature = "cuda"'
+   ```
+
+   `AGENTS.md`'s GPU rule applies: an agent whose own model is served from
+   the card hands the run to the user.
