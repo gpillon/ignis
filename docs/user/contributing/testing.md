@@ -338,14 +338,17 @@ the other. They are no configuration fields: `GET /v1/config` and
   every mix the load holds, whatever the shape policy says (a mix of `w`
   extended lanes beside `n` base lanes within the lanes, and its `2w + n`
   within the pool's slots, the lanes' and the device retained slots': all
-  twelve at 8 lanes); `0`, or unset, captures none and gives back an earlier
-  capture's. The VRAM plan reads it too, at the plan and the load, and plans
+  twelve at 8 lanes); `0` captures none and gives back an earlier capture's;
+  unset, the shape policy decides: `mixed` captures them, `aggregate` and
+  `all` none. The VRAM plan reads it too, at the plan and the load, and plans
   those graphs as its `mixed_graphs` line, so set it before the start for a
-  load to hold them inside its plan. No served round is mixed yet: the round
-  identity test forces a round's mix through the step ABI's test seam
-  (`forced_lane_shapes`), and such a round replays the mix's graph where one
-  was captured, runs eagerly where no capture asked for the mixed graphs, and
-  where the capture asked and could not make that mix's graphs runs at the
+  load to hold them inside its plan. Under `--spec-shape-policy mixed` the
+  grant mixes served rounds (`0` turns that off: the load runs `aggregate`);
+  the round identity test forces a round's mix through the step ABI's test
+  seam (`forced_lane_shapes`), and such a round replays the mix's graph where
+  one was captured, runs eagerly where no capture asked for the mixed graphs,
+  and where the capture asked and could not make that mix's graphs (as a
+  granted round where the pool's slots hold none of that mix) runs at the
   uniform round shape `aggregate` would choose, counted by reason in the
   program's stats (`mixed_fallback_rounds`) and named at load by
   `ignis.runtime.mixed_graph_capture_incomplete`. The stats report each mix's

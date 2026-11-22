@@ -269,7 +269,8 @@ enum ignis_speculative_backend {
 
 /* GitHub #690 (spec #684): the shape policy of such a load, how its lanes'
  * asks of the shape rule become a verify round's shape (kernel/src/round_shape.h
- * `runs_extended`). A round of 5..8 lanes is at the base shape under both. */
+ * `runs_extended`). A round of 5..8 lanes is at the base shape under the first
+ * two; GitHub #715: a round of 8 under all three. */
 enum ignis_shape_policy {
   /* At one lane, the lane's ask. At 2..IGNIS_EXTENDED_SHAPE_MAX_LANES lanes,
    * extended when the drafts the asking lanes are expected to take past
@@ -280,6 +281,13 @@ enum ignis_shape_policy {
   /* Extended only when every lane in the round asks: no lane pays for
    * another. */
   IGNIS_SHAPE_POLICY_ALL = 1,
+  /* GitHub #715 (spec #711): at one lane, the lane's ask; at 2..7 lanes each
+   * asking lane granted the extended shape on its own when what it is
+   * expected to gain beats what its 8 more columns cost every lane, within
+   * 64 columns, so a round may be mixed (kernel/src/round_shape.h `grant`).
+   * On a DFlash2 load of the NVFP4 body at 15 drafts alone; any other load
+   * runs IGNIS_SHAPE_POLICY_AGGREGATE. */
+  IGNIS_SHAPE_POLICY_MIXED = 2,
 };
 
 /* GitHub #690: the most verify rounds a lane's expectations under
@@ -621,6 +629,14 @@ struct ignis_model_load_options {
    * mixed graphs alone, which a capture over a pool of other slots does not
    * follow. Appended at the end: the struct grew by one word and its padding. */
   uint32_t retained_device_slots;
+  /* GitHub #715 (spec #711): the cost table's mixed entries, read under
+   * IGNIS_SHAPE_POLICY_MIXED alone: the period of the round of w extended
+   * lanes beside n base lanes over the base round's at w + n lanes, in
+   * thousandths, for each mix in IGNIS_ROUND_MIXES' order (ignis_step.h),
+   * each in kPeriodRatioMinMilli..kPeriodRatioMaxMilli; 0 is each's default
+   * (kernel/src/round_shape.h `kDefaultMixedPeriodRatios`). Appended at the
+   * end, in the padding and on: the struct grew by twelve words. */
+  uint32_t shape_mixed_period_ratios[12];
 };
 
 /* GitHub #576 (spec #574, ADR 0090): how a verify round's sampling lanes

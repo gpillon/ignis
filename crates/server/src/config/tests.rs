@@ -2026,7 +2026,12 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
     let section = &document["spec"][field::scope(ModelFamily::Qwen38_27b)];
     assert_eq!(
         (section["shape_policy"].clone(), section["shape_estimate_rounds"].clone(), section["shape_period_ratios"].clone()),
-        (serde_json::json!("all"), serde_json::json!(8), serde_json::json!([1.0, 1.2, 1.25, 2.0])),
+        (
+            serde_json::json!("all"),
+            serde_json::json!(8),
+            // GitHub #715: written as the table, the four ratios its uniform entries.
+            serde_json::json!([[1.0], [1.155, 1.2], [1.12, 1.285, 1.25], [1.138, 1.222, 1.384, 2.0], [1.077, 1.207, 1.336], [1.093, 1.241], [1.107]])
+        ),
         "{document}"
     );
     for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
@@ -2057,6 +2062,89 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
         assert!(err.contains(flag[0]) && err.contains("off"), "{err}");
         let err = the_27b_mtp(&["--spec-backend", "mtp", flag[0], flag[1]]).expect_err("DFlash2's").0;
         assert!(err.contains(flag[0]) && err.contains("the shape policy"), "{err}");
+    }
+}
+
+/// GitHub #715 (spec #711): `mixed` is a third shape policy, taken by flag,
+/// env and file, and every built-in profile gives `aggregate`; at 7 drafts it
+/// is accepted and changes nothing. The cost table is taken in both forms: its
+/// seven rows (`/` between rows on a flag or in the env, a list of seven lists
+/// in a file), and the four ratios of the form before it, read as its uniform
+/// entries beside the default mixed ones. A table of other rows, a row of the
+/// wrong length, a ratio outside 1..=2 or one that is not a number is refused,
+/// naming the flag and the value.
+#[test]
+fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gives_aggregate() {
+    use ignis_core::{PeriodTable, ShapePolicy};
+    let policy = |config: &Config| config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().period_table()));
+    let wide = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"];
+    let with = |more: &[&'static str]| -> Vec<&'static str> { wide.iter().chain(more).copied().collect() };
+    assert_eq!(policy(&config(&with(&["--spec-shape-policy", "mixed"]))), Some((ShapePolicy::Mixed, PeriodTable::NVFP4)));
+    let env = env_map(&[("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "15"), ("IGNIS_SPEC_SHAPE_POLICY", "mixed")]);
+    assert_eq!(policy(&expect_config(resolve(&[], env).expect("resolve"))).map(|(policy, _)| policy), Some(ShapePolicy::Mixed));
+    let seven = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-shape-policy", "mixed"]);
+    assert_eq!(policy(&seven).map(|(policy, _)| policy), Some(ShapePolicy::Mixed), "taken at 7 drafts");
+    assert!(!seven.speculation.unwrap().has_extended_shape(), "where no round shape reads it");
+    // Every profile's default, on the 27B.
+    let profiles = profile::built_in();
+    assert!(profiles.contains_key("rtx5090"), "{:?}", profiles.keys());
+    for name in profiles.keys() {
+        let config = config(&["--profile", name]).for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(config.settings().spec.shape_policy, ShapePolicy::Aggregate, "the `{name}` profile");
+    }
+    // The table's seven rows, by flag and by env.
+    let rows = "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5";
+    let mut want = PeriodTable::from_rows(&[
+        vec![1100],
+        vec![1150, 1250],
+        vec![1120, 1300, 1400],
+        vec![1130, 1220, 1380, 1340],
+        vec![1070, 1200, 1330],
+        vec![1090, 1240],
+        vec![1500],
+    ])
+    .unwrap();
+    assert_eq!(policy(&config(&with(&["--spec-shape-policy", "mixed", "--spec-shape-period-ratios", rows]))), Some((ShapePolicy::Mixed, want)));
+    let env = env_map(&[
+        ("IGNIS_SPEC_BACKEND", "dflash2"),
+        ("IGNIS_SPEC_DRAFT_TOKENS", "15"),
+        ("IGNIS_SPEC_SHAPE_PERIOD_RATIOS", "1.1/1.15;1.25/1.12;1.3;1.4/1.13;1.22;1.38;1.34/1.07;1.2;1.33/1.09;1.24/1.5"),
+    ]);
+    assert_eq!(policy(&expect_config(resolve(&[], env).expect("resolve"))), Some((ShapePolicy::Aggregate, want)));
+    // In a file, as the effective configuration writes it, and read back.
+    let named = config(&with(&["--spec-shape-policy", "mixed", "--spec-shape-period-ratios", rows]));
+    let document = file::effective_document(&named);
+    assert_eq!(
+        document["spec"][field::scope(ModelFamily::Qwen38_27b)]["shape_period_ratios"],
+        serde_json::json!([[1.1], [1.15, 1.25], [1.12, 1.3, 1.4], [1.13, 1.22, 1.38, 1.34], [1.07, 1.2, 1.33], [1.09, 1.24], [1.5]]),
+        "{document}"
+    );
+    for (name, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
+        let files = MemFiles::with(&[(name, &format.write(&document))]);
+        let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(policy(&read), Some((ShapePolicy::Mixed, want)), "{name}");
+    }
+    // The four-value form: the uniform entries, the mixed ones their defaults, by flag and in a file.
+    want = PeriodTable::with_uniform([1100, 1200, 1300, 1400]).unwrap();
+    assert_eq!(want.mixed(), PeriodTable::NVFP4.mixed());
+    assert_eq!(policy(&config(&with(&["--spec-shape-period-ratios", "1.1,1.2,1.3,1.4"]))), Some((ShapePolicy::Aggregate, want)));
+    let files = MemFiles::with(&[("c.yaml", "spec:\n  qwen38:\n    backend: dflash2\n    draft_tokens: 15\n    shape_period_ratios: [1.1, 1.2, 1.3, 1.4]\n")]);
+    let read = with_files(&["--config", "c.yaml"], no_env, &files).expect("the four-value form in a file");
+    let read = read.for_family(ModelFamily::Qwen38_27b).unwrap();
+    assert_eq!(policy(&read), Some((ShapePolicy::Aggregate, want)));
+    // Refusals.
+    for raw in [
+        "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24",
+        "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5/1.5",
+        "1.1/1.15/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5",
+        "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34,1.4/1.07,1.2,1.33/1.09,1.24/1.5",
+        "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,0.9/1.5",
+        "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,2.5/1.09,1.24/1.5",
+        "1.1/1.15,1.25/1.12,fast,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5",
+    ] {
+        let err = refused(&with(&["--spec-shape-period-ratios", raw]));
+        assert!(err.contains("--spec-shape-period-ratios") && err.contains(raw), "{raw}: {err}");
     }
 }
 

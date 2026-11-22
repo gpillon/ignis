@@ -36,9 +36,18 @@ inline constexpr std::uint64_t kPageBytes = std::uint64_t{2} << 20;
 
 // The measurement switch IGNIS_MIXED_ROUNDS (ADR 0093's kind), read at each load and at each capture
 // of its decode graphs: `1` asks for the mixed graphs of every mix the load holds, `0` for none.
-// Unset is the shape policy's (until it names the mixes, none). Throws std::invalid_argument, naming
-// the variable, on any other value.
-inline bool asked() { return named_switch("IGNIS_MIXED_ROUNDS", false, {{"0", false}, {"1", true}}); }
+// GitHub #715: unset, the shape policy's: asked where it is `mixed` (`policy_mixed`), never under
+// `aggregate` or `all`. Throws std::invalid_argument, naming the variable, on any other value.
+inline bool asked(bool policy_mixed) {
+  return named_switch("IGNIS_MIXED_ROUNDS", policy_mixed, {{"0", false}, {"1", true}});
+}
+
+// GitHub #715: whether a load runs mixed rounds at all: DFlash2 (`dflash2`) on the NVFP4 body (not
+// `trellis`, which runs none yet) at kWindow drafts. The shape policy `mixed` runs as `aggregate`
+// anywhere else, and no mixed graph is planned or captured there.
+inline bool holds_mixed_rounds(bool dflash2, bool trellis, std::uint32_t window) {
+  return dflash2 && !trellis && window == kWindow;
+}
 
 // GitHub #718: the measurement switch IGNIS_MIXED_GRAPH_BUILD (ADR 0093's kind), read at each capture
 // of a load with an extended shape: unset or `1`, the mixed rounds take the mixed graph's build (one
@@ -53,7 +62,7 @@ inline bool built() { return named_switch("IGNIS_MIXED_GRAPH_BUILD", true, {{"0"
 // pool's `gdn_slots`; 0 anywhere else.
 inline std::uint32_t planned(bool asked, bool dflash2, bool trellis, std::uint32_t window, std::uint32_t lanes,
                              std::int64_t gdn_slots) {
-  if (!asked || !dflash2 || trellis || window != kWindow) {
+  if (!asked || !holds_mixed_rounds(dflash2, trellis, window)) {
     return 0;
   }
   std::uint32_t mask = 0;

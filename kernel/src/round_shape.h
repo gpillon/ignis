@@ -14,10 +14,17 @@
 // into the round's shape (`runs_extended`): `aggregate`, the default, runs it extended when what the
 // asking lanes are expected to gain from their own recent rounds is more than what the wider round
 // costs every lane in it (`policy_extends`); `all` only when every lane asks.
+//
+// GitHub #715 (spec #711): the shape policy `mixed` grants the extended shape lane by lane, so a
+// round may carry both (a mixed round, kernel/src/round_layout.h): `grant` gives each lane its shape
+// under every policy, from a cost table by lane count and extended lanes. Its twin is
+// crates/core/src/shape_grant.rs `lane_shapes`, the definition the CPU tests hold to their tables;
+// kernel/tests/test_round_shape.cpp holds this one to the same rows.
 #pragma once
 
 #include "ignis_model.h"
 #include "process_environment.h"
+#include "round_layout.h"
 
 #include <algorithm>
 #include <array>
@@ -41,6 +48,9 @@ inline constexpr std::uint32_t kDefaultEnterAccepted = 7;
 inline constexpr std::uint32_t kDefaultStayAccepted = 6;
 inline constexpr std::uint32_t kDefaultEstimateRounds = 16;
 inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1128, 1290, 1363, 1344};
+// GitHub #715: the cost table's mixed entries, in kMixTable's order (crates/core/src/shape_grant.rs
+// `PeriodTable::NVFP4`, where each is said to be measured or derived).
+inline constexpr std::array<std::uint32_t, round_layout::kMixes> kDefaultMixedPeriodRatios = {1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336};
 inline constexpr std::uint32_t kPeriodRatioMinMilli = 1000;
 inline constexpr std::uint32_t kPeriodRatioMaxMilli = 2000;
 
@@ -139,7 +149,7 @@ inline LaneEstimate estimate_of(const RecentRounds &rounds, std::uint64_t record
 
 // GitHub #690: the shape policy a load runs (`ignis_model_load_options::shape_policy`,
 // `shape_estimate_rounds`, `shape_period_ratios`; the server's `spec.` fields of the same names).
-enum class Policy : std::uint8_t { kAggregate, kAll };
+enum class Policy : std::uint8_t { kAggregate, kAll, kMixed };
 
 struct ShapePolicy {
   Policy policy = Policy::kAggregate;
@@ -156,37 +166,70 @@ struct ShapePolicy {
   // a slip. The ratio grows with context; these are its value at about 3.5-5K tokens. The one-lane
   // entry is not read: a lane alone runs at the shape it asks.
   std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> period_ratios = kDefaultPeriodRatios;
+  // GitHub #715: the cost table's mixed entries, the round of w extended lanes beside n base lanes
+  // over the base round of w + n lanes, in thousandths, in kMixTable's order: read by `mixed` alone.
+  std::array<std::uint32_t, round_layout::kMixes> mixed_period_ratios = kDefaultMixedPeriodRatios;
 };
 
 // The shape policy a load's options give (`policy`, IGNIS_SHAPE_POLICY_*; `estimate_rounds`, 0 the
 // default; `period_ratios`, IGNIS_EXTENDED_SHAPE_MAX_LANES thousandths, 0 the default of that lane
-// count) in `out`, or the field a load refuses: a policy that is neither, a window past the rounds a
-// lane keeps, a ratio under 1 (an extended round costing less than a base one) or past 2 (more than
-// twice, for at most twice the columns).
+// count; GitHub #715: `mixed_period_ratios`, round_layout::kMixes thousandths, 0 the default of that
+// mix) in `out`, or the field a load refuses: a policy it does not know, a window past the rounds a
+// lane keeps, a ratio under 1 (a round with an extended lane costing less than the base one) or past
+// 2 (more than twice, for at most twice the columns).
 inline const char *policy_of(std::uint32_t policy, std::uint32_t estimate_rounds, const std::uint32_t *period_ratios,
-                             ShapePolicy &out) {
+                             const std::uint32_t *mixed_period_ratios, ShapePolicy &out) {
   ShapePolicy resolved{};
-  if (policy != IGNIS_SHAPE_POLICY_AGGREGATE && policy != IGNIS_SHAPE_POLICY_ALL) {
+  if (policy != IGNIS_SHAPE_POLICY_AGGREGATE && policy != IGNIS_SHAPE_POLICY_ALL && policy != IGNIS_SHAPE_POLICY_MIXED) {
     return "shape_policy";
   }
-  resolved.policy = policy == IGNIS_SHAPE_POLICY_ALL ? Policy::kAll : Policy::kAggregate;
+  resolved.policy = policy == IGNIS_SHAPE_POLICY_ALL     ? Policy::kAll
+                    : policy == IGNIS_SHAPE_POLICY_MIXED ? Policy::kMixed
+                                                         : Policy::kAggregate;
   if (estimate_rounds > IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS) {
     return "shape_estimate_rounds";
   }
   if (estimate_rounds != 0) {
     resolved.estimate_rounds = estimate_rounds;
   }
-  for (std::size_t lanes = 0; lanes < resolved.period_ratios.size(); ++lanes) {
-    const std::uint32_t ratio = period_ratios[lanes];
-    if (ratio != 0 && (ratio < kPeriodRatioMinMilli || ratio > kPeriodRatioMaxMilli)) {
-      return "shape_period_ratios";
+  const auto take = [](const std::uint32_t *given, auto &table) {
+    for (std::size_t at = 0; at < table.size(); ++at) {
+      const std::uint32_t ratio = given[at];
+      if (ratio != 0 && (ratio < kPeriodRatioMinMilli || ratio > kPeriodRatioMaxMilli)) {
+        return false;
+      }
+      if (ratio != 0) {
+        table[at] = ratio;
+      }
     }
-    if (ratio != 0) {
-      resolved.period_ratios[lanes] = ratio;
-    }
+    return true;
+  };
+  if (!take(period_ratios, resolved.period_ratios)) {
+    return "shape_period_ratios";
+  }
+  if (!take(mixed_period_ratios, resolved.mixed_period_ratios)) {
+    return "shape_mixed_period_ratios";
   }
   out = resolved;
   return nullptr;
+}
+
+// GitHub #715: the cost table's entry at a round of `lanes` lanes with `extended` of them extended:
+// 1000 for none, the uniform entry for all of them, a mix's otherwise (`extended` within the lanes
+// 64 columns hold).
+inline std::uint32_t period_ratio(const ShapePolicy &policy, std::uint32_t lanes, std::uint32_t extended) {
+  if (extended == 0) {
+    return 1000;
+  }
+  if (extended == lanes) {
+    return policy.period_ratios[lanes - 1];
+  }
+  for (std::uint32_t m = 0; m < round_layout::kMixes; ++m) {
+    if (round_layout::kMixTable[m][0] == extended && round_layout::kMixTable[m][1] == lanes - extended) {
+      return policy.mixed_period_ratios[m];
+    }
+  }
+  return kPeriodRatioMaxMilli;
 }
 
 // The shape policy over a round of `lanes` lanes (1..IGNIS_EXTENDED_SHAPE_MAX_LANES), `asks[i]`
@@ -241,6 +284,113 @@ inline bool policy_extends(const ShapePolicy &policy, const std::uint8_t *asks, 
   }
   const std::uint64_t ratio = policy.period_ratios[lanes - 1];
   return gain * 1000 > (ratio - 1000) * tokens;
+}
+
+// GitHub #715 (spec #711): one lane of a round as the grant reads it: what it asks, its recent
+// rounds, and the verify rounds in a row it asked the extended shape and ran at the base shape
+// (`ignis_seq::shape_refused_rounds`), which breaks a tie.
+struct GrantLane {
+  bool asks = false;
+  LaneEstimate estimate{};
+  std::uint32_t refused_rounds = 0;
+};
+
+// The most columns a verify round carries (8 lanes at the base shape), and a lane's at the base
+// shape and, at the mixed round's window of 15, at the extended one.
+inline constexpr std::uint32_t kRoundColumns = 64;
+inline constexpr std::uint32_t kBaseColumns = IGNIS_BASE_SHAPE_DRAFT_TOKENS + 1;
+inline constexpr std::uint32_t kMixedExtendedColumns = IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1;
+inline constexpr std::uint32_t kMaxLanes = kRoundColumns / kBaseColumns;
+
+// Each lane's shape in a round of `count` lanes (1..kMaxLanes) under `policy`, `extended[i]` 1 where
+// lane i runs at the extended shape; the extended lanes' count returned. Every lane at one shape is a
+// uniform round, both a mixed round, which only `mixed` gives.
+//   `all`: every lane extended when every lane asks, at 1..IGNIS_EXTENDED_SHAPE_MAX_LANES lanes.
+//   `aggregate`: every lane extended where `policy_extends` says, at those lanes.
+//   `mixed`: at one lane, the lane's ask. At 2..7 the asking lanes are granted one by one, those
+//   with an estimate (an extended round among their recent rounds) first, the highest expected
+//   extra tokens first, at a tie the lane refused longest, then the caller's order. Each grant takes
+//   the round from its w extended lanes to w + 1 while 16 (w + 1) + 8 (n - 1) columns stay within
+//   64, and is made for a lane with no estimate whenever they do, and otherwise when
+//
+//     expected_extra_tokens(lane) * ratio(w) > (ratio(w + 1) - ratio(w)) * sum over lanes of expected_tokens
+//
+//   each mean in thousandths of a token (as `policy_extends` takes them), each ratio the cost
+//   table's (`period_ratio`), signed: a step to a round that costs less is granted. A refused lane
+//   does not end the grant; only the columns do, so 8 lanes are always at the base shape.
+// The columns are the mixed round's window of 15 drafts: a load at another window runs `mixed` as
+// `aggregate` (resolved at load, kernel/src/model.cu).
+inline std::uint32_t grant(const ShapePolicy &policy, const GrantLane *lanes, std::uint64_t count,
+                           std::uint8_t *extended) {
+  std::fill_n(extended, count, std::uint8_t{0});
+  if (count == 0 || count > kMaxLanes) {
+    return 0;
+  }
+  const auto uniform = [&](bool at) {
+    std::fill_n(extended, count, static_cast<std::uint8_t>(at ? 1 : 0));
+    return at ? static_cast<std::uint32_t>(count) : 0u;
+  };
+  if (count == 1) {
+    return uniform(lanes[0].asks);
+  }
+  if (policy.policy != Policy::kMixed) {
+    std::array<std::uint8_t, kMaxLanes> asks{};
+    std::array<LaneEstimate, kMaxLanes> estimates{};
+    for (std::uint64_t i = 0; i < count; ++i) {
+      asks[i] = lanes[i].asks ? 1 : 0;
+      estimates[i] = lanes[i].estimate;
+    }
+    return uniform(policy_extends(policy, asks.data(), estimates.data(), count));
+  }
+  const auto expected_tokens = [](const LaneEstimate &e) -> std::int64_t {
+    return e.rounds == 0 ? kBaseColumns * 1000ll : static_cast<std::int64_t>(e.tokens) * 1000 / e.rounds;
+  };
+  const auto expected_extra = [](const LaneEstimate &e) -> std::int64_t {
+    return e.extended_rounds == 0 ? -1 : static_cast<std::int64_t>(e.extra_tokens) * 1000 / e.extended_rounds;
+  };
+  std::int64_t tokens = 0;
+  std::array<std::uint32_t, kMaxLanes> order{};
+  std::uint32_t asking = 0;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    tokens += expected_tokens(lanes[i].estimate);
+    if (lanes[i].asks) {
+      order[asking++] = i;
+    }
+  }
+  // Lane a before lane b: an estimate before none, then the higher expected extra tokens, then the
+  // lane refused longer, then the caller's order (an insertion sort keeps it).
+  const auto before = [&](std::uint32_t a, std::uint32_t b) {
+    const std::int64_t ea = expected_extra(lanes[a].estimate);
+    const std::int64_t eb = expected_extra(lanes[b].estimate);
+    if ((ea < 0) != (eb < 0)) {
+      return eb < 0;
+    }
+    if (ea != eb) {
+      return ea > eb;
+    }
+    return lanes[a].refused_rounds > lanes[b].refused_rounds;
+  };
+  for (std::uint32_t i = 1; i < asking; ++i) {
+    for (std::uint32_t j = i; j > 0 && before(order[j], order[j - 1]); --j) {
+      std::swap(order[j], order[j - 1]);
+    }
+  }
+  const auto lanes32 = static_cast<std::uint32_t>(count);
+  std::uint32_t granted = 0;
+  for (std::uint32_t k = 0; k < asking; ++k) {
+    if (kMixedExtendedColumns * (granted + 1) + kBaseColumns * (lanes32 - granted - 1) > kRoundColumns) {
+      break;
+    }
+    const std::uint32_t lane = order[k];
+    const std::int64_t current = period_ratio(policy, lanes32, granted);
+    const std::int64_t next = period_ratio(policy, lanes32, granted + 1);
+    const std::int64_t extra = expected_extra(lanes[lane].estimate);
+    if (extra < 0 || extra * current > (next - current) * tokens) {
+      extended[lane] = 1;
+      ++granted;
+    }
+  }
+  return granted;
 }
 
 // What IGNIS_ROUND_SHAPE names: unset, each round at the shape the rule and the policy give it

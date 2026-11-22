@@ -349,9 +349,20 @@ int main() {
       const std::string m = load_error({}, &all);
       check(contains(m, "text/token_embedding"), "`all`, 64 rounds, ratios at 1 and 2 reach the binding: " + m);
       ignis_model_load_options policy = dflash2(15);
-      policy.shape_policy = 2;
+      policy.shape_policy = 3;
       const std::string p = load_error({}, &policy);
-      check(contains(p, "shape_policy 2"), "a shape policy that is neither is refused naming the field: " + p);
+      check(contains(p, "shape_policy 3"), "a shape policy it does not know is refused naming the field: " + p);
+      // GitHub #715: `mixed` and its cost table's entries, the same way.
+      ignis_model_load_options mixed = dflash2(15);
+      mixed.shape_policy = IGNIS_SHAPE_POLICY_MIXED;
+      mixed.shape_mixed_period_ratios[0] = 1000;
+      mixed.shape_mixed_period_ratios[11] = 2000;
+      const std::string x = load_error({}, &mixed);
+      check(contains(x, "text/token_embedding"), "`mixed`, mixed entries at 1 and 2 reach the binding: " + x);
+      mixed.shape_mixed_period_ratios[11] = 2001;
+      const std::string y = load_error({}, &mixed);
+      check(contains(y, "shape_mixed_period_ratios 1000,0,0,0,0,0,0,0,0,0,0,2001") && contains(y, "1000..2000"),
+            "a mixed entry past 2 is refused naming the field: " + y);
       ignis_model_load_options rounds = dflash2(15);
       rounds.shape_estimate_rounds = IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS + 1;
       const std::string r = load_error({}, &rounds);
@@ -369,7 +380,8 @@ int main() {
       one_shape.speculative_backend = backend;
       one_shape.shape_enter_accepted = 9;
       one_shape.shape_stay_accepted = 12;
-      one_shape.shape_policy = 2;
+      one_shape.shape_policy = 3;
+      one_shape.shape_mixed_period_ratios[0] = 999;
       one_shape.shape_estimate_rounds = 65;
       one_shape.shape_period_ratios[0] = 999;
       const std::string m = load_error({}, &one_shape);
