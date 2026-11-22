@@ -1244,9 +1244,9 @@ a **mixed round**. The **cost table** (`spec.shape_period_ratios`) holds each
 round's period over the base round's by lane count (1..7) and extended lanes;
 `aggregate` reads its uniform entries. `mixed` runs on the NVFP4 body at 15
 drafts alone (any other load runs `aggregate`) and asks for the mixed graphs
-there (`IGNIS_MIXED_ROUNDS` unset); a round with a lane held to a grammar, or
-whose mix the load holds no graph of, runs the uniform shape `aggregate` gives
-it. Every profile defaults to `aggregate`.
+there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
+other (#716), and a round whose mix the load holds no graph of runs the uniform
+shape `aggregate` gives it. Every profile defaults to `aggregate`.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify

@@ -216,8 +216,8 @@
 //!
 //! #716: after [`MIX_RIDES`] the same lanes ride [`HELD_RIDES`], mixed rounds
 //! with lanes held to a grammar, the host cutting each held lane's run one
-//! token short as a grammar's check-first cut does: a held lane in the
-//! extended group, then one in each group, none at its caller's row. The host
+//! token short as a grammar's check-first cut does: held lanes in both groups
+//! beside a free lane, all but one away from their caller's row. The host
 //! is handed exactly the held lanes, by the caller's index, each its own run
 //! at its own shape's window, and each commits what the host kept; each held
 //! lane is then repaired from the scores its round kept, which on greedy lanes
@@ -445,15 +445,16 @@ const FAILED_MIX: (u32, u32) = (2, 1);
 /// #716: on the same loads, after [`MIX_RIDES`], on the same lanes: live mixed
 /// rounds with lanes held to a grammar ([`ride_held`]), each of the lanes
 /// named, extended where the second list says, the host cutting the run of
-/// each lane the third marks: a held lane in the extended group, then one in
-/// each group, none at its caller's row, each repaired right after its round.
+/// each lane the third marks: held lanes in both groups beside a free lane,
+/// all but one of them away from their caller's row, each repaired right
+/// after its round.
 /// Then two lanes the last of them did not hold ride [`HELD_STAMP_RIDE`], after
 /// which a repair of a lane it held is refused; then the held lanes ride a
 /// teacher-forced mix, each in the other group ([`HELD_FORCED_RIDE`]): a
 /// teacher-forced round takes no host cut (#590).
 const HELD_RIDES: [(&[usize], &[bool], &[bool]); 2] = [
-    (&[0, 1, 2], &[false, true, false], &[false, true, false]),
-    (&[0, 1, 2, 3], &[true, false, false, true], &[false, false, true, true]),
+    (&[0, 1, 2], &[false, true, false], &[true, true, false]),
+    (&[0, 1, 2, 3], &[true, false, false, true], &[true, false, true, true]),
 ];
 const HELD_STAMP_RIDE: (&[usize], &[bool]) = (&[0, 1], &[true, false]);
 const HELD_FORCED_RIDE: (&[usize], &[bool]) = (&[0, 1, 2, 3], &[false, true, true, false]);
@@ -1472,6 +1473,11 @@ fn ride_held(
     }
     .unwrap_or_else(|e| panic!("{what}: {e}"));
     expect_replay(model, pool, mixed, &what);
+    println!(
+        "round_identity_gpu {what}: runs of {:?} tokens, the host handed {:?}",
+        runs.iter().map(|run| run.tokens.len()).collect::<Vec<_>>(),
+        seen.iter().map(|run| run.as_ref().map(Vec::len)).collect::<Vec<_>>()
+    );
     for (index, ((&lane, run), &at_extended)) in riding.iter().zip(runs).zip(extended).enumerate() {
         let drafts = if at_extended { load.window } else { BASE_WINDOW };
         assert_eq!((run.extent, run.extended), (drafts, at_extended), "{what}: lane {lane} drafts its own shape's whole window");

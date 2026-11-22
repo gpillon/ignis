@@ -437,7 +437,7 @@ and a restore of each right after it: every arm holds them to the reference,
 and each capture that asks for the mixed graphs reports all twelve, their
 measured bytes within the plan's line. From #716 those lanes then ride mixed
 rounds with lanes held to a grammar, the host cutting each held lane's run one
-token short, a held lane in the extended group and then one in each group: the
+token short, held lanes in both groups beside a free lane: the
 host is handed exactly the held lanes, by the caller's index, and each is
 repaired right after its round (with greedy lanes a repair permitting every
 token first draws the pending token again, the argmax of the lane's own

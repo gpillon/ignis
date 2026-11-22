@@ -3288,23 +3288,14 @@ int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *con
   return 0;
 }
 
-// GitHub #715 (spec #711): whether the round of `batch_size` lanes takes each lane's shape from the
-// shape policy `mixed`'s grant (`run_granted_round`): on a load that runs `mixed` (kernel/src/model.cu
-// resolves it to `aggregate` on a load that holds no mixed round) whose latest capture asked for the
-// mixed graphs (a capture under IGNIS_MIXED_ROUNDS=0 turns them off), IGNIS_ROUND_SHAPE unset
-// (`named`). The one place a lane held to a grammar keeps its round uniform: a round with a lane the
-// host cuts runs the uniform choice `aggregate` makes, as no mixed round takes a host cut yet.
-bool round_is_granted(const ignis_model &model, const ignis_decode_options &options, uint64_t batch_size,
-                      ignis::round_shape::Named named) {
-  if (model.extended_shape == nullptr || named != ignis::round_shape::Named::kRule ||
-      model.shape_policy.policy != ignis::round_shape::Policy::kMixed || !model.mixed_capture_asked) {
-    return false;
-  }
-  if (options.host_cut_lanes != nullptr &&
-      std::any_of(options.host_cut_lanes, options.host_cut_lanes + batch_size, [](std::uint8_t at) { return at != 0; })) {
-    return false;
-  }
-  return true;
+// GitHub #715 (spec #711): whether a round takes each lane's shape from the shape policy `mixed`'s
+// grant (`run_granted_round`): on a load that runs `mixed` (kernel/src/model.cu resolves it to
+// `aggregate` on a load that holds no mixed round) whose latest capture asked for the mixed graphs (a
+// capture under IGNIS_MIXED_ROUNDS=0 turns them off), IGNIS_ROUND_SHAPE unset (`named`). GitHub #716:
+// a round with a lane the host cuts, held to a grammar, is granted as any other.
+bool round_is_granted(const ignis_model &model, ignis::round_shape::Named named) {
+  return model.extended_shape != nullptr && named == ignis::round_shape::Named::kRule &&
+         model.shape_policy.policy == ignis::round_shape::Policy::kMixed && model.mixed_capture_asked;
 }
 
 // GitHub #715: a verify round of `sequences` at the shapes the grant gives its lanes from their asks,
@@ -3540,7 +3531,7 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
           return -1;
         }
         // GitHub #715 (spec #711): under `mixed`, each lane's shape from the grant.
-        if (round_is_granted(*model, *options, batch_size, named)) {
+        if (round_is_granted(*model, named)) {
           const auto began = std::chrono::steady_clock::now();
           const int32_t rc = run_granted_round(model, pool, sequences, batch_size, sampling, *options, out_token_ids);
           if (rc != 0) {

@@ -234,8 +234,9 @@ lanes they differ in who pays the wider round:
   beside three conversations can then draft 15 while they draft 7. Mixed rounds
   run only on the NVFP4 artifact at 15 drafts: any other load runs `mixed` as
   `aggregate`, and its load log says so (`shape_policy=aggregate
-  shape_policy_given=mixed`). A round with a request held to a grammar runs
-  the uniform shape `aggregate` gives it. Every profile gives `aggregate`;
+  shape_policy_given=mixed`). A request held to a grammar is granted as any
+  other: the grammar's check cuts its run at its first miss at the shape it
+  was granted, in a mixed round too. Every profile gives `aggregate`;
   `mixed` is opt-in until its served gate passes. A mix whose graphs the load
   does not hold (a two-lane load without a retained device slot holds none,
   [the configuration reference](../configuration/context-and-speculation.md))
