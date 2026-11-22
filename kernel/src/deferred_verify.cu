@@ -201,8 +201,9 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream) {
 }
 
 int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width,
-                       cudaGraphExec_t *out_exec, std::string *error) {
+                       cudaGraphExec_t *out_exec, std::uint32_t *out_nodes, std::string *error) {
   *out_exec = nullptr;
+  *out_nodes = 0;
   cudaError_t err = cudaStreamBeginCapture(model->stream, cudaStreamCaptureModeThreadLocal);
   if (err != cudaSuccess) {
     *error = std::string("cudaStreamBeginCapture failed: ") + cudaGetErrorString(err);
@@ -224,6 +225,11 @@ int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVeri
     (void)cudaGetLastError();
     return -1;
   }
+  std::size_t nodes = 0;
+  if (cudaGraphGetNodes(graph, nullptr, &nodes) != cudaSuccess) {
+    (void)cudaGetLastError();
+    nodes = 0;
+  }
   cudaGraphExec_t exec = nullptr;
   err = cudaGraphInstantiate(&exec, graph, 0);
   cudaGraphDestroy(graph);
@@ -233,6 +239,7 @@ int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVeri
     return -1;
   }
   *out_exec = exec;
+  *out_nodes = static_cast<std::uint32_t>(nodes);
   return 0;
 }
 

@@ -598,6 +598,9 @@ struct IgnisVerifyRound {
   bool defer = false;
   std::unique_ptr<VerifyStaging> staging;
   std::array<cudaGraphExec_t, IGNIS_DECODE_MAX_BATCH> append_exec{};
+  // GitHub #712: each append graph's node count, 0 for a width not captured
+  // (`ignis_program_stats`'s round shapes' `drafter_append_graph_nodes`).
+  std::array<uint32_t, IGNIS_DECODE_MAX_BATCH> append_nodes{};
   std::uint64_t folds_in_flight = 0;
   // GitHub #687: the verify rounds run at this shape, and how many of them ran
   // eagerly, with no graph (`ignis_program_stats`'s round shapes).

@@ -2952,8 +2952,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
                                          accepted[i]);
       }
     }
-    if (options.out_round_shape != nullptr) {
-      *options.out_round_shape = extended ? 1 : 0;
+    // GitHub #712: and each lane's shape.
+    for (uint64_t i = 0; options.out_lane_shapes != nullptr && i < batch_size; ++i) {
+      options.out_lane_shapes[i] = extended ? 1 : 0;
     }
     model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;
@@ -3696,6 +3697,7 @@ ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape, const I
     }
     if (shape.append_exec[width - 1] != nullptr) {
       out.drafter_append_graph_ready_mask |= 1u << (width - 1);
+      out.drafter_append_graph_nodes[width - 1] = shape.append_nodes[width - 1];
     }
   }
   out.verify_folds_in_flight = shape.folds_in_flight;

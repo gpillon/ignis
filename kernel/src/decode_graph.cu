@@ -718,6 +718,7 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
         cudaGraphExecDestroy(held->append_exec[width - 1]);
         held->append_exec[width - 1] = nullptr;
       }
+      held->append_nodes[width - 1] = 0;
     }
   }
   // GitHub #336: the widths the load's lanes serve, and no wider: a round
@@ -771,7 +772,7 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     for (uint32_t width = 1; width <= held->lanes; ++width) {
       std::string error;
       if (ignis::deferred_verify::capture_append(model, pool, *held, width, &held->append_exec[width - 1],
-                                                 &error) != 0) {
+                                                 &held->append_nodes[width - 1], &error) != 0) {
         set_error("ignis_decode_graph_capture: the drafter's append at " + std::to_string(held->window) +
                   " drafts, width " + std::to_string(width) + ": " + error);
       }

@@ -120,6 +120,9 @@ pub mod step;
 // GitHub #340: the step ABI's decode options, a kernel-free mirror whose
 // layout pin runs on CPU.
 pub(crate) mod step_abi;
+// GitHub #712: a verify round's runs from what the leaf wrote, kernel-free so
+// that their reading and counting run on CPU.
+pub(crate) mod verify_run;
 #[cfg(feature = "cuda")]
 pub mod trellis;
 pub mod types;

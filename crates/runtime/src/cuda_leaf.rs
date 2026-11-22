@@ -33,7 +33,7 @@ use ignis_core::seq::{
 use ignis_core::step;
 use ignis_core::{
     ArtifactHash, BlobIdentity, DecodeParams, KvFormat, KvGeometry, KvPoolPlan, ModelConfig,
-    N_DECODE_LANES, SpecCounters, TokenId, plan_kv_pool_for_context,
+    N_DECODE_LANES, TokenId, plan_kv_pool_for_context,
 };
 
 use ignis_core::vision::MediaItem;
@@ -615,13 +615,12 @@ impl CudaLeaf {
         Ok(runs
             .into_iter()
             .map(|run| {
-                // Committed drafts: the run past its anchor, which a stop cut
-                // may leave shorter than what the target accepted.
-                let accepted = (run.tokens.len() as u32).saturating_sub(1).min(run.extent);
+                // GitHub #689, #690, #712: the drafts it committed, at the lane's
+                // own shape, in a round that split its lanes' asks or not.
+                let spec = Some(run.counters());
                 LaneRun {
                     tokens: run.tokens.into_iter().map(|id| id as TokenId).collect(),
-                    // GitHub #689, #690: and the round's shape, and whether it split its lanes' asks.
-                    spec: Some(SpecCounters::round(run.extent, accepted).at_shape(run.extended).in_split_round(run.split)),
+                    spec,
                     drawn_probability: None,
                     redirected: run.redirected,
                 }

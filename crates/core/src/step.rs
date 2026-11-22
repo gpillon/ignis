@@ -131,6 +131,8 @@ pub(crate) mod ffi {
         /// GitHub #687.
         pub verify_rounds: u64,
         pub eager_verify_rounds: u64,
+        /// GitHub #712.
+        pub drafter_append_graph_nodes: [u32; 8],
     }
 
     #[repr(C)]
@@ -578,6 +580,10 @@ pub struct RoundShapeStats {
     /// ran eagerly, with no graph.
     pub verify_rounds: u64,
     pub eager_verify_rounds: u64,
+    /// GitHub #712: entry `w - 1` the node count of the drafter's append
+    /// graph after a round at the shape at width `w`; 0 for a width with no
+    /// append graph.
+    pub drafter_append_graph_nodes: [u32; 8],
 }
 
 impl RoundShapeStats {
@@ -1442,7 +1448,7 @@ fn program_round(
         host_cut_context: std::ptr::null_mut(),
         forced_drafts: std::ptr::null(),
         forced_shape_window: 0,
-        out_round_shape: std::ptr::null_mut(),
+        out_lane_shapes: std::ptr::null_mut(),
         out_shape_asks: std::ptr::null_mut(),
     };
     let mut tokens = vec![-1; handles.len()];
@@ -1724,29 +1730,9 @@ pub fn decode_program_verify(
         .collect())
 }
 
-/// One lane's run through a verify round (P5-05, GitHub #155): the committed run, and how
-/// many drafts the round verified for the lane -- its extent, whether the
-/// caller proposed them or the DFlash2 drafter did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaneVerifyRun {
-    pub tokens: Vec<i32>,
-    pub extent: u32,
-    /// GitHub #307: on a Flash-Next load with the MTP head, the drafts the
-    /// head made for the lane's next round, at the frontier this run left it
-    /// at (`window` of them); empty on any other load.
-    pub next_drafts: Vec<i32>,
-    /// GitHub #315 (ADR 0048): the lane's next pending token is its
-    /// `reasoning_close` in place of a stop id -- the next round emits it
-    /// first.
-    pub redirected: bool,
-    /// GitHub #689: the round ran at its load's extended round shape (one
-    /// shape for every lane of it); false at the base shape, the only one of
-    /// a load at 7 drafts or fewer.
-    pub extended: bool,
-    /// GitHub #690: the round split its lanes' asks of the extended shape
-    /// ([`crate::types::splits_shape_asks`]), the same for every lane of it.
-    pub split: bool,
-}
+/// One lane's run through a verify round (GitHub #712: `crate::verify_run`,
+/// where the round's outputs are read on CPU).
+pub use crate::verify_run::LaneVerifyRun;
 
 /// [`decode_program_verify`], reporting each lane's extent with its run.
 ///
@@ -2073,7 +2059,9 @@ fn verify_round(
     let mut extents = vec![0u32; handles.len()];
     let mut next_drafts = vec![-1i32; handles.len() * width];
     let mut redirected = vec![0i32; handles.len()];
-    let mut round_shape = 0u32;
+    // GitHub #712: each lane's shape; a round that writes none (Flash-Next's)
+    // leaves every lane at the base shape.
+    let mut lane_shapes = vec![0u32; handles.len()];
     let mut shape_asks = 0u32;
     // No proposal on any lane is a null seam: every lane at extent 0 under a
     // caller-fed load, the drafter's own proposals under DFlash2.
@@ -2101,7 +2089,7 @@ fn verify_round(
         }),
         forced_drafts: forced.drafts,
         forced_shape_window: forced.shape_window,
-        out_round_shape: &mut round_shape,
+        out_lane_shapes: lane_shapes.as_mut_ptr(),
         out_shape_asks: &mut shape_asks,
     };
     let rc = unsafe {
@@ -2118,24 +2106,17 @@ fn verify_round(
     if rc != 0 {
         return Err(last_error());
     }
-    let split = crate::types::splits_shape_asks(handles.len(), shape_asks);
-    Ok(committed
-        .iter()
-        .zip(&extents)
-        .enumerate()
-        .map(|(index, (&count, &extent))| {
-            let start = index * (width + 1);
-            let drafts = &next_drafts[index * width..(index + 1) * width];
-            LaneVerifyRun {
-                tokens: tokens[start..start + count as usize].to_vec(),
-                extent,
-                next_drafts: if drafts.iter().all(|&d| d >= 0) { drafts.to_vec() } else { Vec::new() },
-                redirected: redirected[index] == 1,
-                extended: round_shape == 1,
-                split,
-            }
-        })
-        .collect())
+    Ok(crate::verify_run::RoundOutputs {
+        window: width,
+        tokens: &tokens,
+        committed: &committed,
+        extents: &extents,
+        next_drafts: &next_drafts,
+        redirected: &redirected,
+        lane_shapes: &lane_shapes,
+        shape_asks,
+    }
+    .runs())
 }
 
 /// A media item's device-resident encoder output (GitHub #178): the
@@ -2639,6 +2620,7 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
             lanes: shape.lanes,
             verify_rounds: shape.verify_rounds,
             eager_verify_rounds: shape.eager_verify_rounds,
+            drafter_append_graph_nodes: shape.drafter_append_graph_nodes,
         }),
     })
 }
