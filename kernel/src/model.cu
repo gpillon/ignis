@@ -1029,6 +1029,33 @@ std::unique_ptr<IgnisVerifyRound> build_extended_shape(const ignis_topology &top
   return verify;
 }
 
+// GitHub #713 (spec #711): a mixed round's base records -- the base shape's record width laid at the
+// extended shape's stride over the backing the two shapes' records share
+// (kernel/src/round_layout.h `mixed_base_record_capacity`), so that a layer's base rows past its
+// extended rows are the round's columns there -- where such a layout exists and fits the backing;
+// none otherwise, and no mixed round runs on the load. No device memory: a view of the backing.
+void bind_mixed_base_records(ignis_model &model, const ignis_topology &topology) {
+  // The most rows the vendored records and their fold hold.
+  constexpr std::uint32_t kMaxRecordRows = 8;
+  const IgnisVerifyRound &base = *model.base_shape;
+  const IgnisVerifyRound &extended = *model.extended_shape;
+  const std::uint32_t capacity = ignis::round_layout::mixed_base_record_capacity(
+      static_cast<std::uint32_t>(extended.records_layout.spec.record_capacity), extended.window + 1, base.window + 1,
+      kMaxRecordRows);
+  if (capacity == 0) {
+    return;
+  }
+  ninfer::LayoutBuilder builder;
+  const ninfer::GdnReplayRecordLayout layout =
+      ninfer::plan_gdn_replay_records(builder, verify_record_spec(topology, base.window, capacity));
+  const std::size_t bytes = builder.finish(kArenaAlign, "GDN replay records");
+  if (bytes > base.records_backing->bytes) {
+    return;
+  }
+  model.mixed_base_records = ninfer::GdnReplayRecords(ninfer::DeviceSpan{base.records_backing->p, bytes}, layout);
+  model.mixed_base_capacity = capacity;
+}
+
 // P5-03 (GitHub #152): what one prefill chunk adds to the program scratch on
 // a load with the DFlash2 drafter -- the feature taps and the context append
 // kernel/src/step.cu runs over them (`append_dflash2_context`), in the order
@@ -3153,6 +3180,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
       if (sizes.extended_window != 0) {
         model->extended_shape =
             build_extended_shape(*topology, sizes.extended_window, sizes.extended_lanes, *model->base_shape);
+        // GitHub #713: and the base records a mixed round folds its base lanes from.
+        bind_mixed_base_records(*model, *topology);
         // GitHub #689, #690: the thresholds its rounds' shape rule reads, and their policy.
         model->shape_rule = load.shape_rule;
         model->shape_policy = load.shape_policy;
@@ -3311,6 +3340,16 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     model->w4a4_activation_layout_stream.reset();
     // GitHub #681: the gating's branch, idle once the stream is (every round joins it).
     model->gdn_gating_branch.destroy();
+    // GitHub #713: the mixed rounds' graphs, and their branch, idle as the gating's is.
+    for (auto *execs : {&model->mixed_verify_exec, &model->mixed_append_exec}) {
+      for (cudaGraphExec_t &exec : *execs) {
+        if (exec != nullptr) {
+          cudaGraphExecDestroy(exec);
+          exec = nullptr;
+        }
+      }
+    }
+    model->mixed_branch.destroy();
     if (model->stream != nullptr) {
       cudaStreamDestroy(model->stream);
     }

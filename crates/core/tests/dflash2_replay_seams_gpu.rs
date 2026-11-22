@@ -663,7 +663,7 @@ fn two_shape_seams(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>]) {
         let draft_refs: Vec<&[i32]> = drafts.iter().map(Vec::as_slice).collect();
         let recording_refs: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
         let anchors: Vec<i32> = seqs.iter().map(|seq| seq.pending_token().unwrap()).collect();
-        let forcing = TeacherForcing { shape_window: Some(k), drafts: Some(&draft_refs) };
+        let forcing = TeacherForcing { shape_window: Some(k), drafts: Some(&draft_refs), lane_shapes: None };
         let mut refs: Vec<&mut Seq<'_>> = seqs.iter_mut().collect();
         let runs = decode_program_verify_forced_with(model, pool, &mut refs, &greedy_lanes(2), TWO_SHAPE_WINDOW, &recording_refs, forcing)
             .unwrap_or_else(|e| panic!("{label}: forced drafts: {e}"));
@@ -699,7 +699,7 @@ fn two_shape_seams(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>]) {
         &greedy_lanes(1),
         TWO_SHAPE_WINDOW,
         &[&recording],
-        TeacherForcing { shape_window: Some(9), drafts: None },
+        TeacherForcing { shape_window: Some(9), drafts: None, lane_shapes: None },
     )
     .expect_err("a window no shape has");
     assert!(err.contains("no round shape of this load"), "the wrong refusal: {err}");
@@ -714,7 +714,7 @@ fn two_shape_seams(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>]) {
         &[sampled],
         TWO_SHAPE_WINDOW,
         &[&recording],
-        TeacherForcing { shape_window: None, drafts: Some(&[drafts.as_slice()]) },
+        TeacherForcing { shape_window: None, drafts: Some(&[drafts.as_slice()]), lane_shapes: None },
     )
     .expect_err("a sampling lane offered drafts");
     assert!(err.contains("forced_drafts ride greedy lanes"), "the wrong refusal: {err}");
@@ -725,7 +725,7 @@ fn two_shape_seams(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>]) {
         &greedy_lanes(1),
         TWO_SHAPE_WINDOW,
         &[&recording],
-        TeacherForcing { shape_window: None, drafts: Some(&[&drafts[..3]]) },
+        TeacherForcing { shape_window: None, drafts: Some(&[&drafts[..3]]), lane_shapes: None },
     )
     .expect_err("short forced drafts");
     assert!(err.contains("not the window"), "the wrong refusal: {err}");

@@ -172,9 +172,10 @@ the other. They are no configuration fields: `GET /v1/config` and
   graph and one just after it. Every 256 rounds of a kind, the server's
   standard error (`.scratch/serve/ignis-server.log.err` under `make start`)
   gets one line, `ignis leaf: round timing plain n 256: period median … us
-  mean …, span median …, gap median …` (`verify` for the verify rounds, and
+  mean …, span median …, gap median …` (`verify` for the verify rounds,
   `verify extended` for those at the extended round shape of a load past 7
-  drafts): the period from one round's start to the next one's, the graph's
+  drafts, and `verify mixed` for mixed rounds, `IGNIS_MIXED_ROUNDS` below):
+  the period from one round's start to the next one's, the graph's
   span, and the gap from its end to the next round's start, each the round's
   own whatever shape the next round is, two rounds that begin 50 ms or more
   apart left out (a request or a prefill between them). This is where a
@@ -322,6 +323,18 @@ the other. They are no configuration fields: `GET /v1/config` and
   `ignis.runtime.verify_graph_capture_incomplete` names a shape's widths whose
   verify graph, or drafter's append graph (`graph`), could not be captured,
   whose rounds run that part eagerly.
+- `IGNIS_MIXED_ROUNDS=0|1` (from 0.11.0) picks, at each capture of the decode
+  graphs of a DFlash2 load of the 27B at 15 draft tokens on the NVFP4
+  artifact, whether the mixed round of one extended lane beside one base lane
+  (a round whose lanes take both round shapes) has its verify graph and its
+  drafter-append graph: `1` captures them, whatever the shape policy says;
+  `0`, or unset, captures none and gives back an earlier capture's. No served
+  round is mixed yet: the round identity test forces a round's mix through
+  the step ABI's test seam (`forced_lane_shapes`), and such a round replays
+  the mix's graph where one was captured and runs eagerly otherwise. The
+  program's stats report each mix's graph nodes. A load at another window, a
+  trellis artifact, an MTP load and Flash-Next capture none. Any other value
+  refuses the load, naming the variable.
 
 ### The round identity test
 
@@ -366,6 +379,19 @@ single-test mode, under the GPU lock (`--test <name>` on Linux; 0.10.0 runs it a
 IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 \
   make gpu-profile GPU_PROFILE_ARGS='-Test every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
 ```
+
+From 0.11.0 the sessions of DFlash2 at 15 draft tokens under
+`IGNIS_ROUND_SHAPE=extended` (`nvfp4-dflash2-w15`) end with three rounds of two
+lanes at a forced mix of one extended lane beside one base lane, live,
+teacher-forced and live again, each lane at its own shape's window: every arm
+holds them, the reference's run eagerly, and the arms `mixed-rounds`,
+`mixed-round-timing` and `mixed-sync-verify` replay the mix's graphs under
+`IGNIS_MIXED_ROUNDS=1`, timed and with the verify round's synchronous form; the
+reference also prints a digest of its tokens before those rounds.
+`IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` has the `mixed-round-timing` arm first
+ride two lanes `n` rounds at the uniform extended shape and `n` at the mix, so
+that the round timing prints a `verify extended` and a `verify mixed` line
+(`n` of 257 or more) for the two at two lanes.
 
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the
 three is everything. The second test runs the 15-draft loads the loads filter

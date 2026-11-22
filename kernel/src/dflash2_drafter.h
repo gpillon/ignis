@@ -43,8 +43,9 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
                                   ninfer::ops::KVCacheAppendPrefixExecutionEnvelope envelope,
                                   IgnisA16Call call);
 
-// The drafter's forward for a verify round at batch `width` and shape
-// `verify` (GitHub #686: the round's): each lane's
+// The drafter's forward for a verify round at shape `verify` (GitHub #686:
+// the round's), its lanes laid out as `layout` (GitHub #713,
+// kernel/src/round_layout.h): each lane's
 // anchor and `k` mask tokens at positions `base + j`, five layers of two-tap
 // dynamic conv and sliding-window attention over the lane's window, the
 // target's output head over the `k` draft columns, the per-column top-k and
@@ -58,15 +59,20 @@ void ignis_dflash2_append_context(ignis_model *model, ignis_seq_pool *pool,
 // scratch, so a lane's window is read, never written.
 // Every address is model- or pool-owned and the attention envelope is the
 // load's whole context, so the same call runs eagerly and records into a
-// verify graph.
+// verify graph. GitHub #713: the ops that see only columns run once over the
+// round's columns, those that see a lane's block (the masked block, the
+// dynamic convs, the window attention, the draft columns' copy and the
+// selector, its walk and its draw) once a group on its slice, a mixed round's
+// base group on the branch beside its extended group (`ignis_each_group`),
+// each lane's drafts at its draft base.
 //
 // GitHub #267: with a `readout`, the forward also copies what its selector
 // read -- the candidates, their unary logits, the transition scores and,
 // when asked, the proposal head's logits -- into those host buffers, on the
 // model's stream (the caller synchronizes). Test-only: only
 // `ignis_dflash2_readout` (kernel/include/ignis_dflash2_readout.h) passes
-// one, eagerly; the verify round and its graphs pass none, so what they run
-// and record is unchanged. A null member skips that copy. GitHub #577: under
+// one, eagerly, at a uniform round; the verify round and its graphs pass none,
+// so what they run and record is unchanged. A null member skips that copy. GitHub #577: under
 // the sampled draft the readout draws as the round does, and `q` receives the
 // distribution each sampling lane's draft was drawn from.
 //
@@ -80,13 +86,17 @@ struct Dflash2ProposalReadout {
   float *q                    = nullptr; // F32 [width][k][top_k], under the sampled draft
 };
 void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
-                           std::uint32_t width, const Dflash2ProposalReadout *readout = nullptr);
+                           const ignis::round_layout::Layout &layout,
+                           const Dflash2ProposalReadout *readout = nullptr);
 
 // The verify round's half of the append: the committed columns' feature
 // taps (`verify.features`, written by the traversal) at the round's
 // positions, `verify.append_counts` columns per lane (staged by the
 // caller after the cut), into each lane's window; `verify` is the round's
 // shape. GitHub #712: `layout` its lanes' places in those buffers
-// (kernel/src/round_layout.h), a group's lanes at a time.
+// (kernel/src/round_layout.h), a group's lanes at a time. GitHub #713: a
+// mixed round's projections run once over its columns, and each group's
+// keys and values land in its lanes' windows, the base group's on the
+// branch beside the extended group's.
 void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
                                 const ignis::round_layout::Layout &layout);

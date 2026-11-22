@@ -114,6 +114,10 @@ pub(crate) mod ffi {
     /// load's base and extended shapes.
     pub const IGNIS_ROUND_SHAPES_MAX: usize = 2;
 
+    /// `IGNIS_ROUND_MIXES` (`kernel/include/ignis_step.h`, GitHub #713): the
+    /// mixes a mixed verify round takes.
+    pub const IGNIS_ROUND_MIXES: usize = 12;
+
     /// 1:1 with `struct ignis_round_shape_stats` (GitHub #686): one round
     /// shape's verify round.
     #[repr(C)]
@@ -174,6 +178,9 @@ pub(crate) mod ffi {
         /// verify round, the base shape first.
         pub round_shapes: u32,
         pub shapes: [IgnisRoundShapeStats; IGNIS_ROUND_SHAPES_MAX],
+        /// GitHub #713: each mix's verify and drafter append graph nodes.
+        pub mixed_verify_graph_nodes: [u32; IGNIS_ROUND_MIXES],
+        pub mixed_append_graph_nodes: [u32; IGNIS_ROUND_MIXES],
     }
 
     unsafe extern "C" {
@@ -539,6 +546,13 @@ pub struct ProgramStats {
     /// past [`ProgramStats::round_shape_count`] are zero. See
     /// [`ProgramStats::shapes`].
     pub round_shapes: [RoundShapeStats; ffi::IGNIS_ROUND_SHAPES_MAX],
+    /// GitHub #713 (spec #711): entry `m` the node count of mix `m`'s verify
+    /// graph and of its drafter append graph, the mixes in the order
+    /// (1,1)..(1,6), (2,1)..(2,4), (3,1), (3,2) of `w` extended lanes beside `n`
+    /// base lanes, as the latest [`capture_decode_graphs`] made them under
+    /// `IGNIS_MIXED_ROUNDS=1`; 0 for a mix with no graph.
+    pub mixed_verify_graph_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
+    pub mixed_append_graph_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
 }
 
 impl ProgramStats {
@@ -1450,6 +1464,7 @@ fn program_round(
         forced_shape_window: 0,
         out_lane_shapes: std::ptr::null_mut(),
         out_shape_asks: std::ptr::null_mut(),
+        forced_lane_shapes: std::ptr::null(),
     };
     let mut tokens = vec![-1; handles.len()];
     let rc = unsafe {
@@ -1750,6 +1765,38 @@ pub fn decode_program_verify_runs(
     verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), ForcedOptions::NONE, None)
 }
 
+/// GitHub #713 (spec #711, test-only): [`decode_program_verify_runs`] with
+/// each lane's round shape forced, `extended[i]` the extended shape for lane
+/// `i` and the base shape otherwise, whatever `IGNIS_ROUND_SHAPE`, the shape
+/// rule or the shape policy would choose: lanes of both shapes run one mixed
+/// round, every lane of one shape that uniform round. The seam the mixed
+/// round's tests force each round's mix by, so one load runs any mix with no
+/// reload and no capture. No serving path calls it; the leaf refuses it on a
+/// load of one shape, and a mixed round where the load cannot hold it
+/// (`kernel/include/ignis_step.h`, `forced_lane_shapes`). Each run is in the
+/// caller's order, its [`LaneVerifyRun::extended`] its lane's shape.
+pub fn decode_program_verify_mixed(
+    model: &Model,
+    pool: &SeqPool,
+    sequences: &mut [&mut Seq<'_>],
+    lanes: &[VerifyLane<'_>],
+    window: u32,
+    extended: &[bool],
+) -> Result<Vec<LaneVerifyRun>, String> {
+    let shapes = lane_shape_flags(extended, sequences.len(), "decode_program_verify_mixed")?;
+    let forced = ForcedOptions { lane_shapes: shapes.as_ptr(), ..ForcedOptions::NONE };
+    verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), forced, None)
+}
+
+/// GitHub #713: a forced mix's flags as the decode options carry them, one a
+/// lane, refused unless there is one for each of `lanes` lanes.
+fn lane_shape_flags(extended: &[bool], lanes: usize, what: &str) -> Result<Vec<u8>, String> {
+    if extended.len() != lanes {
+        return Err(format!("{what}: {} lane shapes for {lanes} sequences", extended.len()));
+    }
+    Ok(extended.iter().map(|&lane| u8::from(lane)).collect())
+}
+
 /// [`decode_program_verify_runs`] with a **verify commit whose cut the host
 /// decides** (GitHub #590, spec #287, ADR 0089) on every lane `host_cut_lanes`
 /// marks. After the pass, before anything is committed, `cut(lane, run)` sees
@@ -1897,6 +1944,12 @@ pub struct TeacherForcing<'a> {
     /// every one where they are the recording's. A DFlash2 load's, every
     /// lane greedy; such a round runs eagerly. `None`: the drafter's.
     pub drafts: Option<&'a [&'a [i32]]>,
+    /// GitHub #713: each lane's round shape, as
+    /// [`decode_program_verify_mixed`] forces it, so that the round's lanes of
+    /// both shapes run one mixed round, each lane's recording and drafts read
+    /// at its own shape's window. `None`: the shape is chosen as any round's,
+    /// or by [`TeacherForcing::shape_window`], which a forced mix refuses.
+    pub lane_shapes: Option<&'a [bool]>,
 }
 
 /// [`decode_program_verify_forced`], asked `forcing` (GitHub #692): the
@@ -1943,26 +1996,34 @@ pub fn decode_program_verify_forced_with(
         }
         drafts = forced_drafts.iter().flat_map(|row| row.iter().copied()).collect();
     }
+    let shapes = match forcing.lane_shapes {
+        Some(extended) => lane_shape_flags(extended, sequences.len(), "decode_program_verify_forced")?,
+        None => Vec::new(),
+    };
     let options = ForcedOptions {
         tokens: flat.as_ptr(),
         drafts: if forcing.drafts.is_some() { drafts.as_ptr() } else { std::ptr::null() },
         shape_window: forcing.shape_window.unwrap_or(0),
+        lane_shapes: if forcing.lane_shapes.is_some() { shapes.as_ptr() } else { std::ptr::null() },
     };
     verify_round(model, pool, sequences, lanes, window, std::ptr::null(), std::ptr::null_mut(), options, None)
 }
 
 /// A teacher-forced round's inputs as the decode options carry them
 /// (`forced_tokens`, and GitHub #692's `forced_drafts` and
-/// `forced_shape_window`): all null on every round no test forces.
+/// `forced_shape_window`), and GitHub #713's forced lane shapes, which a live
+/// round rides too: all null on every round no test forces.
 #[derive(Clone, Copy)]
 struct ForcedOptions {
     tokens: *const i32,
     drafts: *const i32,
     shape_window: u32,
+    lane_shapes: *const u8,
 }
 
 impl ForcedOptions {
-    const NONE: Self = Self { tokens: std::ptr::null(), drafts: std::ptr::null(), shape_window: 0 };
+    const NONE: Self =
+        Self { tokens: std::ptr::null(), drafts: std::ptr::null(), shape_window: 0, lane_shapes: std::ptr::null() };
 }
 
 /// GitHub #307 (spec flash-next/07): one Flash-Next verify round at the
@@ -2091,6 +2152,7 @@ fn verify_round(
         forced_shape_window: forced.shape_window,
         out_lane_shapes: lane_shapes.as_mut_ptr(),
         out_shape_asks: &mut shape_asks,
+        forced_lane_shapes: forced.lane_shapes,
     };
     let rc = unsafe {
         ffi::ignis_program_decode(
@@ -2622,6 +2684,8 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
             eager_verify_rounds: shape.eager_verify_rounds,
             drafter_append_graph_nodes: shape.drafter_append_graph_nodes,
         }),
+        mixed_verify_graph_nodes: stats.mixed_verify_graph_nodes,
+        mixed_append_graph_nodes: stats.mixed_append_graph_nodes,
     })
 }
 

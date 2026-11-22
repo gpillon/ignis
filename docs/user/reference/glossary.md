@@ -290,8 +290,9 @@ text before the loop, with a nudge. See
 
 **Round shape.** The columns a lane and the most lanes of a 27B verify round:
 the *base shape*, or from 0.11.0 on a DFlash2 load past 7 drafts the *extended
-shape*, one for all of a round's lanes, which the *shape rule* and the *shape
-policy* choose. See
+shape*, which the *shape rule* and the *shape policy* choose for each of a
+round's lanes; the policies `aggregate` and `all` give all of a round's lanes
+one shape. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Row budget.** The most rows one Flash-Next MTP verify round may take across all

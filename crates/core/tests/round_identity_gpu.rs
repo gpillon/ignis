@@ -175,6 +175,30 @@
 //! 12 ([`uniform_graph_nodes`]); a digest of the reference's tokens is printed
 //! beside them, so that two builds' runs say whether they commit one text.
 //!
+//! # Mixed rounds (#713)
+//!
+//! A mixed round carries lanes of both shapes, an extended group beside a
+//! base group; the test forces a round's mix by naming each lane's shape
+//! ([`decode_program_verify_mixed`], and a teacher-forced round's
+//! `lane_shapes`), never by a switch. On each load of [`MIXED_LOADS`] every
+//! session ends with [`MIXED_RIDES`]: two of the lanes left after the release
+//! ride a mix of one extended lane beside one base lane, live, teacher-forced
+//! and live again, the second lane extended first so that the round's rows are
+//! not the caller's; each lane drafts its own shape's window and reports its
+//! own shape, and each round replays the mix's graph where the arm captured it
+//! (`IGNIS_MIXED_ROUNDS=1`, [`MIXED_ROUNDS`]), eagerly otherwise, the
+//! reference's included. So the arms that capture the mixed graphs again, time
+//! them and run them synchronized hold the graph's rounds to the reference's
+//! eager ones, and every other arm holds its eager mixed rounds; each arm's
+//! capture reports the (1,1) graphs' nodes where it asks for them and none
+//! where it does not ([`mixed_graph_nodes`]), and the reference prints a digest
+//! of its tokens before those rounds, which a build that leaves the uniform
+//! rounds as they were keeps. With `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS` set,
+//! the round-timing arm of the mixed rounds first rides two lanes that many
+//! rounds at the uniform extended shape and as many at the mix
+//! ([`time_mixed_rounds`]), so that the leaf's round timing prints a block of
+//! each on the GPU clock; nothing is compared there.
+//!
 //! # Narrow runs
 //!
 //! `IGNIS_ROUND_IDENTITY_LOADS` (a comma list of load names),
@@ -208,8 +232,9 @@ use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
 use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_permitted, decode_program_batch_sampled, decode_program_verify_cut,
-    decode_program_verify_forced, decode_program_verify_runs, prefill_program_multimodal, prefill_program_sampled, program_stats, MultimodalPrefill,
-    PermittedLane, Redirect, SamplingParams, VerifyLane,
+    decode_program_verify_forced, decode_program_verify_forced_with, decode_program_verify_mixed, decode_program_verify_runs,
+    prefill_program_multimodal, prefill_program_sampled, program_stats, MultimodalPrefill, PermittedLane, Redirect,
+    SamplingParams, TeacherForcing, VerifyLane,
 };
 use ignis_core::{
     DraftRule, DrafterSampling, ExceptionWeights, HqDecodeAttention, KvFormat, PrefillAttention, PrefillLinear,
@@ -288,7 +313,24 @@ const ARMS: &[Arm] = &[
     Arm { name: "dflash2-small-t-vendored", switches: &[("IGNIS_DFLASH2_SMALL_T_FILL", "0")], graphs: true },
 
     // #695's arms, below this line.
+
+    // #713's arms, below this line.
+    // The mixed rounds' graphs, captured again on the same load under IGNIS_MIXED_ROUNDS=1, whose
+    // replays of the sessions' forced mixes are held to the reference's eager rounds; then timed;
+    // then with the deferred verify's synchronous form.
+    Arm { name: "mixed-rounds", switches: &[(MIXED_ROUNDS, "1")], graphs: true },
+    Arm { name: "mixed-round-timing", switches: &[(MIXED_ROUNDS, "1"), ("IGNIS_ROUND_TIMING", "1")], graphs: true },
+    Arm { name: "mixed-sync-verify", switches: &[(MIXED_ROUNDS, "1"), ("IGNIS_DEFER_VERIFY", "0")], graphs: true },
 ];
+
+/// #713: the switch that captures the mixed rounds' graphs, read at capture;
+/// the loads whose sessions end with forced mixed rounds; and those rounds:
+/// each a kind of round and the shapes of its two riders, extended where
+/// `true`.
+const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
+const MIXED_LOADS: [&str; 1] = ["nvfp4-dflash2-w15"];
+const MIXED_RIDES: [(Round, [bool; 2]); 3] =
+    [(Round::Verify, [false, true]), (Round::Forced, [true, false]), (Round::Verify, [true, false])];
 
 /// #687: the switch that names a two-shape load's round shape, read at each
 /// verify round; the base shape's drafts a lane, and the most lanes a round
@@ -646,8 +688,25 @@ impl Load {
         } else {
             0
         };
-        let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds + crossings;
+        // #713: and its mixed rounds' runs.
+        let mixed = if self.mixes() { MIXED_RIDES.len() as u32 * (window + 1) } else { 0 };
+        let tokens = PROMPT_TOKENS + (self.lanes + 1) * rounds + crossings + mixed;
         tokens.div_ceil(128) * 128
+    }
+
+    /// #713: whether the load's sessions end with [`MIXED_RIDES`]: a load of
+    /// [`MIXED_LOADS`] under [`ROUND_SHAPE`]`=extended` (not the second test's
+    /// twins of it, at the base shape or at 7 drafts).
+    fn mixes(&self) -> bool {
+        self.two_shapes() && self.round_shape == Some("extended") && MIXED_LOADS.contains(&self.name) && self.lanes > 2
+    }
+
+    /// #713: whether the load holds the mixed round of one extended lane
+    /// beside one base lane, whose graphs `IGNIS_MIXED_ROUNDS=1` captures:
+    /// the NVFP4 body with DFlash2 at 15 drafts, the one window at which a
+    /// mixed round's records are its columns.
+    fn holds_a_mix(&self) -> bool {
+        self.two_shapes() && self.window == 15 && self.artifact == NVFP4 && self.lanes >= 2
     }
 
     /// #689: whether the load's rounds take the shape the shape rule gives
@@ -885,6 +944,25 @@ fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
     }
 }
 
+/// #713: the mixed graphs the arm's capture made: under
+/// `IGNIS_MIXED_ROUNDS=1`, on a load that holds it ([`Load::holds_a_mix`]),
+/// the (1,1) mix's verify graph and, where the arm's rounds defer, its
+/// drafter append graph, and no other mix's; none anywhere else.
+fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    let (verify, append) = (stats.mixed_verify_graph_nodes, stats.mixed_append_graph_nodes);
+    let captures = arm.switches.contains(&(MIXED_ROUNDS, "1")) && load.holds_a_mix();
+    if captures {
+        println!(
+            "round_identity_gpu {label}: arm `{}`: the 1+1 mixed round's verify graph {} nodes, append graph {} nodes",
+            arm.name, verify[0], append[0]
+        );
+    }
+    assert_eq!(verify[0] > 0, captures, "{label}: arm `{}`: the 1+1 mixed verify graph", arm.name);
+    assert_eq!(append[0] > 0, captures && defers_verify(load, arm), "{label}: arm `{}`: the 1+1 mixed append graph", arm.name);
+    assert!(verify[1..].iter().chain(&append[1..]).all(|&nodes| nodes == 0), "{label}: arm `{}`: another mix's graphs", arm.name);
+}
+
 /// #712: a digest of a session's tokens, every lane's in order (FNV-1a over
 /// each token and each lane's end), printed for the reference so that two
 /// builds' logs say whether they commit the same text.
@@ -1104,9 +1182,135 @@ fn ride(
     }
 }
 
+/// #713: one round of `riding` at the mix `extended` names (lane
+/// `riding[i]` extended where `extended[i]`), live or teacher-forced as
+/// `round` says: each lane drafts its own shape's whole window and reports
+/// its shape, and the round replays the mix's graph where the arm captured it
+/// (`mixed`), a teacher-forced round of sampling lanes eagerly whatever it
+/// captured, as every such round runs.
+#[allow(clippy::too_many_arguments)]
+fn ride_mixed(
+    model: &Model,
+    pool: &SeqPool,
+    load: &Load,
+    script: &Script,
+    seqs: &mut [Option<Seq<'_>>],
+    riding: &[usize],
+    sampling: fn(usize) -> SamplingParams,
+    mixed: bool,
+    (round, extended): (Round, [bool; 2]),
+    committed: &mut Committed,
+    mirror: &mut [shape_policy::Lane],
+    label: &str,
+) {
+    let what = format!("{label}: lanes {riding:?} at the mix {extended:?}, a {round:?} round");
+    let rule = load.speculation().shape_rule();
+    let mut refs = riders(seqs, riding);
+    let (runs, on_device) = match round {
+        Round::Verify => {
+            let lanes: Vec<VerifyLane<'_>> =
+                riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
+            (decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &extended), false)
+        }
+        Round::Forced => {
+            let lanes: Vec<VerifyLane<'_>> =
+                riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
+            let recordings: Vec<Vec<i32>> = riding
+                .iter()
+                .map(|&lane| (0..=load.window as usize).map(|at| script.permitted[(lane + at) % script.permitted.len()]).collect())
+                .collect();
+            let forced: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
+            let forcing = TeacherForcing { shape_window: None, drafts: None, lane_shapes: Some(&extended) };
+            let on_device = lanes.iter().any(|lane| lane.sampling.temperature > 0.0);
+            (decode_program_verify_forced_with(model, pool, &mut refs, &lanes, load.window, &forced, forcing), on_device)
+        }
+        _ => unreachable!("a mixed round is a verify round, live or teacher-forced"),
+    };
+    let runs = runs.unwrap_or_else(|e| panic!("{what}: {e}"));
+    expect_replay(model, pool, mixed && !on_device, &what);
+    for ((&lane, run), &at_extended) in riding.iter().zip(runs).zip(&extended) {
+        let drafts = if at_extended { load.window } else { BASE_WINDOW };
+        assert_eq!((run.extent, run.extended), (drafts, at_extended), "{what}: lane {lane} drafts its own shape's whole window");
+        mirror[lane].after(rule, run.extended, run.extent, run.tokens.len() as u32 - 1);
+        committed[lane].extend(run.tokens);
+        committed[lane].push(-1);
+    }
+}
+
+/// #713: each lane's tokens before the session's [`MIXED_RIDES`], which its
+/// two riders' last runs are: the session of a build before mixed rounds.
+/// Each run ends at its -1; the first one follows the [`PLAIN_ROUNDS`] plain
+/// tokens after the last verify run before it, which stay.
+fn before_mixed_rides(load: &Load, sessions: &[Committed]) -> Vec<Committed> {
+    sessions
+        .iter()
+        .map(|session| {
+            let mut lanes = session.clone();
+            if load.mixes() {
+                for lane in mixed_riders(load) {
+                    for ride in 0..MIXED_RIDES.len() {
+                        lanes[lane].pop();
+                        let end = lanes[lane].iter().rposition(|&token| token == -1).map_or(0, |at| at + 1);
+                        let plain = if ride + 1 == MIXED_RIDES.len() { PLAIN_ROUNDS as usize } else { 0 };
+                        lanes[lane].truncate(end + plain);
+                    }
+                }
+            }
+            lanes
+        })
+        .collect()
+}
+
+/// #713: the two lanes that ride [`MIXED_RIDES`], of those the release left.
+fn mixed_riders(load: &Load) -> Vec<usize> {
+    (0..load.lanes as usize).step_by(2).take(2).collect()
+}
+
+/// #713 (opt-in): two lanes ride `rounds` greedy verify rounds at the uniform
+/// extended shape, then as many at the mix of one extended lane beside one
+/// base lane, a fresh pair prefilled whenever a lane nears its context, so
+/// that the leaf's round timing, on in the arm that runs this, prints a block
+/// of each kind on stderr (`verify extended`, `verify mixed`: 256 periods a
+/// block, each round's period to the next round's launch): the two lanes'
+/// periods on the GPU clock, read off the log. Nothing is compared.
+fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, label: &str) {
+    let lanes = [VerifyLane::greedy(&[]), VerifyLane::greedy(&[])];
+    for extended in [[true, true], [true, false]] {
+        let mut ridden = 0;
+        while ridden < rounds {
+            let mut pair: Vec<Seq<'_>> = (0..2)
+                .map(|lane| {
+                    let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: timing alloc: {e}"));
+                    prefill(model, pool, &mut seq, &script.prompts[lane], greedy(lane), false, label);
+                    seq
+                })
+                .collect();
+            let mut used = script.prompts[0].len().max(script.prompts[1].len()) as u32;
+            while ridden < rounds && used + 2 * (load.window + 1) <= load.context() {
+                let mut refs: Vec<&mut Seq<'_>> = pair.iter_mut().collect();
+                let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &extended)
+                    .unwrap_or_else(|e| panic!("{label}: timing at {extended:?}: {e}"));
+                used += runs.iter().map(|run| run.tokens.len() as u32).max().unwrap_or(0);
+                ridden += 1;
+            }
+        }
+        println!("round_identity_gpu {label}: {ridden} timed rounds of two lanes at {extended:?}");
+    }
+}
+
 /// The session (see the module's note) on `pool`, under the arm's graphs or
-/// eagerly.
-fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling: fn(usize) -> SamplingParams, graphs: bool, label: &str) -> Committed {
+/// eagerly. #713: `mixed`, whether the arm captured the mixed rounds' graphs.
+#[allow(clippy::too_many_arguments)]
+fn session(
+    model: &Model,
+    pool: &SeqPool,
+    load: &Load,
+    script: &Script,
+    sampling: fn(usize) -> SamplingParams,
+    graphs: bool,
+    mixed: bool,
+    label: &str,
+) -> Committed {
     let lanes = load.lanes as usize;
     let mut seqs: Vec<Option<Seq<'_>>> = Vec::with_capacity(lanes);
     let mut committed: Committed = vec![Vec::new(); lanes];
@@ -1158,6 +1362,13 @@ fn session(model: &Model, pool: &SeqPool, load: &Load, script: &Script, sampling
         }
         rides(&mut seqs, &riding, (Round::Plain, PLAIN_ROUNDS), load.round_shape, &mut mirror);
     }
+    // #713: two of the lanes left, at forced mixes.
+    if load.mixes() {
+        let riding = mixed_riders(load);
+        for ride in MIXED_RIDES {
+            ride_mixed(model, pool, load, script, &mut seqs, &riding, sampling, graphs && mixed, ride, &mut committed, &mut mirror, label);
+        }
+    }
     assert!(cuts > 0, "{label}: no verify run of two or more was cut, so no cut took a count back");
     committed
 }
@@ -1189,6 +1400,13 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         assert_eq!(append, want, "{label}: {}: the drafter's append graphs", arm.name);
         copy_free_graphs(model, pool, load, arm, label);
         uniform_graph_nodes(model, pool, arm, label);
+        mixed_graph_nodes(model, pool, load, arm, label);
+        // #713: the mixed rounds' period beside the uniform extended round's, where asked.
+        let timed = arm.switches.contains(&("IGNIS_ROUND_TIMING", "1")) && arm.switches.contains(&(MIXED_ROUNDS, "1"));
+        let rounds = std::env::var("IGNIS_ROUND_IDENTITY_TIMING_ROUNDS").ok().and_then(|value| value.parse::<u32>().ok());
+        if let (true, true, Some(rounds)) = (timed, load.mixes(), rounds) {
+            time_mixed_rounds(model, pool, load, script, rounds, label);
+        }
     }
     round_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
     extended_attention(model, load, arm, label);
@@ -1196,7 +1414,10 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
     let extended_before = extended_rounds();
     let sessions = KINDS
         .iter()
-        .map(|&(kind, sampling)| session(model, pool, load, script, sampling, arm.graphs, &format!("{label} {} {kind}", arm.name)))
+        .map(|&(kind, sampling)| {
+            let mixed = arm.switches.contains(&(MIXED_ROUNDS, "1"));
+            session(model, pool, load, script, sampling, arm.graphs, mixed, &format!("{label} {} {kind}", arm.name))
+        })
         .collect();
     // Where the arm defers, every verify round but a cut or a forced one
     // leaves its fold in flight: the rest cut nothing, draft the whole window
@@ -1306,6 +1527,12 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
         let reference = run(model, pool, load, script, &REFERENCE, label);
         assert_ne!(reference[0], reference[1], "{label}: the sampled lanes commit the greedy lanes' tokens: their settings never reached the sampler");
         println!("round_identity_gpu {label}: the reference's tokens, greedy and sampled lanes: digest {:016x}", digest(&reference));
+        if load.mixes() {
+            println!(
+                "round_identity_gpu {label}: the reference's tokens before its mixed rounds: digest {:016x}",
+                digest(&before_mixed_rides(load, &reference))
+            );
+        }
         let mut compared = 0;
         let mut hold_arm = |arm: &Arm, sessions: Vec<Committed>| {
             for (((kind, _), want), got) in KINDS.iter().zip(&reference).zip(&sessions) {
