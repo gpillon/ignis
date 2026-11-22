@@ -285,6 +285,17 @@ where it can be hit on the load: no checkpoint miss with `--reuse-prompt off`,
 no prefix miss without a retained slot. No new family; the rule is the note
 below the table, and the Monitor's *Retained state* card shows the count where
 it read "not measured".
+Edited 2026-11-22 (#719, spec #711): `shape="mixed"` joins
+`ignis_speculative_shape_rounds_total`'s label set beside `base` and
+`extended`, the rounds of a DFlash2 load whose lanes ran at both round shapes
+in one verify round. No new family: like the other shapes it counts each
+request's lanes' rounds, a lane of a mixed round counting once as mixed and at
+neither of the others, so the three series sum to
+`ignis_speculative_rounds_total`; the per-position drafted and accepted
+families keep counting each lane's own drafts, an extended lane's up to its
+window and a base lane's up to its own. The series renders at 0 on a load
+that runs no mixed round, and the Monitor's *Speculation* card shows the
+mixed rounds' share beside the extended rounds'.
 
 ### Context
 

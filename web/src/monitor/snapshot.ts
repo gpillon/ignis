@@ -154,8 +154,8 @@ export type Speculation = {
   accepted: number | null;
   positionDrafted: (number | null)[];
   positionAccepted: (number | null)[];
-  /** Verify rounds a load ran at each round shape (#689); null where the family is not printed. */
-  shapeRounds: { base: number | null; extended: number | null } | null;
+  /** Verify rounds a load ran at each round shape (#689; #719 the mixed rounds, null from a server that does not print them); null where the family is not printed. */
+  shapeRounds: { base: number | null; extended: number | null; mixed: number | null } | null;
   /** Of the verify rounds, those of two lanes or more some but not all of whose lanes asked the extended shape (#690); null where not printed. */
   splitRounds: number | null;
 };
@@ -617,7 +617,7 @@ export function readSnapshot({ families }: Exposition): Snapshot {
       positionDrafted: positions(SPEC_FAMILIES.positionDrafted),
       positionAccepted: positions(SPEC_FAMILIES.positionAccepted),
       shapeRounds: families.has(SPEC_FAMILIES.shapeRounds)
-        ? { base: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "base"]), extended: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "extended"]) }
+        ? { base: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "base"]), extended: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "extended"]), mixed: valueOf(SPEC_FAMILIES.shapeRounds, ["shape", "mixed"]) }
         : null,
       splitRounds: valueOf(SPEC_FAMILIES.splitRounds),
     };
@@ -761,7 +761,7 @@ function inContract(family: string, s: Sample): boolean {
     case NGRAM_FAMILIES.rows:
       return oneOf(NGRAM_SOURCES, s.labels.source) && Object.keys(s.labels).length === 1;
     case SPEC_FAMILIES.shapeRounds:
-      return (s.labels.shape === "base" || s.labels.shape === "extended") && Object.keys(s.labels).length === 1;
+      return (s.labels.shape === "base" || s.labels.shape === "extended" || s.labels.shape === "mixed") && Object.keys(s.labels).length === 1;
     case SPEC_FAMILIES.positionDrafted:
     case SPEC_FAMILIES.positionAccepted: {
       const position = Number(s.labels.position);
@@ -799,6 +799,7 @@ export function counterValues(s: Snapshot): (number | null)[] {
     s.speculation?.accepted ?? null,
     s.speculation?.shapeRounds?.base ?? null,
     s.speculation?.shapeRounds?.extended ?? null,
+    s.speculation?.shapeRounds?.mixed ?? null,
     s.speculation?.splitRounds ?? null,
     ...IMAGE_OUTCOMES.map((outcome) => s.images?.jobs[outcome] ?? null),
     s.images?.images ?? null,

@@ -636,6 +636,11 @@ struct ignis_program_stats {
   uint32_t mixed_verify_graph_memset_nodes[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_roots[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_memset_nodes[IGNIS_ROUND_MIXES];
+  /* GitHub #719 (spec #711): entry m the mixed rounds mix m has run on this load, from its graph or
+   * eagerly (the seam's forced rounds); a round at a mix with no graph that ran at the uniform choice
+   * is in `mixed_fallback_rounds`, not here. All 0 on every load but a DFlash2 load of two round
+   * shapes. */
+  uint64_t mixed_rounds[IGNIS_ROUND_MIXES];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
