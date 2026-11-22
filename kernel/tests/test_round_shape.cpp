@@ -786,11 +786,12 @@ void check_the_switch() {
 }
 
 // Table 7: a run of verify rounds whose shapes alternate, each shape's span and the host's gap
-// after each round fixed, so each shape's true period is known; then a pause.
+// after each round fixed, so each shape's true period is known; then a pause. GitHub #719: and the
+// mixed rounds (round shape 2 here, the mixed block's own in the table) among them.
 void check_the_round_timing() {
-  constexpr float kSpan[2] = {14.4f, 16.6f};  // ms: a base round's graph, an extended round's
+  constexpr float kSpan[3] = {14.4f, 16.6f, 15.2f};  // ms: a base round's graph, an extended round's, a mixed one's
   constexpr float kGap = 0.5f;                // ms: the host between a round's end and the next launch
-  const std::vector<std::uint8_t> shapes = {0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1};
+  const std::vector<std::uint8_t> shapes = {0, 0, 1, 2, 1, 2, 1, 0, 1, 2, 0, 1, 2, 1, 1, 0, 2, 0, 1, 2, 0, 1};
   std::vector<float> pre;
   std::vector<float> post;
   float clock = 3.0f;
@@ -803,14 +804,14 @@ void check_the_round_timing() {
   pre.push_back(post.back() + 80.0f);
   ignis::round_timing::Blocks blocks;
   for (std::size_t r = 0; r + 1 < pre.size(); ++r) {
-    ignis::round_timing::add(blocks, shapes[r], post[r] - pre[r], pre[r + 1] - pre[r], pre[r + 1] - post[r]);
+    ignis::round_timing::add(blocks, shapes[r] == 2 ? ignis::round_timing::kMixedBlock : shapes[r], post[r] - pre[r], pre[r + 1] - pre[r], pre[r + 1] - post[r]);
   }
   double periods = 0.0;
   std::size_t rounds = 0;
-  for (std::size_t shape = 0; shape < 2; ++shape) {
-    const ignis::round_timing::Block &block = blocks[shape];
+  for (std::size_t shape = 0; shape < 3; ++shape) {
+    const ignis::round_timing::Block &block = blocks[shape == 2 ? ignis::round_timing::kMixedBlock : shape];
     const std::size_t of_shape = static_cast<std::size_t>(std::count(shapes.begin(), shapes.end(), shape));
-    const std::string name = shape == 0 ? "base" : "extended";
+    const std::string name = shape == 0 ? "base" : shape == 1 ? "extended" : "mixed";
     check(block.span.size() == of_shape, name + ": a span for each of its " + std::to_string(of_shape) + " rounds");
     const bool spans = std::all_of(block.span.begin(), block.span.end(),
                                    [&](float us) { return std::fabs(us - kSpan[shape] * 1000.0f) < 1.0f; });

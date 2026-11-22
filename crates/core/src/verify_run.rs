@@ -30,6 +30,9 @@ pub struct LaneVerifyRun {
     /// GitHub #690: the round split its lanes' asks of the extended shape
     /// ([`crate::types::splits_shape_asks`]), the same for every lane of it.
     pub split: bool,
+    /// GitHub #719: the round was a mixed round, its lanes at both round
+    /// shapes, the same for every lane of it.
+    pub mixed: bool,
 }
 
 impl LaneVerifyRun {
@@ -40,7 +43,10 @@ impl LaneVerifyRun {
     /// asks or not.
     pub fn counters(&self) -> SpecCounters {
         let accepted = (self.tokens.len() as u32).saturating_sub(1).min(self.extent);
-        SpecCounters::round(self.extent, accepted).at_shape(self.extended).in_split_round(self.split)
+        SpecCounters::round(self.extent, accepted)
+            .at_shape(self.extended)
+            .in_mixed_round(self.mixed)
+            .in_split_round(self.split)
     }
 }
 
@@ -67,6 +73,7 @@ impl RoundOutputs<'_> {
     pub(crate) fn runs(&self) -> Vec<LaneVerifyRun> {
         let width = self.window;
         let split = splits_shape_asks(self.committed.len(), self.shape_asks);
+        let mixed = self.lane_shapes.contains(&0) && self.lane_shapes.contains(&1);
         self.committed
             .iter()
             .zip(self.extents)
@@ -81,6 +88,7 @@ impl RoundOutputs<'_> {
                     redirected: self.redirected[index] == 1,
                     extended: self.lane_shapes[index] == 1,
                     split,
+                    mixed,
                 }
             })
             .collect()
@@ -145,11 +153,17 @@ mod tests {
         assert_eq!((base.rounds, base.drafted, base.accepted, base.extended_rounds, base.split_rounds), (3, 8, 3, 0, 3));
         assert_eq!((base.drafted_at, base.accepted_at), (extended.drafted_at, extended.accepted_at));
 
-        // Lane 0 at the extended shape beside two lanes at the base shape.
+        // Lane 0 at the extended shape beside two lanes at the base shape: a
+        // mixed round, whose every lane counts once as mixed, at neither the
+        // extended nor the base shape.
         let runs = round(&[1, 0, 0], 1);
         assert_eq!(runs.iter().map(|run| run.extended).collect::<Vec<_>>(), [true, false, false]);
-        assert_eq!(runs.iter().map(|run| run.counters().extended_rounds).collect::<Vec<_>>(), [1, 0, 0]);
+        assert_eq!(runs.iter().map(|run| run.mixed).collect::<Vec<_>>(), [true, true, true]);
+        assert_eq!(runs.iter().map(|run| run.counters().extended_rounds).collect::<Vec<_>>(), [0, 0, 0]);
         let mixed = total(&runs);
-        assert_eq!((mixed.rounds, mixed.drafted, mixed.accepted, mixed.extended_rounds, mixed.split_rounds), (3, 8, 3, 1, 3));
+        assert_eq!((mixed.rounds, mixed.drafted, mixed.accepted, mixed.extended_rounds, mixed.split_rounds), (3, 8, 3, 0, 3));
+        assert_eq!(mixed.mixed_rounds, 3);
+        assert_eq!((mixed.drafted_at, mixed.accepted_at), (extended.drafted_at, extended.accepted_at));
+        assert_eq!((extended.mixed_rounds, base.mixed_rounds), (0, 0), "a uniform round is never mixed");
     }
 }

@@ -1148,6 +1148,7 @@ function SpeculationCard({ speculation, win }: { speculation: Speculation; win: 
           ["Rounds", formatCount(speculation.rounds.window)],
           ["Drafts committed", formatCount(speculation.accepted.window)],
           ...(speculation.extendedShare === null ? [] : [["Extended rounds", asShare(speculation.extendedShare)] as [string, string]]),
+          ...(speculation.mixedShare === null ? [] : [["Mixed rounds", asShare(speculation.mixedShare)] as [string, string]]),
         ]}
       />
       {positions.length > 0 && <Figures items={positions} />}

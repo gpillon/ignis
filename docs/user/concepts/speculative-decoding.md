@@ -262,7 +262,8 @@ takes all 7, so it stays at the base shape and decodes as at 7 drafts (a
 greedy answer can differ at a near-tie where the shape changes, below). A
 request evicted and restored keeps what it asked; its recent rounds for
 `aggregate` start again. `/metrics` counts the rounds at each shape
-(`ignis_speculative_shape_rounds_total`), the rounds of two requests or more
+(`ignis_speculative_shape_rounds_total`: `base`, `extended`, and `mixed` for
+the lanes of a round that ran at both, each counted once, at one of the three), the rounds of two requests or more
 some but not all of which asked the extended shape, at whichever shape they
 ran (`ignis_speculative_shape_split_rounds_total`, counted on each request's
 rounds as the others are), and, per position up to the window, the drafts
