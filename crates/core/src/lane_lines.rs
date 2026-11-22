@@ -12,6 +12,10 @@
 //! kernel's plan to these functions to the byte at 1, 2 and 8 lanes, as it
 //! does the drafter's window against `speculation.rs`.
 //!
+//! GitHub #714 (spec #711): and the mixed rounds' graphs ([`mixed_graphs`]),
+//! which follow the lanes and the pool's device retained slots, and which the
+//! GPU test holds the kernel's plan to at every lane count it asks.
+//!
 //! The decode round's line (`decode_graph`) is not here. It is the widest
 //! decoder layer's activations plus five workspace queries -- the hq
 //! attention's split-K over the context envelope, and the W4A4 activation
@@ -98,6 +102,69 @@ pub fn lane_lines(
         lane_state: u64::from(lanes) * slot,
         hq_residual_window: u64::from(lanes + retained_device_slots) * hq_window,
     }
+}
+
+/// GitHub #713, #714 (spec #711): the mixes a mixed verify round takes, `w`
+/// extended lanes beside `n` base lanes at 64 columns or fewer, in the leaf's
+/// order (`kMixTable`, `kernel/src/round_layout.h`; `IGNIS_ROUND_MIXES`).
+pub const MIXES: [(u32, u32); 12] =
+    [(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 1), (2, 2), (2, 3), (2, 4), (3, 1), (3, 2)];
+
+/// The one draft window a mixed round runs at (#711, the owner's decision):
+/// at any other a base group's GDN records do not share the extended ones'
+/// stride over the backing both shapes share.
+pub const MIXED_ROUND_WINDOW: u32 = 15;
+
+/// The device memory a load's mixed graphs take (`kernel/src/mixed_graphs.h`
+/// `bytes_of`): [`MIXED_GRAPH_BYTES`] a mix, each its verify graph and its
+/// drafter append graph, and [`MIXED_GRAPHS_FIRST_BYTES`] beside them, in
+/// whole pages of [`MIXED_GRAPHS_PAGE_BYTES`], as the RTX 5090 measured them:
+/// 62 MiB for the twelve at capture, and a page more on the process's own
+/// counter.
+pub const MIXED_GRAPH_BYTES: u64 = 5 << 20;
+pub const MIXED_GRAPHS_FIRST_BYTES: u64 = 4 << 20;
+pub const MIXED_GRAPHS_PAGE_BYTES: u64 = 2 << 20;
+
+/// The mixed graphs a load captures and plans (GitHub #714): the mixes, in
+/// [`MIXES`]' order, and their bytes, the plan's `mixed_graphs` line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MixedGraphs {
+    pub mixes: Vec<(u32, u32)>,
+    pub bytes: u64,
+}
+
+/// The mixed graphs a 27B load of `speculation` at `lanes` decode lanes over a
+/// pool with `retained_device_slots` device retained slots captures when
+/// mixed rounds are asked (`mixed`; `kernel/src/mixed_graphs.h` `planned`): on a
+/// DFlash2 load of the NVFP4 body (`trellis` false: the trellis body runs no
+/// mixed round yet) at [`MIXED_ROUND_WINDOW`] drafts, every mix whose `w + n`
+/// lanes fit the load's and whose base group's fold, behind its `2w` leading
+/// rows that commit nothing, fits the pool's GDN slots, the lanes' and the
+/// device retained slots'. None anywhere else.
+pub fn mixed_graphs(
+    speculation: Option<Speculation>,
+    trellis: bool,
+    mixed: bool,
+    lanes: u32,
+    retained_device_slots: u32,
+) -> MixedGraphs {
+    let captures = speculation.is_some_and(|speculation| {
+        speculation.backend() == crate::speculation::SpeculativeBackend::Dflash2
+            && speculation.draft_tokens() == MIXED_ROUND_WINDOW
+    }) && mixed
+        && !trellis;
+    let slots = lanes + retained_device_slots;
+    let mixes: Vec<(u32, u32)> = MIXES
+        .into_iter()
+        .filter(|&(extended, base)| captures && extended + base <= lanes && 2 * extended + base <= slots)
+        .collect();
+    let bytes = if mixes.is_empty() {
+        0
+    } else {
+        (MIXED_GRAPHS_FIRST_BYTES + mixes.len() as u64 * MIXED_GRAPH_BYTES).div_ceil(MIXED_GRAPHS_PAGE_BYTES)
+            * MIXED_GRAPHS_PAGE_BYTES
+    };
+    MixedGraphs { mixes, bytes }
 }
 
 /// Device sampling's line at `lanes` lanes (`LoadSizes::reservations`): the
@@ -399,6 +466,45 @@ mod tests {
         assert_eq!((plain.verify_round, plain.drafter_round, plain.hq_residual_window), (0, 0, 0));
         assert_eq!(plain.lane_state, 2 * config.state_image(KvFormat::Bf16).total_bytes());
         assert_eq!(plain.sampling, served(2, false).sampling, "sampling is the lanes' alone");
+    }
+
+    /// GitHub #714 (spec #711): the mixed graphs a load plans are the mixes it
+    /// captures, and only there: a DFlash2 load of the NVFP4 body at 15
+    /// drafts with mixed rounds asked, each mix whose lanes fit the load's
+    /// and whose base group's fold, its 2w leading rows beside its n lanes,
+    /// fits the pool's GDN slots (the lanes and the device retained slots).
+    #[test]
+    fn the_mixed_graphs_are_planned_for_the_mixes_a_load_captures() {
+        let at = |window: u32, lanes: u32, retained: u32| {
+            let speculation = Speculation::new(SpeculativeBackend::Dflash2, window).expect("dflash2");
+            mixed_graphs(Some(speculation), false, true, lanes, retained).mixes
+        };
+        // The `rtx5090` profile's 8 lanes and no device retained slot hold all twelve.
+        assert_eq!(
+            at(15, 8, 0),
+            [(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (1, 6), (2, 1), (2, 2), (2, 3), (2, 4), (3, 1), (3, 2)]
+        );
+        assert_eq!(at(15, 1, 2), [], "one lane makes no mix");
+        assert_eq!(at(15, 2, 0), [], "two lanes and no retained slot: (1,1)'s fold wants three slots");
+        assert_eq!(at(15, 2, 1), [(1, 1)]);
+        assert_eq!(at(15, 4, 0), [(1, 1), (1, 2)]);
+        assert_eq!(at(15, 4, 2), [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)]);
+        assert_eq!(at(15, 7, 0), [(1, 1), (1, 2), (1, 3), (1, 4), (1, 5), (2, 1), (2, 2), (2, 3), (3, 1)]);
+        for window in [7, 8, 10, 14] {
+            assert_eq!(at(window, 8, 2), [], "{window} drafts: a mixed round runs at 15 alone");
+        }
+        let fifteen = Speculation::new(SpeculativeBackend::Dflash2, 15).expect("dflash2-15");
+        let mtp = Speculation::new(SpeculativeBackend::Mtp, 7).expect("mtp-7");
+        assert_eq!(mixed_graphs(Some(fifteen), false, false, 8, 0), MixedGraphs::default(), "mixed rounds not asked");
+        assert_eq!(mixed_graphs(Some(fifteen), true, true, 8, 2), MixedGraphs::default(), "the trellis body");
+        assert_eq!(mixed_graphs(Some(mtp), false, true, 8, 2), MixedGraphs::default(), "the MTP head");
+        assert_eq!(mixed_graphs(None, false, true, 8, 2), MixedGraphs::default(), "no speculation");
+        // What the RTX 5090 measured the graphs to take, and a page more: the
+        // twelve 64 MiB (62 at capture, 64 MiB and 4 KiB left after the
+        // teardown), the first mix alone 10 MiB (8 at capture); two, 14 MiB.
+        assert_eq!(mixed_graphs(Some(fifteen), false, true, 8, 0).bytes, 67_108_864);
+        assert_eq!(mixed_graphs(Some(fifteen), false, true, 2, 1).bytes, 10 << 20);
+        assert_eq!(mixed_graphs(Some(fifteen), false, true, 4, 0).bytes, 14 << 20);
     }
 
     /// The sampler's workspace the leaf asks the vendored query for: one

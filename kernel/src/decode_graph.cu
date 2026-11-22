@@ -22,6 +22,7 @@
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
+#include "mixed_graphs.h"
 #include "model_internal.h"
 #include "mtp_head.h"
 #include "sampled_draft.h"
@@ -673,17 +674,18 @@ bool read_gdn_gating(ignis_model *model) {
   return true;
 }
 
-// GitHub #713 (spec #711): the mixes this capture makes graphs for under IGNIS_MIXED_ROUNDS=1, of
-// those the load holds (`ignis_mixed_round_refusal`): one extended lane beside one base lane.
-constexpr std::array<std::array<std::uint32_t, 2>, 1> kCapturedMixes = {{{1, 1}}};
-
-// GitHub #713: IGNIS_MIXED_ROUNDS, read at each capture (a measurement switch, ADR 0093's kind):
-// `1` captures a verify graph for each of `kCapturedMixes` that the load holds and, on a load whose
-// verify rounds defer, the drafter's append after it; `0`, or unset until the shape policy names
-// the mixes, none. Every mixed graph of an earlier capture goes first, so a capture under `0` gives
-// their memory back. A mix whose capture fails has no graph -- its rounds run eagerly, the
-// capture's error naming it -- and no capture is refused for it. False (error set) on a value
-// other than `0` or `1`, and where CUDA cannot make the branch a mixed round runs its base group on.
+// GitHub #713 (spec #711): IGNIS_MIXED_ROUNDS, read at each capture (a measurement switch, ADR 0093's
+// kind, kernel/src/mixed_graphs.h `asked`): `1` captures a verify graph and, on a load whose verify
+// rounds defer, the drafter's append after it for each mix the load holds (GitHub #714: every mix of
+// kMixTable whose lanes fit the load's and whose base group's fold fits the pool's GDN slots,
+// `ignis::mixed_graphs::planned`, the mixes the load's plan holds); `0`, or unset until the shape
+// policy names the mixes, none. Every mixed graph of an earlier capture goes first, so a capture
+// under `0` gives their memory back. A mix whose capture fails has no graph -- its verify graph is
+// released where its append graph fails, so a mix is both or neither -- its rounds run at the
+// uniform choice (kernel/src/step.cu), its bit is in `mixed_failed_mask` and the capture's error
+// names it, and no capture is refused for it. Each captured mix's bytes are the device's free
+// memory before its capture less after. False (error set) on a value other than `0` or `1`, and
+// where CUDA cannot make the branch a mixed round runs its base group on.
 bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
   for (std::uint32_t i = 0; i < ignis::round_layout::kMixes; ++i) {
     for (cudaGraphExec_t *exec : {&model->mixed_verify_exec[i], &model->mixed_append_exec[i]}) {
@@ -694,20 +696,54 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
     }
     model->mixed_verify_nodes[i] = 0;
     model->mixed_append_nodes[i] = 0;
+    model->mixed_graph_bytes[i] = 0;
   }
+  model->mixed_failed_mask = 0;
+  model->mixed_capture_asked = false;
   bool captures = false;
-  const auto read = [] { return ignis::named_switch("IGNIS_MIXED_ROUNDS", false, {{"0", false}, {"1", true}}); };
-  if (!capture_switch(read, captures)) {
+  if (!capture_switch(ignis::mixed_graphs::asked, captures)) {
     return false;
   }
   IgnisVerifyRound *const base = model->base_shape.get();
   if (!captures || base == nullptr || model->extended_shape == nullptr) {
     return true;
   }
-  for (const auto &mix : kCapturedMixes) {
+  model->mixed_capture_asked = true;
+  const std::int64_t slots = pool->gdn_pool.slot_count();
+  const std::uint32_t planned =
+      ignis::mixed_graphs::planned(true, model->drafter == IgnisDrafter::kDflash2, model->is_trellis_body,
+                                   model->extended_shape->window, model->decode_lanes, slots);
+  // GitHub #714 (test-only): the mix the test seam fails, once.
+  const int fault = model->mixed_capture_fault;
+  model->mixed_capture_fault = -1;
+  for (std::uint32_t at = 0; at < ignis::round_layout::kMixes; ++at) {
+    if (((planned >> at) & 1u) == 0) {
+      continue;
+    }
+    const auto &mix = ignis::round_layout::kMixTable[at];
     const ignis::round_layout::Layout layout =
         ignis::round_layout::layout_of(mix[0], model->extended_shape->window, mix[1], base->window);
-    if (ignis_mixed_round_refusal(*model, pool->gdn_pool.slot_count(), layout) != nullptr) {
+    const std::string name = "the mixed round " + std::to_string(mix[0]) + "+" + std::to_string(mix[1]);
+    const auto failed = [&](const std::string &why) {
+      for (cudaGraphExec_t *exec : {&model->mixed_verify_exec[at], &model->mixed_append_exec[at]}) {
+        if (*exec != nullptr) {
+          cudaGraphExecDestroy(*exec);
+          *exec = nullptr;
+        }
+      }
+      model->mixed_verify_nodes[at] = 0;
+      model->mixed_append_nodes[at] = 0;
+      model->mixed_failed_mask |= 1u << at;
+      set_error("ignis_decode_graph_capture: " + name + ": " + why);
+    };
+    // The plan's rule and the round's own refusal name one set of mixes; a mix the rule holds and
+    // the round refuses has no graph, as any failed capture.
+    if (const char *refusal = ignis_mixed_round_refusal(*model, slots, layout)) {
+      failed(std::string("the round refuses it: ") + refusal);
+      continue;
+    }
+    if (fault == static_cast<int>(at)) {
+      failed("its capture failed at the test seam's ask (ignis_decode_graph_fail_mixed_capture)");
       continue;
     }
     std::string branch_error;
@@ -715,22 +751,28 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
       set_error("ignis_decode_graph_capture: IGNIS_MIXED_ROUNDS: " + branch_error);
       return false;
     }
-    const auto at = static_cast<std::size_t>(ignis::round_layout::mix_index(layout));
-    const std::string name = std::to_string(mix[0]) + "+" + std::to_string(mix[1]);
+    std::size_t free_before = 0;
+    std::size_t free_after = 0;
+    std::size_t total = 0;
+    const bool measured = cudaMemGetInfo(&free_before, &total) == cudaSuccess;
     uint32_t copies = 0;
     if (capture_verify_graph(model, pool, *base, layout, &model->mixed_verify_exec[at], &model->mixed_verify_nodes[at],
                              &copies) != 0) {
       model->mixed_verify_exec[at] = nullptr;
-      model->mixed_verify_nodes[at] = 0;
-      set_error("ignis_decode_graph_capture: the mixed round " + name + "'s verify graph: " + g_last_error);
+      failed("its verify graph: " + g_last_error);
       continue;
     }
     if (base->defer && base->staging != nullptr) {
       std::string error;
       if (ignis::deferred_verify::capture_append(model, pool, *base, layout, &model->mixed_append_exec[at],
                                                  &model->mixed_append_nodes[at], &error) != 0) {
-        set_error("ignis_decode_graph_capture: the drafter's append after the mixed round " + name + ": " + error);
+        model->mixed_append_exec[at] = nullptr;
+        failed("the drafter's append after it: " + error);
+        continue;
       }
+    }
+    if (measured && cudaMemGetInfo(&free_after, &total) == cudaSuccess && free_after < free_before) {
+      model->mixed_graph_bytes[at] = free_before - free_after;
     }
   }
   return true;
@@ -900,4 +942,15 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
 
 extern "C" const char *ignis_decode_graph_last_error(void) {
   return g_last_error.c_str();
+}
+
+extern "C" int32_t ignis_decode_graph_fail_mixed_capture(struct ignis_model *model, uint32_t extended_lanes,
+                                                         uint32_t base_lanes) {
+  if (model == nullptr || model->flash_next) {
+    set_error("ignis_decode_graph_fail_mixed_capture: a 27B model's mixed graphs");
+    return -1;
+  }
+  model->mixed_capture_fault =
+      ignis::round_layout::mix_index(ignis::round_layout::layout_of(extended_lanes, 0, base_lanes, 0));
+  return 0;
 }

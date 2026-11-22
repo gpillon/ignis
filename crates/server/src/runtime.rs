@@ -617,6 +617,7 @@ pub fn log_vram_plan(
                 decode_graph_bytes = lines.decode_graph,
                 verify_round_bytes = lines.verify_round,
                 drafter_round_bytes = lines.drafter_round,
+                mixed_graphs_bytes = lines.mixed_graphs,
                 lane_state_bytes = lines.lane_state,
                 retained_slots_bytes = lines.retained_slots,
                 hq_residual_window_bytes = lines.hq_residual_window,
@@ -1448,7 +1449,8 @@ pub fn qwen27b_load(
     let leaf = CudaLeaf::new(device, reader, artifact, handles, leaf_config)
         .with_kv_ram_arena(shape.host_pool_bytes)?;
     let model = Arc::new(Model::load(Arc::new(leaf)).map_err(|e| format!("model load: {e:?}"))?);
-    ignis_runtime::note_qwen27b_loaded(extended_shape);
+    // GitHub #714: and the mixed graphs it planned, whose pages the driver keeps too.
+    ignis_runtime::note_qwen27b_loaded(extended_shape, reservations.reserved.mixed_graphs);
 
     // GitHub #98 (P3-02): do not just trust that formula — ask the leaf
     // what it actually built (`ignis_seq_pool_stats`, surfaced through
@@ -2692,6 +2694,7 @@ mod tests {
             decode_graph: 5,
             verify_round: 6,
             drafter_round: 7,
+            mixed_graphs: 14,
             lane_state: 8,
             retained_slots: 10,
             hq_residual_window: 11,
@@ -2712,6 +2715,7 @@ mod tests {
                 5,
                 6,
                 7,
+                14,
                 8,
                 10,
                 11,

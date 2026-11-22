@@ -42,11 +42,11 @@ import {
 /**
  * The plan lines a server may predate, counted as 0 when absent: the 27B
  * trellis body's workspace (GitHub #339) and its dense prefill's buffer
- * (GitHub #509), the NVFP4 body's TMA descriptor slots (GitHub #650),
- * Flash-Next's two (GitHub #306) and the image model's condition budget
- * (GitHub #324).
+ * (GitHub #509), the NVFP4 body's TMA descriptor slots (GitHub #650), the
+ * mixed rounds' graphs (GitHub #714), Flash-Next's two (GitHub #306) and the
+ * image model's condition budget (GitHub #324).
  */
-const LATER_LINES: readonly VramLine[] = ["trellis_workspace", "trellis_dense", "tma_descriptors", "residency", "expert_cache", "condition_budget"];
+const LATER_LINES: readonly VramLine[] = ["trellis_workspace", "trellis_dense", "tma_descriptors", "mixed_graphs", "residency", "expert_cache", "condition_budget"];
 
 // Everything the Monitor shows, derived from the scrape history for one
 // window: counter gains and rates, scheduler load, latency quantiles and

@@ -630,10 +630,10 @@ async fn labels_stay_within_the_bounded_sets() {
     .collect();
     assert_eq!(names, expected, "{text}");
 
-    /// The plan's fifteen lines, as ADR 0030 §Observability spells them
+    /// The plan's sixteen lines, as ADR 0030 §Observability spells them
     /// (GitHub #339 added `trellis_workspace`, #509 `trellis_dense`, #650
-    /// `tma_descriptors`, ADR 0101), then Flash-Next's two and the image
-    /// model's condition budget.
+    /// `tma_descriptors`, ADR 0101, #714 `mixed_graphs`), then Flash-Next's
+    /// two and the image model's condition budget.
     const VRAM_LINES: &[&str] = &[
         "weights",
         "cuda_context",
@@ -646,6 +646,7 @@ async fn labels_stay_within_the_bounded_sets() {
         "decode_graph",
         "verify_round",
         "drafter_round",
+        "mixed_graphs",
         "lane_state",
         "retained_slots",
         "hq_residual_window",

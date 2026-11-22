@@ -142,6 +142,11 @@ pub(crate) mod ffi {
         pub shape_policy: u32,
         pub shape_estimate_rounds: u32,
         pub shape_period_ratios: [u32; 4],
+        /// GitHub #714 (spec #711): the device retained slots of the pool the
+        /// load's rounds run on, whose GDN slots a mixed round's fold takes
+        /// beside the lanes': read to plan the mixed graphs alone; 0 on
+        /// Flash-Next.
+        pub retained_device_slots: u32,
     }
 
     /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
@@ -184,6 +189,13 @@ pub(crate) mod ffi {
         /// the trellis body, Flash-Next, a card below compute capability 12, a
         /// chunk below 1,024 tokens and under `IGNIS_TMA_DESCRIPTOR_CACHE=0`.
         pub tma_descriptor_bytes: u64,
+        /// GitHub #714 (spec #711): the mixed rounds' graphs, a verify and an
+        /// append graph for each mix the load captures when mixed rounds are
+        /// asked, at one mix's measured bytes
+        /// ([`crate::lane_lines::mixed_graphs`] mirrors it); a loaded model
+        /// reports the line it planned. 0 but on a DFlash2 load of the NVFP4
+        /// body at 15 drafts with `IGNIS_MIXED_ROUNDS=1`.
+        pub mixed_graphs_bytes: u64,
     }
 
     /// 1:1 with `struct ignis_model_stats`.
@@ -561,8 +573,20 @@ fn load_options(
             shape_policy: speculation.map_or(0, |s| s.shape_policy().abi_code()),
             shape_estimate_rounds: speculation.map_or(0, |s| s.shape_estimate().rounds()),
             shape_period_ratios: speculation.map_or([0; 4], |s| s.shape_estimate().period_ratios_milli()),
+            // GitHub #714: set by the loads that name their pool's slots.
+            retained_device_slots: 0,
         }
     })
+}
+
+/// GitHub #714: `options` for a pool of `retained_device_slots` device
+/// retained slots. A load that crosses no options has no speculation, so no
+/// mixed graph for the slots to plan.
+fn with_retained_device_slots(
+    options: Option<ffi::IgnisModelLoadOptions>,
+    retained_device_slots: u32,
+) -> Option<ffi::IgnisModelLoadOptions> {
+    options.map(|options| ffi::IgnisModelLoadOptions { retained_device_slots, ..options })
 }
 
 /// Read the NVFP4 blockscale layout's trailing FP32 weight divisor
@@ -966,6 +990,44 @@ pub fn load_qwen38_27b_with_decode_lanes(
     prefill_linear: PrefillLinear,
     decode_lanes: u32,
 ) -> Result<Model, String> {
+    load_qwen38_27b_with_pool_slots(
+        reader,
+        artifact,
+        handles,
+        prefill_chunk_tokens,
+        max_context_tokens,
+        kv_format,
+        speculation,
+        vision,
+        rope_scaling,
+        prefill_attention,
+        prefill_linear,
+        decode_lanes,
+        0,
+    )
+}
+
+/// [`load_qwen38_27b_with_decode_lanes`] for a sequence pool of
+/// `retained_device_slots` device retained slots beside its lanes
+/// ([`crate::seq::SeqPoolBudget::retained_slot_count`]), whose GDN slots a
+/// mixed round's fold takes (GitHub #714): the mixed graphs the load plans
+/// are those such a pool holds ([`crate::lane_lines::mixed_graphs`]).
+#[allow(clippy::too_many_arguments)]
+pub fn load_qwen38_27b_with_pool_slots(
+    reader: &Reader,
+    artifact: &MaterializedArtifact,
+    handles: &[ObjectHandle],
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    speculation: Option<Speculation>,
+    vision: Option<Vision>,
+    rope_scaling: RopeScaling,
+    prefill_attention: PrefillAttention,
+    prefill_linear: PrefillLinear,
+    decode_lanes: u32,
+    retained_device_slots: u32,
+) -> Result<Model, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) = build_bound_tensors(
         reader,
@@ -975,8 +1037,10 @@ pub fn load_qwen38_27b_with_decode_lanes(
         device_placement(artifact),
     )?;
     let topology = ModelConfig::qwen38_27b().topology_abi();
-    let options =
-        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes);
+    let options = with_retained_device_slots(
+        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes),
+        retained_device_slots,
+    );
 
     let mut handle: *mut ffi::IgnisModel = std::ptr::null_mut();
     let rc = unsafe {
@@ -1022,6 +1086,42 @@ pub fn plan_qwen38_27b_reservations(
     prefill_linear: PrefillLinear,
     decode_lanes: u32,
 ) -> Result<IgnisModelReservations, String> {
+    plan_qwen38_27b_reservations_with_pool_slots(
+        reader,
+        plan,
+        handles,
+        prefill_chunk_tokens,
+        max_context_tokens,
+        kv_format,
+        speculation,
+        vision,
+        rope_scaling,
+        prefill_attention,
+        prefill_linear,
+        decode_lanes,
+        0,
+    )
+}
+
+/// [`plan_qwen38_27b_reservations`] for a sequence pool of
+/// `retained_device_slots` device retained slots, as
+/// [`load_qwen38_27b_with_pool_slots`] loads (GitHub #714).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_qwen38_27b_reservations_with_pool_slots(
+    reader: &Reader,
+    plan: &MaterializationPlan,
+    handles: &[ObjectHandle],
+    prefill_chunk_tokens: u32,
+    max_context_tokens: u32,
+    kv_format: KvFormat,
+    speculation: Option<Speculation>,
+    vision: Option<Vision>,
+    rope_scaling: RopeScaling,
+    prefill_attention: PrefillAttention,
+    prefill_linear: PrefillLinear,
+    decode_lanes: u32,
+    retained_device_slots: u32,
+) -> Result<IgnisModelReservations, String> {
     validate_prefill_config(prefill_chunk_tokens, max_context_tokens)?;
     let (_names, tensors) = build_bound_tensors(
         reader,
@@ -1031,8 +1131,10 @@ pub fn plan_qwen38_27b_reservations(
         planned_placement(plan),
     )?;
     let topology = ModelConfig::qwen38_27b().topology_abi();
-    let options =
-        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes);
+    let options = with_retained_device_slots(
+        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes),
+        retained_device_slots,
+    );
 
     let mut reservations = IgnisModelReservations::default();
     let rc = unsafe {
@@ -1200,6 +1302,7 @@ fn flash_next_options(
         shape_policy: 0,
         shape_estimate_rounds: 0,
         shape_period_ratios: [0; 4],
+        retained_device_slots: 0,
     }
 }
 
@@ -1884,7 +1987,10 @@ mod tests {
         // GitHub #689: then the shape rule's two uint32 thresholds.
         // GitHub #690: then the shape policy, its estimate window and its
         // four period ratios, six uint32.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 136);
+        // GitHub #714: then the pool's device retained slots, a uint32,
+        // padded to the pointer's alignment.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 144);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, retained_device_slots), 136);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_policy), 112);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_estimate_rounds), 116);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_period_ratios), 120);
@@ -1904,14 +2010,15 @@ mod tests {
         // (GitHub #302) the seventh, Flash-Next's activations, (GitHub #339)
         // the eighth, the trellis workspace, (GitHub #509) the ninth, the
         // dense prefill's buffer, (GitHub #650) the tenth, the TMA
-        // descriptor slots, and (ADR 0062) the uint64 host-mapped bytes. The leaf pins the same sizes (kernel/include/ignis_model.h).
-        assert_eq!(std::mem::size_of::<IgnisModelReservations>(), 80);
+        // descriptor slots, (GitHub #714) the eleventh, the mixed graphs, and (ADR 0062) the uint64 host-mapped bytes. The leaf pins the same sizes (kernel/include/ignis_model.h).
+        assert_eq!(std::mem::size_of::<IgnisModelReservations>(), 88);
         assert_eq!(std::mem::offset_of!(IgnisModelReservations, trellis_workspace_bytes), 56);
         assert_eq!(std::mem::offset_of!(IgnisModelReservations, trellis_dense_bytes), 64);
         assert_eq!(std::mem::offset_of!(IgnisModelReservations, tma_descriptor_bytes), 72);
-        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 112);
+        assert_eq!(std::mem::offset_of!(IgnisModelReservations, mixed_graphs_bytes), 80);
+        assert_eq!(std::mem::size_of::<IgnisModelStats>(), 120);
         assert_eq!(std::mem::offset_of!(IgnisModelStats, reserved), 24);
-        assert_eq!(std::mem::offset_of!(IgnisModelStats, host_mapped_bytes), 104);
+        assert_eq!(std::mem::offset_of!(IgnisModelStats, host_mapped_bytes), 112);
     }
 
     #[test]

@@ -333,16 +333,25 @@ the other. They are no configuration fields: `GET /v1/config` and
   whose rounds run that part eagerly.
 - `IGNIS_MIXED_ROUNDS=0|1` (from 0.11.0) picks, at each capture of the decode
   graphs of a DFlash2 load of the 27B at 15 draft tokens on the NVFP4
-  artifact, whether the mixed round of one extended lane beside one base lane
-  (a round whose lanes take both round shapes) has its verify graph and its
-  drafter-append graph: `1` captures them, whatever the shape policy says;
-  `0`, or unset, captures none and gives back an earlier capture's. No served
-  round is mixed yet: the round identity test forces a round's mix through
-  the step ABI's test seam (`forced_lane_shapes`), and such a round replays
-  the mix's graph where one was captured and runs eagerly otherwise. The
-  program's stats report each mix's graph nodes. A load at another window, a
-  trellis artifact, an MTP load and Flash-Next capture none. Any other value
-  refuses the load, naming the variable.
+  artifact, whether the mixed rounds (rounds whose lanes take both round
+  shapes) have their verify and drafter-append graphs: `1` captures them for
+  every mix the load holds, whatever the shape policy says (a mix of `w`
+  extended lanes beside `n` base lanes within the lanes, and its `2w + n`
+  within the pool's slots, the lanes' and the device retained slots': all
+  twelve at 8 lanes); `0`, or unset, captures none and gives back an earlier
+  capture's. The VRAM plan reads it too, at the plan and the load, and plans
+  those graphs as its `mixed_graphs` line, so set it before the start for a
+  load to hold them inside its plan. No served round is mixed yet: the round
+  identity test forces a round's mix through the step ABI's test seam
+  (`forced_lane_shapes`), and such a round replays the mix's graph where one
+  was captured, runs eagerly where no capture asked for the mixed graphs, and
+  where the capture asked and could not make that mix's graphs runs at the
+  uniform round shape `aggregate` would choose, counted by reason in the
+  program's stats (`mixed_fallback_rounds`) and named at load by
+  `ignis.runtime.mixed_graph_capture_incomplete`. The stats report each mix's
+  graph nodes and the device memory its capture took. A load at another
+  window, a trellis artifact, an MTP load and Flash-Next capture none. Any
+  other value refuses the load, naming the variable.
 
 ### The round identity test
 
@@ -396,6 +405,23 @@ holds them, the reference's run eagerly, and the arms `mixed-rounds`,
 `mixed-round-timing` and `mixed-sync-verify` replay the mix's graphs under
 `IGNIS_MIXED_ROUNDS=1`, timed and with the verify round's synchronous form; the
 reference also prints a digest of its tokens before those rounds.
+From #714 the same sessions, and those of `nvfp4-vision-w15`, then release
+every lane, prefill the load's lanes afresh and ride each of the twelve mixes
+once (lane 0, the vision load's image lane, at both shapes), three lanes from
+a mix to the uniform base round, the uniform extended round and another mix,
+a teacher-forced mix of five lanes, and a mix of five lanes with a snapshot
+and a restore of each right after it: every arm holds them to the reference,
+and each capture that asks for the mixed graphs reports all twelve, their
+measured bytes within the plan's line. The `mixed-capture-failure` arm is not
+held to the reference: a test seam (`ignis_decode_graph_fail_mixed_capture`,
+`step::fail_mixed_capture`) fails the 2+1 mix's capture, whose forced round
+then runs at the uniform shape `aggregate` gives its three lanes, from that
+shape's graph, counted once under `capture failed`, while the 1+2 mix still
+runs from its own. `vram_plan_gpu` holds the leaf's `mixed_graphs` line to
+`ignis_core::lane_lines::mixed_graphs` at 1, 2, 4, 5 and 8 lanes and 0 to 2
+device retained slots and prints its bytes and KV pages; `vram_reload_gpu`
+reloads a load that holds the twelve, which plans within 1% of its pages and
+holds no more past its plan than the same load without them.
 `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` has the `mixed-round-timing` arm first
 ride two greedy lanes `n` rounds at the uniform extended shape, `n` at the mix
 and `n` at the uniform base shape, so that the round timing prints a `verify

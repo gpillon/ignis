@@ -118,6 +118,10 @@ pub(crate) mod ffi {
     /// mixes a mixed verify round takes.
     pub const IGNIS_ROUND_MIXES: usize = 12;
 
+    /// `IGNIS_MIXED_FALLBACK_REASONS` (GitHub #714): why a round at a mix
+    /// with no graph ran at the uniform choice (`enum ignis_mixed_fallback`).
+    pub const IGNIS_MIXED_FALLBACK_REASONS: usize = 2;
+
     /// 1:1 with `struct ignis_round_shape_stats` (GitHub #686): one round
     /// shape's verify round.
     #[repr(C)]
@@ -181,6 +185,14 @@ pub(crate) mod ffi {
         /// GitHub #713: each mix's verify and drafter append graph nodes.
         pub mixed_verify_graph_nodes: [u32; IGNIS_ROUND_MIXES],
         pub mixed_append_graph_nodes: [u32; IGNIS_ROUND_MIXES],
+        /// GitHub #714: whether the latest capture asked for the mixed
+        /// graphs, the mixes it could not capture, each mix's graphs' bytes
+        /// and the rounds at a mix with no graph run at the uniform choice,
+        /// by reason.
+        pub mixed_graphs_asked: u32,
+        pub mixed_graph_failed_mask: u32,
+        pub mixed_graph_bytes: [u64; IGNIS_ROUND_MIXES],
+        pub mixed_fallback_rounds: [u64; IGNIS_MIXED_FALLBACK_REASONS],
     }
 
     unsafe extern "C" {
@@ -254,6 +266,8 @@ pub(crate) mod ffi {
         ) -> i32;
 
         pub fn ignis_decode_graph_last_error() -> *const c_char;
+
+        pub fn ignis_decode_graph_fail_mixed_capture(model: *mut IgnisModel, extended_lanes: u32, base_lanes: u32) -> i32;
 
         pub fn ignis_media_encode(
             model: *mut IgnisModel,
@@ -550,9 +564,37 @@ pub struct ProgramStats {
     /// graph and of its drafter append graph, the mixes in the order
     /// (1,1)..(1,6), (2,1)..(2,4), (3,1), (3,2) of `w` extended lanes beside `n`
     /// base lanes, as the latest [`capture_decode_graphs`] made them under
-    /// `IGNIS_MIXED_ROUNDS=1`; 0 for a mix with no graph.
+    /// `IGNIS_MIXED_ROUNDS=1` (GitHub #714: every mix the load holds); 0 for
+    /// a mix with no graph.
     pub mixed_verify_graph_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
     pub mixed_append_graph_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
+    /// GitHub #714 (spec #711): whether the latest [`capture_decode_graphs`]
+    /// asked for the mixed graphs (`IGNIS_MIXED_ROUNDS=1`).
+    pub mixed_graphs_asked: bool,
+    /// Bit `m` set for a mix whose graphs that capture tried and could not
+    /// make: the mix has neither its verify nor its append graph.
+    pub mixed_graph_failed_mask: u32,
+    /// Entry `m` the device memory mix `m`'s graphs took, the free memory
+    /// before its capture less after it; 0 for a mix with no graph. A capture
+    /// after another in one process may read less, where the driver reuses
+    /// what the earlier graphs left it.
+    pub mixed_graph_bytes: [u64; ffi::IGNIS_ROUND_MIXES],
+    /// The rounds at a mix with no graph, after a capture that asked for
+    /// them, that ran at the uniform round shape `aggregate` would choose,
+    /// by [`MixedFallback`].
+    pub mixed_fallback_rounds: [u64; ffi::IGNIS_MIXED_FALLBACK_REASONS],
+}
+
+/// GitHub #714 (spec #711): why a round at a mix ran at the uniform choice,
+/// the index of [`ProgramStats::mixed_fallback_rounds`]
+/// (`enum ignis_mixed_fallback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MixedFallback {
+    /// The capture tried the mix's graphs and failed.
+    CaptureFailed = 0,
+    /// The capture made no graph of the mix: the load's lanes or its pool's
+    /// GDN slots do not hold it.
+    NotCaptured = 1,
 }
 
 impl ProgramStats {
@@ -655,6 +697,19 @@ fn last_error() -> String {
 pub fn last_decode_graph_error() -> String {
     let message = unsafe { CStr::from_ptr(ffi::ignis_decode_graph_last_error()) };
     message.to_string_lossy().into_owned()
+}
+
+/// GitHub #714 (spec #711) -- test-only, the seam a test fails one mix's
+/// capture by: the next [`capture_decode_graphs`] that asks for the mixed
+/// graphs fails the mix of `extended_lanes` beside `base_lanes` where it
+/// would capture it, as a capture CUDA refused would, and then forgets it.
+/// A pair that is no mix clears the fault.
+pub fn fail_mixed_capture(model: &Model, extended_lanes: u32, base_lanes: u32) -> Result<(), String> {
+    let rc = unsafe { ffi::ignis_decode_graph_fail_mixed_capture(model.handle(), extended_lanes, base_lanes) };
+    if rc != 0 {
+        return Err(last_decode_graph_error());
+    }
+    Ok(())
 }
 
 /// Captures one CUDA graph per exact decode batch width 1..=8 (P3-05,
@@ -2686,6 +2741,10 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         }),
         mixed_verify_graph_nodes: stats.mixed_verify_graph_nodes,
         mixed_append_graph_nodes: stats.mixed_append_graph_nodes,
+        mixed_graphs_asked: stats.mixed_graphs_asked != 0,
+        mixed_graph_failed_mask: stats.mixed_graph_failed_mask,
+        mixed_graph_bytes: stats.mixed_graph_bytes,
+        mixed_fallback_rounds: stats.mixed_fallback_rounds,
     })
 }
 

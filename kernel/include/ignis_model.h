@@ -615,6 +615,12 @@ struct ignis_model_load_options {
   uint32_t shape_policy;
   uint32_t shape_estimate_rounds;
   uint32_t shape_period_ratios[IGNIS_EXTENDED_SHAPE_MAX_LANES];
+  /* GitHub #714 (spec #711): the device retained slots of the sequence pool
+   * the load's rounds run on, whose GDN slots, with the decode lanes', a
+   * mixed round's fold takes (kernel/src/mixed_graphs.h): read to plan the
+   * mixed graphs alone, which a capture over a pool of other slots does not
+   * follow. Appended at the end: the struct grew by one word and its padding. */
+  uint32_t retained_device_slots;
 };
 
 /* GitHub #576 (spec #574, ADR 0090): how a verify round's sampling lanes
@@ -694,6 +700,15 @@ struct ignis_model_reservations {
    * Flash-Next, on a card below compute capability 12, below a 1,024-token
    * chunk, and under the measurement switch IGNIS_TMA_DESCRIPTOR_CACHE=0. */
   uint64_t tma_descriptor_bytes;
+  /* GitHub #714 (spec #711): the mixed rounds' graphs, a verify graph and a
+   * drafter append graph for each mix the load captures when mixed rounds are
+   * asked (kernel/src/mixed_graphs.h `planned`), at the bytes one mix's graphs
+   * were measured to take. Not a buffer: the driver allocates the graphs at
+   * capture, and a loaded model reports the line it planned, whatever its
+   * capture made. 0 on every load but a DFlash2 load of the NVFP4 body at 15
+   * drafts with mixed rounds asked (IGNIS_MIXED_ROUNDS=1, read at the plan and
+   * the load), and where no mix fits the lanes and the pool's GDN slots. */
+  uint64_t mixed_graphs_bytes;
 };
 
 struct ignis_model_stats {
@@ -720,13 +735,14 @@ struct ignis_model_stats {
 #ifdef __cplusplus
 /* Neither struct has a `size` field, so both sides pin their layouts (here,
  * and crates/core/src/model_load.rs's mirror test). */
-static_assert(sizeof(struct ignis_model_reservations) == 80 &&
+static_assert(sizeof(struct ignis_model_reservations) == 88 &&
                   offsetof(struct ignis_model_reservations, trellis_workspace_bytes) == 56 &&
                   offsetof(struct ignis_model_reservations, trellis_dense_bytes) == 64 &&
-                  offsetof(struct ignis_model_reservations, tma_descriptor_bytes) == 72,
+                  offsetof(struct ignis_model_reservations, tma_descriptor_bytes) == 72 &&
+                  offsetof(struct ignis_model_reservations, mixed_graphs_bytes) == 80,
               "ignis_model_reservations drifted from crates/core/src/model_load.rs IgnisModelReservations");
-static_assert(sizeof(struct ignis_model_stats) == 112 && offsetof(struct ignis_model_stats, reserved) == 24 &&
-                  offsetof(struct ignis_model_stats, host_mapped_bytes) == 104,
+static_assert(sizeof(struct ignis_model_stats) == 120 && offsetof(struct ignis_model_stats, reserved) == 24 &&
+                  offsetof(struct ignis_model_stats, host_mapped_bytes) == 112,
               "ignis_model_stats drifted from crates/core/src/model_load.rs IgnisModelStats");
 #endif
 

@@ -222,12 +222,24 @@ pub const QWEN27B_EXTENDED_SHAPE_STATE_BYTES: [u64; 4] = [2_101_248, 8_392_704, 
 /// at seven drafts or fewer) leaves on the device beside the CUDA context once
 /// torn down: [`QWEN27B_PROCESS_STATE_BYTES`], and its extended shape's
 /// [`QWEN27B_EXTENDED_SHAPE_STATE_BYTES`].
-pub fn qwen27b_state_after(extended: Option<ignis_core::RoundShape>) -> u64 {
+///
+/// GitHub #714 (spec #711): and its mixed rounds' graphs, the plan's
+/// `mixed_graphs` line (`mixed_graphs`, 0 on a load that captures none): the
+/// driver keeps their pages for the context's life once they are gone, as it
+/// keeps the round shapes' state. Read from the same WDDM counter on the RTX
+/// 5090 (driver 610.88) on 2026-11-22 at `vram_reload_gpu`'s shape, the
+/// twelve mixes of eight lanes: the process held 599,408,640 B after the
+/// teardown of a 15-draft load that captured them, 67,112,960 B over the same
+/// load without them (532,295,680 B), where the line is 67,108,864 B: a reload
+/// adds back 4,096 B less than the graphs left, the safe side. Its plan
+/// charges the line again, so the add-back stays within what the plan
+/// charges again.
+pub fn qwen27b_state_after(extended: Option<ignis_core::RoundShape>, mixed_graphs: u64) -> u64 {
     let extended_bytes = extended.map_or(0, |shape| {
         let lanes = shape.lanes.clamp(1, QWEN27B_EXTENDED_SHAPE_STATE_BYTES.len() as u32);
         QWEN27B_EXTENDED_SHAPE_STATE_BYTES[lanes as usize - 1]
     });
-    QWEN27B_PROCESS_STATE_BYTES + extended_bytes
+    QWEN27B_PROCESS_STATE_BYTES + extended_bytes + mixed_graphs
 }
 
 /// The 27B's per-process state this process holds (GitHub #324, #687): 0
@@ -235,10 +247,11 @@ pub fn qwen27b_state_after(extended: Option<ignis_core::RoundShape>) -> u64 {
 static QWEN27B_STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Records that a 27B load ran in this process, its extended round shape
-/// `extended`: from then on the process holds what the widest of its 27B
-/// loads left ([`qwen27b_state_after`]), whatever it loads next.
-pub fn note_qwen27b_loaded(extended: Option<ignis_core::RoundShape>) {
-    QWEN27B_STATE.fetch_max(qwen27b_state_after(extended), std::sync::atomic::Ordering::Relaxed);
+/// `extended` and (GitHub #714) its plan's `mixed_graphs` line: from then on
+/// the process holds what the widest of its 27B loads left
+/// ([`qwen27b_state_after`]), whatever it loads next.
+pub fn note_qwen27b_loaded(extended: Option<ignis_core::RoundShape>, mixed_graphs: u64) {
+    QWEN27B_STATE.fetch_max(qwen27b_state_after(extended, mixed_graphs), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether a 27B load has run in this process ([`note_qwen27b_loaded`]).
@@ -411,6 +424,9 @@ pub struct ReservedBytes {
     pub decode_graph: u64,
     pub verify_round: u64,
     pub drafter_round: u64,
+    /// GitHub #714: the mixed rounds' graphs the load captures; the line the
+    /// leaf planned, read back as it is (the driver holds the graphs).
+    pub mixed_graphs: u64,
     /// Every lane's state in the sequence pool.
     pub lane_state: u64,
     /// The sequence pool's retained slots (GitHub #211).
@@ -454,6 +470,7 @@ pub fn vram_lines(weights_bytes: u64, cuda_context_bytes: u64, reserved: Reserve
         decode_graph: reserved.decode_graph,
         verify_round: reserved.verify_round,
         drafter_round: reserved.drafter_round,
+        mixed_graphs: reserved.mixed_graphs,
         lane_state: reserved.lane_state,
         retained_slots: reserved.retained_slots,
         hq_residual_window: reserved.hq_residual_window,
@@ -2737,6 +2754,7 @@ mod tests {
             hq_residual_window: base + 10,
             trellis_dense: base + 11,
             tma_descriptors: base + 12,
+            mixed_graphs: base + 13,
             kv_pool: 0,
         }
     }
@@ -2913,20 +2931,38 @@ mod tests {
         // GitHub #687: a load at seven drafts or fewer leaves the 27B's state,
         // one past seven that and its extended shape's, by that shape's lanes.
         let extended = |lanes| Some(ignis_core::RoundShape { window: 15, lanes });
-        assert_eq!(qwen27b_state_after(None), STATE);
-        assert_eq!(qwen27b_state_after(extended(1)), STATE + 2_101_248);
-        assert_eq!(qwen27b_state_after(extended(4)), 77_606_912, "the extended shape of eight lanes, four lanes");
+        assert_eq!(qwen27b_state_after(None, 0), STATE);
+        assert_eq!(qwen27b_state_after(extended(1), 0), STATE + 2_101_248);
+        assert_eq!(qwen27b_state_after(extended(4), 0), 77_606_912, "the extended shape of eight lanes, four lanes");
         let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
         assert_eq!(
-            held_before_load(Qwen38_27b, measured(CONTEXT), qwen27b_state_after(extended(4)), None),
+            held_before_load(Qwen38_27b, measured(CONTEXT), qwen27b_state_after(extended(4), 0), None),
             charged_again(CONTEXT + 77_606_912)
         );
         // The state is the context's for its life: a 7-draft load after a
         // 15-draft one leaves what the 15-draft load left.
-        note_qwen27b_loaded(extended(4));
-        note_qwen27b_loaded(None);
+        note_qwen27b_loaded(extended(4), 0);
+        note_qwen27b_loaded(None, 0);
         assert_eq!(qwen27b_state(), 77_606_912);
         assert!(qwen27b_loaded());
+    }
+
+    #[test]
+    fn a_load_with_mixed_graphs_leaves_them_and_a_reload_adds_them_back() {
+        use ignis_core::compute::ModelFamily::Qwen38_27b;
+        // GitHub #714: the driver keeps the mixed graphs' pages once the load
+        // is torn down, so a reload adds back the plan's `mixed_graphs` line
+        // beside the extended shape's state; its own plan charges the line
+        // again. The twelve mixes at eight lanes, measured 67,112,960 B past
+        // the same load without them, which the line holds to 4 KiB.
+        let extended = Some(ignis_core::RoundShape { window: 15, lanes: 4 });
+        assert_eq!(qwen27b_state_after(extended, 67_108_864), 144_715_776);
+        assert_eq!(qwen27b_state_after(extended, 0), 77_606_912, "no mixed graph");
+        let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
+        assert_eq!(
+            held_before_load(Qwen38_27b, measured(CONTEXT), qwen27b_state_after(extended, 67_108_864), None),
+            charged_again(CONTEXT + 144_715_776)
+        );
     }
 
     #[test]

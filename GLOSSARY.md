@@ -1189,7 +1189,12 @@ at row `2w + s`, and its fold runs behind `2w` leading rows that commit
 nothing; only at 15 drafts are a group's record rows its columns, so a load
 at another window holds no mix. Until the **shape policy** grants one, a test
 forces a round's mix (`forced_lane_shapes`), from the mix's graphs where
-`IGNIS_MIXED_ROUNDS=1` captured them and eagerly otherwise.
+`IGNIS_MIXED_ROUNDS=1` captured them and eagerly where no capture asked for
+them. A load that asks captures every mix its lanes and its pool's GDN slots
+hold (a mix takes `2w + n` slots, the lanes' and the device retained slots':
+all twelve at 8 lanes), a line of the VRAM plan (`mixed_graphs`, #714); a mix
+whose capture failed runs its rounds at the uniform shape `aggregate` would
+choose, counted, never eagerly.
 
 **Shape rule**:
 What a lane of a DFlash2 load past 7 drafts asks of its next **verify round**,

@@ -36,6 +36,7 @@
 #include "hq_decode_attention.h"
 #include "layer_internal.h"
 #include "model_internal.h"
+#include "mixed_graphs.h"
 #include "mtp_head.h"
 #include "sampled_draft.h"
 #include "trellis_body.h"
@@ -1344,6 +1345,11 @@ struct LoadOptions {
   ignis::round_shape::ShapeRule shape_rule{};
   // GitHub #690: and the shape policy.
   ignis::round_shape::ShapePolicy shape_policy{};
+  // GitHub #714 (spec #711): whether mixed rounds are asked (kernel/src/mixed_graphs.h `asked`), read
+  // once per plan and per load, and the device retained slots of the pool the rounds run on: the
+  // mixed graphs the load plans.
+  bool mixed_rounds_asked = false;
+  uint32_t retained_device_slots = 0;
 };
 
 // The current device's compute capability major, which a load's route choices read: false (error
@@ -1647,6 +1653,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   std::uint32_t shape_estimate_rounds = 0;
   std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> shape_period_ratios{};
   ignis::RopeScaling rope_scaling{};
+  uint32_t retained_device_slots = 0;
   if (options != nullptr) {
     if (options->size != sizeof(struct ignis_model_load_options)) {
       set_error("ignis_model_load: options.size " + std::to_string(options->size) +
@@ -1680,6 +1687,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     shape_policy = options->shape_policy;
     shape_estimate_rounds = options->shape_estimate_rounds;
     std::copy_n(options->shape_period_ratios, shape_period_ratios.size(), shape_period_ratios.begin());
+    // GitHub #714: the pool's device retained slots, for the mixed graphs' plan.
+    retained_device_slots = options->retained_device_slots;
   }
   // GitHub #335: a value the leaf does not know is refused rather than run as
   // one of the three.
@@ -1850,6 +1859,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   out.drafter_temperature_factor = drafter_temperature_factor;
   out.drafter_top_p = drafter_top_p;
   out.shape_rule = shape_rule;
+  out.retained_device_slots = retained_device_slots;
   // The routes a load decides from the card and a measurement switch, and the switches it reads
   // on their own, in this order, so a value a switch does not know refuses the plan and the load by
   // name: IGNIS_HQ_DECODE_ATTENTION (GitHub #572), IGNIS_PREFILL_SWIGLU (GitHub #651, #653: unset
@@ -1874,7 +1884,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       !load_switch(ignis::fp8_exception::gemv_paired, fp8_gemv_paired) ||
       !load_switch(ignis::fp8_exception::w8a8_tile16, fp8_w8a8_tile16) ||
       !load_switch(ignis::dflash2_small_t::append_kv_only, dflash2_append_kv_only) ||
-      !load_switch(ignis::dflash2_small_t::small_t_fill, dflash2_small_t_fill)) {
+      !load_switch(ignis::dflash2_small_t::small_t_fill, dflash2_small_t_fill) ||
+      !load_switch(ignis::mixed_graphs::asked, out.mixed_rounds_asked)) {
     return nullptr;
   }
 
@@ -2160,6 +2171,10 @@ struct LoadSizes {
   std::size_t trellis_dense = 0;
   // GitHub #650: the W4A4 TMA products' descriptor slots (0 unless the load keeps them).
   std::size_t tma_descriptors = 0;
+  // GitHub #714 (spec #711): the mixes whose graphs the load captures when mixed rounds are asked
+  // (kernel/src/mixed_graphs.h `planned`, bit m for kMixTable[m]), and their bytes.
+  uint32_t mixed_graph_mask = 0;
+  std::uint64_t mixed_graphs = 0;
   // GitHub #336: the load's decode lanes, which every round line is sized
   // for.
   std::size_t lanes = IGNIS_DECODE_MAX_BATCH;
@@ -2196,6 +2211,7 @@ struct LoadSizes {
     out.trellis_workspace_bytes = trellis_workspace;
     out.trellis_dense_bytes = trellis_dense;
     out.tma_descriptor_bytes = tma_descriptors;
+    out.mixed_graphs_bytes = mixed_graphs;
     return out;
   }
 };
@@ -2586,6 +2602,12 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     }
   }
   sizes.tma_descriptors = tma_descriptor_bytes(model, prefill_chunk_tokens, options);
+  // GitHub #714 (spec #711): the mixed rounds' graphs, each mix the capture makes them for over a
+  // pool of the lanes' and the device retained slots' GDN slots.
+  sizes.mixed_graph_mask = ignis::mixed_graphs::planned(
+      options.mixed_rounds_asked, two_shapes, model.is_trellis_body, sizes.extended_window, lanes,
+      static_cast<std::int64_t>(lanes) + options.retained_device_slots);
+  sizes.mixed_graphs = ignis::mixed_graphs::bytes_of(sizes.mixed_graph_mask);
   return sizes;
 }
 
@@ -2614,6 +2636,8 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.trellis_workspace_bytes = bytes(model.trellis_workspace_buffer);
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   out.tma_descriptor_bytes = model.tma_descriptors != nullptr ? model.tma_descriptors->bytes() : 0;
+  // GitHub #714: the mixed graphs the load planned; the driver holds them, not a buffer of its own.
+  out.mixed_graphs_bytes = ignis::mixed_graphs::bytes_of(model.mixed_planned_mask);
   // GitHub #687: a load's extended shape holds the base shape's buffers and
   // none of its own, so the base shape's are every byte of both.
   if (model.base_shape != nullptr) {
@@ -2901,6 +2925,8 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
     set_error(std::string("ignis_model_load: reservation sizing failed: ") + e.what());
     return -1;
   }
+  // GitHub #714: the mixed graphs the plan holds, which the load reports as its line.
+  model->mixed_planned_mask = sizes.mixed_graph_mask;
 
   const cudaError_t stream_err = cudaStreamCreate(&model->stream);
   if (stream_err != cudaSuccess) {

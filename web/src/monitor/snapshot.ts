@@ -16,12 +16,14 @@ export const REJECT_REASONS = ["full", "unknown_model", "oversized"] as const;
 export type RejectReason = (typeof REJECT_REASONS)[number];
 
 /**
- * The plan's fifteen lines (GitHub #339: `trellis_workspace`, the 27B
+ * The plan's sixteen lines (GitHub #339: `trellis_workspace`, the 27B
  * trellis body's, 0 on the served artifact and absent from a server that
  * predates it; GitHub #509: `trellis_dense`, the dense prefill's one buffer,
  * 0 unless the load runs it and absent from a server that predates it;
  * GitHub #650: `tma_descriptors`, the W4A4 TMA products' descriptor slots, 0
- * but on a Windows NVFP4 load and absent from a server that predates it), then Flash-Next's two (GitHub #306: `residency`,
+ * but on a Windows NVFP4 load and absent from a server that predates it;
+ * GitHub #714: `mixed_graphs`, the mixed rounds' graphs, 0 unless a 15-draft
+ * DFlash2 load asks for them and absent from a server that predates it), then Flash-Next's two (GitHub #306: `residency`,
  * the expert residency's fixed bytes, and `expert_cache`, the VRAM cache of
  * experts; 0 on the 27B, absent from a server that predates them), in the order `VramLines::entries()` lays them out
  * — which is the order the load itself reserves them in, so the panel reads
@@ -42,6 +44,7 @@ export const VRAM_LINES = [
   "decode_graph",
   "verify_round",
   "drafter_round",
+  "mixed_graphs",
   "lane_state",
   "retained_slots",
   "hq_residual_window",

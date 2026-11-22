@@ -137,7 +137,8 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
     let artifact = materialize(reader, &bound, &mut device, None).map_err(|e| format!("materialize: {e}"))?;
     let config = leaf_config(&shape, plan.kv_budget_bytes(format, geometry));
     let pages = config.kv_pool_plan().map_err(|e| e.to_string())?.page_count;
-    let model = model_load::load_qwen38_27b_with_decode_lanes(
+    // GitHub #714: for the pool's device retained slots, as the plan was asked.
+    let model = model_load::load_qwen38_27b_with_pool_slots(
         reader,
         &artifact,
         &handles,
@@ -150,9 +151,13 @@ pub fn load(reader: &Reader, shape: LoadShape) -> Result<Loaded, String> {
         config.prefill_attention,
         config.prefill_linear,
         config.slot_count,
+        config.retained_device_slots,
     )
     .map_err(|e| format!("model load: {e}"))?;
-    ignis_runtime::note_qwen27b_loaded(config.speculation.and_then(|s| s.round_shapes(config.slot_count).1));
+    ignis_runtime::note_qwen27b_loaded(
+        config.speculation.and_then(|s| s.round_shapes(config.slot_count).1),
+        reservations.reserved.mixed_graphs,
+    );
     let pool = SeqPool::create_with_speculation(
         &ModelConfig::qwen38_27b(),
         &SeqPoolBudget {
