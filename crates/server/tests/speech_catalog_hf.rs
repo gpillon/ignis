@@ -4,7 +4,8 @@
 //! Needs the network and downloads the smallest entry (about 1 GB), so it is
 //! `--ignored`: `cargo test -p ignis-server --test speech_catalog_hf --
 //! --ignored --nocapture`. `fetch` refuses a file whose size or SHA-256 is not
-//! the pin's, so a pass is the check.
+//! the pin's, so a pass is the check. CI runs it in the release workflow's
+//! `network` job (GitHub #709).
 
 use ignis_server::download::{Catalog, Downloader};
 
