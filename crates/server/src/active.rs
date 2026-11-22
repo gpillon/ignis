@@ -333,7 +333,8 @@ pub enum ModelStatus {
         /// a switch recovers from.
         from_unloaded: bool,
     },
-    /// Nobody used the model for `model.idle_unload` seconds, so it was torn
+    /// Nobody used the model for `model.idle_unload` seconds, or a client
+    /// asked for it (`POST /v1/ignis/models/unload`, ADR 0105), so it was torn
     /// down the way a switch tears one down (spec model-switch/02, ADR 0049):
     /// the process and the API are up, the model's id and source are kept,
     /// and the next request that needs it loads it again.
@@ -372,8 +373,8 @@ impl ModelStatus {
         }
     }
 
-    /// Whether nothing is resident because the idle clock unloaded the
-    /// model (spec model-switch/02): [`ModelStatus::Unloaded`], or a load out
+    /// Whether nothing is resident because the model was unloaded, idle or on
+    /// request (spec model-switch/02): [`ModelStatus::Unloaded`], or a load out
     /// of it that failed. A request that needs the model loads it from here,
     /// and a run of the switch's slot only loads — nothing to drain, tear
     /// down, or reload when it fails.

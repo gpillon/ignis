@@ -2,7 +2,8 @@
 //! unload is `ignis.model.unloaded`, once, and the load a request begins
 //! after it `ignis.model.load_started` then `ignis.model.reloaded` — neither
 //! of them a switch — while a switch out of `unloaded` is logged as any
-//! switch is. A binary of its own with one test, which installs the
+//! switch is; an unload a client asks for (GitHub #723) is the same line,
+//! without the idle time. A binary of its own with one test, which installs the
 //! process's subscriber: the unload's line is written on the blocking thread
 //! that tears the model down, which a subscriber scoped to the test's thread
 //! never sees.
@@ -113,9 +114,21 @@ async fn the_unload_and_the_load_after_it_are_logged_and_neither_is_a_switch() {
     assert_eq!(named(&log, "ignis.model.load_started").len(), 1, "no load_started for a switch");
     assert_eq!(named(&log, "ignis.model.reloaded").len(), 1, "no reloaded for a switch");
 
+    // An unload a client asks for (GitHub #723): the same line, logged before
+    // the answer, with no idle time; the load after it is a load as before.
+    assert_eq!(post(&app, "/v1/ignis/models/unload", &json!({ "model": "mock-b" })).await, StatusCode::OK);
+    let unloads = named(&log, "ignis.model.unloaded");
+    assert_eq!(unloads.len(), 3, "{unloads:?}");
+    assert_eq!(field(&unloads[2], "model"), json!("mock-b"));
+    assert_eq!(field(&unloads[2], "idle_secs"), Value::Null, "asked for, not idle: {}", unloads[2]);
+    assert!(field(&unloads[2], "teardown_ms").is_u64(), "{}", unloads[2]);
+    assert_eq!(post(&app, "/v1/chat/completions", &chat).await, StatusCode::OK);
+    assert_eq!(named(&log, "ignis.model.reloaded").len(), 2, "the load after it is logged as a load");
+    assert_eq!(named(&log, "ignis.model.switch_started").len(), 1, "neither is a switch");
+
     // Unloaded again, and the next load refused before it reaches the GPU:
     // `reload_failed` at the prepare stage, still not a switch.
-    unloaded(&server, &log, 3).await;
+    unloaded(&server, &log, 4).await;
     loader.refuse("mock-b");
     assert_eq!(post(&app, "/v1/chat/completions", &chat).await, StatusCode::SERVICE_UNAVAILABLE);
     let failed = named(&log, "ignis.model.reload_failed");

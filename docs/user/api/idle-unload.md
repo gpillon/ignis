@@ -47,38 +47,57 @@ change. A measurement should not meet a cold reload: the Makefile's
 `IDLE_UNLOAD=0` passes `--model-idle-unload 0`, and the A/B and TTFT session
 scripts do so themselves.
 
+## Unloading and loading on request
 
-## Load and unload on demand
-
-`GET /v1/models/{model}` retrieves one entry from `GET /v1/models` without
-loading it or extending the idle timer. An unknown id returns `404 model_not_found`.
-
-The lifecycle routes below are Ignis extensions, not OpenAI model deletion.
-They use the same API key as generation requests and operate on the exact id
-of the current text or image model. They never delete artifact files or unload
-the separate CPU speech model.
+From 0.11.0 a client can give the card back without waiting for the idle
+time, and take it again without sending a generation: another program on the
+same card, a video encoder say, runs between the two calls while the server
+stays up. Both routes are ignis extensions, not OpenAI's model deletion: no
+file is touched. They take the active model's id, the one `GET /v1/models`
+lists first, under the same API key as inference; a call refused for its key
+loads and unloads nothing. Neither selects another model, which is what a
+[switch](model-switching.md) does, and neither touches the
+[speech model](transcriptions.md).
 
 ```bash
-curl http://localhost:8000/v1/models/qwen3.8-27b-16g \
-  -H 'Authorization: Bearer YOUR_API_KEY'
-curl -X POST http://localhost:8000/v1/ignis/models/unload \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+curl -X POST http://127.0.0.1:8000/v1/ignis/models/unload \
+  -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-27b-16g"}'
-curl -X POST http://localhost:8000/v1/ignis/models/load \
-  -H 'Authorization: Bearer YOUR_API_KEY' -H 'Content-Type: application/json' \
+curl -X POST http://127.0.0.1:8000/v1/ignis/models/load \
+  -H 'Content-Type: application/json' \
   -d '{"model":"qwen3.8-27b-16g"}'
 ```
 
-Unload waits for teardown and answers `200` with
-`{"model":"qwen3.8-27b-16g","status":"unloaded"}`. If a request is admitted,
-queued or running, a switch or reload holds the model, or the model has no
-reloadable artifact, it answers `409 model_busy` without cancelling work.
-Already unloaded is a successful no-op. A later generation request automatically
-loads the model again; this route does not lock it out of service.
+With `--server-api-key`, add `-H "Authorization: Bearer $IGNIS_SERVER_API_KEY"`.
 
-Load waits until the current model is warm and answers `200` with
-`{"model":"qwen3.8-27b-16g","status":"serving"}`. Already serving is a no-op.
-It does not generate tokens. A failed reload returns `503 model_load_failed`;
-concurrent loads share the same reload. Use [model switching](model-switching.md)
-to select another model: a different id on either lifecycle route returns `404`.
-These are full unloads and cold reloads, not a VRAM-only suspension retaining KV.
+`POST /v1/ignis/models/unload` unloads the model the way the idle clock does,
+and answers once the teardown is done, so the card is free when the answer
+arrives: `200 {"model":"qwen3.8-27b-16g","status":"unloaded"}`. It never ends
+a request: one admitted, waiting or running on the model refuses it `409
+model_busy`, and so does a load, a reload or another unload under way, or a
+model not loaded from an artifact, which could not be loaded again; nothing is
+changed. A model unloaded already, or whose load out of `unloaded` failed, has
+nothing resident, and the answer is the same `200` at once. The next request
+that needs the model loads it again, as after an idle unload, and the unload
+is logged as one (`ignis.model.unloaded`, without `idle_secs`).
+
+`POST /v1/ignis/models/load` loads the model out of `unloaded` the way the
+next request would, and answers once it serves, without generating:
+`200 {"model":"qwen3.8-27b-16g","status":"serving"}`. A model serving already
+is answered at once and is not loaded again. Calls and requests arriving
+during the load wait for the same load. A load that fails is `503
+model_load_failed` with its reason, and the next call or request tries again;
+a switch or an unload begun between the load and the answer is `409
+model_busy`.
+
+On either route, an id other than the active model's is `404
+model_not_found`, and a body that does not parse, or carries a field other than
+`model`, is `400 invalid_json`. While a switch runs, both are answered `503
+model_switching` with `Retry-After`, as every other route is. These are a full
+teardown and a cold load, not a VRAM-only suspension that keeps the KV: the
+first request after the load finds no retained prompt state.
+
+`GET /v1/models/{model}`, OpenAI's retrieve, answers the entry `GET
+/v1/models` lists under the id, from 0.11.0. Like the listing it neither loads
+the model nor counts as its use, so polling it does not keep the model loaded;
+an id the listing does not name is `404 model_not_found`.

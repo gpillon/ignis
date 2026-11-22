@@ -294,8 +294,8 @@ async fn a_client_hanging_up_mid_stream_releases_its_use() {
     until(&server, "unloaded", IDLE * 5).await;
 }
 
-/// AC 5: polling every route that reports state — the model, the catalog,
-/// the configuration, the metrics — neither keeps the model loaded nor
+/// AC 5: polling every route that reports state — the models, one model's
+/// entry (GitHub #723), the catalog, the configuration, the metrics — neither keeps the model loaded nor
 /// loads it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn polling_the_state_routes_neither_keeps_the_model_nor_loads_it_again() {
@@ -307,7 +307,7 @@ async fn polling_the_state_routes_neither_keeps_the_model_nor_loads_it_again() {
     server.usage.touch();
     let _clock = server.spawn_idle_clock(TICK).expect("a clock");
     let poll = || async {
-        for uri in ["/v1/models", "/v1/models/catalog", "/v1/config", "/v1/config/fields", "/v1/config/origins"] {
+        for uri in ["/v1/models", "/v1/models/mock-a", "/v1/models/catalog", "/v1/config", "/v1/config/fields", "/v1/config/origins"] {
             send(&app, Method::GET, uri, None).await;
         }
         send(&metrics, Method::GET, "/metrics", None).await;
@@ -1054,8 +1054,10 @@ async fn the_catalog_offers_the_unloaded_model_to_load() {
     assert_eq!((row(&catalog)["loaded"].clone(), row(&catalog)["switchable"].clone()), (json!(false), json!(true)), "{catalog}");
 }
 
-
-/// Manual lifecycle calls reuse the idle teardown and reload machinery.
+/// GitHub #723: an explicit unload tears the active model down as an idle
+/// unload does, and a second one finds nothing to do; the model's entry
+/// reads without loading it; an explicit load loads it once, and a second
+/// finds it serving; a request is then served on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unload_is_idempotent_and_load_warms_without_generation() {
     let loader = MockLoader::new();
@@ -1082,6 +1084,9 @@ async fn explicit_unload_is_idempotent_and_load_warms_without_generation() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// GitHub #723: an explicit unload with a request admitted is `409` and
+/// unloads nothing; an id other than the active model's is `404` on either
+/// lifecycle route, and on the model's entry.
 #[tokio::test]
 async fn explicit_unload_refuses_an_admitted_request_and_unknown_ids() {
     let loader = MockLoader::new();
@@ -1101,6 +1106,8 @@ async fn explicit_unload_refuses_an_admitted_request_and_unknown_ids() {
     assert_eq!(loader.resident(), 1);
 }
 
+/// GitHub #723: the lifecycle routes and the model's entry are behind the API
+/// key, and a body with a field other than `model` is `400 invalid_json`.
 #[tokio::test]
 async fn lifecycle_requires_authentication_and_rejects_unknown_body_fields() {
     let loader = MockLoader::new();
@@ -1118,7 +1125,8 @@ async fn lifecycle_requires_authentication_and_rejects_unknown_body_fields() {
     assert_eq!(loader.resident(), 1);
 }
 
-
+/// GitHub #723: an explicit unload while a stream runs is `409`, and the
+/// stream runs to its end on the model still serving.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn explicit_unload_never_cancels_a_running_stream() {
     let loader = MockLoader::new();
@@ -1142,4 +1150,162 @@ async fn explicit_unload_never_cancels_a_running_stream() {
     assert_eq!(stream_status, StatusCode::OK);
     assert!(stream_body.as_str().unwrap().contains("[DONE]"));
     assert_eq!(*server.status(), ModelStatus::Serving);
+}
+
+/// A lifecycle route's call for `model` on its own task, as a client sends
+/// it and waits.
+fn lifecycle_task(app: &axum::Router, route: &str, model: &str) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let (app, uri, body) = (app.clone(), format!("/v1/ignis/models/{route}"), json!({ "model": model }));
+    tokio::spawn(async move { send(&app, Method::POST, &uri, Some(body)).await })
+}
+
+/// GitHub #723: two explicit loads and a request arriving while the model is
+/// unloaded wait for one load, `loading` meanwhile, and each is answered once
+/// the model serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn explicit_loads_and_a_request_arriving_together_share_one_load() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[]);
+    let app = server.app();
+    let (status, body) = lifecycle_task(&app, "unload", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let release = loader.hold_next_load();
+    let (first, second, request) = (lifecycle_task(&app, "load", "mock-a"), lifecycle_task(&app, "load", "mock-a"), chat_task(&app, None));
+    until(&server, "loading", PATIENT).await;
+    until_true("both loads and the request are admitted", || server.usage.in_flight() == 3).await;
+    assert!(!first.is_finished() && !second.is_finished() && !request.is_finished(), "all three wait for the load");
+
+    release.send(()).expect("the held load is waiting");
+    for task in [first, second] {
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, json!({ "model": "mock-a", "status": "serving" }));
+    }
+    let (status, completion) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(loader.loads(), ["mock-a"], "one load for all three");
+}
+
+/// GitHub #723: while a switch runs, the lifecycle routes and a model's entry
+/// are answered `503 model_switching` as every other route is, and change
+/// nothing: the switch lands on its own model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn while_a_switch_runs_the_lifecycle_routes_answer_as_every_route_does() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[]);
+    let app = server.app();
+    let release = loader.hold_next_load();
+    let switch = json!({ "artifact": "mock-b.ninfer", "model": "mock-b" });
+    let (status, _) = send(&app, Method::POST, "/v1/models/switch", Some(switch)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    until(&server, "switching", PATIENT).await;
+
+    for (method, uri, body) in [
+        (Method::POST, "/v1/ignis/models/load", Some(json!({ "model": "mock-a" }))),
+        (Method::POST, "/v1/ignis/models/unload", Some(json!({ "model": "mock-a" }))),
+        (Method::GET, "/v1/models/mock-a", None),
+    ] {
+        let (status, refused) = send(&app, method, uri, body).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {refused}");
+        assert_eq!(refused["error"]["code"], "model_switching", "{uri}: {refused}");
+    }
+    release.send(()).expect("the held load is waiting");
+    until(&server, "serving", PATIENT).await;
+    assert_eq!(server.active().model_id(), "mock-b");
+    assert_eq!(loader.loads(), ["mock-b"]);
+}
+
+/// GitHub #723: an explicit unload while a load out of `unloaded` runs is
+/// `409 model_busy`, and the request waiting on that load is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_unload_while_a_load_runs_is_refused_and_ends_nothing() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[]);
+    let app = server.app();
+    let (status, body) = lifecycle_task(&app, "unload", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let release = loader.hold_next_load();
+    let request = chat_task(&app, None);
+    until(&server, "loading", PATIENT).await;
+
+    let (status, refused) = lifecycle_task(&app, "unload", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "model_busy", "{refused}");
+    release.send(()).expect("the held load is waiting");
+    let (status, completion) = request.await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{completion}");
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    assert_eq!(loader.loads(), ["mock-a"]);
+}
+
+/// GitHub #723: an explicit load that fails is `503 model_load_failed` with
+/// its reason and leaves `failed`; an explicit unload then finds nothing
+/// resident and answers `unloaded`; once the artifact loads, the next
+/// explicit load serves it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_explicit_load_is_503_and_the_next_one_tries_again() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[]);
+    let app = server.app();
+    let (status, body) = lifecycle_task(&app, "unload", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    loader.break_load("mock-a");
+
+    let (status, refused) = lifecycle_task(&app, "load", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{refused}");
+    assert_eq!(refused["error"]["code"], "model_load_failed", "{refused}");
+    assert!(refused["error"]["message"].as_str().unwrap().contains("simulated kernel load error"), "{refused}");
+    assert_eq!(server.status().as_str(), "failed");
+
+    let (status, body) = lifecycle_task(&app, "unload", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "nothing is resident: {body}");
+    assert_eq!(body["status"], "unloaded");
+    assert_eq!(server.status().as_str(), "failed", "GET /v1/models keeps the failure's reason");
+
+    loader.mend("mock-a");
+    let (status, body) = lifecycle_task(&app, "load", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    assert_eq!(loader.loads(), ["mock-a", "mock-a"]);
+}
+
+/// GitHub #723: a model not loaded from an artifact could not be loaded
+/// again, so an explicit unload is `409 model_busy` and it keeps serving.
+#[tokio::test]
+async fn a_model_with_no_artifact_is_not_unloaded_on_request() {
+    let loader = MockLoader::new();
+    let mut model = loader.model("mock-a");
+    model.source = None;
+    let server = idle_server(&loader, model, Duration::ZERO, &[]);
+    let app = server.app();
+    let (status, refused) = lifecycle_task(&app, "unload", "mock-a").await.unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["error"]["code"], "model_busy", "{refused}");
+    assert_eq!(*server.status(), ModelStatus::Serving);
+    assert_eq!(loader.resident(), 1);
+}
+
+/// GitHub #723, as AC 8 for a request: while unloaded, an explicit load
+/// without the key is `401` and loads nothing; with it, the model loads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unauthenticated_explicit_load_while_unloaded_loads_nothing() {
+    let loader = MockLoader::new();
+    let server = idle_server(&loader, loader.model("mock-a"), Duration::ZERO, &[])
+        .with_api_key(ignis_server::config::ApiKey::new("sk-test"));
+    let app = server.app();
+    let body = json!({ "model": "mock-a" });
+    let (status, unloaded) = send_keyed(&app, Method::POST, "/v1/ignis/models/unload", Some(body.clone()), Some("sk-test")).await;
+    assert_eq!(status, StatusCode::OK, "{unloaded}");
+
+    for key in [None, Some("sk-wrong")] {
+        let (status, refused) = send_keyed(&app, Method::POST, "/v1/ignis/models/load", Some(body.clone()), key).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{key:?}: {refused}");
+    }
+    assert_eq!(*server.status(), ModelStatus::Unloaded);
+    assert!(loader.loads().is_empty(), "{:?}", loader.loads());
+
+    let (status, loaded) = send_keyed(&app, Method::POST, "/v1/ignis/models/load", Some(body), Some("sk-test")).await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(loader.loads(), ["mock-a"]);
 }
