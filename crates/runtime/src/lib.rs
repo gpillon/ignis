@@ -230,8 +230,8 @@ pub const QWEN27B_EXTENDED_SHAPE_STATE_BYTES: [u64; 4] = [2_101_248, 8_392_704, 
 /// 5090 (driver 610.88) on 2026-11-22 at `vram_reload_gpu`'s shape, the
 /// twelve mixes of eight lanes: the process held 599,408,640 B after the
 /// teardown of a 15-draft load that captured them, 67,112,960 B over the same
-/// load without them (532,295,680 B), where the line is 65,011,712 B: a reload
-/// adds back 2,101,248 B less than the graphs left, the safe side. Its plan
+/// load without them (532,295,680 B), where the line is 67,108,864 B: a reload
+/// adds back 4,096 B less than the graphs left, the safe side. Its plan
 /// charges the line again, so the add-back stays within what the plan
 /// charges again.
 pub fn qwen27b_state_after(extended: Option<ignis_core::RoundShape>, mixed_graphs: u64) -> u64 {
@@ -2954,14 +2954,14 @@ mod tests {
         // is torn down, so a reload adds back the plan's `mixed_graphs` line
         // beside the extended shape's state; its own plan charges the line
         // again. The twelve mixes at eight lanes, measured 67,112,960 B past
-        // the same load without them, which the line holds to 2 MiB.
+        // the same load without them, which the line holds to 4 KiB.
         let extended = Some(ignis_core::RoundShape { window: 15, lanes: 4 });
-        assert_eq!(qwen27b_state_after(extended, 65_011_712), 142_618_624);
+        assert_eq!(qwen27b_state_after(extended, 67_108_864), 144_715_776);
         assert_eq!(qwen27b_state_after(extended, 0), 77_606_912, "no mixed graph");
         let charged_again = |bytes| ProcessHeld { bytes, source: HeldSource::ChargedAgain };
         assert_eq!(
-            held_before_load(Qwen38_27b, measured(CONTEXT), qwen27b_state_after(extended, 65_011_712), None),
-            charged_again(CONTEXT + 142_618_624)
+            held_before_load(Qwen38_27b, measured(CONTEXT), qwen27b_state_after(extended, 67_108_864), None),
+            charged_again(CONTEXT + 144_715_776)
         );
     }
 

@@ -117,11 +117,12 @@ pub const MIXED_ROUND_WINDOW: u32 = 15;
 
 /// The device memory a load's mixed graphs take (`kernel/src/mixed_graphs.h`
 /// `bytes_of`): [`MIXED_GRAPH_BYTES`] a mix, each its verify graph and its
-/// drafter append graph, and [`MIXED_GRAPHS_FIRST_BYTES`] beside the first,
-/// in whole pages of [`MIXED_GRAPHS_PAGE_BYTES`], as the RTX 5090 measured
-/// them: 62 MiB for the twelve.
+/// drafter append graph, and [`MIXED_GRAPHS_FIRST_BYTES`] beside them, in
+/// whole pages of [`MIXED_GRAPHS_PAGE_BYTES`], as the RTX 5090 measured them:
+/// 62 MiB for the twelve at capture, and a page more on the process's own
+/// counter.
 pub const MIXED_GRAPH_BYTES: u64 = 5 << 20;
-pub const MIXED_GRAPHS_FIRST_BYTES: u64 = 2 << 20;
+pub const MIXED_GRAPHS_FIRST_BYTES: u64 = 4 << 20;
 pub const MIXED_GRAPHS_PAGE_BYTES: u64 = 2 << 20;
 
 /// The mixed graphs a load captures and plans (GitHub #714): the mixes, in
@@ -498,11 +499,12 @@ mod tests {
         assert_eq!(mixed_graphs(Some(fifteen), true, true, 8, 2), MixedGraphs::default(), "the trellis body");
         assert_eq!(mixed_graphs(Some(mtp), false, true, 8, 2), MixedGraphs::default(), "the MTP head");
         assert_eq!(mixed_graphs(None, false, true, 8, 2), MixedGraphs::default(), "no speculation");
-        // What the RTX 5090 measured the graphs to take: the twelve 62 MiB,
-        // the first mix alone 8 MiB; two, 12 MiB.
-        assert_eq!(mixed_graphs(Some(fifteen), false, true, 8, 0).bytes, 65_011_712);
-        assert_eq!(mixed_graphs(Some(fifteen), false, true, 2, 1).bytes, 8 << 20);
-        assert_eq!(mixed_graphs(Some(fifteen), false, true, 4, 0).bytes, 12 << 20);
+        // What the RTX 5090 measured the graphs to take, and a page more: the
+        // twelve 64 MiB (62 at capture, 64 MiB and 4 KiB left after the
+        // teardown), the first mix alone 10 MiB (8 at capture); two, 14 MiB.
+        assert_eq!(mixed_graphs(Some(fifteen), false, true, 8, 0).bytes, 67_108_864);
+        assert_eq!(mixed_graphs(Some(fifteen), false, true, 2, 1).bytes, 10 << 20);
+        assert_eq!(mixed_graphs(Some(fifteen), false, true, 4, 0).bytes, 14 << 20);
     }
 
     /// The sampler's workspace the leaf asks the vendored query for: one

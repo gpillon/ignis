@@ -124,8 +124,8 @@ Why each:
   ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
   From 0.11.0 a load that asks for mixed rounds (for now the measurement
   switch `IGNIS_MIXED_ROUNDS=1`) holds the graphs of all twelve mixes at these
-  eight lanes, with or without a device retained slot: 62 MiB, at most 111 KV
-  pages (7,104 tokens) of the pool
+  eight lanes, with or without a device retained slot: 64 MiB, at most 114 KV
+  pages (7,296 tokens) of the pool
   ([the VRAM plan](vram-plan.md#what-the-plan-counts)).
   `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
   to measure a window past 7, so `rtxpro6000` keeps 7.

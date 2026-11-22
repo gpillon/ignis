@@ -706,8 +706,10 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
     // GitHub #714: the mixed graphs, asked by the switch the plan reads.
     let page_bytes =
         KvFormat::HqE8_2b.page_bytes(ignis_core::seq::kv_geometry(&topology, Some(SpeculativeBackend::Dflash2)));
+    let _switch = MIXED_ROUNDS_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let asking = |asked: bool| {
-        // SAFETY (test-only): the leaf reads the switch on this thread, during the plan.
+        // SAFETY (test-only): the leaf reads the switch on this thread, during the plan, and no
+        // other test of this binary sets it while [`MIXED_ROUNDS_HELD`] is held.
         unsafe {
             if asked {
                 std::env::set_var(MIXED_ROUNDS, "1");
@@ -786,8 +788,11 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
 }
 
 /// GitHub #714: the switch that asks for the mixed rounds' graphs, read at the
-/// plan (and at the load and its capture).
+/// plan (and at the load and its capture), and the lock a test holds while it
+/// sets it: the tests of this binary may run on threads side by side, and
+/// every plan at 15 drafts reads the process's environment.
 const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
+static MIXED_ROUNDS_HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A decode round's token staging a lane (`decode_graph_token_ids` and
 /// `decode_graph_slots`, `kernel/src/model.cu`), in 4-byte words: a load with
@@ -886,10 +891,14 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
         let base = planned(seven);
         assert!(base.trellis_workspace > 0, "{}: a trellis body plans its workspace", profile.label);
         // GitHub #714: the trellis body runs no mixed round yet, so it plans no mixed graph when asked.
-        // SAFETY (test-only): as in the NVFP4 body's test.
-        unsafe { std::env::set_var(MIXED_ROUNDS, "1") };
-        let asked = planned(at_window(15));
-        unsafe { std::env::remove_var(MIXED_ROUNDS) };
+        let asked = {
+            let _switch = MIXED_ROUNDS_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY (test-only): as in the NVFP4 body's test, under the same lock.
+            unsafe { std::env::set_var(MIXED_ROUNDS, "1") };
+            let asked = planned(at_window(15));
+            unsafe { std::env::remove_var(MIXED_ROUNDS) };
+            asked
+        };
         assert_eq!(asked.mixed_graphs, 0, "{}: the trellis body's mixed graphs", profile.label);
         for (window, two_lane_decode_round) in [(8, 331_776), (12, 1_658_880), (15, 2_654_208)] {
             let wide = at_window(window);

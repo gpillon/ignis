@@ -16,9 +16,11 @@
 //! round's named shape and drafts (`step::TeacherForcing`, the decode
 //! options' `forced_shape_window` and `forced_drafts`, which the leaf reads
 //! only beside `forced_tokens` and its verify graphs refuse) and the plain
-//! round's logits readout (`dflash2_readout::plain_round_logits`). The
-//! replays that call the seams are examples (`crates/runtime/examples/`),
-//! outside every directory scanned.
+//! round's logits readout (`dflash2_readout::plain_round_logits`). GitHub
+//! #714: so is the seam that fails one mixed round's capture
+//! (`step::fail_mixed_capture`, the leaf's
+//! `ignis_decode_graph_fail_mixed_capture`). The replays that call the seams
+//! are examples (`crates/runtime/examples/`), outside every directory scanned.
 
 use std::path::{Path, PathBuf};
 
@@ -44,7 +46,7 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The seams' names, as code would call them.
-const SEAMS: [&str; 12] = [
+const SEAMS: [&str; 13] = [
     "decode_program_verify_forced",
     "dflash2_readout",
     "forced_tokens",
@@ -57,6 +59,7 @@ const SEAMS: [&str; 12] = [
     "forced_drafts",
     "forced_shape_window",
     "plain_round_logits",
+    "fail_mixed_capture",
 ];
 
 /// The core crate's files that define the seams, and its root, which

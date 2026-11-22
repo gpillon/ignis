@@ -21,14 +21,17 @@ namespace ignis::mixed_graphs {
 // one's stride over the backing both shapes' records share (`ignis_mixed_round_refusal`).
 inline constexpr std::uint32_t kWindow = 15;
 
-// The device memory a load's mixed graphs take: 5 MiB a mix (its verify graph of 1,215 to 1,251
-// nodes and its append graph of 37 to 43, on the 27B's NVFP4 body at 8 lanes) and 2 MiB beside the
-// first, in whole 2 MiB pages. Measured on the RTX 5090 (2026-11-22, driver 610.88) as the device's
-// free memory before each mix's capture less after it, the twelve in kMixTable's order: 8, 4, 6, 4,
-// 4, 6, 6, 4, 6, 4, 4 and 6 MiB, 62 MiB in all, which this holds at every count from one mix to
-// twelve, to the page at ten of them.
+// The device memory a load's mixed graphs take: 5 MiB a mix (its verify graph of 1,215 to 1,260
+// nodes and its append graph of 37 to 43, on the 27B's NVFP4 body at 8 lanes, BF16 or FP8 exception
+// weights) and 4 MiB beside them, in whole 2 MiB pages. Measured on the RTX 5090 (2026-11-22, driver
+// 610.88) as the device's free memory before each mix's capture less after it, the twelve in
+// kMixTable's order: 8, 4, 6, 4, 4, 6, 6, 4, 6, 4, 4 and 6 MiB, 62 MiB in all, which 2 MiB beside
+// them holds at every count from one mix to twelve; and on the process's WDDM counter, where the
+// twelve's load held up to 2,088,960 B more past its plan than the same load without them, and the
+// driver held 67,112,960 B more (64 MiB and 4 KiB) once each was torn down: one page more, so that
+// the line is never short of what the process holds.
 inline constexpr std::uint64_t kBytesPerMix = std::uint64_t{5} << 20;
-inline constexpr std::uint64_t kFirstMixBytes = std::uint64_t{2} << 20;
+inline constexpr std::uint64_t kFirstMixBytes = std::uint64_t{4} << 20;
 inline constexpr std::uint64_t kPageBytes = std::uint64_t{2} << 20;
 
 // The measurement switch IGNIS_MIXED_ROUNDS (ADR 0093's kind), read at each load and at each capture

@@ -1003,10 +1003,12 @@ fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
 /// a drafter append graph for each mix the load holds (#714: every mix the
 /// plan's rule picks, `ignis_core::lane_lines::mixed_graphs`, on this pool of
 /// the load's lanes and no retained slot: all twelve at 8 lanes on the NVFP4
-/// body at 15 drafts), and no other mix's; none anywhere else. The captured
-/// mixes' graphs took no more than the plan's line, as the device's free
-/// memory reads them (an arm's capture after another's may take less, where
-/// the driver reuses what the earlier graphs left it).
+/// body at 15 drafts), and no other mix's; none anywhere else. What the
+/// captured mixes' graphs took, as the device's free memory reads them, prints
+/// beside the plan's line, held to nothing: the reading moves with anything
+/// else on the card, and an arm's capture after another's may read none,
+/// where the driver reuses what the earlier graphs left it (`vram_reload_gpu`
+/// holds the line on the process's own counter).
 fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label: &str) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
     let (verify, append) = (stats.mixed_verify_graph_nodes, stats.mixed_append_graph_nodes);
@@ -1034,7 +1036,6 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
             stats.mixed_graph_bytes,
             planned.bytes
         );
-        assert!(measured <= planned.bytes, "{label}: arm `{}`: the mixed graphs took {measured} B, past the plan's {} B", arm.name, planned.bytes);
     }
 }
 
@@ -1411,10 +1412,13 @@ fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script
 /// #714: on a load of [`MIXED_LOADS`], the test seam fails [`FAILED_MIX`]'s
 /// capture and the arm captures the mixed graphs: that mix has neither graph,
 /// its bit is the capture's failed mask and every other mix the load holds
-/// is captured ([`mixed_graph_nodes`]). Three lanes prefilled afresh ride two
-/// uniform verify rounds, then the failed mix, live: every lane runs at the
-/// uniform round shape the shape rule and `aggregate` give them (the mirror's,
-/// with `IGNIS_ROUND_SHAPE` read by no mix), from that shape's graph, never
+/// is captured ([`mixed_graph_nodes`]). Three lanes prefilled afresh ride a
+/// teacher-forced round at the uniform base shape whose drafts are its
+/// recording, so that each takes its whole 7 and asks the extended shape with
+/// no extended round behind it; then the failed mix, live: every lane runs at
+/// the uniform round shape the shape rule and `aggregate` give them (the
+/// mirror's, the extended one, which a base round would not be; with
+/// `IGNIS_ROUND_SHAPE` read by no mix), from that shape's graph, never
 /// eagerly, and the program counts one round under
 /// [`MixedFallback::CaptureFailed`]; then another mix of the same lanes runs
 /// as that mix from its graph, and counts none. The arms compared: 1, or 0 on
@@ -1444,17 +1448,25 @@ fn capture_failure(model: &Model, pool: &SeqPool, load: &Load, script: &Script, 
         .collect();
     let mut mirror = vec![shape_policy::Lane::default(); riding.len()];
     let lanes: Vec<VerifyLane<'_>> = riding.iter().map(|_| VerifyLane::greedy(&[])).collect();
-    for round in 0..2 {
-        let mut refs = riders(&mut seqs, &riding);
-        let runs = decode_program_verify_runs(model, pool, &mut refs, &lanes, load.window).unwrap_or_else(|e| panic!("{label}: round {round}: {e}"));
-        for (lane, run) in riding.iter().zip(runs) {
-            mirror[*lane].after(rule, run.extended, run.extent, run.tokens.len() as u32 - 1);
-        }
+    let recordings: Vec<Vec<i32>> = riding
+        .iter()
+        .map(|&lane| (0..=load.window as usize).map(|at| script.permitted[(lane + at) % script.permitted.len()]).collect())
+        .collect();
+    let forced: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
+    let drafts: Vec<&[i32]> = recordings.iter().map(|recording| &recording[..load.window as usize]).collect();
+    let forcing = TeacherForcing { shape_window: None, drafts: Some(&drafts), lane_shapes: Some(&[false, false, false]) };
+    let mut refs = riders(&mut seqs, &riding);
+    let runs = decode_program_verify_forced_with(model, pool, &mut refs, &lanes, load.window, &forced, forcing)
+        .unwrap_or_else(|e| panic!("{label}: a full base round: {e}"));
+    for (lane, run) in riding.iter().zip(runs) {
+        assert_eq!((run.extent, run.extended, run.tokens.len() as u32 - 1), (BASE_WINDOW, false, BASE_WINDOW), "{label}: lane {lane}'s full base round");
+        mirror[*lane].after(rule, run.extended, run.extent, run.tokens.len() as u32 - 1);
     }
     let counted = || stats().mixed_fallback_rounds;
     let before = counted();
     let mirrors: Vec<&shape_policy::Lane> = mirror.iter().collect();
     let want = shape_policy::extends(ShapePolicy::Aggregate, spec.shape_estimate(), &mirrors);
+    assert!(want, "{label}: lanes that took a full base round ask the extended shape with no extended round behind them");
     let mut refs = riders(&mut seqs, &riding);
     let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &[true, false, true])
         .unwrap_or_else(|e| panic!("{label}: the failed mix: {e}"));
