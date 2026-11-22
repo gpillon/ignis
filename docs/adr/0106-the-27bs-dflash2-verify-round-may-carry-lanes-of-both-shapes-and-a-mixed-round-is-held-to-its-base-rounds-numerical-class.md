@@ -99,12 +99,13 @@ Forced, every mixed row is its base row within 1 ulp, both groups' (the uniform 
 than in the base leg, each leg's drafts and accepted counts its own, as between a uniform graph cell's two shapes. One
 bound fails, on one lane, in both runs of 2026-11-22: on graph rounds the prose prompt's lane, extended at the mix 3+2,
 reads its text's mean log-probability 0.0256 nats a token below the base rows', over 79 rows (its leg ended with the
-table prompt's text); the next furthest is the same lane at 2+1 and 3+1, 0.0194 over 51. Over the first 64
-rows that lane reads 0.0177, as the same prompt's lane of ADR 0104's uniform extended graph cell at 4 lanes does there
-(0.0124 over its 210 rows), and that cell's lane at one lane reads 0.0242 there: the excess is the extended round's on
-a short window of an uncertain text, which a mixed lane's shorter leg reads whole, not the mix's. Whether the likelihood
-is read over a window every lane reaches, or the margin stands, is the owner's to decide with this ADR; the test holds
-0.02, as ADR 0104 confirmed it, and fails on that lane until then.
+table prompt's text); the next furthest is the same lane at 2+1 and 3+1, 0.0194 over 51. Measured over the first 64
+rows: that lane 0.0177; the same prompt's lane of ADR 0104's uniform extended graph cell at 4 lanes 0.0177 too (0.0124
+over its 210 rows); that cell's lane at one lane 0.0242. The uniform lane over the same 79 rows was not read. So the
+excess looks like the extended round's on a short window of an uncertain text, which a mixed lane's shorter leg reads
+whole, rather than the mix's: an inference from those readings, not a measurement of it. How a short lane's likelihood
+is held is the owner's to decide with this ADR; the test holds 0.02, as ADR 0104 confirmed it, and fails on that lane
+until then.
 
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class
 reaches the mixed round; "lanes of both shapes in one round" is built, the only way to an extended shape past 4 lanes.

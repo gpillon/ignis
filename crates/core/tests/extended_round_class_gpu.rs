@@ -262,11 +262,12 @@ const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 /// rounds: forced at most 0.0010; graph 0.0256 on one lane, past it, the
 /// prose prompt's extended lane at the mix 3+2 over 79 rows (its leg ends
 /// with the table prompt's text), the next 0.0194 over 51 (the same lane at
-/// 2+1 and 3+1). Over the first 64 rows that lane reads 0.0177, as the same
-/// prompt's lane of the uniform extended graph cell at 4 lanes does there
-/// (0.0124 over its 210), and that cell's lane at one lane 0.0242: the
-/// likelihood's excess is the extended round's on a short window, which a
-/// mixed lane's shorter leg reads whole. ADR 0106 leaves it to the owner.
+/// 2+1 and 3+1). Over the first 64 rows that lane reads 0.0177, the same
+/// prompt's lane of the uniform extended graph cell at 4 lanes 0.0177 too
+/// (0.0124 over its 210), and that cell's lane at one lane 0.0242 (the uniform
+/// lane over the same 79 rows was not read): the excess looks like the
+/// extended round's on a short window, which a mixed lane's shorter leg reads
+/// whole, an inference, not a measurement. ADR 0106 leaves it to the owner.
 const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 
 /// The control's median, one index off, over the right rows' median and over
