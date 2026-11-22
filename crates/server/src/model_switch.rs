@@ -48,7 +48,8 @@
 //!
 //! **Idle unload** (spec model-switch/02, ADR 0049). The idle clock
 //! (`crate::idle`) tears a model nobody uses down through this module's own
-//! slot and teardown (`claim_unload`, `unload`): the status is
+//! slot and teardown (`claim_unload_if`, `unload`), and so does `POST
+//! /v1/ignis/models/unload` one a client asks for (ADR 0105): the status is
 //! [`ModelStatus::Unloaded`], the [`ActiveModel`] is kept — its id and its
 //! source — and its engine is never called again. Leaving that state is a
 //! load and nothing more, [`ModelStatus::Loading`]: whatever begins it — a
@@ -1645,30 +1646,28 @@ fn load_target(server: &Server, switcher: &Switcher, requested: Option<&str>) ->
         .or(unloaded)
 }
 
-/// The switch's slot, held by an idle unload from the moment it closes the
-/// model to new work until its teardown is done ([`claim_unload`]).
+/// The switch's slot, held by an unload — idle, on request or of a failed
+/// image model — from the moment it closes the model to new work until its
+/// teardown is done ([`claim_unload_if`]).
 pub(crate) struct Unloading {
     _slot: RunningGuard,
 }
 
-/// Take the switch's slot for an idle unload (spec model-switch/02) and
-/// close the model: the status is [`ModelStatus::Unloaded`] from now, so a
-/// request admitted after this loads the model again rather than reaching an
-/// engine about to go. `None` — the unload waits for a later tick — while a
-/// switch, a reload or a load holds the slot (AC 12), when the model is not
-/// serving, or when it was not loaded from an artifact and could not be
-/// loaded again.
+/// Take the switch's slot for an unload (spec model-switch/02) and close the
+/// model, when `meant` says the model loaded now is the one to unload: one a
+/// switch has loaded since is left alone. The status is
+/// [`ModelStatus::Unloaded`] from now, so a request admitted after this loads
+/// the model again rather than reaching an engine about to go. `None` — the
+/// idle unload waits for a later tick, the one asked for is refused — while
+/// a switch, a reload, a load or another unload holds the slot (AC 12), when
+/// the model is not serving, or when it was not loaded from an artifact and
+/// could not be loaded again.
 ///
-/// The idle clock calls it holding the in-flight count's lock
-/// ([`crate::idle::Usage`]), which a request's admission takes too: the
-/// count it saw at zero stays zero until the status says `unloaded`.
-pub(crate) fn claim_unload(server: &Server) -> Option<Unloading> {
-    claim_unload_if(server, |_| true)
-}
-
-/// [`claim_unload`], when `meant` says the model loaded now is the one to
-/// unload: one a switch has loaded since is left alone.
-fn claim_unload_if(server: &Server, meant: impl FnOnce(&ActiveModel) -> bool) -> Option<Unloading> {
+/// The idle clock and `POST /v1/ignis/models/unload` call it holding the
+/// in-flight count's lock ([`crate::idle::unload_unused`]), which a
+/// request's admission takes too: the count they saw at zero stays zero
+/// until the status says `unloaded`.
+pub(crate) fn claim_unload_if(server: &Server, meant: impl FnOnce(&ActiveModel) -> bool) -> Option<Unloading> {
     let switcher = server.switcher.clone()?;
     let mut running = switcher.running.lock().expect("switch lock");
     let active = server.active();
@@ -1685,14 +1684,16 @@ fn claim_unload_if(server: &Server, meant: impl FnOnce(&ActiveModel) -> bool) ->
 pub(crate) enum UnloadCause {
     /// Nobody used it for this long (`model.idle_unload`).
     Idle(Duration),
+    /// A client asked for it, `POST /v1/ignis/models/unload` (GitHub #723).
+    Requested,
     /// It failed while it served, for this reason ([`unload_failed`]).
     Failed(String),
 }
 
 /// Tear the model down the way a switch does ([`ActiveModel::shut_down`]:
 /// the model thread drops its scheduler, and with it every GPU buffer and
-/// pinned arena), after [`claim_unload`] closed it, for `cause`: idle for
-/// so long after its last use, or failed. The [`ActiveModel`] stays published — its id and its source are
+/// pinned arena), after [`claim_unload_if`] closed it, for `cause`: idle for
+/// so long after its last use, asked for, or failed. The [`ActiveModel`] stays published — its id and its source are
 /// what `GET /v1/models` names and what the next load reads — and its
 /// engine is never called again. Not a switch: `ignis.model.unloaded`, and
 /// `last_switch` is left as it was (AC 14). The slot is freed, and the
@@ -1720,6 +1721,12 @@ pub(crate) async fn unload(server: &Server, unloading: Unloading, cause: UnloadC
                 teardown_ms,
                 "nobody used the model for model.idle_unload seconds: it is unloaded, and the next request that needs it loads it again"
             ),
+            UnloadCause::Requested => tracing::info!(
+                name: "ignis.model.unloaded",
+                model = %model.model_id(),
+                teardown_ms,
+                "a client asked for the model to be unloaded (POST /v1/ignis/models/unload): it is unloaded, and the next request that needs it loads it again"
+            ),
             UnloadCause::Failed(reason) => tracing::warn!(
                 name: "ignis.model.unloaded",
                 model = %model.model_id(),
@@ -1738,7 +1745,7 @@ pub(crate) async fn unload(server: &Server, unloading: Unloading, cause: UnloadC
 /// The image model `failed` stopped serving on a fault of its own — a
 /// runner call panicked mid-job, and the job closed its queue and dropped
 /// its runner (`images::job::spawn`): unloaded as the idle clock unloads a
-/// model ([`claim_unload`], [`unload`]), so the next request that needs it
+/// model ([`claim_unload_if`], [`unload`]), so the next request that needs it
 /// loads it again ([`ensure_loaded`]). Nothing when it is no longer the
 /// model serving — a switch has replaced it, or one under way replaces it
 /// anyway — or the server could not load it again (no switcher): then each

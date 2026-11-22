@@ -83,9 +83,10 @@ of weights, while single-turn code barely moves
   refused), and the second lane and DFlash2 as costs.
 - The class's catalog entry, `qwen3.8-27b-12g` (#638), pins `trellis-ig28` at
   `gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`, revision `15333a0829f055e7ee25d6d5ef84fd8d521518c6`, public under
-  Apache 2.0: the artifact and its conversion record, 12,754,973,515 bytes. On a 12 GB card it is the one built-in
-  text or image model that loads; the uncensored variant and Swift 1.5 have no build of the class, and they and
-  every 16 GB entry are refused there by name before a fetch or a teardown. An artifact named by its path still
+  Apache 2.0: the artifact and its conversion record, 12,754,973,515 bytes. On a 12 GB card it and the
+  uncensored variant's build of the class, `qwen3.8-27b-abliterated-12g` (#706), are the built-in text or image models
+  that load; Swift 1.5 has no build of the class, and it and every 16 GB entry are refused there by name before a
+  fetch or a teardown. An artifact named by its path still
   loads, judged by the plan alone.
 - Two entries now answer to `qwen3.8-27b`, the 16 GB 27B and this one, so ADR 0064's one claimant of an alias
   becomes one claimant of each card class within a layer, and where several entries that answer to an id fit the

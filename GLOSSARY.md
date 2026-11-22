@@ -726,6 +726,14 @@ request that needs the model loads it again (`status: loading`, requests
 arriving meanwhile wait) and is served.
 _Avoid_: sleep, suspend, eviction (that word is a sequence's, not a model's)
 
+**Explicit unload**:
+An unload of the active model a client asks for, at once rather than after
+the idle time: the same teardown into the same `unloaded` state as an **idle
+unload**, refused while anything uses the model, never ending a request (ADR
+0105). Its counterpart, an **explicit load**, leaves `unloaded` the way the
+next request that needs the model would, without generating.
+_Avoid_: manual unload, release, suspend, deletion (no file is touched)
+
 ### Prompt rendering
 
 **Instruction message**:

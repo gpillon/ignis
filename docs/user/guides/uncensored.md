@@ -147,10 +147,12 @@ Under MTP it decodes 0.99x to 1.08x the 12 GB artifact (against one launch
 of it; the one cell below 1, a cold 8,192-token prompt, is inside that cell's
 spread). Its first token comes about 2.5 s after an 8,192-token prompt,
 1.2% later than the 12 GB artifact's, and 20.9 s after 65,536 and 46 s after
-130,560, within 1% of it. DFlash2
-loads in the same 12 GiB with the same context and a smaller KV pool (150,720
-tokens against MTP's 214,144), and decodes 1.31x to 1.47x MTP; the profile
-keeps MTP, as for the 12 GB artifact.
+130,560, within 1% of it. Held to the same 12 GiB, DFlash2 loads with the
+same context and a smaller KV pool (150,720 tokens against MTP's 214,144), and
+decodes 1.31x to 1.47x MTP. The profile keeps MTP, as for the 12 GB artifact:
+on a real 12 GB card DFlash2's 0.7 GB more is the context, and by the plan's
+arithmetic it keeps 49,152 tokens on an RTX 50 card with nothing else on it and
+none beside a desktop ([`rtx-12gb`](../concepts/profiles.md#rtx-12gb)).
 
 What these numbers do not cover:
 
