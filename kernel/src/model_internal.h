@@ -1031,6 +1031,9 @@ struct ignis_model {
   // The kept-scores stamp (`IgnisVerifyRound::kept_epoch`) of the latest mixed round, which ran on
   // the base shape's buffers at each group's stride, so that a read of them at one stride refuses.
   std::uint64_t mixed_kept_epoch = 0;
+  // GitHub #717: and its mix, its extended lanes and its base lanes, which a read of its rows names
+  // (`ignis_verify_readout_mixed_logits`).
+  std::array<std::uint32_t, 2> mixed_kept_mix{};
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;

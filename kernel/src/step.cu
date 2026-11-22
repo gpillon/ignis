@@ -2530,9 +2530,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     // so a round that fails part way leaves no earlier record believing them
     // its own.
     verify.kept_epoch = ++model->kept_epoch;
-    // GitHub #713: a mixed round's stamp, whose logits are at its groups' strides.
+    // GitHub #713: a mixed round's stamp, whose logits are at its groups' strides; GitHub #717: and
+    // its mix.
     if (mixed) {
       model->mixed_kept_epoch = verify.kept_epoch;
+      model->mixed_kept_mix = {layout.groups[0].lanes, layout.groups[1].lanes};
     }
     // Armed before the launch: a pass that fails part way may still have
     // appended some of its columns.
