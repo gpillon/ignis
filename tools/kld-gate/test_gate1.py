@@ -58,20 +58,36 @@ def test_the_gate_holds_the_position_weighted_kld_to_the_limit(tmp_path):
     assert (code, report["verdict"]) == (1, "FAIL")
 
 
-def test_a_cross_term_not_above_the_matched_pair_in_every_window_stops_the_gate(tmp_path):
+def test_a_cross_term_holds_when_the_ci_of_its_difference_from_the_matched_pair_is_above_0(tmp_path):
     matched = (0.02, 0.06, 0.05, 0.03)
 
     code, report = run(tmp_path, world(tmp_path, matched), "--limit", "0.0590", "--baseline", "0.04916")
     assert (code, report["verdict"], report["stop"]) == (0, "PASS", False)
     assert report["cross"]["cross_artifact"]["above_windows"] == 4
     assert report["cross"]["cross_reference"]["ratio"] == pytest.approx(0.3 / 0.045)
-    assert report["cross_rule"] == "above in every window, the CI of the difference above 0"
+    assert report["cross_rule"] == "the CI of the difference above 0"
 
-    # The vanilla artifact sits below the matched pair in window 2: the gate may have measured the base.
+    # The vanilla artifact sits below the matched pair in window 2 alone. Only a resample of window 2 four times
+    # over (1 in 256) puts the difference below 0, so its CI is above 0: the term holds, and the windows above
+    # are reported, not required.
     code, report = run(tmp_path, world(tmp_path, matched, cross_artifact=(0.3, 0.3, 0.03, 0.3)),
                        "--limit", "0.0590", "--baseline", "0.04916")
-    assert (code, report["verdict"], report["stop"]) == (3, "PASS", True)
+    assert (code, report["verdict"], report["stop"]) == (0, "PASS", False)
     assert report["cross"]["cross_artifact"]["above_windows"] == 3
+    assert report["cross"]["cross_artifact"]["above"] is True
+
+
+def test_a_cross_term_above_the_matched_pair_on_average_with_its_ci_reaching_0_stops_the_gate(tmp_path):
+    # The vanilla artifact sits below the matched pair in windows 1 and 2, above on average (2.1 / 0.72 of the
+    # matched pair's position sums). A resample of those two windows alone (1 in 16) puts the difference below 0,
+    # more often than the CI's 2.5%: the gate may have measured the base.
+    code, report = run(tmp_path, world(tmp_path, (0.02, 0.06, 0.05, 0.03), cross_artifact=(0.3, 0.03, 0.03, 0.3)),
+                       "--limit", "0.0590", "--baseline", "0.04916")
+    assert (code, report["verdict"], report["stop"]) == (3, "PASS", True)
+    x = report["cross"]["cross_artifact"]
+    assert (x["above_windows"], x["above"]) == (2, False)
+    assert x["ratio"] == pytest.approx(2.1 / 0.72)
+    assert x["diff_ci95"][0] < 0
     assert report["cross"]["cross_reference"]["above"] is True
 
 
@@ -121,7 +137,8 @@ G340 = f"{SCRATCH}/kld-2026-09-24/results/g340-gate1.json"
 def test_machine_local_it_reproduces_422s_gate_1(tmp_path):
     """#422's results on this machine, read the way its own gate1.py read them: the same numbers it printed
     (`.scratch/386/422/gate1.log`). Its two artifacts differ in 70 matrices, so its cross terms sit only
-    7-9% above the matched pair, and not in every window: under #449's rule the gate would have stopped."""
+    7-9% above the matched pair, and not in every window: under #449's rule, every window above, the gate would
+    have stopped. Each difference's CI is above 0, so under #725's the cross terms hold."""
     paths = [f"{G422}/g422-abl.json", f"{G422}/g422-base.json", G340]
     if not all(map(os.path.isfile, paths)):
         pytest.skip(f"#422's results are not on this machine ({G422})")
@@ -142,4 +159,6 @@ def test_machine_local_it_reproduces_422s_gate_1(tmp_path):
     assert round(report["cross"]["cross_artifact"]["kld"], 5) == 0.04362
     assert round(report["cross"]["cross_reference"]["kld"], 5) == 0.04453
     assert [report["cross"][k]["above_windows"] for k in ("cross_artifact", "cross_reference")] == [15, 15]
-    assert (code, report["stop"]) == (3, True)
+    assert [[round(x, 5) for x in report["cross"][k]["diff_ci95"]] for k in ("cross_artifact", "cross_reference")] \
+        == [[0.00144, 0.00389], [0.00245, 0.00498]]
+    assert (code, report["stop"]) == (0, False)
