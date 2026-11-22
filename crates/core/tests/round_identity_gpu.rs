@@ -195,9 +195,11 @@
 //! of its tokens before those rounds, which a build that leaves the uniform
 //! rounds as they were keeps. With `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS` set,
 //! the round-timing arm of the mixed rounds first rides two lanes that many
-//! rounds at the uniform extended shape and as many at the mix
-//! ([`time_mixed_rounds`]), so that the leaf's round timing prints a block of
-//! each on the GPU clock; nothing is compared there.
+//! rounds at the uniform extended shape, as many at the mix and as many at the
+//! uniform base shape ([`time_mixed_rounds`]), so that the leaf's round timing
+//! prints a block of each on the GPU clock, beside each lane's tokens a round
+//! and how far its text at the mix follows its text at its own shape; nothing
+//! is compared there.
 //!
 //! # Narrow runs
 //!
@@ -1268,15 +1270,23 @@ fn mixed_riders(load: &Load) -> Vec<usize> {
 
 /// #713 (opt-in): two lanes ride `rounds` greedy verify rounds at the uniform
 /// extended shape, then as many at the mix of one extended lane beside one
-/// base lane, a fresh pair prefilled whenever a lane nears its context, so
-/// that the leaf's round timing, on in the arm that runs this, prints a block
-/// of each kind on stderr (`verify extended`, `verify mixed`: 256 periods a
-/// block, each round's period to the next round's launch): the two lanes'
-/// periods on the GPU clock, read off the log. Nothing is compared.
+/// base lane, then as many at the uniform base shape, a fresh pair prefilled
+/// whenever a lane nears its context, so that the leaf's round timing, on in
+/// the arm that runs this, prints a block of each kind on stderr (`verify
+/// extended`, `verify mixed`, `verify`: 256 periods a block, each round's
+/// period to the next round's launch): the two lanes' periods on the GPU
+/// clock, read off the log. Beside them, each lane's tokens a round, and where
+/// the first pair's text of each lane at the mix first leaves its text at its
+/// own shape's uniform round (a greedy lane commits the target's text at
+/// either shape, but for a near tie the two rounds' widths rank apart).
+/// Nothing is compared.
 fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, label: &str) {
     let lanes = [VerifyLane::greedy(&[]), VerifyLane::greedy(&[])];
-    for extended in [[true, true], [true, false]] {
+    let mut texts: Vec<[Vec<i32>; 2]> = Vec::new();
+    for extended in [[true, true], [true, false], [false, false]] {
         let mut ridden = 0;
+        let mut tokens = [0u64; 2];
+        let mut first: Option<[Vec<i32>; 2]> = None;
         while ridden < rounds {
             let mut pair: Vec<Seq<'_>> = (0..2)
                 .map(|lane| {
@@ -1285,16 +1295,42 @@ fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script
                     seq
                 })
                 .collect();
+            let mut text: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
             let mut used = script.prompts[0].len().max(script.prompts[1].len()) as u32;
             while ridden < rounds && used + 2 * (load.window + 1) <= load.context() {
                 let mut refs: Vec<&mut Seq<'_>> = pair.iter_mut().collect();
                 let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &extended)
                     .unwrap_or_else(|e| panic!("{label}: timing at {extended:?}: {e}"));
                 used += runs.iter().map(|run| run.tokens.len() as u32).max().unwrap_or(0);
+                for (lane, run) in runs.iter().enumerate() {
+                    tokens[lane] += run.tokens.len() as u64;
+                    text[lane].extend(&run.tokens);
+                }
                 ridden += 1;
             }
+            first.get_or_insert(text);
         }
-        println!("round_identity_gpu {label}: {ridden} timed rounds of two lanes at {extended:?}");
+        let per_round = tokens.map(|lane| lane as f64 / f64::from(ridden.max(1)));
+        println!(
+            "round_identity_gpu {label}: {ridden} timed rounds of two lanes at {extended:?}, {:.2} and {:.2} tokens a round",
+            per_round[0], per_round[1]
+        );
+        texts.push(first.unwrap_or_default());
+    }
+    // Each lane's text at each pair of the three rounds.
+    let names = ["uniform extended", "mixed", "uniform base"];
+    for lane in 0..2 {
+        for (a, b) in [(1, 0), (1, 2), (0, 2)] {
+            let (one, other) = (&texts[a][lane], &texts[b][lane]);
+            let same = one.iter().zip(other).take_while(|(x, y)| x == y).count();
+            println!(
+                "round_identity_gpu {label}: lane {lane}'s text at the {} round and at the {} round: the first {same} tokens alike ({} and {} committed)",
+                names[a],
+                names[b],
+                one.len(),
+                other.len()
+            );
+        }
     }
 }
 

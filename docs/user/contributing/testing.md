@@ -397,9 +397,11 @@ holds them, the reference's run eagerly, and the arms `mixed-rounds`,
 `IGNIS_MIXED_ROUNDS=1`, timed and with the verify round's synchronous form; the
 reference also prints a digest of its tokens before those rounds.
 `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` has the `mixed-round-timing` arm first
-ride two lanes `n` rounds at the uniform extended shape and `n` at the mix, so
-that the round timing prints a `verify extended` and a `verify mixed` line
-(`n` of 257 or more) for the two at two lanes.
+ride two greedy lanes `n` rounds at the uniform extended shape, `n` at the mix
+and `n` at the uniform base shape, so that the round timing prints a `verify
+extended`, a `verify mixed` and a `verify` line (`n` of 257 or more) for the
+three at two lanes; the test prints each lane's tokens a round and how far
+each lane's text at the mix follows its text at its own shape's uniform round.
 
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the
 three is everything. The second test runs the 15-draft loads the loads filter
