@@ -1190,7 +1190,9 @@ Each group's GDN
 records lie in its shape's records over the backing both share, base lane `s`
 at row `2w + s`, and its fold runs behind `2w` leading rows that commit
 nothing; only at 15 drafts are a group's record rows its columns, so a load
-at another window holds no mix. Until the **shape policy** grants one, a test
+at another window holds no mix. A lane held to a grammar rides one as any
+lane does (#716): the host cut reads its run, and the repair after it the
+scores it kept, at its own group's columns. Until the **shape policy** grants one, a test
 forces a round's mix (`forced_lane_shapes`), from the mix's graphs where
 `IGNIS_MIXED_ROUNDS=1` captured them and eagerly where no capture asked for
 them. A load that asks captures every mix its lanes and its pool's GDN slots

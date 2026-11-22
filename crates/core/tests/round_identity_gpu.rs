@@ -214,6 +214,22 @@
 //! and how far its text at the mix follows its text at its own shape; nothing
 //! is compared there.
 //!
+//! #716: after [`MIX_RIDES`] the same lanes ride [`HELD_RIDES`], mixed rounds
+//! with lanes held to a grammar, the host cutting each held lane's run one
+//! token short as a grammar's check-first cut does: a held lane in the
+//! extended group, then one in each group, none at its caller's row. The host
+//! is handed exactly the held lanes, by the caller's index, each its own run
+//! at its own shape's window, and each commits what the host kept; each held
+//! lane is then repaired from the scores its round kept, which on greedy lanes
+//! a repair permitting every token proves are its own group's column (it draws
+//! the pending token again), then by a mask without the pending token. A
+//! mixed round of two other lanes follows, after which a repair of a lane the
+//! last held round cut is refused (one stamp across both shapes and the
+//! mixes), then the held lanes ride a teacher-forced mix, each in the other
+//! group (a teacher-forced round takes no host cut). Every arm holds those
+//! rounds and the repaired tokens to the reference's, and none of them falls
+//! back to a uniform round.
+//!
 //! #718: under the mixed graph's build (the switch `IGNIS_MIXED_GRAPH_BUILD`
 //! unset) every captured mix's graphs have one root and no memset node; the
 //! `mixed-graph-build-off` arm captures them without it (`0`), two roots and
@@ -252,15 +268,16 @@ use std::path::Path;
 
 use ignis_artifact::{bind_model_scope_27b_with, materialize, CudaDevice, FrontendSet, Reader, VisionResidency};
 use ignis_core::compute::ModelConfig;
+use ignis_core::constrained::PermittedMask;
 use ignis_core::gpu_profile;
 use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, model_scope, Model};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::speculation::QWEN38_MTP_DEFAULT_DRAFT_TOKENS;
 use ignis_core::step::{
     capture_decode_graphs, decode_program_batch_permitted, decode_program_batch_sampled, decode_program_verify_cut,
-    decode_program_verify_forced, decode_program_verify_forced_with, decode_program_verify_mixed, decode_program_verify_runs,
-    fail_mixed_capture, prefill_program_multimodal, prefill_program_sampled, program_stats, MixedFallback, MultimodalPrefill,
-    PermittedLane, Redirect, SamplingParams, TeacherForcing, VerifyLane,
+    decode_program_verify_forced, decode_program_verify_forced_with, decode_program_verify_mixed, decode_program_verify_mixed_cut,
+    decode_program_verify_runs, fail_mixed_capture, prefill_program_multimodal, prefill_program_sampled, program_stats,
+    repair_program, MixedFallback, MultimodalPrefill, PermittedLane, Redirect, SamplingParams, TeacherForcing, VerifyLane,
 };
 use ignis_core::{
     DraftRule, DrafterSampling, ExceptionWeights, HqDecodeAttention, KvFormat, PrefillAttention, PrefillLinear,
@@ -357,6 +374,9 @@ const ARMS: &[Arm] = &[
     // #715's arms, below this line.
 
     // #716's arms, below this line.
+    // None: mixed rounds with lanes held to a grammar, the repair after each cut and a repair
+    // refused after a mixed round the lane sat out are rides every arm's sessions take on the
+    // loads of [`MIXED_LOADS`] ([`HELD_RIDES`]).
 
     // #717's arms, below this line.
 
@@ -421,6 +441,22 @@ const MIXED_MARK: i32 = -2;
 /// lanes beside one base lane.
 const CAPTURE_FAILURE_ARM: &str = "mixed-capture-failure";
 const FAILED_MIX: (u32, u32) = (2, 1);
+
+/// #716: on the same loads, after [`MIX_RIDES`], on the same lanes: live mixed
+/// rounds with lanes held to a grammar ([`ride_held`]), each of the lanes
+/// named, extended where the second list says, the host cutting the run of
+/// each lane the third marks: a held lane in the extended group, then one in
+/// each group, none at its caller's row, each repaired right after its round.
+/// Then two lanes the last of them did not hold ride [`HELD_STAMP_RIDE`], after
+/// which a repair of a lane it held is refused; then the held lanes ride a
+/// teacher-forced mix, each in the other group ([`HELD_FORCED_RIDE`]): a
+/// teacher-forced round takes no host cut (#590).
+const HELD_RIDES: [(&[usize], &[bool], &[bool]); 2] = [
+    (&[0, 1, 2], &[false, true, false], &[false, true, false]),
+    (&[0, 1, 2, 3], &[true, false, false, true], &[false, false, true, true]),
+];
+const HELD_STAMP_RIDE: (&[usize], &[bool]) = (&[0, 1], &[true, false]);
+const HELD_FORCED_RIDE: (&[usize], &[bool]) = (&[0, 1, 2, 3], &[false, true, true, false]);
 
 /// #718: the switch that builds the mixed graphs without the mixed graph's
 /// build, read at capture, and its arm; and the mixes [`time_mixed_rounds`]
@@ -1374,6 +1410,104 @@ fn ride_mixed(
     }
 }
 
+/// #716: a repair's mask permitting every token of the vocabulary, or every
+/// one but `excluded`.
+fn every_token_but(excluded: Option<i32>) -> PermittedMask {
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    let mut words = vec![u64::MAX; vocab.div_ceil(64)];
+    if vocab % 64 != 0 {
+        words[vocab / 64] = (1u64 << (vocab % 64)) - 1;
+    }
+    if let Some(excluded) = excluded {
+        words[excluded as usize / 64] &= !(1u64 << (excluded as usize % 64));
+    }
+    PermittedMask::from_words(vocab as u32, words).unwrap_or_else(|e| panic!("mask: {e}"))
+}
+
+/// #716: one live round of `riding` at the mix `extended` names whose runs the
+/// host cuts on the lanes `held` marks, as a grammar's check-first cut does,
+/// one token short where a run is two or more (counted into `cuts`), the
+/// round replaying the mix's graph where the arm captured it (`mixed`): the
+/// host is handed exactly the held lanes, each by its caller's index whatever
+/// its row in the round, each its own run from its own anchor at its own
+/// shape's window, and each held lane commits the prefix the host kept. Then
+/// each held lane's pending token, the draft the cut ended at, is repaired
+/// from the scores the round kept for it: with greedy lanes a repair that
+/// permits every token draws it again, the argmax of the held lane's own
+/// column in its group, which a column at another lane's or another shape's
+/// stride would not be; then a repair that permits every token but it draws
+/// another, which the lane's next round consumes.
+#[allow(clippy::too_many_arguments)]
+fn ride_held(
+    model: &Model,
+    pool: &SeqPool,
+    load: &Load,
+    seqs: &mut [Option<Seq<'_>>],
+    riding: &[usize],
+    sampling: fn(usize) -> SamplingParams,
+    mixed: bool,
+    (extended, held): (&[bool], &[bool]),
+    committed: &mut Committed,
+    cuts: &mut u32,
+    mirror: &mut [shape_policy::Lane],
+    label: &str,
+) {
+    let what = format!("{label}: lanes {riding:?} at the mix {extended:?}, a round the host cuts on {held:?}");
+    let rule = load.speculation().shape_rule();
+    let anchors: Vec<Option<i32>> = riding.iter().map(|&lane| seqs[lane].as_ref().and_then(|seq| seq.pending_token())).collect();
+    let lanes: Vec<VerifyLane<'_>> =
+        riding.iter().map(|&lane| VerifyLane { sampling: sampling(lane), ..VerifyLane::greedy(&[]) }).collect();
+    let mut seen: Vec<Option<Vec<i32>>> = vec![None; riding.len()];
+    let mut kept = vec![0usize; riding.len()];
+    let runs = {
+        let mut refs = riders(seqs, riding);
+        let mut cut = |index: usize, run: &[i32]| -> usize {
+            assert!(seen[index].is_none(), "lane {index}'s run handed to the host twice");
+            seen[index] = Some(run.to_vec());
+            kept[index] = if run.len() < 2 { 1 } else { run.len() - 1 };
+            *cuts += u32::from(run.len() >= 2);
+            kept[index]
+        };
+        decode_program_verify_mixed_cut(model, pool, &mut refs, &lanes, load.window, extended, held, &mut cut)
+    }
+    .unwrap_or_else(|e| panic!("{what}: {e}"));
+    expect_replay(model, pool, mixed, &what);
+    for (index, ((&lane, run), &at_extended)) in riding.iter().zip(runs).zip(extended).enumerate() {
+        let drafts = if at_extended { load.window } else { BASE_WINDOW };
+        assert_eq!((run.extent, run.extended), (drafts, at_extended), "{what}: lane {lane} drafts its own shape's whole window");
+        let accepted = match &seen[index] {
+            Some(handed) => {
+                assert!(held[index], "{what}: the host was handed lane {lane}'s run, which it does not hold");
+                assert!(handed.len() as u32 <= drafts + 1, "{what}: held lane {lane}'s run of {} past its window of {drafts}", handed.len());
+                assert_eq!(Some(handed[0]), anchors[index], "{what}: the run the host was handed for lane {lane} starts at its anchor");
+                assert_eq!(run.tokens, handed[..kept[index]], "{what}: held lane {lane} commits the prefix of its run the host kept");
+                handed.len() as u32 - 1
+            }
+            None => {
+                assert!(!held[index], "{what}: the host was not handed held lane {lane}'s run");
+                run.tokens.len() as u32 - 1
+            }
+        };
+        mirror[lane].after(rule, run.extended, run.extent, accepted);
+        committed[lane].extend(run.tokens);
+        committed[lane].push(-1);
+    }
+    for (&lane, _) in riding.iter().zip(held).filter(|&(_, &at)| at) {
+        let seq = seqs[lane].as_mut().expect("a riding lane");
+        let pending = seq.pending_token().unwrap_or_else(|| panic!("{what}: held lane {lane} has a pending token"));
+        if sampling(lane).temperature <= 0.0 {
+            let again = repair_program(model, pool, seq, sampling(lane), &every_token_but(None))
+                .unwrap_or_else(|e| panic!("{what}: held lane {lane}'s repair permitting every token: {e}"));
+            assert_eq!(again, pending, "{what}: held lane {lane}'s kept scores are not its own column's: their argmax is not its pending token");
+        }
+        let repaired = repair_program(model, pool, seq, sampling(lane), &every_token_but(Some(pending)))
+            .unwrap_or_else(|e| panic!("{what}: held lane {lane}'s repair: {e}"));
+        assert_ne!(repaired, pending, "{what}: held lane {lane}'s repair drew the token its mask leaves out");
+        assert_eq!(seq.pending_token(), Some(repaired), "{what}: held lane {lane}'s repaired token waits as its pending token");
+        committed[lane].push(repaired);
+    }
+}
+
 /// #713: each lane's tokens before the session's [`MIXED_RIDES`] (#714: and
 /// [`MIX_RIDES`]): the session of a build before mixed rounds. #714: each
 /// lane's stream up to the [`MIXED_MARK`] the session wrote where they begin.
@@ -1657,6 +1791,30 @@ fn session(
                 }
             }
         }
+        // #716: lanes held to a grammar in mixed rounds, on the same lanes; no round falls back.
+        let fallbacks = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}")).mixed_fallback_rounds;
+        let mut held_cuts = 0;
+        for (riding, extended, held) in HELD_RIDES {
+            ride_held(model, pool, load, &mut seqs, riding, sampling, graphs && mixed, (extended, held), &mut committed, &mut held_cuts, &mut mirror, label);
+        }
+        assert!(held_cuts > 0, "{label}: no held lane's run of two or more was cut in a mixed round");
+        cuts += held_cuts;
+        let (riding, extended) = HELD_STAMP_RIDE;
+        ride_mixed(model, pool, load, script, &mut seqs, riding, sampling, (graphs, graphs && mixed), (Round::Verify, extended), &mut committed, &mut mirror, label);
+        let (last, _, last_held) = HELD_RIDES[HELD_RIDES.len() - 1];
+        let stale = last.iter().zip(last_held).find(|&(lane, &at)| at && !riding.contains(lane)).map(|(&lane, _)| lane).expect("a held lane that sat out");
+        let seq = seqs[stale].as_mut().expect("a held lane");
+        let pending = seq.pending_token();
+        let refused = repair_program(model, pool, seq, sampling(stale), &every_token_but(pending));
+        assert!(
+            refused.as_ref().is_err_and(|e| e.contains("written over")),
+            "{label}: lane {stale}'s repair after a mixed round it sat out read the scores that round wrote over: {refused:?}"
+        );
+        assert_eq!(seq.pending_token(), pending, "{label}: a refused repair leaves lane {stale}'s pending token");
+        let (riding, extended) = HELD_FORCED_RIDE;
+        ride_mixed(model, pool, load, script, &mut seqs, riding, sampling, (graphs, graphs && mixed), (Round::Forced, extended), &mut committed, &mut mirror, label);
+        let after = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}")).mixed_fallback_rounds;
+        assert_eq!(after, fallbacks, "{label}: a mixed round with a lane held to a grammar fell back to a uniform one");
     }
     assert!(cuts > 0, "{label}: no verify run of two or more was cut, so no cut took a count back");
     committed

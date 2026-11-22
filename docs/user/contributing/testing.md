@@ -432,7 +432,15 @@ a mix to the uniform base round, the uniform extended round and another mix,
 a teacher-forced mix of five lanes, and a mix of five lanes with a snapshot
 and a restore of each right after it: every arm holds them to the reference,
 and each capture that asks for the mixed graphs reports all twelve, their
-measured bytes within the plan's line. The `mixed-capture-failure` arm is not
+measured bytes within the plan's line. From #716 those lanes then ride mixed
+rounds with lanes held to a grammar, the host cutting each held lane's run one
+token short, a held lane in the extended group and then one in each group: the
+host is handed exactly the held lanes, by the caller's index, and each is
+repaired right after its round (with greedy lanes a repair permitting every
+token first draws the pending token again, the argmax of the lane's own
+column); a repair after a mixed round the lane sat out is refused, and a
+teacher-forced mix of the held lanes follows. Every arm holds them to the
+reference, and none falls back. The `mixed-capture-failure` arm is not
 held to the reference: a test seam (`ignis_decode_graph_fail_mixed_capture`,
 `step::fail_mixed_capture`) fails the 2+1 mix's capture, whose forced round
 then runs at the uniform shape `aggregate` gives its three lanes, from that
