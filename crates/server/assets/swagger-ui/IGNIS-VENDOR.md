@@ -34,12 +34,14 @@ copy of what that pin installs:
 ```sh
 npm --prefix web install --save-dev --save-exact swagger-ui-dist@<version>
 make swagger-ui-sync     # copies the files here and rewrites the line above
-make ci                  # swagger-ui-check fails if the two ever disagree
+make swagger-ui-check    # fails if the two ever disagree
 ```
 
-`make swagger-ui-check` runs inside `make ci`, comparing every file here
-against `web/node_modules/swagger-ui-dist`, so a bump that was not synced —
-or a hand-edited file here — fails the gate instead of shipping. The page
+`make swagger-ui-check` runs `mk/swagger-ui-check.sh`, which the release
+workflow's test job runs on CI too, comparing every file here against
+`web/node_modules/swagger-ui-dist`, so a bump that was not synced — or a
+hand-edited file here — fails the gate instead of shipping. The script holds
+the list of the files kept here, which `make swagger-ui-sync` copies. The page
 that drives these files is `crates/server/src/openapi.rs`'s `PAGE_HTML`, so
 a new Swagger UI major is worth a look at
 `http://127.0.0.1:8000/v1` before committing.

@@ -6,7 +6,7 @@ status: accepted
 
 ## Status
 
-Accepted (2026-09-21, owner decision — GitHub #250 / #251).
+Accepted (2026-09-21, owner decision — GitHub #250 / #251). Edited 2026-11-22 (#709).
 
 ## Context
 
@@ -83,8 +83,9 @@ contract. Neither is regenerated from the other.
 - The binary grows by the vendored distribution (~1.8 MB). The *version* is
   not vendored: `swagger-ui-dist` is pinned in `web/package.json` like every
   other frontend dependency, `make swagger-ui-sync` copies that pin's files
-  into the assets directory, and `make swagger-ui-check` — inside `make ci` —
-  fails when the copy and the pin disagree. A bump is therefore an npm bump
+  into the assets directory, and `make swagger-ui-check`
+  (`mk/swagger-ui-check.sh`, which the release workflow runs on CI) fails
+  when the copy and the pin disagree. A bump is therefore an npm bump
   plus one make target, and a forgotten sync fails the gate rather than
   shipping.
 - An operator on an air-gapped machine gets the same page as everyone else:

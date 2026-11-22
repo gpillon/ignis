@@ -184,7 +184,12 @@ fn the_test_job_runs_every_shard_of_the_count_it_gives_the_script() {
 
     // The selftests and the Playground's checks run once per host, in shard 1,
     // the shard script's own test among them.
-    for selftest in ["bash mk/test-shard-selftest.sh", "bash mk/cuda-build-check-selftest.sh", "bash mk/linux/doctor-selftest.sh"] {
+    for selftest in [
+        "bash mk/test-shard-selftest.sh",
+        "bash mk/cuda-build-check-selftest.sh",
+        "bash mk/linux/doctor-selftest.sh",
+        "bash mk/swagger-ui-check-selftest.sh",
+    ] {
         let step = steps(test).into_iter().find(|step| text(step, "run").map(str::trim) == Some(selftest));
         let step = step.unwrap_or_else(|| panic!("the test job runs `{selftest}`"));
         let when = get(step, "if").map(condition);
@@ -213,6 +218,39 @@ fn every_test_shard_installs_the_grammar_validator_before_the_suite() {
     }
     let run = text(steps[install], "run").unwrap();
     assert!(run.contains("IGNIS_GRAMMAR_CHECK_PYTHON=") && run.contains("GITHUB_ENV"), "the tests are handed its Python: {run}");
+}
+
+/// The vendored Swagger UI against the pin in web/package.json (ADR 0036,
+/// GitHub #709): the test job compares them once, on Linux, after the step
+/// whose `npm ci` installs the pin into web/node_modules, and `make
+/// swagger-ui-check` runs the same script.
+#[test]
+fn the_vendored_swagger_ui_is_compared_with_its_pin_after_the_playground_installs_it() {
+    let workflow = workflow();
+    let test = job(jobs(&workflow), "test");
+    let steps = steps(test);
+    let check = "bash mk/swagger-ui-check.sh";
+    let at = steps
+        .iter()
+        .position(|step| text(step, "run").map(str::trim) == Some(check))
+        .unwrap_or_else(|| panic!("the test job runs `{check}`"));
+    assert_eq!(get(steps[at], "if").map(condition).as_deref(), Some("matrix.host == 'linux' && matrix.shard == 1"), "`{check}` runs once, in Linux's shard 1");
+    let install = steps
+        .iter()
+        .position(|step| {
+            text(step, "working-directory") == Some("web") && text(step, "run").is_some_and(|run| run.lines().any(|line| line.trim() == "npm ci"))
+        })
+        .expect("the test job runs `npm ci` in web/");
+    assert_eq!(get(steps[install], "if").map(condition), get(steps[at], "if").map(condition), "the check runs where web/node_modules is installed");
+    assert!(install < at, "the check runs before `npm ci` has installed the pin: {install} {at}");
+
+    let makefile = read("Makefile");
+    let recipe = makefile
+        .split("\nswagger-ui-check:")
+        .nth(1)
+        .and_then(|rest| rest.lines().nth(1))
+        .expect("the Makefile has a swagger-ui-check target with a recipe");
+    assert_eq!(recipe.trim(), format!("@{check}"), "make swagger-ui-check runs the script CI runs");
 }
 
 /// The Windows build's kernel/build cache (#552): ninja decides by date and

@@ -258,6 +258,13 @@ jobs:
         shell: bash
         run: bash mk/cuda-build-check-selftest.sh
 
+      # The vendored Swagger UI check below (GitHub #709), on temp
+      # directories: no npm is needed.
+      - name: Swagger UI check selftest
+        if: matrix.shard == 1
+        shell: bash
+        run: bash mk/swagger-ui-check-selftest.sh
+
       # `make doctor`'s CUDA checks on Linux (GitHub #498), on fake roots.
       - name: Linux doctor selftest
         if: matrix.shard == 1
@@ -308,6 +315,14 @@ jobs:
           npm ci
           npm run typecheck
           npm run test
+
+      # The Swagger UI the API reference serves is vendored, and its version
+      # is the pin the step above installed into web/node_modules (ADR 0036,
+      # GitHub #709): a bump not synced, or a hand-edited file, fails here.
+      - name: Vendored Swagger UI matches its pin
+        if: matrix.host == 'linux' && matrix.shard == 1
+        shell: bash
+        run: bash mk/swagger-ui-check.sh
 
       # The skill's scripts (spec #656) are plain Node with no dependencies,
       # so the Node set up above runs their tests as they are: no `npm ci`.
