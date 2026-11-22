@@ -1194,7 +1194,8 @@ them. A load that asks captures every mix its lanes and its pool's GDN slots
 hold (a mix takes `2w + n` slots, the lanes' and the device retained slots':
 all twelve at 8 lanes), a line of the VRAM plan (`mixed_graphs`, #714); a mix
 whose capture failed runs its rounds at the uniform shape `aggregate` would
-choose, counted, never eagerly.
+choose, counted, never eagerly. Its rows, of either group, are held to its
+base round's numerical class, as an extended round's are (#717, ADR 0106).
 
 **Shape rule**:
 What a lane of a DFlash2 load past 7 drafts asks of its next **verify round**,

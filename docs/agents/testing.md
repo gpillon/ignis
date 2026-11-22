@@ -434,7 +434,13 @@ shape, and a forced round may name its shape and its drafts
 shape whatever `IGNIS_ROUND_SHAPE` says and, offered drafts, eagerly. The plain
 round's rows come from `dflash2_readout::plain_round_logits`. The numerical
 class of the extended round (`crates/core/tests/extended_round_class_gpu.rs`,
-ADR 0104) stands on all of them.
+ADR 0104) stands on all of them. A forced round may instead name each lane's
+shape (GitHub #713, `TeacherForcing::lane_shapes`): lanes of both shapes run
+one mixed round, its drafts placed by group, and its rows are read by group
+(GitHub #717, `dflash2_readout::mixed_verify_logits`, each lane's rows in the
+caller's order at its own shape's stride), a read refused after any other
+round, as the one-shape read is after a mixed round. The mixed round's
+numerical class (the same test, ADR 0106) stands on them.
 The same instruments under the 27B's MTP head (GitHub #626,
 `crates/core/tests/mtp_replay_seams_gpu.rs`, both bodies): the chain readout
 (`mtp_readout::chain`) runs the round's own chain once, eagerly at width 1,

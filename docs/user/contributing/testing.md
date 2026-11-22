@@ -446,11 +446,19 @@ teacher-forced to it at 1 to 4 lanes, once offered the text as their drafts
 and once replaying their captured
 graphs on the drafter's own drafts, and every extended row is held to the base
 row at the same text index and lane count, in BF16 ulps, by bounds named in the
-file with their measured values. Each test loads once and takes about two and
-a half minutes; the test's name runs one:
+file with their measured values. On the NVFP4 artifact the same load then holds
+the mixed round, whose lanes take both shapes
+([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)):
+its graphs are captured again under `IGNIS_MIXED_ROUNDS=1`, speculation off
+writes three more prompts' text, and each of the twelve mixes is
+teacher-forced to the text at its 2 to 7 lanes, offered the text and from its
+graph, every mixed row held to the base row at the same text index and lane
+count by the same bounds. Each test loads once; the NVFP4 one takes five to six
+minutes, the trellis one about two and a half. The test's name runs one:
 
 ```sh
-cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture
+cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture --test-threads=1
+cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture --exact an_extended_rounds_rows_are_the_base_rounds_class
 cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture --exact on_the_trellis_body_an_extended_rounds_rows_are_the_base_rounds_class
 ```
 

@@ -86,13 +86,42 @@
 //! and per kind: a reading, not a bound. The margins are proposed, the
 //! owner's to confirm or replace (ADR 0104).
 //!
+//! # Mixed rounds (#717, spec #711; ADR 0106)
+//!
+//! A **mixed round** carries lanes of both shapes, `w` at the extended shape
+//! beside `n` at the base shape, one of the twelve mixes
+//! ([`ignis_core::lane_lines::MIXES`]), and is held to the base round's
+//! class with the same method and margins. On the same load (no new load:
+//! the NVFP4 cell's, [`Cell::mixed`]; a trellis body runs none), its decode
+//! graphs are captured again under `IGNIS_MIXED_ROUNDS=1` ([`MIXED_ROUNDS`]),
+//! a verify graph for every mix, and speculation off writes the text of three
+//! more prompts ([`MIXED_PROMPTS`]), so that 2 to 7 lanes each hold a text of
+//! their own. Then, in each kind, at each lane count of 2 to 7, a leg of base
+//! rounds at that lane count, the lanes on the prompts in order, is the
+//! reference of every mix of that lane count, each a leg of rounds at that mix
+//! (`TeacherForcing::lane_shapes`), its last `w` lanes extended so that the
+//! round's rows, extended lanes first, are not the caller's order: forced
+//! rounds offered the text as their drafts, placed by group (eager), and
+//! graph rounds replaying the mix's graph on the drafter's own drafts. A mixed
+//! leg rides its mix while every lane's text holds a whole round of its
+//! shape, so every one of its rounds is at the mix and at the cell's lane
+//! count, and its lanes end on fewer rows than a uniform cell's
+//! ([`MIXED_MIN_ROWS`]); each round asserts every lane's shape and extent,
+//! that it ran eagerly or from its graph, at neither uniform shape and with no
+//! fallback. Its rows are read by group
+//! ([`dflash2_readout::mixed_verify_logits`]), and every mixed row is held
+//! to the base row at the same text index and lane count by the bounds above:
+//! the row, a lane's median row and the text's likelihood per lane; the
+//! class at each lane count (over its mixes) and over the kind's; the near
+//! tie and the control, one index off, over the kind's.
+//!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a **skip**; under the profile the same
 //! condition is a **hard failure**. Run via `scripts/gpu-profile.ps1`, or
 //! alone:
 //!
 //! ```text
-//! cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture
+//! cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture --test-threads=1
 //! ```
 
 #![cfg(feature = "cuda")]
@@ -103,6 +132,7 @@ use ignis_artifact::{bind_model_scope_27b_with, materialize, CudaDevice, Fronten
 use ignis_core::compute::ModelConfig;
 use ignis_core::dflash2_readout;
 use ignis_core::gpu_profile;
+use ignis_core::lane_lines::MIXES;
 use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, model_scope, Model};
 use ignis_core::seq::{Seq, SeqPool, SeqPoolBudget};
 use ignis_core::speculation::{BASE_SHAPE_DRAFT_TOKENS, EXTENDED_SHAPE_MAX_LANES};
@@ -131,7 +161,10 @@ use logit_drift::{row_drift, within, RowDrift};
 // test's run of 2026-11-20 (the `sc30` artifact, BF16, hq-e8-2b), forced
 // rounds over 3,360 rows and graph rounds over 3,255, at 1 to 4 lanes; its
 // rows sit a median 1 ulp from speculation off's where the NVFP4 body's sit
-// about 12 in this test, so it is far inside every bound below.
+// about 12 in this test, so it is far inside every bound below. "The mixed
+// rounds" (#717): this test's run of 2026-11-22 on the NVFP4 cell, the twelve
+// mixes at 2 to 7 lanes, forced rounds over 8,040 mixed rows and graph rounds
+// over 8,060, each against the base rows at the same lane count.
 
 /// The extended row against the base row after the same tokens: no logit
 /// further than this, in BF16 ulps at the base row's largest magnitude.
@@ -139,8 +172,9 @@ use logit_drift::{row_drift, within, RowDrift};
 /// this test, forced rounds 96.9 at one lane, 0.0 at two and 1.0 at three
 /// and four, graph rounds 114.1 at one lane and 115.2 at two to four; the
 /// trellis body, forced rounds 66.6, 43.9 and 0.0 at one, two and three or
-/// four lanes, graph rounds 64.0, 88.7, 41.1 and 39.8 at one to four; 256 is
-/// the next power of two above, ADR 0056's rule for its own tolerance.
+/// four lanes, graph rounds 64.0, 88.7, 41.1 and 39.8 at one to four; the
+/// mixed rounds, forced 1.0, graph 115.2; 256 is the next power of two above,
+/// ADR 0056's rule for its own tolerance.
 const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 
 /// What a lane's median row of that pair stays within. Measured medians:
@@ -149,7 +183,9 @@ const EXTENDED_VS_BASE_TOLERANCE_ULPS: f32 = 256.0;
 /// at two to four, graph rounds 13.6 to 16.0 at one lane and 11.8 to 14.2 at
 /// two to four but for the code prompt's 0.0 there (neither split is
 /// explained); the trellis body, 1.0 but for forced rounds' 0.0 at three and
-/// four lanes; 32 is the next power of two above.
+/// four lanes; the mixed rounds, forced 0.0 to 0.5, graph 0.0 to 15.0 (the
+/// extended lanes 0.0 to 14.6, the base lanes 0.0 to 15.0); 32 is the next
+/// power of two above.
 const EXTENDED_VS_BASE_TYPICAL_ULPS: f32 = 32.0;
 
 /// ADR 0056's near tie, in the reference row's ulps: the floor of the class's
@@ -162,20 +198,22 @@ const PICK_GAP_ULPS: f32 = logit_drift::PICK_GAP_ULPS;
 /// off's rows over the base rows'. Measured ratios: prototype 0.96, 1.01,
 /// 1.01, 1.00, 1.01, 1.01; this test, forced rounds 1.00 (0.99 to 1.00 by lane
 /// count), graph rounds 1.02 (0.99 to 1.03); the trellis body, 1.00 for both
-/// kinds at every lane count. Held at each lane count too.
+/// kinds at every lane count; the mixed rounds, forced 1.00 at every lane
+/// count, graph 1.01 (1.00 to 1.03). Held at each lane count too.
 const CLASS_MEDIAN_MARGIN: f32 = 1.25;
 
 /// The class, 90th percentile. Measured ratios: prototype 0.86, 1.03, 1.02,
 /// 1.00, 1.02, 0.87; this test, forced rounds 1.00 (0.98 to 1.01), graph
 /// rounds 0.99 (0.94 to 1.02); the trellis body, forced rounds 0.95 (0.75 to
-/// 1.08), graph rounds 1.01 (1.00 to 1.04).
+/// 1.08), graph rounds 1.01 (1.00 to 1.04); the mixed rounds, forced 1.00,
+/// graph 1.00 (0.97 to 1.01).
 const CLASS_P90_MARGIN: f32 = 1.25;
 
 /// The class, widest row: one tail logit each, so the loosest of the three.
 /// Measured ratios: prototype 1.02, 1.20, 0.97, 1.07, 1.25, 1.02; this test,
 /// forced rounds 1.00 (1.00 to 1.02), graph rounds 1.03 (1.03 to 1.06); the
 /// trellis body, forced rounds 0.69 (0.59 to 1.00), graph rounds 0.49 (0.42 to
-/// 0.53).
+/// 0.53); the mixed rounds, forced 1.00, graph 1.00 (1.00 to 1.13).
 const CLASS_WIDEST_MARGIN: f32 = 1.5;
 
 /// The class, moved picks: the extended rows may move this many times the
@@ -187,7 +225,8 @@ const CLASS_WIDEST_MARGIN: f32 = 1.5;
 /// rounds 76 and 73 (19 and 20, 19 and 21, 12 and 11, 26 and 21: 26 against a
 /// bound of 28 at 4 lanes); the trellis body, forced rounds 8 and 8 (2 and 2 at
 /// each lane count), graph rounds 11 and 12 (3 and 2, 3 and 3, 2 and 3, 3 and
-/// 4).
+/// 4); the mixed rounds, forced 248 and 248 (the same at each lane count),
+/// graph 108 and 97 (30 against a bound of 33 at 6 lanes the closest).
 const CLASS_MOVED_PICKS_MARGIN: f32 = 1.25;
 const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 
@@ -209,7 +248,9 @@ const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 /// 0056's 16 alone, the bound between the shapes before this one, failed the
 /// test's first run. The trellis body: from spec-off 1.0 over 1.0 for both
 /// kinds, so its near tie is ADR 0056's 16; between the shapes none moved on
-/// forced rounds, 1.0 on graph rounds.
+/// forced rounds, 1.0 on graph rounds. The mixed rounds: from spec-off, forced
+/// 12.0 over 12.0, graph 9.0 over 9.0; against the base rows, none moved on
+/// forced rounds, 11.0 on graph rounds.
 const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 
 /// A lane's mean log-probability of the text under the extended rows against
@@ -217,7 +258,15 @@ const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 /// 0.0074, 0.0031, 0.0001, 0.0040, 0.0001, and 0.0089 at the furthest of the
 /// three prompts; this test, forced rounds at most 0.0089, graph rounds at
 /// most 0.0124; the trellis body, forced rounds at most 0.0025, graph rounds
-/// at most 0.0016; 0.02 is ADR 0056's bound for its own pair.
+/// at most 0.0016; 0.02 is ADR 0056's bound for its own pair. The mixed
+/// rounds: forced at most 0.0010; graph 0.0256 on one lane, past it, the
+/// prose prompt's extended lane at the mix 3+2 over 79 rows (its leg ends
+/// with the table prompt's text), the next 0.0194 over 51 (the same lane at
+/// 2+1 and 3+1). Over the first 64 rows that lane reads 0.0177, as the same
+/// prompt's lane of the uniform extended graph cell at 4 lanes does there
+/// (0.0124 over its 210), and that cell's lane at one lane 0.0242: the
+/// likelihood's excess is the extended round's on a short window, which a
+/// mixed lane's shorter leg reads whole. ADR 0106 leaves it to the owner.
 const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 
 /// The control's median, one index off, over the right rows' median and over
@@ -227,9 +276,19 @@ const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 /// test, forced rounds 166.0 (14.0 times the right rows', 5.2 times the
 /// typical bound), graph rounds 165.0 (13.8, 5.2); the trellis body, forced
 /// rounds 167.5 (167.5 times the right rows' 1.0, 5.2 times the typical
-/// bound), graph rounds 168.1 (168.1, 5.3); 2 is far inside both and far
+/// bound), graph rounds 168.1 (168.1, 5.3); the mixed rounds, forced 160.0
+/// (13.5, 5.0), graph 166.8 (14.4, 5.2); 2 is far inside both and far
 /// outside a right pair's margins above.
 const CONTROL_MARGIN: f32 = 2.0;
+
+/// #717: the fewest rows a lane of a mixed cell must compare. A mixed leg
+/// rides its mix only while every lane's text holds a whole round of its
+/// shape, so it ends with its fastest lane's text: an extended lane commits
+/// up to 16 columns a round where a base lane beside it commits 8 at most,
+/// and on graph rounds a lane on prose commits a few. Measured, the fewest: 104
+/// on forced rounds, 51 on graph rounds (the prose prompt's lane beside the
+/// structured one, extended both).
+const MIXED_MIN_ROWS: usize = MIN_ROWS / 2;
 
 /// One body the class is held on: its artifact and the exception weights it
 /// loads under.
@@ -237,13 +296,16 @@ struct Cell {
     name: &'static str,
     artifact: &'static str,
     exceptions: ExceptionWeights,
+    /// #717: whether the mixed rounds' class is held on it too. A trellis
+    /// body runs no mixed round yet (#720).
+    mixed: bool,
 }
 
 /// The NVFP4 body the RTX 5090 profile serves, under FP8 exception weights.
-const NVFP4: Cell = Cell { name: "nvfp4", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer", exceptions: ExceptionWeights::Fp8 };
+const NVFP4: Cell = Cell { name: "nvfp4", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer", exceptions: ExceptionWeights::Fp8, mixed: true };
 /// #695: the trellis body the 16 GB and 24 GB profiles load (the `sc30`
 /// artifact), which holds no BF16 exception tensor: `bf16` is its own.
-const TRELLIS: Cell = Cell { name: "trellis", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer", exceptions: ExceptionWeights::Bf16 };
+const TRELLIS: Cell = Cell { name: "trellis", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer", exceptions: ExceptionWeights::Bf16, mixed: false };
 
 /// The load: the widest DFlash2 window, at the served lanes, prefill chunk and
 /// context. The context is the envelope the rounds' attention splits by, so it
@@ -270,6 +332,18 @@ const PROMPTS: [&str; 4] = [
     "Explain in three paragraphs why the sky is blue, why sunsets are red and why clouds are white.",
     "Write a Rust function that splits a CSV line into its fields, honouring double-quoted fields, with three unit tests.",
 ];
+
+/// #717: the prompts of the mixed cells' fifth to seventh lanes, after
+/// [`PROMPTS`]: a table, prose and code.
+const MIXED_PROMPTS: [&str; 3] = [
+    "Write a Markdown table of the twelve months of the year, with columns for the month's number, its name, its number of days and one holiday in it.",
+    "Write a short story in four paragraphs about a lighthouse keeper who finds a message in a bottle.",
+    "Write a SQL schema for a library, with tables for books, authors, members and loans, their foreign keys and an index on each foreign key.",
+];
+
+/// #717: the measurement switch that captures the mixed rounds' graphs, read
+/// at capture: `1` captures a verify graph for every mix the load holds.
+const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
 
 /// A verify round's shape, named to the round by its window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,6 +526,117 @@ fn leg(
     rows
 }
 
+/// #717: a lane's shape in a mix, extended where its entry is `true`.
+fn shape_of(extended: bool) -> Shape {
+    if extended { Shape::Extended } else { Shape::Base }
+}
+
+/// #717: one teacher-forced mixed round of `seqs`, of `kind`, lane `i` at the
+/// extended shape where `extended[i]` and at the base shape otherwise, at
+/// index `at[i]` of `texts[i]`: each lane's rows that stand after its text, as
+/// [`forced_round`]'s, read at its own group's stride.
+#[allow(clippy::too_many_arguments)]
+fn mixed_round(
+    model: &Model,
+    pool: &SeqPool,
+    seqs: &mut [Seq<'_>],
+    texts: &[&[i32]],
+    at: &[usize],
+    extended: &[bool],
+    kind: Kind,
+    what: &str,
+) -> Vec<Vec<Vec<u16>>> {
+    let lanes = seqs.len();
+    for (i, text) in texts.iter().enumerate() {
+        let columns = shape_of(extended[i]).columns();
+        assert!(at[i] + columns < text.len(), "{what}: lane {i}'s correction at {} is past its text", at[i] + columns);
+    }
+    // The load's stride whatever each lane's shape, as a uniform round's; the
+    // round reads each lane's first columns of its shape, at its group's place.
+    let recordings: Vec<Vec<i32>> = (0..lanes).map(|i| after(texts[i], at[i], WINDOW as usize + 1)).collect();
+    let drafts: Vec<Vec<i32>> = (0..lanes).map(|i| after(texts[i], at[i], WINDOW as usize)).collect();
+    let recording_refs: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
+    let draft_refs: Vec<&[i32]> = drafts.iter().map(Vec::as_slice).collect();
+    let forcing = TeacherForcing {
+        shape_window: None,
+        drafts: (kind == Kind::Forced).then_some(draft_refs.as_slice()),
+        lane_shapes: Some(extended),
+    };
+    let before = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
+    let greedy: Vec<VerifyLane<'_>> = (0..lanes).map(|_| VerifyLane::greedy(&[])).collect();
+    let mut refs: Vec<&mut Seq<'_>> = seqs.iter_mut().collect();
+    let runs = decode_program_verify_forced_with(model, pool, &mut refs, &greedy, WINDOW, &recording_refs, forcing)
+        .unwrap_or_else(|e| panic!("{what}: a {kind:?} mixed round: {e}"));
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
+    // A mixed round is neither shape's round, and ran at its mix: from its
+    // graph, or eagerly when offered drafts, never a uniform round in its place.
+    for shape in [Shape::Base, Shape::Extended] {
+        let (was, is) = (before.shapes()[shape.stats_index()].verify_rounds, stats.shapes()[shape.stats_index()].verify_rounds);
+        assert_eq!(is, was, "{what}: a mixed round is no {shape:?} round");
+    }
+    assert_eq!(stats.mixed_fallback_rounds, before.mixed_fallback_rounds, "{what}: the round ran at its mix, not at a uniform shape");
+    let graph = u64::from(kind == Kind::Graph);
+    assert_eq!(stats.graph_launches, graph, "{what}: a {kind:?} mixed round {}", if graph == 1 { "replays its mix's graph" } else { "runs eagerly" });
+    let vocab = ModelConfig::qwen38_27b().vocab as usize;
+    let logits = dflash2_readout::mixed_verify_logits(model, WINDOW, extended)
+        .unwrap_or_else(|e| panic!("{what}: the mixed round's rows: {e}"));
+    runs.iter()
+        .enumerate()
+        .map(|(i, run)| {
+            let shape = shape_of(extended[i]);
+            let columns = shape.columns();
+            assert_eq!(run.extended, extended[i], "{what}: lane {i} ran at the {shape:?} shape");
+            assert_eq!(run.extent, shape.window(), "{what}: lane {i} drafts the {shape:?} shape's window");
+            let committed = run.tokens.len();
+            assert!(committed >= 1 && committed <= columns, "{what}: lane {i} committed {committed} of {columns} columns");
+            if kind == Kind::Forced {
+                assert_eq!(committed, columns, "{what}: lane {i} commits its whole {shape:?} columns of its text's drafts");
+            }
+            assert_eq!(run.tokens[..], texts[i][at[i]..at[i] + committed], "{what}: lane {i} commits its text");
+            assert_eq!(logits[i].len(), columns * vocab, "{what}: lane {i}'s rows");
+            (0..committed).map(|j| logits[i][j * vocab..(j + 1) * vocab].to_vec()).collect()
+        })
+        .collect()
+}
+
+/// #717: the rows a mixed leg gives each lane of `group`, by text index: every
+/// round of `kind` at the mix `extended` names, from the prompt on, while
+/// every lane's text holds a whole round of its shape, so that every round is
+/// at the mix and at the cell's lane count; at least one.
+#[allow(clippy::too_many_arguments)]
+fn mixed_leg(
+    model: &Model,
+    pool: &SeqPool,
+    prompts: &[Vec<i32>],
+    texts: &[Vec<i32>],
+    group: &[usize],
+    extended: &[bool],
+    kind: Kind,
+    what: &str,
+) -> Vec<Vec<Vec<u16>>> {
+    let greedy = SamplingParams::greedy();
+    let mut seqs: Vec<Seq<'_>> = Vec::new();
+    for &p in group {
+        let mut seq = pool.alloc(SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
+        prefill_program_permitted(model, pool, &mut seq, &prompts[p], 0, greedy, &[texts[p][0]], None)
+            .unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
+        seqs.push(seq);
+    }
+    let mut rows: Vec<Vec<Vec<u16>>> = vec![Vec::new(); group.len()];
+    let lane_texts: Vec<&[i32]> = group.iter().map(|&p| texts[p].as_slice()).collect();
+    let mut rounds = 0;
+    while (0..group.len()).all(|l| rows[l].len() + shape_of(extended[l]).columns() < lane_texts[l].len()) {
+        let at: Vec<usize> = rows.iter().map(Vec::len).collect();
+        let round_rows = mixed_round(model, pool, &mut seqs, &lane_texts, &at, extended, kind, what);
+        for (lane, lane_rows) in rows.iter_mut().zip(round_rows) {
+            lane.extend(lane_rows);
+        }
+        rounds += 1;
+    }
+    assert!(rounds > 0, "{what}: no round at the mix");
+    rows
+}
+
 /// The `p`-th quantile of `values` (nearest rank), 0 where there is none.
 fn quantile(values: &[f32], p: f64) -> f32 {
     let mut sorted = values.to_vec();
@@ -506,7 +691,9 @@ impl Pair {
     }
 }
 
-/// Every pair a kind compares, over the lanes it ran.
+/// Every pair a kind compares, over the lanes it ran: the extended rows', or
+/// #717 the mixed rows' in their place, named to the prints and the failures
+/// as `tested`.
 #[derive(Default)]
 struct Class {
     extended_off: Pair,
@@ -527,36 +714,36 @@ impl Class {
         self.moved_between.extend_from_slice(&other.moved_between);
     }
 
-    fn print(&self, label: &str) {
+    fn print(&self, label: &str, tested: &str) {
         println!("extended_round_class_gpu {label}:");
-        println!("  extended against base:     {}", self.extended_base.line());
-        println!("  extended against spec-off: {}", self.extended_off.line());
+        println!("  {tested} against base:     {}", self.extended_base.line());
+        println!("  {tested} against spec-off: {}", self.extended_off.line());
         println!("  base against spec-off:     {}", self.base_off.line());
         println!("  control, one index off:    {}", self.control.line());
         for (name, p) in [("median", 0.5), ("90th percentile", 0.9), ("widest", 1.0)] {
             let (extended, base) = (self.extended_off.at(p), self.base_off.at(p));
-            println!("  class, {name}: extended {extended:.1} ulps from spec-off, base {base:.1}, ratio {:.2}", extended / base);
+            println!("  class, {name}: {tested} {extended:.1} ulps from spec-off, base {base:.1}, ratio {:.2}", extended / base);
         }
     }
 
     /// The class's distances and moved picks over these rows, held at each
     /// lane count and over a kind's rows together; each excess a line in
     /// `failures`.
-    fn hold_distances(&self, label: &str, failures: &mut Vec<String>) {
+    fn hold_distances(&self, label: &str, tested: &str, failures: &mut Vec<String>) {
         for (name, p, margin) in [("median", 0.5, CLASS_MEDIAN_MARGIN), ("90th percentile", 0.9, CLASS_P90_MARGIN), ("widest", 1.0, CLASS_WIDEST_MARGIN)] {
             let (extended, base) = (self.extended_off.at(p), self.base_off.at(p));
             if extended > margin * base {
                 failures.push(format!(
-                    "{label}, the class: the {name} extended row sits {extended:.1} ulps from spec-off's, the base one {base:.1}: past {margin} times it"
+                    "{label}, the class: the {name} {tested} row sits {extended:.1} ulps from spec-off's, the base one {base:.1}: past {margin} times it"
                 ));
             }
         }
         let (moved_extended, moved_base) = (self.extended_off.moved().len(), self.base_off.moved().len());
         let moved_bound = (CLASS_MOVED_PICKS_MARGIN * moved_base as f32) as usize + CLASS_MOVED_PICKS_ALLOWANCE;
-        println!("  class, picks moved from spec-off's: extended {moved_extended}, base {moved_base} (at most {moved_bound})");
+        println!("  class, picks moved from spec-off's: {tested} {moved_extended}, base {moved_base} (at most {moved_bound})");
         if moved_extended > moved_bound {
             failures.push(format!(
-                "{label}, the class: the extended rows moved {moved_extended} picks from spec-off's, the base rows {moved_base}: past {CLASS_MOVED_PICKS_MARGIN} times them and {CLASS_MOVED_PICKS_ALLOWANCE}"
+                "{label}, the class: the {tested} rows moved {moved_extended} picks from spec-off's, the base rows {moved_base}: past {CLASS_MOVED_PICKS_MARGIN} times them and {CLASS_MOVED_PICKS_ALLOWANCE}"
             ));
         }
     }
@@ -566,17 +753,17 @@ impl Class {
     /// pick's of 11 to 25 a lane count moves, so it is read over every lane
     /// count of the kind, as the control's median is; each excess a line in
     /// `failures`.
-    fn hold_near_tie(&self, label: &str, failures: &mut Vec<String>) {
+    fn hold_near_tie(&self, label: &str, tested: &str, failures: &mut Vec<String>) {
         let gap_bound = PICK_GAP_ULPS.max(CLASS_PICK_GAP_MARGIN * self.base_off.widest_gap());
         println!(
-            "  class, the near tie {gap_bound:.1} ulps: the widest moved gap from spec-off's, extended {:.1}, base {:.1}; between the shapes {:.1}",
+            "  class, the near tie {gap_bound:.1} ulps: the widest moved gap from spec-off's, {tested} {:.1}, base {:.1}; between the shapes {:.1}",
             self.extended_off.widest_gap(),
             self.base_off.widest_gap(),
             self.extended_base.widest_gap()
         );
         if self.extended_off.widest_gap() > gap_bound {
             failures.push(format!(
-                "{label}, the class: an extended row moved a pick spec-off's row rates {:.1} ulps apart, past {gap_bound:.1} (the near tie, or {CLASS_PICK_GAP_MARGIN} times the base rows' widest, {:.1})",
+                "{label}, the class: one {tested} row moved a pick spec-off's row rates {:.1} ulps apart, past {gap_bound:.1} (the near tie, or {CLASS_PICK_GAP_MARGIN} times the base rows' widest, {:.1})",
                 self.extended_off.widest_gap(),
                 self.base_off.widest_gap()
             ));
@@ -584,7 +771,7 @@ impl Class {
         for (place, gap) in &self.moved_between {
             if *gap > gap_bound {
                 failures.push(format!(
-                    "{place}: the extended row moved the base row's pick, {gap:.1} ulps apart in the base row, past the class's near tie {gap_bound:.1}"
+                    "{place}: the {tested} row moved the base row's pick, {gap:.1} ulps apart in the base row, past the class's near tie {gap_bound:.1}"
                 ));
             }
         }
@@ -696,40 +883,13 @@ fn hold_the_class(cell: &Cell) {
             assert!(stats.widths_without_a_graph().is_empty(), "the {shape:?} shape's widths without a graph: {:?}", stats.widths_without_a_graph());
         }
         assert_eq!(shapes[1].lanes, EXTENDED_SHAPE_MAX_LANES, "the extended shape's lanes");
-        let greedy = SamplingParams::greedy();
-
         // Speculation off: each prompt's own greedy text, and the row after
         // each of its tokens.
         let mut prompts: Vec<Vec<i32>> = Vec::new();
         let mut texts: Vec<Vec<i32>> = Vec::new();
         let mut rows_off: Vec<Vec<Vec<u16>>> = Vec::new();
         for (number, prompt) in PROMPTS.iter().enumerate() {
-            let what = format!("prompt {number}");
-            let ids: Vec<i32> = frontend
-                .tokenizer()
-                .encode(&format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"))
-                .unwrap_or_else(|e| panic!("tokenize: {e}"))
-                .into_iter()
-                .map(|id| i32::try_from(id).expect("token id fits i32"))
-                .collect();
-            assert!(ids.len() + MAX_TOKENS + 2 * (WINDOW as usize + 1) <= SEQ_CONTEXT as usize, "{what}: {} prompt tokens", ids.len());
-            let mut off = pool.alloc(SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
-            prefill_program_sampled(&model, &pool, &mut off, &ids, 0, greedy, None).unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
-            let mut text = vec![off.pending_token().expect("the prefill drew")];
-            let mut rows: Vec<Vec<u16>> = Vec::new();
-            while text.len() <= MAX_TOKENS && *text.last().expect("a token") != IM_END {
-                let (emitted, row, next) = plain_round(&model, &pool, &mut off, &what);
-                assert_eq!(emitted, text[text.len() - 1], "{what}: the plain round emitted its pending token");
-                assert_eq!(logit_drift::argmax(&row).0 as i32, next, "{what}: the plain round's row is the one its greedy draw read");
-                rows.push(row);
-                text.push(next);
-            }
-            println!(
-                "extended_round_class_gpu {what}: {} prompt tokens, {} of text (ended: {})",
-                ids.len(),
-                text.len(),
-                text.last() == Some(&IM_END)
-            );
+            let (ids, text, rows) = spec_off(&model, &pool, &frontend, number, prompt);
             prompts.push(ids);
             texts.push(text);
             rows_off.push(rows);
@@ -745,79 +905,220 @@ fn hold_the_class(cell: &Cell) {
                     let extended = leg(&model, &pool, &prompts, &texts, &group, Shape::Extended, kind, &what);
                     for (l, &p) in group.iter().enumerate() {
                         let lane = format!("{what}, lane {l} (prompt {p})");
-                        let text = &texts[p];
-                        let off = &rows_off[p];
-                        // Every text index all three reached.
-                        let rows = base[l].len().min(extended[l].len()).min(off.len());
-                        if rows < MIN_ROWS {
-                            failures.push(format!("{lane}: {rows} rows to compare, under {MIN_ROWS}"));
-                        }
-                        let mut lane_class = Class::default();
-                        let (mut lp_off, mut lp_base, mut lp_extended) = (0f64, 0f64, 0f64);
-                        for i in 0..rows {
-                            lane_class.extended_off.drifts.push(row_drift(&off[i], &extended[l][i]));
-                            lane_class.base_off.drifts.push(row_drift(&off[i], &base[l][i]));
-                            lane_class.extended_base.drifts.push(row_drift(&base[l][i], &extended[l][i]));
-                            if i + 1 < off.len() {
-                                lane_class.control.drifts.push(row_drift(&off[i + 1], &extended[l][i]));
-                            }
-                            let next = text[i + 1] as u32;
-                            lp_off += logit_drift::log_prob(&off[i], next);
-                            lp_base += logit_drift::log_prob(&base[l][i], next);
-                            lp_extended += logit_drift::log_prob(&extended[l][i], next);
-                        }
-                        let mean = |sum: f64| sum / rows.max(1) as f64;
-                        println!("extended_round_class_gpu {lane}:");
-                        println!("  extended against base:     {}", lane_class.extended_base.line());
-                        println!("  extended against spec-off: {}", lane_class.extended_off.line());
-                        println!("  base against spec-off:     {}", lane_class.base_off.line());
-                        println!("  control, one index off:    {}", lane_class.control.line());
-                        let apart = mean(lp_extended) - mean(lp_base);
-                        println!(
-                            "  mean log-probability of the text, nats a token: spec-off {:.5}, base {:+.5}, extended {:+.5} from it; extended against base {apart:+.5}",
-                            mean(lp_off),
-                            mean(lp_base) - mean(lp_off),
-                            mean(lp_extended) - mean(lp_off)
-                        );
-
-                        // The row itself: extended against base, every logit;
-                        // its moved picks are held to the class's near tie
-                        // once the kind's rows are in.
-                        for (index, drift) in lane_class.extended_base.drifts.iter().enumerate() {
-                            if let Err(excess) = within(drift, EXTENDED_VS_BASE_TOLERANCE_ULPS, f32::INFINITY) {
-                                failures.push(format!("{lane}: extended against base, row {index}: {excess} (the logit that moved most: id {})", drift.worst));
-                            }
-                            if drift.pick_off != drift.pick_on {
-                                lane_class.moved_between.push((format!("{lane}, row {index}"), drift.gap_ulps));
-                            }
-                        }
-                        let median = lane_class.extended_base.at(0.5);
-                        if median > EXTENDED_VS_BASE_TYPICAL_ULPS {
-                            failures.push(format!(
-                                "{lane}: the median extended row sits {median:.1} ulps from the base row, past {EXTENDED_VS_BASE_TYPICAL_ULPS}"
-                            ));
-                        }
-                        if apart.abs() > EXTENDED_VS_BASE_LOG_PROB_NATS {
-                            failures.push(format!(
-                                "{lane}: the text's mean log-probability under the extended rows is {apart:+.5} nats a token from the base rows', past {EXTENDED_VS_BASE_LOG_PROB_NATS}"
-                            ));
-                        }
+                        let lane_class = hold_lane(&lane, "extended", &texts[p], &rows_off[p], &base[l], &extended[l], MIN_ROWS, &mut failures);
                         width_class.extend(&lane_class);
                     }
                 }
                 let width_label = format!("{kind:?} rounds at {width} lanes");
-                width_class.print(&width_label);
-                width_class.hold_distances(&width_label, &mut failures);
+                width_class.print(&width_label, "extended");
+                width_class.hold_distances(&width_label, "extended", &mut failures);
                 kind_class.extend(&width_class);
             }
             // The class: the extended rows' distance from speculation off's
             // against the base rows', over every lane of the kind.
             let label = format!("{kind:?} rounds, 1 to {EXTENDED_SHAPE_MAX_LANES} lanes");
-            kind_class.print(&label);
-            kind_class.hold_distances(&label, &mut failures);
-            kind_class.hold_near_tie(&label, &mut failures);
+            kind_class.print(&label, "extended");
+            kind_class.hold_distances(&label, "extended", &mut failures);
+            kind_class.hold_near_tie(&label, "extended", &mut failures);
+        }
+
+        // #717: the mixed rounds' class, on the same load.
+        if cell.mixed {
+            for (number, prompt) in MIXED_PROMPTS.iter().enumerate() {
+                let (ids, text, rows) = spec_off(&model, &pool, &frontend, PROMPTS.len() + number, prompt);
+                prompts.push(ids);
+                texts.push(text);
+                rows_off.push(rows);
+            }
+            hold_the_mixed_class(&model, &pool, &prompts, &texts, &rows_off, &mut failures);
         }
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
     assert!(failures.is_empty(), "{}: {} excesses, the first of them:\n{}", cell.name, failures.len(),failures.iter().take(24).cloned().collect::<Vec<_>>().join("\n"));
+}
+
+/// Speculation off on prompt `number`, `prompt`: its ids, its own greedy text
+/// and the row after each of the text's tokens.
+fn spec_off(model: &Model, pool: &SeqPool, frontend: &FrontendSet, number: usize, prompt: &str) -> (Vec<i32>, Vec<i32>, Vec<Vec<u16>>) {
+    let greedy = SamplingParams::greedy();
+    let what = format!("prompt {number}");
+    let ids: Vec<i32> = frontend
+        .tokenizer()
+        .encode(&format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"))
+        .unwrap_or_else(|e| panic!("tokenize: {e}"))
+        .into_iter()
+        .map(|id| i32::try_from(id).expect("token id fits i32"))
+        .collect();
+    assert!(ids.len() + MAX_TOKENS + 2 * (WINDOW as usize + 1) <= SEQ_CONTEXT as usize, "{what}: {} prompt tokens", ids.len());
+    let mut off = pool.alloc(SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
+    prefill_program_sampled(model, pool, &mut off, &ids, 0, greedy, None).unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
+    let mut text = vec![off.pending_token().expect("the prefill drew")];
+    let mut rows: Vec<Vec<u16>> = Vec::new();
+    while text.len() <= MAX_TOKENS && *text.last().expect("a token") != IM_END {
+        let (emitted, row, next) = plain_round(model, pool, &mut off, &what);
+        assert_eq!(emitted, text[text.len() - 1], "{what}: the plain round emitted its pending token");
+        assert_eq!(logit_drift::argmax(&row).0 as i32, next, "{what}: the plain round's row is the one its greedy draw read");
+        rows.push(row);
+        text.push(next);
+    }
+    println!(
+        "extended_round_class_gpu {what}: {} prompt tokens, {} of text (ended: {})",
+        ids.len(),
+        text.len(),
+        text.last() == Some(&IM_END)
+    );
+    (ids, text, rows)
+}
+
+/// One lane's rows held: the `tested` rows (the extended ones, or #717 the
+/// mixed ones) against the base rows after the same tokens at the same lane
+/// count, and both against speculation off's, at every text index all three
+/// reached, at least `min_rows`; each excess a line in `failures`. Its pairs,
+/// for the class.
+#[allow(clippy::too_many_arguments)]
+fn hold_lane(
+    lane: &str,
+    tested: &str,
+    text: &[i32],
+    off: &[Vec<u16>],
+    base: &[Vec<u16>],
+    under_test: &[Vec<u16>],
+    min_rows: usize,
+    failures: &mut Vec<String>,
+) -> Class {
+    // Every text index all three reached.
+    let rows = base.len().min(under_test.len()).min(off.len());
+    if rows < min_rows {
+        failures.push(format!("{lane}: {rows} rows to compare, under {min_rows}"));
+    }
+    let mut lane_class = Class::default();
+    let (mut lp_off, mut lp_base, mut lp_tested) = (0f64, 0f64, 0f64);
+    // #717: and over the lane's first MIN_ROWS rows, a reading beside the
+    // bound: every lane of either cell reaches them, so a short mixed lane's
+    // mean reads beside a uniform lane's over one window of its text.
+    let (mut window_base, mut window_tested) = (0f64, 0f64);
+    for i in 0..rows {
+        lane_class.extended_off.drifts.push(row_drift(&off[i], &under_test[i]));
+        lane_class.base_off.drifts.push(row_drift(&off[i], &base[i]));
+        lane_class.extended_base.drifts.push(row_drift(&base[i], &under_test[i]));
+        if i + 1 < off.len() {
+            lane_class.control.drifts.push(row_drift(&off[i + 1], &under_test[i]));
+        }
+        let next = text[i + 1] as u32;
+        lp_off += logit_drift::log_prob(&off[i], next);
+        lp_base += logit_drift::log_prob(&base[i], next);
+        lp_tested += logit_drift::log_prob(&under_test[i], next);
+        if i + 1 == MIN_ROWS {
+            (window_base, window_tested) = (lp_base, lp_tested);
+        }
+    }
+    let mean = |sum: f64| sum / rows.max(1) as f64;
+    println!("extended_round_class_gpu {lane}:");
+    println!("  {tested} against base:     {}", lane_class.extended_base.line());
+    println!("  {tested} against spec-off: {}", lane_class.extended_off.line());
+    println!("  base against spec-off:     {}", lane_class.base_off.line());
+    println!("  control, one index off:    {}", lane_class.control.line());
+    let apart = mean(lp_tested) - mean(lp_base);
+    println!(
+        "  mean log-probability of the text, nats a token: spec-off {:.5}, base {:+.5}, {tested} {:+.5} from it; {tested} against base {apart:+.5}",
+        mean(lp_off),
+        mean(lp_base) - mean(lp_off),
+        mean(lp_tested) - mean(lp_off)
+    );
+    if rows >= MIN_ROWS {
+        println!(
+            "  the same over its first {MIN_ROWS} rows: {tested} against base {:+.5} ({:+.3} nats over the {rows} rows)",
+            (window_tested - window_base) / MIN_ROWS as f64,
+            lp_tested - lp_base
+        );
+    }
+
+    // The row itself: against base, every logit; its moved picks are held to
+    // the class's near tie once the kind's rows are in.
+    for (index, drift) in lane_class.extended_base.drifts.iter().enumerate() {
+        if let Err(excess) = within(drift, EXTENDED_VS_BASE_TOLERANCE_ULPS, f32::INFINITY) {
+            failures.push(format!("{lane}: {tested} against base, row {index}: {excess} (the logit that moved most: id {})", drift.worst));
+        }
+        if drift.pick_off != drift.pick_on {
+            lane_class.moved_between.push((format!("{lane}, row {index}"), drift.gap_ulps));
+        }
+    }
+    let median = lane_class.extended_base.at(0.5);
+    if median > EXTENDED_VS_BASE_TYPICAL_ULPS {
+        failures.push(format!(
+            "{lane}: the median {tested} row sits {median:.1} ulps from the base row, past {EXTENDED_VS_BASE_TYPICAL_ULPS}"
+        ));
+    }
+    if apart.abs() > EXTENDED_VS_BASE_LOG_PROB_NATS {
+        failures.push(format!(
+            "{lane}: the text's mean log-probability under the {tested} rows is {apart:+.5} nats a token from the base rows', past {EXTENDED_VS_BASE_LOG_PROB_NATS}"
+        ));
+    }
+    lane_class
+}
+
+/// #717: the mixed rounds' class on the loaded cell, its decode graphs
+/// captured again under [`MIXED_ROUNDS`] (the switch removed after, so that a
+/// later test of the binary captures as it would): at each lane count of 2 to
+/// 7, a leg of base rounds on the first prompts, then every mix of that count
+/// on the same prompts, its last `w` lanes extended; each lane's mixed rows
+/// held to its base rows, the class at each lane count and over the kind's,
+/// in both kinds of round.
+fn hold_the_mixed_class(
+    model: &Model,
+    pool: &SeqPool,
+    prompts: &[Vec<i32>],
+    texts: &[Vec<i32>],
+    rows_off: &[Vec<Vec<u16>>],
+    failures: &mut Vec<String>,
+) {
+    let began = std::time::Instant::now();
+    // SAFETY (test-only): this binary's tests run one at a time on the card
+    // (the profile's --test-threads=1, or one test by name), and the leaf
+    // reads the environment on this thread.
+    unsafe { std::env::set_var(MIXED_ROUNDS, "1") };
+    let captured = capture_decode_graphs(model, pool);
+    // SAFETY: as above.
+    unsafe { std::env::remove_var(MIXED_ROUNDS) };
+    captured.unwrap_or_else(|e| panic!("capture under {MIXED_ROUNDS}=1: {e}"));
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("stats: {e}"));
+    assert!(stats.mixed_graphs_asked, "the capture asked for the mixed graphs");
+    for (at, &(w, n)) in MIXES.iter().enumerate() {
+        assert!(stats.mixed_verify_graph_nodes[at] > 0, "the {w}+{n} mixed round's verify graph, on {LANES} lanes and slots");
+    }
+    for shape in stats.shapes() {
+        assert!(shape.widths_without_a_graph().is_empty(), "the {} drafts shape's widths without a graph: {:?}", shape.window, shape.widths_without_a_graph());
+    }
+    let most = MIXES.iter().map(|&(w, n)| (w + n) as usize).max().expect("twelve mixes");
+    assert!(prompts.len() >= most, "{} prompts for a mix of {most} lanes", prompts.len());
+    for kind in [Kind::Forced, Kind::Graph] {
+        let mut kind_class = Class::default();
+        for lanes in 2..=most {
+            let group: Vec<usize> = (0..lanes).collect();
+            let what = format!("{kind:?} rounds at {lanes} lanes, prompts {group:?}");
+            let base = leg(model, pool, prompts, texts, &group, Shape::Base, kind, &what);
+            let mut width_class = Class::default();
+            for &(w, n) in MIXES.iter().filter(|&&(w, n)| (w + n) as usize == lanes) {
+                let extended: Vec<bool> = (0..lanes).map(|l| l >= n as usize).collect();
+                let what = format!("{kind:?} rounds at the mix {w}+{n}, prompts {group:?}");
+                let mixed = mixed_leg(model, pool, prompts, texts, &group, &extended, kind, &what);
+                for (l, &p) in group.iter().enumerate() {
+                    let lane = format!("{what}, lane {l} (prompt {p}, {:?})", shape_of(extended[l]));
+                    let lane_class = hold_lane(&lane, "mixed", &texts[p], &rows_off[p], &base[l], &mixed[l], MIXED_MIN_ROWS, failures);
+                    width_class.extend(&lane_class);
+                }
+            }
+            let width_label = format!("{kind:?} mixed rounds at {lanes} lanes");
+            width_class.print(&width_label, "mixed");
+            width_class.hold_distances(&width_label, "mixed", failures);
+            kind_class.extend(&width_class);
+        }
+        // The class: the mixed rows' distance from speculation off's against
+        // the base rows', over every lane of every mix of the kind.
+        let label = format!("{kind:?} mixed rounds, 2 to {most} lanes");
+        kind_class.print(&label, "mixed");
+        kind_class.hold_distances(&label, "mixed", failures);
+        kind_class.hold_near_tie(&label, "mixed", failures);
+    }
+    println!("extended_round_class_gpu: the mixed rounds' class took {:.0} s", began.elapsed().as_secs_f64());
 }
