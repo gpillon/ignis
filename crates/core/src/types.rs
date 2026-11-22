@@ -690,6 +690,11 @@ pub struct SpecCounters {
     /// of whose lanes asked the extended shape going into them
     /// ([`splits_shape_asks`]), whichever shape they then ran at.
     pub split_rounds: u32,
+    /// GitHub #719 (spec #711): of `rounds`, those of a mixed round, one whose
+    /// lanes ran at both round shapes. Counted at neither `extended_rounds`
+    /// nor the base shape's, whose rounds are the rest of `rounds`; each
+    /// lane's drafted and accepted counts are its own.
+    pub mixed_rounds: u32,
 }
 
 /// GitHub #690: whether a verify round of `lanes` lanes, `asking` of which
@@ -728,6 +733,7 @@ impl SpecCounters {
             accepted_at,
             extended_rounds: 0,
             split_rounds: 0,
+            mixed_rounds: 0,
         }
     }
 
@@ -735,6 +741,14 @@ impl SpecCounters {
     /// `extended` (GitHub #689): a verify round's own, read off its run.
     pub fn at_shape(self, extended: bool) -> Self {
         Self { extended_rounds: if extended { self.rounds } else { 0 }, ..self }
+    }
+
+    /// The same counters with every round one of a mixed round where `mixed`
+    /// (GitHub #719): a verify round's own, read off its run. A mixed round's
+    /// lanes are counted here and not at a shape, so a round is at one of the
+    /// base shape, the extended shape and the mixed round.
+    pub fn in_mixed_round(self, mixed: bool) -> Self {
+        Self { mixed_rounds: if mixed { self.rounds } else { 0 }, extended_rounds: if mixed { 0 } else { self.extended_rounds }, ..self }
     }
 
     /// The same counters with every round one that split its lanes' asks of
@@ -788,6 +802,7 @@ impl std::ops::Add for SpecCounters {
             accepted_at,
             extended_rounds: self.extended_rounds.saturating_add(other.extended_rounds),
             split_rounds: self.split_rounds.saturating_add(other.split_rounds),
+            mixed_rounds: self.mixed_rounds.saturating_add(other.mixed_rounds),
         }
     }
 }

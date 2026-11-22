@@ -199,6 +199,8 @@ pub(crate) mod ffi {
         pub mixed_verify_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
         pub mixed_append_graph_roots: [u32; IGNIS_ROUND_MIXES],
         pub mixed_append_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
+        /// GitHub #719: the mixed rounds run at each mix.
+        pub mixed_rounds: [u64; IGNIS_ROUND_MIXES],
     }
 
     unsafe extern "C" {
@@ -599,6 +601,11 @@ pub struct ProgramStats {
     pub mixed_verify_graph_memset_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
     pub mixed_append_graph_roots: [u32; ffi::IGNIS_ROUND_MIXES],
     pub mixed_append_graph_memset_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
+    /// GitHub #719 (spec #711): entry `m` the mixed rounds mix `m` has run on
+    /// the load, from its graph or eagerly (the seam's forced rounds); a round
+    /// at a mix with no graph that ran at the uniform choice is in
+    /// [`ProgramStats::mixed_fallback_rounds`], not here.
+    pub mixed_rounds: [u64; ffi::IGNIS_ROUND_MIXES],
 }
 
 /// GitHub #714 (spec #711): why a round at a mix ran at the uniform choice,
@@ -2806,6 +2813,7 @@ pub fn program_stats(model: &Model, pool: &SeqPool) -> Result<ProgramStats, Stri
         mixed_verify_graph_memset_nodes: stats.mixed_verify_graph_memset_nodes,
         mixed_append_graph_roots: stats.mixed_append_graph_roots,
         mixed_append_graph_memset_nodes: stats.mixed_append_graph_memset_nodes,
+        mixed_rounds: stats.mixed_rounds,
     })
 }
 

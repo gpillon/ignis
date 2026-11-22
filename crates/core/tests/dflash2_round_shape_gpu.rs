@@ -329,6 +329,7 @@ fn mixed_graphs_captured(model: &Model, pool: &SeqPool, spec: Speculation, failu
 /// at the uniform shape `aggregate` gives them, both extended.
 fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], failures: &mut Vec<String>) {
     const ROUNDS: usize = 6;
+    let mixed_before = program_stats(model, pool).unwrap_or_else(|e| panic!("part 6: stats: {e}")).mixed_rounds;
     // Lane 1 asks beside lane 0, so the granted round's rows are not the caller's order.
     let (granted, refused) = ([false, true], [false, false]);
     let courses: [(&str, u32, [[bool; 2]; ROUNDS]); 2] = [
@@ -382,6 +383,12 @@ fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], fa
         }
     }
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("part 6: stats: {e}"));
+    // GitHub #719: the program's stats count the rounds each mix ran: the high course's five granted
+    // rounds and its live one, the low course's one, all at 1+1 (the first of the mixes).
+    let mixed: Vec<u64> = stats.mixed_rounds.iter().zip(mixed_before).map(|(after, before)| after - before).collect();
+    if mixed[0] != 7 || mixed[1..].iter().any(|&rounds| rounds != 0) {
+        failures.push(format!("part 6: the mixed rounds each mix ran: {mixed:?}, not seven at 1+1"));
+    }
     if stats.mixed_fallback_rounds != [0, 0] {
         failures.push(format!("part 6: rounds fell back to the uniform choice: {:?}", stats.mixed_fallback_rounds));
     }

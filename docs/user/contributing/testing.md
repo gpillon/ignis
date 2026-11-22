@@ -352,7 +352,8 @@ the other. They are no configuration fields: `GET /v1/config` and
   uniform round shape `aggregate` would choose, counted by reason in the
   program's stats (`mixed_fallback_rounds`) and named at load by
   `ignis.runtime.mixed_graph_capture_incomplete`. The stats report each mix's
-  graph nodes and the device memory its capture took. A load at another
+  graph nodes, the device memory its capture took and the mixed rounds it ran
+  (`mixed_rounds`). A load at another
   window, a trellis artifact, an MTP load and Flash-Next capture none. Any
   other value refuses the load, naming the variable.
 - `IGNIS_MIXED_GRAPH_BUILD=0` (from 0.11.0) gives the 27B's mixed rounds,

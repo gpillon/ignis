@@ -3231,6 +3231,7 @@ int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *con
     set_error("ignis_program_decode: a mixed round: " + branch_error);
     return -1;
   }
+  const int mix = ignis::round_layout::mix_index(layout);
   // Each lane's inputs and outputs in the round's rows.
   const std::size_t caller_k = options.speculative_window;
   const std::size_t caller_columns = caller_k + 1;
@@ -3284,6 +3285,9 @@ int32_t run_mixed_round(ignis_model *model, ignis_seq_pool *pool, ignis_seq *con
     if (options.out_lane_shapes != nullptr) {
       options.out_lane_shapes[i] = row_shapes[r];
     }
+  }
+  if (mix >= 0) {
+    ++model->mixed_rounds[static_cast<std::size_t>(mix)];
   }
   return 0;
 }
@@ -4237,6 +4241,8 @@ extern "C" int32_t ignis_program_stats(const struct ignis_model *model,
     out_stats->mixed_verify_graph_memset_nodes[i] = model->mixed_verify_memsets[i];
     out_stats->mixed_append_graph_roots[i] = model->mixed_append_roots[i];
     out_stats->mixed_append_graph_memset_nodes[i] = model->mixed_append_memsets[i];
+    // GitHub #719: and the rounds run at each.
+    out_stats->mixed_rounds[i] = model->mixed_rounds[i];
   }
   // GitHub #714: what the latest capture asked and could not capture, and the rounds that ran at
   // the uniform choice for a mix with no graph.

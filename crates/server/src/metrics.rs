@@ -772,6 +772,8 @@ pub struct Metrics {
     /// GitHub #690: of `spec_rounds`, those of two lanes or more some but not
     /// all of whose lanes asked the extended shape.
     spec_split_rounds: AtomicU64,
+    /// GitHub #719: of `spec_rounds`, those of a mixed round.
+    spec_mixed_rounds: AtomicU64,
     spec_drafted: AtomicU64,
     spec_accepted: AtomicU64,
     spec_drafted_at: [AtomicU64; ignis_core::types::DRAFT_POSITIONS],
@@ -973,6 +975,7 @@ impl Metrics {
             spec_rounds: AtomicU64::new(0),
             spec_extended_rounds: AtomicU64::new(0),
             spec_split_rounds: AtomicU64::new(0),
+            spec_mixed_rounds: AtomicU64::new(0),
             spec_drafted: AtomicU64::new(0),
             spec_accepted: AtomicU64::new(0),
             spec_drafted_at: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1072,6 +1075,7 @@ impl Metrics {
         self.spec_rounds.fetch_add(u64::from(spec.rounds), Ordering::Relaxed);
         self.spec_extended_rounds.fetch_add(u64::from(spec.extended_rounds), Ordering::Relaxed);
         self.spec_split_rounds.fetch_add(u64::from(spec.split_rounds), Ordering::Relaxed);
+        self.spec_mixed_rounds.fetch_add(u64::from(spec.mixed_rounds), Ordering::Relaxed);
         self.spec_drafted.fetch_add(u64::from(spec.drafted), Ordering::Relaxed);
         self.spec_accepted.fetch_add(u64::from(spec.accepted), Ordering::Relaxed);
         for (series, &n) in self.spec_drafted_at.iter().zip(&spec.drafted_at) {
@@ -1877,12 +1881,16 @@ impl Metrics {
             }
             // GitHub #689: the rounds by round shape. The base shape is a load
             // of one shape's only one (an MTP or a Flash-Next load, DFlash2 at
-            // 7 drafts or fewer), whose extended series stays at 0.
+            // 7 drafts or fewer), whose extended series stays at 0. GitHub
+            // #719: a mixed round counts once as mixed, at neither shape; the
+            // series stays at 0 where no load runs one.
             let name = "ignis_speculative_shape_rounds_total";
-            declare(&mut out, name, "counter", "Verify rounds run, by round shape: base or extended.");
+            declare(&mut out, name, "counter", "Verify rounds run, by round shape: base, extended or mixed.");
             let extended = read(&self.spec_extended_rounds);
-            let _ = writeln!(out, "{name}{{shape=\"base\"}} {}", rounds.saturating_sub(extended));
+            let mixed = read(&self.spec_mixed_rounds);
+            let _ = writeln!(out, "{name}{{shape=\"base\"}} {}", rounds.saturating_sub(extended).saturating_sub(mixed));
             let _ = writeln!(out, "{name}{{shape=\"extended\"}} {extended}");
+            let _ = writeln!(out, "{name}{{shape=\"mixed\"}} {mixed}");
             // GitHub #690: and the rounds of two lanes or more whose lanes did
             // not all ask the same shape, at whichever shape they ran: 0 on a
             // load of one shape, where no lane asks.
@@ -2339,6 +2347,38 @@ mod tests {
         // GitHub #690: none of those rounds split its lanes' asks.
         declared_once(&text, &[("ignis_speculative_shape_split_rounds_total", "counter")]);
         assert_eq!(value(&text, "ignis_speculative_shape_split_rounds_total", ""), "0");
+    }
+
+    /// GitHub #719 (spec #711): a mixed round counts as `shape="mixed"`, not
+    /// as base and extended, beside the uniform rounds counted as before; its
+    /// lanes' drafted and accepted counts per position stay each lane's own,
+    /// the extended lane's to its window and the base lane's to its.
+    #[test]
+    fn a_mixed_rounds_lanes_count_as_mixed_and_their_drafts_by_position_each_at_its_own_shape() {
+        use ignis_core::types::SpecCounters;
+        use ignis_core::{Speculation, SpeculativeBackend};
+        let metrics = Metrics::new();
+        let draft_positions = Speculation::new(SpeculativeBackend::Dflash2, 15).unwrap().draft_positions();
+        metrics.set_load_reservations(LoadReservations { draft_positions, ..LoadReservations::none() });
+        // One request: an extended round, a base round, and a mixed round of
+        // its extended lane (15 drafts, 12 taken) beside a base lane (7, 7).
+        metrics.record_speculation(
+            &(SpecCounters::round(15, 15).at_shape(true)
+                + SpecCounters::round(7, 7).at_shape(false)
+                + SpecCounters::round(15, 12).in_mixed_round(true)
+                + SpecCounters::round(7, 7).in_mixed_round(true)),
+        );
+        let text = metrics.render();
+        declared_once(&text, &[("ignis_speculative_shape_rounds_total", "counter")]);
+        assert_eq!(value(&text, "ignis_speculative_rounds_total", ""), "4");
+        let shape = |name: &str| value(&text, "ignis_speculative_shape_rounds_total", &format!("shape=\"{name}\""));
+        assert_eq!((shape("base"), shape("extended"), shape("mixed")), ("1".to_owned(), "1".to_owned(), "2".to_owned()));
+        let at = |family: &str, position: u32| value(&text, family, &format!("position=\"{position}\""));
+        let drafted = "ignis_speculative_position_drafted_total";
+        let accepted = "ignis_speculative_position_accepted_total";
+        for (position, want_drafted, want_accepted) in [(1, "4", "4"), (7, "4", "4"), (8, "2", "2"), (12, "2", "2"), (13, "2", "1"), (15, "2", "1")] {
+            assert_eq!((at(drafted, position), at(accepted, position)), (want_drafted.to_owned(), want_accepted.to_owned()), "position {position}");
+        }
     }
 
     /// GitHub #690: the rounds of two lanes or more whose lanes did not all
