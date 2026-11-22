@@ -342,6 +342,18 @@ const ARMS: &[Arm] = &[
     // test seam's ask, and its forced rounds run at the uniform round shape `aggregate` chooses,
     // counted ([`capture_failure`]).
     Arm { name: CAPTURE_FAILURE_ARM, switches: &[(MIXED_ROUNDS, "1")], graphs: true },
+
+    // #715's arms, below this line.
+
+    // #716's arms, below this line.
+
+    // #717's arms, below this line.
+
+    // #718's arms, below this line.
+
+    // #719's arms, below this line.
+
+    // #720's arms, below this line.
 ];
 
 /// #713: the switch that captures the mixed rounds' graphs, read at capture;
