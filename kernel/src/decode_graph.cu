@@ -19,6 +19,7 @@
 #include "dflash2_drafter.h"
 #include "extended_attention.h"
 #include "gdn_gating_home.h"
+#include "graph_nodes.h"
 #include "ignis_gdn_layer.h"
 #include "ignis_gqa_layer.h"
 #include "layer_internal.h"
@@ -26,6 +27,7 @@
 #include "model_internal.h"
 #include "mtp_head.h"
 #include "sampled_draft.h"
+#include "tiled_argmax.h"
 #include "trellis_body.h"
 #include "flash_next/program.h"
 
@@ -349,7 +351,14 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     ninfer::Tensor logits(verify.logits->p, ninfer::DType::BF16, {vocab, columns, 1, 1});
     ignis::trellis_body::output_head(*model, normalized, logits, model->stream);
     ninfer::Tensor target_tokens(verify.target_tokens->p, ninfer::DType::I32, {columns, 1, 1, 1});
-    ninfer::ops::argmax(logits, target_tokens, vocab, model->stream);
+    // GitHub #718: a mixed round under the mixed graph's build zeroes its argmax's output by a kernel
+    // where the vendored launcher's memset node would wait behind the output head, the same answer
+    // (kernel/src/tiled_argmax.h); every other round, the vendored op.
+    if (!layout.uniform() && model->mixed_graph_build) {
+      ignis::tiled_argmax::argmax(logits, target_tokens, vocab, model->stream);
+    } else {
+      ninfer::ops::argmax(logits, target_tokens, vocab, model->stream);
+    }
 
     // The vendored accept: the greedy branch keeps the longest draft prefix
     // the target argmax agrees with and takes the target argmax at the
@@ -423,35 +432,18 @@ uint32_t node_count(cudaGraph_t graph) {
 // GitHub #677: how many of a captured graph's nodes are copies (`ignis_program_stats`); 0 if the
 // runtime cannot say.
 uint32_t copy_node_count(cudaGraph_t graph) {
-  std::size_t count = 0;
-  if (cudaGraphGetNodes(graph, nullptr, &count) != cudaSuccess) {
-    (void)cudaGetLastError();
-    return 0;
-  }
-  std::vector<cudaGraphNode_t> nodes(count);
-  if (count > 0 && cudaGraphGetNodes(graph, nodes.data(), &count) != cudaSuccess) {
-    (void)cudaGetLastError();
-    return 0;
-  }
-  uint32_t copies = 0;
-  for (const cudaGraphNode_t node : nodes) {
-    cudaGraphNodeType type = cudaGraphNodeTypeCount;
-    if (cudaGraphNodeGetType(node, &type) != cudaSuccess) {
-      (void)cudaGetLastError();
-      return 0;
-    }
-    copies += type == cudaGraphNodeTypeMemcpy ? 1 : 0;
-  }
-  return copies;
+  return ignis::graph_nodes::of_type(graph, cudaGraphNodeTypeMemcpy);
 }
 
 // P5-04 (GitHub #153): records one width-W verify graph -- exactly
 // `ignis_verify_graph_run_batch`, captured once at shape `verify` (GitHub
 // #686). Same failure handling as the decode capture below. GitHub #713: at
-// `layout`, a uniform round of its width or a mixed round's mix.
+// `layout`, a uniform round of its width or a mixed round's mix. GitHub #718: and, where asked, its
+// root nodes and memset nodes; a mixed round's under the mixed graph's build instantiated with its
+// nodes' priorities (`ignis_mixed_priorities`).
 int32_t capture_verify_graph(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
                              const ignis::round_layout::Layout &layout, cudaGraphExec_t *out_exec, uint32_t *out_nodes,
-                             uint32_t *out_copies) {
+                             uint32_t *out_copies, uint32_t *out_roots = nullptr, uint32_t *out_memsets = nullptr) {
   *out_exec = nullptr;
   *out_nodes = 0;
   *out_copies = 0;
@@ -486,8 +478,12 @@ int32_t capture_verify_graph(ignis_model *model, ignis_seq_pool *pool, IgnisVeri
   }
   const uint32_t nodes = node_count(graph);
   const uint32_t copies = copy_node_count(graph);
+  const uint32_t roots = out_roots != nullptr ? ignis::graph_nodes::roots(graph) : 0;
+  const uint32_t memsets = out_memsets != nullptr ? ignis::graph_nodes::of_type(graph, cudaGraphNodeTypeMemset) : 0;
+  const unsigned long long flags =
+      ignis_mixed_priorities(*model, layout) ? static_cast<unsigned long long>(cudaGraphInstantiateFlagUseNodePriority) : 0ULL;
   cudaGraphExec_t exec = nullptr;
-  const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, 0);
+  const cudaError_t inst_err = cudaGraphInstantiate(&exec, graph, flags);
   cudaGraphDestroy(graph);
   if (inst_err != cudaSuccess) {
     set_error(std::string("ignis_verify_graph_capture: cudaGraphInstantiate failed: ") +
@@ -497,6 +493,12 @@ int32_t capture_verify_graph(ignis_model *model, ignis_seq_pool *pool, IgnisVeri
   *out_exec = exec;
   *out_nodes = nodes;
   *out_copies = copies;
+  if (out_roots != nullptr) {
+    *out_roots = roots;
+  }
+  if (out_memsets != nullptr) {
+    *out_memsets = memsets;
+  }
   return 0;
 }
 
@@ -674,6 +676,41 @@ bool read_gdn_gating(ignis_model *model) {
   return true;
 }
 
+// GitHub #718 (spec #711): IGNIS_MIXED_GRAPH_BUILD, read at each capture of a load with an extended
+// shape (kernel/src/mixed_graphs.h `built`): the mixed rounds' build from here on, their graphs' and
+// their eager rounds' alike (`ignis_model::mixed_graph_build`). The first capture that reads the
+// build makes the branch the extended group of a mixed round runs on, at the device's greatest
+// stream priority, kept for the load. False (error set) on a value other than `0` or `1`, and where
+// CUDA cannot make that branch.
+bool read_mixed_graph_build(ignis_model *model) {
+  if (!capture_switch(ignis::mixed_graphs::built, model->mixed_graph_build)) {
+    return false;
+  }
+  ignis::flash_next::SideBranch &branch = model->mixed_priority_branch;
+  if (!model->mixed_graph_build || branch.stream != nullptr) {
+    return true;
+  }
+  int least = 0;
+  int greatest = 0;
+  cudaError_t err = cudaDeviceGetStreamPriorityRange(&least, &greatest);
+  if (err == cudaSuccess) {
+    err = cudaStreamCreateWithPriority(&branch.stream, cudaStreamNonBlocking, greatest);
+  }
+  if (err == cudaSuccess) {
+    err = cudaEventCreateWithFlags(&branch.fork, cudaEventDisableTiming);
+  }
+  if (err == cudaSuccess) {
+    err = cudaEventCreateWithFlags(&branch.join, cudaEventDisableTiming);
+  }
+  if (err != cudaSuccess) {
+    branch.destroy();
+    set_error(std::string("ignis_decode_graph_capture: IGNIS_MIXED_GRAPH_BUILD: the extended group's branch: ") +
+              cudaGetErrorString(err));
+    return false;
+  }
+  return true;
+}
+
 // GitHub #713 (spec #711): IGNIS_MIXED_ROUNDS, read at each capture (a measurement switch, ADR 0093's
 // kind, kernel/src/mixed_graphs.h `asked`): `1` captures a verify graph and, on a load whose verify
 // rounds defer, the drafter's append after it for each mix the load holds (GitHub #714: every mix of
@@ -698,6 +735,10 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
     model->mixed_verify_nodes[i] = 0;
     model->mixed_append_nodes[i] = 0;
     model->mixed_graph_bytes[i] = 0;
+    model->mixed_verify_roots[i] = 0;
+    model->mixed_verify_memsets[i] = 0;
+    model->mixed_append_roots[i] = 0;
+    model->mixed_append_memsets[i] = 0;
   }
   model->mixed_failed_mask = 0;
   model->mixed_capture_asked = false;
@@ -736,6 +777,10 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
       }
       model->mixed_verify_nodes[at] = 0;
       model->mixed_append_nodes[at] = 0;
+      model->mixed_verify_roots[at] = 0;
+      model->mixed_verify_memsets[at] = 0;
+      model->mixed_append_roots[at] = 0;
+      model->mixed_append_memsets[at] = 0;
       model->mixed_failed_mask |= 1u << at;
       set_error("ignis_decode_graph_capture: " + name + ": " + why);
     };
@@ -760,7 +805,7 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
     const bool measured = cudaMemGetInfo(&free_before, &total) == cudaSuccess;
     uint32_t copies = 0;
     if (capture_verify_graph(model, pool, *base, layout, &model->mixed_verify_exec[at], &model->mixed_verify_nodes[at],
-                             &copies) != 0) {
+                             &copies, &model->mixed_verify_roots[at], &model->mixed_verify_memsets[at]) != 0) {
       model->mixed_verify_exec[at] = nullptr;
       failed("its verify graph: " + g_last_error);
       continue;
@@ -768,7 +813,8 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
     if (base->defer && base->staging != nullptr) {
       std::string error;
       if (ignis::deferred_verify::capture_append(model, pool, *base, layout, &model->mixed_append_exec[at],
-                                                 &model->mixed_append_nodes[at], &error) != 0) {
+                                                 &model->mixed_append_nodes[at], &error, &model->mixed_append_roots[at],
+                                                 &model->mixed_append_memsets[at]) != 0) {
         model->mixed_append_exec[at] = nullptr;
         failed("the drafter's append after it: " + error);
         continue;
@@ -837,6 +883,10 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
   // rounds' alike. A load without one never reads it.
   if (model->extended_shape != nullptr &&
       !capture_switch(ignis::extended_attention::read_switch, model->extended_attention)) {
+    return -1;
+  }
+  // GitHub #718: IGNIS_MIXED_GRAPH_BUILD, the mixed rounds' build, on the same loads.
+  if (model->extended_shape != nullptr && !read_mixed_graph_build(model)) {
     return -1;
   }
   const auto began = std::chrono::steady_clock::now();

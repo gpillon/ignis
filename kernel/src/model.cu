@@ -3394,6 +3394,8 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
       }
     }
     model->mixed_branch.destroy();
+    // GitHub #718: and the extended group's branch beside it.
+    model->mixed_priority_branch.destroy();
     if (model->stream != nullptr) {
       cudaStreamDestroy(model->stream);
     }
