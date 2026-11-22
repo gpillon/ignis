@@ -332,7 +332,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   verify graph, or drafter's append graph (`graph`), could not be captured,
   whose rounds run that part eagerly.
 - `IGNIS_MIXED_ROUNDS=0|1` (from 0.11.0) picks, at each capture of the decode
-  graphs of a DFlash2 load of the 27B at 15 draft tokens on the NVFP4
+  graphs of a DFlash2 load of the 27B at 15 draft tokens on either
   artifact, whether the mixed rounds (rounds whose lanes take both round
   shapes) have their verify and drafter-append graphs: `1` captures them for
   every mix the load holds, whatever the shape policy says (a mix of `w`
@@ -347,15 +347,15 @@ the other. They are no configuration fields: `GET /v1/config` and
   the round identity test forces a round's mix through the step ABI's test
   seam (`forced_lane_shapes`), and such a round replays the mix's graph where
   one was captured, runs eagerly where no capture asked for the mixed graphs,
-  and where the capture asked and could not make that mix's graphs (as a
-  granted round where the pool's slots hold none of that mix) runs at the
-  uniform round shape `aggregate` would choose, counted by reason in the
+  and where the capture asked and could not make that mix's graphs runs at
+  the uniform round shape `aggregate` would choose, counted by reason in the
   program's stats (`mixed_fallback_rounds`) and named at load by
-  `ignis.runtime.mixed_graph_capture_incomplete`. The stats report each mix's
-  graph nodes, the device memory its capture took and the mixed rounds it ran
-  (`mixed_rounds`). A load at another
-  window, a trellis artifact, an MTP load and Flash-Next capture none. Any
-  other value refuses the load, naming the variable.
+  `ignis.runtime.mixed_graph_capture_incomplete`; the grant never takes such
+  a mix. The stats report each mix's graph nodes, the device memory its
+  capture took and the mixed rounds it ran (`mixed_rounds`). A load at
+  another window, a pool whose lanes and slots hold no mix (`rtx-16gb`'s 2
+  lanes with no device retained slot), an MTP load and Flash-Next capture
+  none. Any other value refuses the load, naming the variable.
 - `IGNIS_MIXED_GRAPH_BUILD=0` (from 0.11.0) gives the 27B's mixed rounds,
   at each capture of the decode graphs of a DFlash2 load past 7 draft tokens,
   their graphs as `IGNIS_MIXED_ROUNDS` first captured them, the comparison a
@@ -429,14 +429,14 @@ holds them, the reference's run eagerly, and the arms `mixed-rounds`,
 `mixed-round-timing` and `mixed-sync-verify` replay the mix's graphs under
 `IGNIS_MIXED_ROUNDS=1`, timed and with the verify round's synchronous form; the
 reference also prints a digest of its tokens before those rounds.
-From #714 the same sessions, and those of `nvfp4-vision-w15`, then release
+The same sessions, and those of `nvfp4-vision-w15`, then release
 every lane, prefill the load's lanes afresh and ride each of the twelve mixes
 once (lane 0, the vision load's image lane, at both shapes), three lanes from
 a mix to the uniform base round, the uniform extended round and another mix,
 a teacher-forced mix of five lanes, and a mix of five lanes with a snapshot
 and a restore of each right after it: every arm holds them to the reference,
 and each capture that asks for the mixed graphs reports all twelve, their
-measured bytes within the plan's line. From #716 those lanes then ride mixed
+measured bytes within the plan's line. Those lanes then ride mixed
 rounds with lanes held to a grammar, the host cutting each held lane's run one
 token short, held lanes in both groups beside a free lane: the
 host is handed exactly the held lanes, by the caller's index, and each is
@@ -453,7 +453,7 @@ runs from its own. `vram_plan_gpu` holds the leaf's `mixed_graphs` line to
 `ignis_core::lane_lines::mixed_graphs` at 1, 2, 4, 5 and 8 lanes and 0 to 2
 device retained slots and prints its bytes and KV pages; `vram_reload_gpu`
 reloads a load that holds the twelve, which plans within 1% of its pages and
-holds no more past its plan than the same load without them. From #720
+holds no more past its plan than the same load without them.
 `trellis-24gb-w15-rule`, the trellis artifact at 15 drafts and 8 lanes under
 the shape rule, ends its sessions with the same mixed rounds, all twelve mixes
 captured where an arm asks; `trellis-16gb-w15-rule`'s 2 lanes and no retained
@@ -464,7 +464,7 @@ and `n` at the uniform base shape, so that the round timing prints a `verify
 extended`, a `verify mixed` and a `verify` line (`n` of 257 or more) for the
 three at two lanes; the test prints each lane's tokens a round and how far
 each lane's text at the mix follows its text at its own shape's uniform round.
-From #718 every capture that asks for the mixed graphs is also held to their
+Every capture that asks for the mixed graphs is also held to their
 form: one root and no memset node in each graph of each mix under the mixed
 graph's build, and in the `mixed-graph-build-off` arm (`IGNIS_MIXED_ROUNDS=1`,
 `IGNIS_MIXED_GRAPH_BUILD=0`, `IGNIS_ROUND_TIMING=1`) two roots and one memset
@@ -481,7 +481,7 @@ build's comparison, the arms' runs alternated:
 make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2-w15 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
 ```
 
-From #720, `IGNIS_ROUND_IDENTITY_TIMING_TABLE=1` beside
+`IGNIS_ROUND_IDENTITY_TIMING_TABLE=1` beside
 `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` has a timing arm ride every cell of
 the cost table in place of those rides: at each lane count of the load, `n`
 rounds at the base shape, then `n` at each count of extended lanes 64 columns
