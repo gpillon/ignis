@@ -91,17 +91,20 @@ nats a token, the class at each lane count and over a kind's lane counts togethe
 percentile, 1.5 at the widest row, no more moved picks than 1.25 times the base rows' plus 2), the class's near tie and
 the control one index off over a kind's lane counts together. Every one of the twelve mixes runs in both kinds of round,
 its last lanes extended so that the round's rows are not the caller's order, its lanes on seven prompts of their own.
-How the rows are read is the owner's decision of 2026-11-22 (#717), after a first reading failed on one lane:
+The owner decided on 2026-11-22 (#717), after a first reading failed on one lane, that the mixed rows are held exactly
+as ADR 0104 holds the extended round: legs long enough for each lane to reach the uniform cells' row counts, every
+round at its mix; the near tie read the way ADR 0104 reads it; the margins unchanged. How the test does so is proposed
+here, for the owner to confirm with this ADR:
 
 - **A lane is held over a uniform cell's window.** A mixed lane holds the rows after its text's first 224 tokens, as a
   uniform cell's lane does, against the base rows a leg of base rounds at its lane count gives over the same window, at
   least 64 of them. Its leg rides at its mix, every round at the mix and the lane count, until every lane holds the rows
   its base leg gave it: a lane that commits more a round rides on past them on its text, its rows there not read, and
   a lane whose text runs out first fails. Speculation off writes each text's rows over the window one lane at a time,
-  and the text past it the lanes together.
-- **The near tie is read the way ADR 0104 reads it**, over the base rows of the kind's uniform cells at 1 to 4 lanes
-  (both kinds' widest moved gap 12.0 ulps, so 24), not over the mixed cells' own base rows.
-- **The margins are ADR 0104's**, unchanged.
+  and the text past it, which no row is read from, the lanes together.
+- **The near tie is the uniform cells'**: read, as ADR 0104 reads it, over the base rows of the kind's uniform cells
+  at 1 to 4 lanes (both kinds' widest moved gap 12.0 ulps, so 24), not over the mixed cells' own base rows nor pooled
+  with them.
 
 The first reading rode each mixed leg while every lane's text, at most 224 tokens, held a whole round of its shape, so a
 lane beside a faster one held 51 to 85 rows on prose. On graph rounds the prose prompt's lane extended at the mix 3+2
@@ -138,8 +141,9 @@ Forced, every mixed row is its base row within 1 ulp, both groups' (the uniform 
 2 to 4 lanes); on graph rounds a lane's row at one text index can stand at another column of its round in the mixed leg
 than in the base leg, each leg's drafts and accepted counts its own, as between a uniform graph cell's two shapes. The
 furthest likelihood is the essay prompt's lane extended at the mix 3+2, 0.0158 over its 218 rows, which reads 0.0229
-over its first 64: the short window's excess again, inside the bound over the window. The same run's uniform cells print
-what the first reading's did, line for line.
+over its first 64: the short window's excess again, inside the bound over the window. The near tie's reading was not put
+to the test on this run: over the mixed cells' own base rows it would have been 18 and 20, which the mixed rows' 9.0 and
+10.0 pass too. The same run's uniform cells print what the first reading's did, line for line.
 
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class
 reaches the mixed round; "lanes of both shapes in one round" is built, the only way to an extended shape past 4 lanes.

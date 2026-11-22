@@ -274,10 +274,11 @@ const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 /// of prose move on a short one: the prose prompt's uniform extended graph
 /// lane reads 0.0348 over its first 32 rows at one lane and 0.0303 at four,
 /// 0.0242 and 0.0177 over 64, inside 0.02 for good only from row 87 and 180
-/// (#717). So a mixed lane is held over the same window (ADR 0106, the owner's
-/// decision of 2026-11-22): the mixed rounds, forced at most 0.0005, graph at
-/// most 0.0158, the essay prompt's extended lane at the mix 3+2 over 218 rows,
-/// which reads 0.0229 over its first 64.
+/// (#717). The owner decided on 2026-11-22 that the mixed rows are held as the
+/// extended round is, on legs that reach a uniform cell's rows; this test holds
+/// a mixed lane over the same window (ADR 0106, proposed): the mixed rounds,
+/// forced at most 0.0005, graph at most 0.0158, the essay prompt's extended
+/// lane at the mix 3+2 over 218 rows, which reads 0.0229 over its first 64.
 const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 
 /// The control's median, one index off, over the right rows' median and over
