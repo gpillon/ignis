@@ -15,6 +15,7 @@
 #include "prefill_swiglu.h"
 #include "process_environment.h"
 #include "rope_scaling.h"
+#include "round_layout.h"
 #include "round_shape.h"
 #include "round_timing.h"
 #include "tma_descriptor_cache.h"

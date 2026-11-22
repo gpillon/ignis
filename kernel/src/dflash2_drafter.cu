@@ -359,18 +359,28 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerify
 }
 
 void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
-                                std::uint32_t width) {
+                                const ignis::round_layout::Layout &layout) {
   ninfer::DeviceArena &arena = *verify.drafter_scratch;
   ninfer::DeviceArena::Scope scope = arena.scope();
   const auto hidden          = static_cast<std::int32_t>(model->hidden);
-  const auto block           = static_cast<std::int32_t>(verify.window + 1);
-  const auto batch           = static_cast<std::int32_t>(width);
   const auto taps            = static_cast<std::int32_t>(kDflash2TapLayers.size());
-  const ninfer::Tensor features(verify.features->p, ninfer::DType::BF16,
-                                {taps * hidden, block * batch, 1, 1});
-  const ninfer::Tensor positions(verify.positions->p, ninfer::DType::I32, {block, batch, 1, 1});
-  const ninfer::Tensor counts(verify.append_counts->p, ninfer::DType::I32, {batch, 1, 1, 1});
-  const ninfer::Tensor lanes(model->decode_graph_slots->p, ninfer::DType::I32, {batch, 1, 1, 1});
-  ignis_dflash2_append_context(model, pool, arena, features, positions, counts, lanes,
-                               {0, static_cast<std::uint32_t>(block)}, IgnisA16Call::General);
+  const std::size_t column_bytes =
+      static_cast<std::size_t>(taps) * static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+  for (const ignis::round_layout::Group &group : layout.groups) {
+    if (group.lanes == 0) {
+      continue;
+    }
+    const auto block = static_cast<std::int32_t>(group.lane_columns());
+    const auto batch = static_cast<std::int32_t>(group.lanes);
+    const ninfer::Tensor features(static_cast<std::uint8_t *>(verify.features->p) + group.first_column * column_bytes,
+                                  ninfer::DType::BF16, {taps * hidden, block * batch, 1, 1});
+    const ninfer::Tensor positions(static_cast<std::int32_t *>(verify.positions->p) + group.first_column,
+                                   ninfer::DType::I32, {block, batch, 1, 1});
+    const ninfer::Tensor counts(static_cast<std::int32_t *>(verify.append_counts->p) + group.first_lane,
+                                ninfer::DType::I32, {batch, 1, 1, 1});
+    const ninfer::Tensor lanes(static_cast<std::int32_t *>(model->decode_graph_slots->p) + group.first_lane,
+                               ninfer::DType::I32, {batch, 1, 1, 1});
+    ignis_dflash2_append_context(model, pool, arena, features, positions, counts, lanes,
+                                 {0, static_cast<std::uint32_t>(block)}, IgnisA16Call::General);
+  }
 }

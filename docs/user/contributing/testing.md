@@ -348,7 +348,14 @@ and on both trellis loads at 15; and a third holds a prefill whose last
 chunk is 9 to 16 tokens to the same logits, bit for bit, under
 `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is held to the graphs' replay
 with every switch unset; a change behind a switch
-of its own adds that switch as an arm, as the file says. The whole run
+of its own adds that switch as an arm, as the file says. From 0.11.0 the
+reference's verify and drafter-append graphs, each round shape's at each
+width, are also held to main's node counts on the NVFP4 artifact with DFlash2
+at 7 and 15 draft tokens and with its MTP head, under both exception weights,
+on a card of compute capability 12 (`MAIN_GRAPH_NODES`), and every load
+prints them and a digest of the reference's tokens, so that two builds' runs
+of one load say whether they capture the same graphs and commit the same
+text. The whole run
 materializes nineteen loads in turn for the first test and eight for the
 second, so a narrow one is the usual run, from 0.11.0 through the GPU profile's
 single-test mode, under the GPU lock (`--test <name>` on Linux; 0.10.0 runs it as

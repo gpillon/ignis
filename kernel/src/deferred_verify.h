@@ -68,9 +68,11 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream);
 int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width,
                        cudaGraphExec_t *out_exec, std::uint32_t *out_nodes, std::string *error);
 
-// The append at `width` lanes after a round at shape `verify`: that shape's
-// graph where the latest capture made one, eagerly otherwise. Throws on a
+// The append after a round at shape `verify` laid out as `layout`
+// (GitHub #712): that shape's graph at the round's width where the latest
+// capture made one and the round is uniform, eagerly otherwise. Throws on a
 // failed launch, as the eager append does.
-void append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width);
+void append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                  const ignis::round_layout::Layout &layout);
 
 } // namespace ignis::deferred_verify
