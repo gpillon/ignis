@@ -264,8 +264,8 @@ Why each:
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   Their graphs cost nothing here: a mix of `w` extended lanes beside `n` base
   lanes takes `2w + n` of the pool's slots, so two lanes with no device
-  retained slot hold no mix, and every round a mix would be granted runs at
-  the shape `aggregate` gives it. One device retained slot
+  retained slot hold no mix, and the load runs `aggregate`, which its load
+  log says (`ignis.runtime.mixed_rounds_hold_no_mix`). One device retained slot
   (`--reuse-retained-device 1`, a lane's state out of the KV pool) holds the
   1+1 mix, its graphs planned at 16 MiB (29 KV pages) more; that shape is
   planned, not yet run on a card.

@@ -569,11 +569,19 @@ GrantLane conversation() { return lane(false, 16, 32, 0, 0, 0); }
 GrantLane asking(std::uint32_t extra, std::uint32_t refused) { return lane(true, 16, 128, 4, 4 * extra, refused); }
 
 void check_the_grant() {
+  // The mixes a load holds a graph of, bit m for kMixTable[m]: every mix, and those of pools of 4
+  // lanes beside one device retained slot (1+1, 1+2, 1+3, 2+1), of 4 lanes beside none (1+1, 1+2),
+  // and of every mix but 1+2.
+  constexpr std::uint32_t kEveryMix = (1u << ignis::round_layout::kMixes) - 1;
+  constexpr std::uint32_t kFourAndOne = 0b1000111;
+  constexpr std::uint32_t kFour = 0b11;
+  constexpr std::uint32_t kButOnePlusTwo = kEveryMix & ~0b10u;
   struct Row {
     const char *what;
     Policy policy;
     std::vector<GrantLane> lanes;
     std::vector<int> want;
+    std::uint32_t held = kEveryMix;
   };
   const auto seven = [](std::uint32_t at, GrantLane one, std::uint32_t other_at, GrantLane other) {
     std::vector<GrantLane> lanes(7, conversation());
@@ -631,11 +639,26 @@ void check_the_grant() {
       {"all: four asking", Policy::kAll, std::vector<GrantLane>(4, asking(0, 0)), {1, 1, 1, 1}},
       {"all: five asking", Policy::kAll, std::vector<GrantLane>(5, asking(8, 0)), {0, 0, 0, 0, 0}},
       {"aggregate: five asking", Policy::kAggregate, std::vector<GrantLane>(5, asking(8, 0)), {0, 0, 0, 0, 0}},
+      {"a partial pool: the grant stops at 1+3, the last mix it holds", Policy::kMixed,
+       {asking(5, 0), conversation(), asking(6, 0), conversation()}, {0, 0, 1, 0}, kFourAndOne},
+      {"a partial pool: every lane gaining, still 1+3", Policy::kMixed, std::vector<GrantLane>(4, asking(8, 0)),
+       {1, 0, 0, 0}, kFourAndOne},
+      {"1+2 failed: 1+1 and the uniform round at 2 lanes", Policy::kMixed, {asking(8, 0), asking(8, 0)}, {1, 1},
+       kButOnePlusTwo},
+      {"1+2 failed: no mix at 3 lanes, aggregate's choice", Policy::kMixed,
+       {asking(8, 0), asking(8, 0), conversation()}, {1, 1, 1}, kButOnePlusTwo},
+      {"no mix held at 2 lanes: aggregate's choice, 6 pays", Policy::kMixed, {asking(6, 0), conversation()}, {1, 1}, 0},
+      {"no mix held at 2 lanes: aggregate's choice, 2 does not", Policy::kMixed, {asking(2, 0), conversation()},
+       {0, 0}, 0},
+      {"no mix held at 4 lanes: aggregate's choice", Policy::kMixed,
+       {asking(6, 0), conversation(), conversation(), conversation()}, {1, 1, 1, 1}, kFour},
+      {"no mix held at 5 lanes: aggregate's base round", Policy::kMixed, std::vector<GrantLane>(5, asking(8, 0)),
+       {0, 0, 0, 0, 0}, kFourAndOne},
   };
   for (const Row &row : rows) {
     std::array<std::uint8_t, kMaxLanes> extended{};
     const std::uint32_t granted =
-        ignis::round_shape::grant(policy_of(row.policy), row.lanes.data(), row.lanes.size(), extended.data());
+        ignis::round_shape::grant(policy_of(row.policy), row.lanes.data(), row.lanes.size(), extended.data(), row.held);
     bool same = granted == static_cast<std::uint32_t>(std::count(row.want.begin(), row.want.end(), 1));
     std::string got;
     for (std::size_t i = 0; i < row.lanes.size(); ++i) {

@@ -238,10 +238,12 @@ lanes they differ in who pays the wider round:
   (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a grammar is granted as any
   other: the grammar's check cuts its run at its first miss at the shape it
   was granted, in a mixed round too. Every profile gives `aggregate`;
-  `mixed` is opt-in until its served gate passes. A mix whose graphs the load
-  does not hold (a two-lane load without a retained device slot holds none,
+  `mixed` is opt-in until its served gate passes. The grant stops at the last
+  mix whose graphs the load holds, and a round at a lane count where it holds
+  none takes the uniform shape `aggregate` gives it; a load whose pool holds
+  no mix at all (two lanes without a retained device slot,
   [the configuration reference](../configuration/context-and-speculation.md))
-  runs at the uniform shape `aggregate` gives it.
+  runs `aggregate`, and its load log says so and why.
 
 The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
 the round's period with 1, 2, ... of them extended over the base round's) are

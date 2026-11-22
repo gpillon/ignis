@@ -98,15 +98,19 @@ inline constexpr std::uint32_t kMixes = 12;
 inline constexpr std::array<std::array<std::uint32_t, 2>, kMixes> kMixTable = {
     {{1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {2, 1}, {2, 2}, {2, 3}, {2, 4}, {3, 1}, {3, 2}}};
 
-// The index in kMixTable of `layout`'s mix, -1 for a uniform layout or a mix past the table.
-inline int mix_index(const Layout &layout) {
+// The index in kMixTable of `extended` extended lanes beside `base` base lanes, -1 for a uniform
+// round or a mix past the table.
+inline int mix_of(std::uint32_t extended, std::uint32_t base) {
   for (std::uint32_t i = 0; i < kMixes; ++i) {
-    if (kMixTable[i][0] == layout.groups[0].lanes && kMixTable[i][1] == layout.groups[1].lanes) {
+    if (kMixTable[i][0] == extended && kMixTable[i][1] == base) {
       return static_cast<int>(i);
     }
   }
   return -1;
 }
+
+// The index in kMixTable of `layout`'s mix, -1 for a uniform layout or a mix past the table.
+inline int mix_index(const Layout &layout) { return mix_of(layout.groups[0].lanes, layout.groups[1].lanes); }
 
 // GitHub #713: the record capacity of a mixed round's base layout, rows of `base_width` columns laid
 // at the stride of the extended records' `extended_capacity` rows of `extended_width` a layer, so

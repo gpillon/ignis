@@ -404,9 +404,24 @@ captures the graphs of every mix its lanes hold, inside its
 [VRAM plan](concepts/vram-plan.md#what-the-plan-counts). A round at a mix whose
 graphs could not be captured still serves: it runs every lane at the one shape
 the shape policy `aggregate` would give them, the same tokens a round of that
-shape commits without the mix's gain, never refused and never eager. The load
-goes on. As for the verify graphs, restart the server with the card quiet, or
-with more `--vram-headroom-bytes`.
+shape commits without the mix's gain, never refused and never eager; the
+shape policy `mixed` grants no round at such a mix, its grant stopping at the
+last mix the load holds. The load goes on. As for the verify graphs, restart
+the server with the card quiet, or with more `--vram-headroom-bytes`.
+
+### WARN `ignis.runtime.mixed_rounds_hold_no_mix`
+
+"the shape policy mixed: this load holds no mix (...), so it runs aggregate",
+with the load's `lanes` and `gdn_slots`. From 0.11.0 a mixed round of `w`
+extended lanes beside `n` base lanes takes `w + n` of the load's lanes and
+`2w + n` of its pool's GDN slots (the lanes and the device retained slots), so
+a load given `--spec-shape-policy mixed` at 15 draft tokens whose pool holds
+no mix, two lanes without a device retained slot (`rtx-16gb`'s) or one lane,
+runs `aggregate`, and its load log's `speculation` says
+`shape_policy=aggregate shape_policy_given=mixed`. The load serves as
+`aggregate` serves. One device retained slot (`--reuse-retained-device 1`)
+gives two lanes the 1+1 mix
+([Built-in profiles](concepts/profiles.md#rtx-16gb)).
 
 ### `--spec-backend mtp` refuses the start
 

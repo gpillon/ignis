@@ -1199,8 +1199,8 @@ graphs where a capture made them and eagerly where no capture asked for them.
 A load that asks (`mixed`, or `IGNIS_MIXED_ROUNDS=1`) captures every mix its lanes and its pool's GDN slots
 hold (a mix takes `2w + n` slots, the lanes' and the device retained slots':
 all twelve at 8 lanes), a line of the VRAM plan (`mixed_graphs`, #714); a mix
-whose capture failed runs its rounds at the uniform shape `aggregate` would
-choose, counted, never eagerly. Its rows, of either group, are held to its
+whose capture failed is never granted, and a round forced at it runs at the
+uniform shape `aggregate` would choose, counted, never eagerly. Its rows, of either group, are held to its
 base round's numerical class, as an extended round's are (#717, ADR 0106).
 
 **Shape rule**:
@@ -1248,8 +1248,10 @@ own (#720: the NVFP4 body's or the trellis body's, `PeriodTableSetting::of_body`
 runs at 15 drafts alone, on either body (#720; any other load runs
 `aggregate`) and asks for the mixed graphs
 there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
-other (#716), and a round whose mix the load holds no graph of runs the uniform
-shape `aggregate` gives it. Every profile defaults to `aggregate`.
+other (#716); the grant stops at the last mix the load holds a graph of, and a
+round at a lane count where it holds none takes the uniform shape `aggregate`
+gives it; a load that holds no mix runs `aggregate`, as its startup line says.
+Every profile defaults to `aggregate`.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify

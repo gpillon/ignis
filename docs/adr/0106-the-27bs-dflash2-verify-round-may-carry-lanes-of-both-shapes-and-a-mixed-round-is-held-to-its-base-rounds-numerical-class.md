@@ -33,25 +33,29 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   holds none. No vendored file changes.
 - **The grant** (`spec.shape_policy: mixed`, #715). The shape rule is unchanged: it says what each lane asks. At one
   lane the lane's ask decides, as under `aggregate`. At 2 to 7 lanes the round starts from the uniform base round and
-  the asking lanes are granted the extended shape one by one: the highest expected extra tokens first, at a tie the
-  lane refused longest, then the caller's order; a lane that asks with no extended round among its recent rounds after
-  those with an estimate, granted when the columns allow, so that its estimate has a round to read. A lane is granted
-  while the round with it extended too stays within 64 columns, and when its expected extra tokens exceed (that round's
-  period ratio over the current round's, less one) times the tokens every lane of the round is expected to take, each
-  lane's expectations read over its own last `spec.shape_estimate_rounds` verify rounds as under `aggregate`; a step to
-  a round the cost table says costs less is granted. A refused lane does not end the grant, only the columns do, so a
-  round of 8 lanes is at the base shape. A lane under a grammar is granted like any other (#716). The grant is a pure
-  function in the core, held to tables, and the leaf runs its twin each round, held to the same rows. `all` and
-  `aggregate` are unchanged and never run a mixed round. Granting every ask in the caller's order, as the prototype
-  did, bought nothing on a moderately predictable answer beside a conversation (+0.6%, inside the spread, the
-  conversation 5.0% slower): the grant has to refuse such a lane.
-- **Its default.** `aggregate` on every profile. The `rtx5090` profile's becomes `mixed` only in the commit that
-  records the served gate's pass (#722: a JSON answer beside three conversations at four lanes at least 10% faster
-  together than the build of #684, no conversation lane more than 15% below it). The trellis bodies keep `aggregate`
-  until a run on a 16 GB or 24 GB card; given `mixed`, a trellis body at 15 drafts runs it (#720). A load given `mixed`
-  that holds no mix, of DFlash2 at 8 to 14 drafts, runs `aggregate`, and its startup line names both; at 7 drafts or fewer `mixed` is taken and changes
-  nothing, the load holding one shape; the 27B's MTP head refuses it by name, as it refuses every shape policy (#690).
-  A load whose latest capture ran under `IGNIS_MIXED_ROUNDS=0` takes `aggregate`'s uniform choice too.
+  the asking lanes are granted the extended shape one by one: the highest expected extra tokens first, at a tie the lane
+  refused longest, then the caller's order; a lane that asks with no extended round among its recent rounds after those
+  with an estimate, granted when the columns allow, so that its estimate has a round to read. A lane is granted while
+  the round with it extended too stays within 64 columns, and when its expected extra tokens exceed (that round's period
+  ratio over the current round's, less one) times the tokens every lane of the round is expected to take, each lane's
+  expectations read over its own last `spec.shape_estimate_rounds` verify rounds as under `aggregate`; a step to a round
+  the cost table says costs less is granted. A refused lane does not end the grant, only the columns do, so a round of 8
+  lanes is at the base shape, and a step to a mix the load holds no graph of: the grant stops at the last mix the load
+  holds, so a pool that holds some of them keeps their gain, and a round at a lane count where the load holds no mix
+  takes `aggregate`'s choice. A lane under a grammar is granted like any other (#716). The grant is a pure function in
+  the core, held to tables, and the leaf runs its twin each round, held to the same rows. `all` and `aggregate` are
+  unchanged and never run a mixed round. Granting every ask in the caller's order, as the prototype did, bought nothing
+  on a moderately predictable answer beside a conversation (+0.6%, inside the spread, the conversation 5.0% slower): the
+  grant has to refuse such a lane.
+- **Its default.** `aggregate` on every profile. The `rtx5090` profile's becomes `mixed` only once the served gate
+  passes: a JSON answer beside three conversations at four lanes at least 10% faster together than the build of #684, no
+  conversation lane more than 15% below it. The trellis bodies keep `aggregate` until a run on a 16 GB or 24 GB card;
+  given `mixed`, a trellis body at 15 drafts runs it. A load given `mixed` that holds no mix runs `aggregate`, and its
+  startup line names both: a load of DFlash2 at 8 to 14 drafts, one whose pool's lanes and GDN slots hold no mix (which
+  a WARN at load names, with the lanes and the slots), and one whose plan asked for none under `IGNIS_MIXED_ROUNDS=0`; a
+  load whose latest capture ran under that switch takes `aggregate`'s choice too. At 7 drafts or fewer `mixed` is taken
+  and changes nothing, the load holding one shape; the 27B's MTP head refuses it by name, as it refuses every shape
+  policy (#690).
 - **The cost table.** `spec.shape_period_ratios` becomes a table by lane count (1 to 7) and extended lanes, each entry
   the period of the round with that many lanes extended over the base round at the same lane count; `aggregate` reads
   its uniform entries at 1 to 4 lanes and `mixed` reads every entry. Its default, `auto`, is the loaded body's own
@@ -72,13 +76,13 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   counts said 23.9 and 27.7 ms). The four-value form stays accepted as the uniform entries.
 - **The mixed graphs, a sixteenth line of the VRAM plan** (#714). A mixed round replays a verify graph and a drafter
   append graph of its mix, both or neither, captured at load for every mix the load holds where mixed rounds are asked;
-  a mix with no graph runs its rounds at the uniform shape `aggregate` would choose, counted and logged, never eagerly
-  and never refused. The graphs are the plan's line `mixed_graphs`, in the leaf's reservations and their mirror in the
-  core, a measured size of each body: the twelve at 8 lanes at what the RTX 5090 measured their captures to take with
-  the mixed graph build, as the device's free memory before them less after them, 69,206,016 B (66 MiB, two runs) on the
-  NVFP4 body and at most 73,400,320 B (70 MiB) on the trellis body, and 5 MiB less a mix fewer (one mix's capture took 4
-  to 10 MiB), in whole 2 MiB pages; 0 on a load that captures none. The driver keeps the graphs' pages after a teardown,
-  so a reload adds the line back. This amends
+  the grant never takes a mix with no graph, and a round forced at one (the test seam) runs at the uniform shape
+  `aggregate` would choose, counted, never eagerly and never refused. The graphs are the plan's line `mixed_graphs`, in
+  the leaf's reservations and their mirror in the core, a measured size of each body: the twelve at 8 lanes at what the
+  RTX 5090 measured their captures to take with the mixed graph build, as the device's free memory before them less
+  after them, 69,206,016 B (66 MiB, two runs) on the NVFP4 body and at most 73,400,320 B (70 MiB) on the trellis body,
+  and 5 MiB less a mix fewer (one mix's capture took 4 to 10 MiB), in whole 2 MiB pages; 0 on a load that captures none.
+  The driver keeps the graphs' pages after a teardown, so a reload adds the line back. This amends
   [ADR 0030](0030-device-memory-reserved-at-load.md) as
   [ADR 0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)
   did for the fifteenth line, by a new ADR rather than an edit in place, which only the owner decides.

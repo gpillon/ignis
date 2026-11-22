@@ -32,7 +32,10 @@
 //!
 //!   or, for a lane with no estimate, whenever the columns allow, so that its
 //!   estimate has an extended round to read. A refused lane does not end the
-//!   grant; only the columns do. Eight lanes are always at the base shape.
+//!   grant; only the columns do, and a step to a mix the load holds no graph
+//!   of, so that the grant stops at the last mix it holds. A round at a lane
+//!   count where the load holds no mix takes `aggregate`'s choice. Eight
+//!   lanes are always at the base shape.
 //!
 //! Each mean is in thousandths of a token and each ratio a thousandth, and
 //! the comparison is cross-multiplied in integers, so the leaf's twin decides
@@ -349,8 +352,9 @@ pub struct GrantLane {
 /// Each lane's shape in a round of `lanes` under `policy` and the cost table
 /// `table`, `true` where it is extended (the module's header). Every lane at
 /// one shape is a uniform round; both shapes, a mixed round, which only
-/// `mixed` grants.
-pub fn lane_shapes(policy: ShapePolicy, table: &PeriodTable, lanes: &[GrantLane]) -> Vec<bool> {
+/// `mixed` grants, and only at a mix in `held`, the mixes the load holds a
+/// graph of.
+pub fn lane_shapes(policy: ShapePolicy, table: &PeriodTable, lanes: &[GrantLane], held: &[(u32, u32)]) -> Vec<bool> {
     let count = lanes.len() as u32;
     let uniform = |extended: bool| vec![extended; lanes.len()];
     if count <= 1 {
@@ -359,7 +363,12 @@ pub fn lane_shapes(policy: ShapePolicy, table: &PeriodTable, lanes: &[GrantLane]
     match policy {
         ShapePolicy::All => uniform(count <= EXTENDED_SHAPE_MAX_LANES && lanes.iter().all(|lane| lane.asks)),
         ShapePolicy::Aggregate => uniform(count <= EXTENDED_SHAPE_MAX_LANES && aggregate_extends(table, lanes)),
-        ShapePolicy::Mixed => granted(table, lanes),
+        // A round at a lane count where the load holds no mix, the first step's 1+n among them,
+        // takes `aggregate`'s choice, as a round of a load that holds none.
+        ShapePolicy::Mixed if !held.contains(&(1, count - 1)) => {
+            uniform(count <= EXTENDED_SHAPE_MAX_LANES && aggregate_extends(table, lanes))
+        }
+        ShapePolicy::Mixed => granted(table, lanes, held),
     }
 }
 
@@ -377,8 +386,8 @@ fn aggregate_extends(table: &PeriodTable, lanes: &[GrantLane]) -> bool {
     gain * 1000 > u64::from(table.ratio(count, count) - 1000) * tokens
 }
 
-/// `mixed` at 2 or more lanes.
-fn granted(table: &PeriodTable, lanes: &[GrantLane]) -> Vec<bool> {
+/// `mixed` at 2 or more lanes, the grant stopping at the last mix in `held`.
+fn granted(table: &PeriodTable, lanes: &[GrantLane], held: &[(u32, u32)]) -> Vec<bool> {
     let count = lanes.len() as u32;
     let tokens: i128 = lanes.iter().map(|lane| i128::from(lane.estimate.expected_tokens())).sum();
     // The asking lanes in the grant's order: those with an estimate first, the
@@ -393,6 +402,9 @@ fn granted(table: &PeriodTable, lanes: &[GrantLane]) -> Vec<bool> {
     let mut extended = 0u32;
     for i in order {
         if EXTENDED_COLUMNS * (extended + 1) + BASE_COLUMNS * (count - extended - 1) > ROUND_COLUMNS {
+            break;
+        }
+        if extended + 1 < count && !held.contains(&(extended + 1, count - extended - 1)) {
             break;
         }
         let (current, next) = (i128::from(table.ratio(count, extended)), i128::from(table.ratio(count, extended + 1)));
@@ -431,7 +443,14 @@ mod tests {
     }
 
     fn shapes(policy: ShapePolicy, lanes: &[GrantLane]) -> Vec<bool> {
-        lane_shapes(policy, &PeriodTable::NVFP4, lanes)
+        lane_shapes(policy, &PeriodTable::NVFP4, lanes, &MIXES)
+    }
+
+    /// The mixes a pool of `lanes` lanes and `retained` device retained slots
+    /// holds (`crate::lane_lines::mixed_graphs`).
+    fn held(lanes: u32, retained: u32) -> Vec<(u32, u32)> {
+        let fifteen = crate::Speculation::new(crate::SpeculativeBackend::Dflash2, 15).unwrap();
+        crate::lane_lines::mixed_graphs(Some(fifteen), true, lanes, retained, ignis_artifact::Body27b::Nvfp4).mixes
     }
 
     /// The default table's rows: at 1 to 7 lanes, an entry for each count of
@@ -579,6 +598,46 @@ mod tests {
     fn a_step_to_a_cheaper_round_is_granted() {
         let lanes = [asking(8, 0), asking(8, 0), asking(8, 0), asking(0, 0)];
         assert_eq!(shapes(ShapePolicy::Mixed, &lanes), [true; 4]);
+    }
+
+    /// The grant knows the mixes the load holds: a step to a mix it holds no
+    /// graph of is not taken, so the grant stops at the last held mix and a
+    /// pool that holds some keeps their gain.
+    #[test]
+    fn the_grant_stops_at_the_last_mix_the_load_holds() {
+        // 4 lanes beside one device retained slot hold 1+1, 1+2, 1+3 and 2+1, not 2+2.
+        let partial = held(4, 1);
+        assert_eq!(partial, [(1, 1), (1, 2), (1, 3), (2, 1)]);
+        let four = [asking(5, 0), conversation(), asking(6, 0), conversation()];
+        assert_eq!(shapes(ShapePolicy::Mixed, &four), [true, false, true, false], "every mix held: 2+2");
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &four, &partial), [false, false, true, false], "1+3");
+        let gains = vec![asking(8, 0); 4];
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &gains, &partial), [true, false, false, false]);
+        // A capture that failed 1+2 leaves 1+1 at 2 lanes and no mix at 3.
+        let failed: Vec<(u32, u32)> = MIXES.into_iter().filter(|&mix| mix != (1, 2)).collect();
+        let three = [asking(8, 0), asking(8, 0), conversation()];
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &three[..2], &failed), [true, true]);
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &three, &failed), [true; 3], "aggregate's");
+    }
+
+    /// A round at a lane count where the load holds no mix (its first step's
+    /// 1+n has no graph) takes the uniform shape `aggregate` gives it, as a
+    /// round of a load that holds none: two lanes beside no device retained
+    /// slot, the `rtx-16gb` profile's, or the last lane of a pool without one.
+    #[test]
+    fn a_round_where_the_load_holds_no_mix_takes_aggregates_choice() {
+        assert_eq!(held(2, 0), []);
+        let pair = [asking(6, 0), conversation()];
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &pair, &[]), [true, true], "6 > 0.29 * 10");
+        let pair = [asking(2, 0), conversation()];
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &pair, &[]), [false, false], "2 does not");
+        // 4 lanes and no retained slot hold 1+1 and 1+2: a round of 4 holds none.
+        assert_eq!(held(4, 0), [(1, 1), (1, 2)]);
+        let four = [asking(6, 0), conversation(), conversation(), conversation()];
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &four, &held(4, 0)), [true; 4], "6 > 0.344 * 14");
+        // 5 lanes and more: past the extended shape's lanes, `aggregate`'s base round.
+        let five = vec![asking(8, 0); 5];
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &five, &held(5, 0)), [false; 5]);
     }
 
     /// One lane runs at the shape it asks under `mixed` and `aggregate`, and
