@@ -66,9 +66,12 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream);
 // `*out_nodes` the graph's node count (`ignis_program_stats`), 0 where the
 // capture failed or the runtime cannot say. GitHub #713: after a round laid
 // out as `layout`, a uniform round of its width or a mixed round's mix.
+// GitHub #718: and, where asked, its root nodes and memset nodes; a mixed
+// round's under the mixed graph's build instantiated with its nodes'
+// priorities (kernel/src/model_internal.h `ignis_mixed_priorities`).
 int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
                        const ignis::round_layout::Layout &layout, cudaGraphExec_t *out_exec, std::uint32_t *out_nodes,
-                       std::string *error);
+                       std::string *error, std::uint32_t *out_roots = nullptr, std::uint32_t *out_memsets = nullptr);
 
 // The append after a round at shape `verify` laid out as `layout`
 // (GitHub #712): that shape's graph at the round's width where the latest

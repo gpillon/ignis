@@ -803,6 +803,15 @@ target_include_directories(ignis_kernel_dflash2_small_t_test PRIVATE ${IGNIS_VEN
 target_link_libraries(ignis_kernel_dflash2_small_t_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_dflash2_small_t_test COMMAND ignis_kernel_dflash2_small_t_test)
 
+# GitHub #718 (spec #711): OURS, an adapted op -- the target argmax of a mixed round with its
+# zeroing by a kernel (kernel/src/tiled_argmax.h) against the vendored argmax bit for bit, at the
+# 27B's verify logits and each mix's columns, eagerly and from a graph of two kernel nodes and no
+# memset node, and at each block the restated launcher picks. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_tiled_argmax_test test_tiled_argmax.cu)
+target_include_directories(ignis_kernel_tiled_argmax_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_tiled_argmax_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_tiled_argmax_test COMMAND ignis_kernel_tiled_argmax_test)
+
 # OURS: the same route timed against the vendored small-T GEMVs on one weight.
 # A timing is a finding, not a pass/fail, so a tool and NOT registered with
 # CTest.

@@ -290,6 +290,24 @@ leaf-internal.
   `IGNIS_PREFILL_SWIGLU=split` at exactly 1,024 tokens (`kernel/vendor/VENDOR.md`); the op is
   held to the split route byte for byte (`kernel/tests/test_prefill_swiglu.cu`).
 
+### The mixed round's target argmax, `kernel/src/tiled_argmax.cu` (spec #711, GitHub #718)
+`ignis::tiled_argmax::argmax`: the target argmax of a mixed verify round under the mixed graph's
+build, its output zeroed by a kernel so that the round's graph holds no memset node,
+leaf-internal.
+- Upstream: the reference, `gpillon/ninfer`, commit `a00648cb828457986cf5b4b4f712b4cbcd7af0d1`
+  (the commit `kernel/vendor/manifest.json` pins), Apache-2.0 (`kernel/vendor/LICENSE`):
+  - `src/ops/kernel/argmax.cuh`: `argmax_better`, `argmax_warp_reduce`, `argmax_block_reduce`
+    and `argmax_tiled_atomic_kernel` (a CTA a tile of rows and a column, its winner by value then
+    lowest row kept by an atomic compare-and-swap), restated at one row a thread;
+  - `src/ops/launcher/argmax.cu`: `argmax_launch`'s one-tile test, `tiled_block_for` and
+    `argmax_tiled_atomic_launch` (the grid of tiles by columns, a launch every 65,535 columns as
+    `src/ops/common/token_slices.h` slices them), restated.
+- Changed here: each slice's output is zeroed by a kernel of ours, where the vendored launcher
+  zeroes it by `cudaMemsetAsync`; the one-tile route is the vendored op, called and not copied; a
+  failed launch throws naming the op. The vendored op stays in the subtree as it is, as every
+  other argmax and the mixed round's under `IGNIS_MIXED_GRAPH_BUILD=0`; the op is held to it bit
+  for bit (`kernel/tests/test_tiled_argmax.cu`).
+
 ## Per-file provenance (pre-#42 adaptations, superseded by ADR 0010)
 
 ### `kernel/src/nvfp4_gemm_decode.cuh` (ticket 03)

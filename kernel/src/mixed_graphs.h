@@ -40,6 +40,13 @@ inline constexpr std::uint64_t kPageBytes = std::uint64_t{2} << 20;
 // the variable, on any other value.
 inline bool asked() { return named_switch("IGNIS_MIXED_ROUNDS", false, {{"0", false}, {"1", true}}); }
 
+// GitHub #718: the measurement switch IGNIS_MIXED_GRAPH_BUILD (ADR 0093's kind), read at each capture
+// of a load with an extended shape: unset or `1`, the mixed rounds take the mixed graph's build (one
+// root, the target argmax zeroed by a kernel, the extended group at the greatest stream priority,
+// `ignis_model::mixed_graph_build`); `0`, the mixed rounds without it, the comparison a measurement
+// of it needs. Throws std::invalid_argument, naming the variable, on any other value.
+inline bool built() { return named_switch("IGNIS_MIXED_GRAPH_BUILD", true, {{"0", false}, {"1", true}}); }
+
 // The mixes a load captures and plans (bit m for kMixTable[m]): where mixed rounds are `asked`, on a
 // DFlash2 load (`dflash2`) of the NVFP4 body (not `trellis`, which runs no mixed round yet) at
 // kWindow drafts, each mix whose lanes fit the load's `lanes` and whose base group's fold fits the

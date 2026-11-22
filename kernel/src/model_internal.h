@@ -1031,6 +1031,21 @@ struct ignis_model {
   // The kept-scores stamp (`IgnisVerifyRound::kept_epoch`) of the latest mixed round, which ran on
   // the base shape's buffers at each group's stride, so that a read of them at one stride refuses.
   std::uint64_t mixed_kept_epoch = 0;
+  // GitHub #718 (spec #711): the mixed graph's build, as the latest capture read it from
+  // IGNIS_MIXED_GRAPH_BUILD (kernel/src/mixed_graphs.h `built`; on before a load's first capture):
+  // a mixed round's first op runs one group after the other on the round's stream, so that its
+  // graph has one root; its target argmax zeroes its output by a kernel (kernel/src/tiled_argmax.h),
+  // so that its graph has no memset node; and its extended group runs on `mixed_priority_branch`,
+  // which a capture that reads the build makes at the device's greatest stream priority, its graphs
+  // instantiated with their nodes' priorities (`ignis_mixed_priorities`). Off: each as it was. And
+  // each captured mix's verify and append graph's root nodes and memset nodes
+  // (`ignis_program_stats`), 0 for a mix with no graph.
+  bool mixed_graph_build = true;
+  ignis::flash_next::SideBranch mixed_priority_branch;
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_verify_roots{};
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_verify_memsets{};
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_append_roots{};
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_append_memsets{};
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;
@@ -1038,11 +1053,22 @@ struct ignis_model {
   std::unique_ptr<ignis::flash_next::FlashNextModel, ignis::flash_next::FlashNextModelDeleter> flash_next;
 };
 
+// GitHub #718 (spec #711): whether a round of `layout` runs its extended group at the device's
+// greatest stream priority, and a graph of it is instantiated with its nodes' priorities
+// (cudaGraphInstantiateFlagUseNodePriority): a mixed round under the mixed graph's build, on a load
+// whose capture made the branch for it.
+inline bool ignis_mixed_priorities(const ignis_model &model, const ignis::round_layout::Layout &layout) {
+  return !layout.uniform() && model.mixed_graph_build && model.mixed_priority_branch.stream != nullptr;
+}
+
 // GitHub #713 (spec #711): `call(group, stream)` for each group of `layout` that holds lanes: a uniform
 // round's one group on the model's stream, as every round of one shape runs; a mixed round's two
 // side by side, the extended group on the model's stream and the base group on `mixed_branch`,
 // forked from it and joined back (in a capture, edges of the graph and no nodes). The branch is
-// joined whatever `call` throws; a mixed round with no branch made throws.
+// joined whatever `call` throws; a mixed round with no branch made throws. GitHub #718: where the
+// round takes the mixed graph's priorities (`ignis_mixed_priorities`), the extended group on
+// `mixed_priority_branch` instead, at the device's greatest stream priority, and the base group on
+// `mixed_branch`, both forked from the model's stream and joined back.
 template <class Call>
 void ignis_each_group(ignis_model &model, const ignis::round_layout::Layout &layout, Call &&call) {
   if (layout.uniform()) {
@@ -1060,6 +1086,23 @@ void ignis_each_group(ignis_model &model, const ignis::round_layout::Layout &lay
   };
   if (model.mixed_branch.stream == nullptr) {
     throw std::runtime_error("a mixed round on a load whose mixed branch was not made");
+  }
+  if (ignis_mixed_priorities(model, layout)) {
+    check(cudaEventRecord(model.mixed_branch.fork, model.stream), "fork");
+    check(cudaStreamWaitEvent(model.mixed_priority_branch.stream, model.mixed_branch.fork, 0), "fork");
+    check(cudaStreamWaitEvent(model.mixed_branch.stream, model.mixed_branch.fork, 0), "fork");
+    struct JoinBoth {
+      ignis_model &model;
+      ~JoinBoth() {
+        (void)cudaEventRecord(model.mixed_priority_branch.join, model.mixed_priority_branch.stream);
+        (void)cudaEventRecord(model.mixed_branch.join, model.mixed_branch.stream);
+        (void)cudaStreamWaitEvent(model.stream, model.mixed_priority_branch.join, 0);
+        (void)cudaStreamWaitEvent(model.stream, model.mixed_branch.join, 0);
+      }
+    } join{model};
+    call(layout.groups[0], model.mixed_priority_branch.stream);
+    call(layout.groups[1], model.mixed_branch.stream);
+    return;
   }
   check(cudaEventRecord(model.mixed_branch.fork, model.stream), "fork");
   check(cudaStreamWaitEvent(model.mixed_branch.stream, model.mixed_branch.fork, 0), "fork");
