@@ -91,29 +91,33 @@
 //! A **mixed round** carries lanes of both shapes, `w` at the extended shape
 //! beside `n` at the base shape, one of the twelve mixes
 //! ([`ignis_core::lane_lines::MIXES`]), and is held to the base round's
-//! class with the same method and margins. On the same load (no new load:
-//! the NVFP4 cell's, [`Cell::mixed`]; a trellis body runs none), its decode
-//! graphs are captured again under `IGNIS_MIXED_ROUNDS=1` ([`MIXED_ROUNDS`]),
-//! a verify graph for every mix, and speculation off writes the text of three
-//! more prompts ([`MIXED_PROMPTS`]), so that 2 to 7 lanes each hold a text of
-//! their own. Then, in each kind, at each lane count of 2 to 7, a leg of base
-//! rounds at that lane count, the lanes on the prompts in order, is the
-//! reference of every mix of that lane count, each a leg of rounds at that mix
-//! (`TeacherForcing::lane_shapes`), its last `w` lanes extended so that the
-//! round's rows, extended lanes first, are not the caller's order: forced
-//! rounds offered the text as their drafts, placed by group (eager), and
-//! graph rounds replaying the mix's graph on the drafter's own drafts. A mixed
-//! leg rides its mix while every lane's text holds a whole round of its
-//! shape, so every one of its rounds is at the mix and at the cell's lane
-//! count, and its lanes end on fewer rows than a uniform cell's
-//! ([`MIXED_MIN_ROWS`]); each round asserts every lane's shape and extent,
-//! that it ran eagerly or from its graph, at neither uniform shape and with no
-//! fallback. Its rows are read by group
+//! class as the extended round is, with the same method, margins and
+//! windows. On the same load (no new load: the NVFP4 cell's, [`Cell::mixed`];
+//! a trellis body runs none), speculation off writes the text of seven
+//! prompts of its own ([`MIXED_PROMPTS`]), one a lane, its rows over a uniform
+//! cell's window ([`MAX_TOKENS`]) and its text on past it
+//! ([`MIXED_TEXT_TOKENS`]), and the decode graphs are captured again under
+//! `IGNIS_MIXED_ROUNDS=1` ([`MIXED_ROUNDS`]), a verify graph for every mix.
+//! Then, in each kind, at each lane count of 2 to 7, a leg of base rounds at
+//! that lane count over the window, the lanes on the prompts in order, as a
+//! uniform cell's, is the reference of every mix of that lane count, each a
+//! leg of rounds at that mix (`TeacherForcing::lane_shapes`), its last `w`
+//! lanes extended so that the round's rows, extended lanes first, are not the
+//! caller's order: forced rounds offered the text as their drafts, placed by
+//! group (eager), and graph rounds replaying the mix's graph on the drafter's
+//! own drafts. A mixed leg rides its mix until every lane holds the rows its
+//! base leg gave it, a lane that commits more a round riding on past them on
+//! its text, so every one of its rounds is at the mix and at the cell's lane
+//! count and each lane holds as many rows as a uniform cell's (a lane short of
+//! them, its text run out first, is an excess); each round asserts every
+//! lane's shape and extent, that it ran eagerly or from its graph, at neither
+//! uniform shape and with no fallback. Its rows are read by group
 //! ([`dflash2_readout::mixed_verify_logits`]), and every mixed row is held
 //! to the base row at the same text index and lane count by the bounds above:
 //! the row, a lane's median row and the text's likelihood per lane; the
-//! class at each lane count (over its mixes) and over the kind's; the near
-//! tie and the control, one index off, over the kind's.
+//! class at each lane count (over its mixes) and over the kind's; the control,
+//! one index off, over the kind's; and the near tie over the kind's, read, as
+//! the extended rows' is, over the uniform cells' base rows of the kind.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a **skip**; under the profile the same
@@ -282,15 +286,6 @@ const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;
 /// outside a right pair's margins above.
 const CONTROL_MARGIN: f32 = 2.0;
 
-/// #717: the fewest rows a lane of a mixed cell must compare. A mixed leg
-/// rides its mix only while every lane's text holds a whole round of its
-/// shape, so it ends with its fastest lane's text: an extended lane commits
-/// up to 16 columns a round where a base lane beside it commits 8 at most,
-/// and on graph rounds a lane on prose commits a few. Measured, the fewest: 104
-/// on forced rounds, 51 on graph rounds (the prose prompt's lane beside the
-/// structured one, extended both).
-const MIXED_MIN_ROWS: usize = MIN_ROWS / 2;
-
 /// One body the class is held on: its artifact and the exception weights it
 /// loads under.
 struct Cell {
@@ -317,10 +312,22 @@ const CHUNK: u32 = 1024;
 const MAX_CONTEXT: u32 = 262_144;
 /// Each sequence's context: its prompt, its text and a round past it.
 const SEQ_CONTEXT: u32 = 512;
-/// The text speculation off writes per prompt, at most; and the fewest rows a
-/// lane must compare for its figures to mean anything.
+/// The text speculation off writes per prompt, at most, and so the rows a lane
+/// holds; and the fewest rows a lane must compare for its figures to mean
+/// anything.
 const MAX_TOKENS: usize = 224;
 const MIN_ROWS: usize = 64;
+/// #717: the text speculation off writes for each of [`MIXED_PROMPTS`], at
+/// most: a mixed leg rides every lane at its mix until each holds the rows of
+/// a uniform cell's lane ([`MAX_TOKENS`]), so a lane that commits more a round
+/// rides past them on its text. Sized on the 2026-11-22 run: a prose lane
+/// commits about 3 tokens a graph round, so a leg beside one rides about 78
+/// rounds, and an extended lane on structured text about 13.5 a round, 1,050
+/// tokens; this holds a third more.
+const MIXED_TEXT_TOKENS: usize = 1408;
+/// #717: a mixed leg's sequence's context: its prompt, its text and a round
+/// past it.
+const MIXED_SEQ_CONTEXT: u32 = 1536;
 /// `<|im_end|>`, where the server stops a turn.
 const IM_END: i32 = 248_046;
 
@@ -334,12 +341,19 @@ const PROMPTS: [&str; 4] = [
     "Write a Rust function that splits a CSV line into its fields, honouring double-quoted fields, with three unit tests.",
 ];
 
-/// #717: the prompts of the mixed cells' fifth to seventh lanes, after
-/// [`PROMPTS`]: a table, prose and code.
-const MIXED_PROMPTS: [&str; 3] = [
-    "Write a Markdown table of the twelve months of the year, with columns for the month's number, its name, its number of days and one holiday in it.",
-    "Write a short story in four paragraphs about a lighthouse keeper who finds a message in a bottle.",
-    "Write a SQL schema for a library, with tables for books, authors, members and loans, their foreign keys and an index on each foreign key.",
+/// #717: the prompts of the mixed cells' lanes, one a lane, as [`PROMPTS`]'s
+/// kinds of text in their order and then a table, prose and code, each asking
+/// for more text than [`MIXED_TEXT_TOKENS`], which every one of them must reach
+/// ([`PROMPTS`]' prose prompt ends at 337 tokens, and the shorter table prompt
+/// this held before at 223, on 2026-11-22).
+const MIXED_PROMPTS: [&str; 7] = [
+    "Write a complete Python module for a library management system, with classes for books, authors, members, loans and reservations, a docstring on every method, and then a unittest test suite of at least forty test cases.",
+    "Write a JSON array of 60 objects describing fictional employees, each with the fields id, name, email, department, city, start_date and salary. Output only the JSON.",
+    "Write a long essay of thirty paragraphs on the history of the printing press, from its invention to the present day.",
+    "Write a Rust module implementing a CSV parser that honours double-quoted fields and escaped quotes, with an error type, an iterator over records, a documentation comment on every item and thirty unit tests.",
+    "Write a Markdown table of all 118 chemical elements, with columns for the atomic number, the symbol, the name, the atomic mass, the group and the period.",
+    "Write a long story of thirty paragraphs about a lighthouse keeper who finds a message in a bottle.",
+    "Write a SQL script for a library database: CREATE TABLE statements for books, authors, members, loans and reservations with their foreign keys and an index on each foreign key, then INSERT statements for thirty rows of sample data in each table.",
 ];
 
 /// #717: the measurement switch that captures the mixed rounds' graphs, read
@@ -600,10 +614,12 @@ fn mixed_round(
         .collect()
 }
 
-/// #717: the rows a mixed leg gives each lane of `group`, by text index: every
-/// round of `kind` at the mix `extended` names, from the prompt on, while
-/// every lane's text holds a whole round of its shape, so that every round is
-/// at the mix and at the cell's lane count; at least one.
+/// #717: the rows a mixed leg gives each lane of `group`, by text index, at
+/// most `held[l]` to lane `l`: every round of `kind` at the mix `extended`
+/// names, from the prompt on, until every lane holds its `held` rows or a
+/// lane's text holds no whole round of its shape, so that every round is at
+/// the mix and at the cell's lane count. A lane that holds its rows rides on,
+/// its rows past them dropped; with the leg's rounds.
 #[allow(clippy::too_many_arguments)]
 fn mixed_leg(
     model: &Model,
@@ -612,30 +628,36 @@ fn mixed_leg(
     texts: &[Vec<i32>],
     group: &[usize],
     extended: &[bool],
+    held: &[usize],
     kind: Kind,
     what: &str,
-) -> Vec<Vec<Vec<u16>>> {
+) -> (Vec<Vec<Vec<u16>>>, usize) {
     let greedy = SamplingParams::greedy();
     let mut seqs: Vec<Seq<'_>> = Vec::new();
     for &p in group {
-        let mut seq = pool.alloc(SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
+        let mut seq = pool.alloc(MIXED_SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
         prefill_program_permitted(model, pool, &mut seq, &prompts[p], 0, greedy, &[texts[p][0]], None)
             .unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
         seqs.push(seq);
     }
     let mut rows: Vec<Vec<Vec<u16>>> = vec![Vec::new(); group.len()];
+    // Each lane's text index, which runs past the rows it holds.
+    let mut at: Vec<usize> = vec![0; group.len()];
     let lane_texts: Vec<&[i32]> = group.iter().map(|&p| texts[p].as_slice()).collect();
     let mut rounds = 0;
-    while (0..group.len()).all(|l| rows[l].len() + shape_of(extended[l]).columns() < lane_texts[l].len()) {
-        let at: Vec<usize> = rows.iter().map(Vec::len).collect();
+    while (0..group.len()).any(|l| rows[l].len() < held[l])
+        && (0..group.len()).all(|l| at[l] + shape_of(extended[l]).columns() < lane_texts[l].len())
+    {
         let round_rows = mixed_round(model, pool, &mut seqs, &lane_texts, &at, extended, kind, what);
-        for (lane, lane_rows) in rows.iter_mut().zip(round_rows) {
-            lane.extend(lane_rows);
+        for (l, lane_rows) in round_rows.into_iter().enumerate() {
+            at[l] += lane_rows.len();
+            let room = held[l].saturating_sub(rows[l].len());
+            rows[l].extend(lane_rows.into_iter().take(room));
         }
         rounds += 1;
     }
     assert!(rounds > 0, "{what}: no round at the mix");
-    rows
+    (rows, rounds)
 }
 
 /// The `p`-th quantile of `values` (nearest rank), 0 where there is none.
@@ -752,21 +774,22 @@ impl Class {
     /// The class's near tie and the control, over a kind's rows together. The
     /// near tie rests on the widest gap at which the base rows move a pick, one
     /// pick's of 11 to 25 a lane count moves, so it is read over every lane
-    /// count of the kind, as the control's median is; each excess a line in
+    /// count of the kind, as the control's median is: `base_widest`, these
+    /// rows' own base rows' for the extended rows, and #717 for the mixed rows
+    /// the uniform cells' of the same kind (ADR 0106). Each excess a line in
     /// `failures`.
-    fn hold_near_tie(&self, label: &str, tested: &str, failures: &mut Vec<String>) {
-        let gap_bound = PICK_GAP_ULPS.max(CLASS_PICK_GAP_MARGIN * self.base_off.widest_gap());
+    fn hold_near_tie(&self, label: &str, tested: &str, base_widest: f32, failures: &mut Vec<String>) {
+        let gap_bound = PICK_GAP_ULPS.max(CLASS_PICK_GAP_MARGIN * base_widest);
         println!(
-            "  class, the near tie {gap_bound:.1} ulps: the widest moved gap from spec-off's, {tested} {:.1}, base {:.1}; between the shapes {:.1}",
+            "  class, the near tie {gap_bound:.1} ulps, over base rows whose widest moved gap is {base_widest:.1}: the widest moved gap from spec-off's, {tested} {:.1}, base {:.1}; between the shapes {:.1}",
             self.extended_off.widest_gap(),
             self.base_off.widest_gap(),
             self.extended_base.widest_gap()
         );
         if self.extended_off.widest_gap() > gap_bound {
             failures.push(format!(
-                "{label}, the class: one {tested} row moved a pick spec-off's row rates {:.1} ulps apart, past {gap_bound:.1} (the near tie, or {CLASS_PICK_GAP_MARGIN} times the base rows' widest, {:.1})",
-                self.extended_off.widest_gap(),
-                self.base_off.widest_gap()
+                "{label}, the class: one {tested} row moved a pick spec-off's row rates {:.1} ulps apart, past {gap_bound:.1} (the near tie, or {CLASS_PICK_GAP_MARGIN} times the widest gap its base rows move a pick at, {base_widest:.1})",
+                self.extended_off.widest_gap()
             ));
         }
         for (place, gap) in &self.moved_between {
@@ -860,11 +883,13 @@ fn hold_the_class(cell: &Cell) {
             LANES,
         )
         .unwrap_or_else(|e| panic!("model load: {e}"));
+        // #717: a mixed leg's sequences hold its longer texts.
+        let context = if cell.mixed { MIXED_SEQ_CONTEXT } else { SEQ_CONTEXT };
         let pool = SeqPool::create_with_speculation(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
                 kv_format: KvFormat::HqE8_2b,
-                kv_page_group_count: SEQ_CONTEXT.div_ceil(64) * LANES,
+                kv_page_group_count: context.div_ceil(64) * LANES,
                 max_context_tokens: MAX_CONTEXT,
                 slot_count: LANES,
                 retained_slot_count: 0,
@@ -890,13 +915,16 @@ fn hold_the_class(cell: &Cell) {
         let mut texts: Vec<Vec<i32>> = Vec::new();
         let mut rows_off: Vec<Vec<Vec<u16>>> = Vec::new();
         for (number, prompt) in PROMPTS.iter().enumerate() {
-            let (ids, text, rows) = spec_off(&model, &pool, &frontend, number, prompt);
+            let (ids, text, rows, _) = spec_off(&model, &pool, &frontend, &format!("prompt {number}"), prompt, SEQ_CONTEXT);
             prompts.push(ids);
             texts.push(text);
             rows_off.push(rows);
         }
 
-        for kind in [Kind::Forced, Kind::Graph] {
+        // #717: the widest gap at which each kind's base rows move a pick, the
+        // mixed rows' near tie.
+        let mut base_widest = [0f32; 2];
+        for (k, kind) in [Kind::Forced, Kind::Graph].into_iter().enumerate() {
             let mut kind_class = Class::default();
             for width in 1..=EXTENDED_SHAPE_MAX_LANES as usize {
                 let mut width_class = Class::default();
@@ -906,7 +934,7 @@ fn hold_the_class(cell: &Cell) {
                     let extended = leg(&model, &pool, &prompts, &texts, &group, Shape::Extended, kind, &what);
                     for (l, &p) in group.iter().enumerate() {
                         let lane = format!("{what}, lane {l} (prompt {p})");
-                        let lane_class = hold_lane(&lane, "extended", &texts[p], &rows_off[p], &base[l], &extended[l], MIN_ROWS, &mut failures);
+                        let lane_class = hold_lane(&lane, "extended", &texts[p], &rows_off[p], &base[l], &extended[l], &mut failures);
                         width_class.extend(&lane_class);
                     }
                 }
@@ -920,29 +948,31 @@ fn hold_the_class(cell: &Cell) {
             let label = format!("{kind:?} rounds, 1 to {EXTENDED_SHAPE_MAX_LANES} lanes");
             kind_class.print(&label, "extended");
             kind_class.hold_distances(&label, "extended", &mut failures);
-            kind_class.hold_near_tie(&label, "extended", &mut failures);
+            base_widest[k] = kind_class.base_off.widest_gap();
+            kind_class.hold_near_tie(&label, "extended", base_widest[k], &mut failures);
         }
 
         // #717: the mixed rounds' class, on the same load.
         if cell.mixed {
-            for (number, prompt) in MIXED_PROMPTS.iter().enumerate() {
-                let (ids, text, rows) = spec_off(&model, &pool, &frontend, PROMPTS.len() + number, prompt);
-                prompts.push(ids);
-                texts.push(text);
-                rows_off.push(rows);
-            }
-            hold_the_mixed_class(&model, &pool, &prompts, &texts, &rows_off, &mut failures);
+            hold_the_mixed_class(&model, &pool, &frontend, base_widest, &mut failures);
         }
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
     assert!(failures.is_empty(), "{}: {} excesses, the first of them:\n{}", cell.name, failures.len(),failures.iter().take(24).cloned().collect::<Vec<_>>().join("\n"));
 }
 
-/// Speculation off on prompt `number`, `prompt`: its ids, its own greedy text
-/// and the row after each of the text's tokens.
-fn spec_off(model: &Model, pool: &SeqPool, frontend: &FrontendSet, number: usize, prompt: &str) -> (Vec<i32>, Vec<i32>, Vec<Vec<u16>>) {
+/// Speculation off on `prompt`, named `what`: its ids, its own greedy text
+/// and the row after each of the text's tokens, and its sequence, of
+/// `context`, its text's last token pending.
+fn spec_off<'p>(
+    model: &Model,
+    pool: &'p SeqPool,
+    frontend: &FrontendSet,
+    what: &str,
+    prompt: &str,
+    context: u32,
+) -> (Vec<i32>, Vec<i32>, Vec<Vec<u16>>, Seq<'p>) {
     let greedy = SamplingParams::greedy();
-    let what = format!("prompt {number}");
     let ids: Vec<i32> = frontend
         .tokenizer()
         .encode(&format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"))
@@ -950,13 +980,13 @@ fn spec_off(model: &Model, pool: &SeqPool, frontend: &FrontendSet, number: usize
         .into_iter()
         .map(|id| i32::try_from(id).expect("token id fits i32"))
         .collect();
-    assert!(ids.len() + MAX_TOKENS + 2 * (WINDOW as usize + 1) <= SEQ_CONTEXT as usize, "{what}: {} prompt tokens", ids.len());
-    let mut off = pool.alloc(SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
+    assert!(ids.len() + MAX_TOKENS + 2 * (WINDOW as usize + 1) <= context as usize, "{what}: {} prompt tokens", ids.len());
+    let mut off = pool.alloc(context).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
     prefill_program_sampled(model, pool, &mut off, &ids, 0, greedy, None).unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
     let mut text = vec![off.pending_token().expect("the prefill drew")];
     let mut rows: Vec<Vec<u16>> = Vec::new();
     while text.len() <= MAX_TOKENS && *text.last().expect("a token") != IM_END {
-        let (emitted, row, next) = plain_round(model, pool, &mut off, &what);
+        let (emitted, row, next) = plain_round(model, pool, &mut off, what);
         assert_eq!(emitted, text[text.len() - 1], "{what}: the plain round emitted its pending token");
         assert_eq!(logit_drift::argmax(&row).0 as i32, next, "{what}: the plain round's row is the one its greedy draw read");
         rows.push(row);
@@ -968,13 +998,34 @@ fn spec_off(model: &Model, pool: &SeqPool, frontend: &FrontendSet, number: usize
         text.len(),
         text.last() == Some(&IM_END)
     );
-    (ids, text, rows)
+    (ids, text, rows, off)
+}
+
+/// #717: speculation off's texts continued past the rows a lane holds to
+/// [`MIXED_TEXT_TOKENS`], `offs[i]` writing `texts[i]`: plain greedy rounds of
+/// every lane whose text is short of them and has not ended, the lanes
+/// together, no row read. A mixed leg's lane only rides on this text, so it
+/// need not be one lane's.
+fn continue_texts(model: &Model, pool: &SeqPool, offs: &mut [Seq<'_>], texts: &mut [Vec<i32>]) {
+    loop {
+        let riding: Vec<usize> =
+            (0..offs.len()).filter(|&i| texts[i].len() <= MIXED_TEXT_TOKENS && texts[i].last() != Some(&IM_END)).collect();
+        if riding.is_empty() {
+            break;
+        }
+        let mut refs: Vec<&mut Seq<'_>> = offs.iter_mut().enumerate().filter(|(i, _)| riding.contains(i)).map(|(_, seq)| seq).collect();
+        let emitted = decode_program_batch(model, pool, &mut refs).unwrap_or_else(|e| panic!("the mixed prompts' texts: plain round: {e}"));
+        for (k, &i) in riding.iter().enumerate() {
+            assert_eq!(emitted[k], *texts[i].last().expect("a token"), "mixed prompt {i}: the plain round emitted its pending token");
+            texts[i].push(refs[k].pending_token().expect("a plain round draws"));
+        }
+    }
 }
 
 /// One lane's rows held: the `tested` rows (the extended ones, or #717 the
 /// mixed ones) against the base rows after the same tokens at the same lane
 /// count, and both against speculation off's, at every text index all three
-/// reached, at least `min_rows`; each excess a line in `failures`. Its pairs,
+/// reached, at least [`MIN_ROWS`]; each excess a line in `failures`. Its pairs,
 /// for the class.
 #[allow(clippy::too_many_arguments)]
 fn hold_lane(
@@ -984,13 +1035,12 @@ fn hold_lane(
     off: &[Vec<u16>],
     base: &[Vec<u16>],
     under_test: &[Vec<u16>],
-    min_rows: usize,
     failures: &mut Vec<String>,
 ) -> Class {
     // Every text index all three reached.
     let rows = base.len().min(under_test.len()).min(off.len());
-    if rows < min_rows {
-        failures.push(format!("{lane}: {rows} rows to compare, under {min_rows}"));
+    if rows < MIN_ROWS {
+        failures.push(format!("{lane}: {rows} rows to compare, under {MIN_ROWS}"));
     }
     let mut lane_class = Class::default();
     let (mut lp_off, mut lp_base, mut lp_tested) = (0f64, 0f64, 0f64);
@@ -1058,22 +1108,44 @@ fn hold_lane(
     lane_class
 }
 
-/// #717: the mixed rounds' class on the loaded cell, its decode graphs
-/// captured again under [`MIXED_ROUNDS`] (the switch removed after, so that a
-/// later test of the binary captures as it would): at each lane count of 2 to
-/// 7, a leg of base rounds on the first prompts, then every mix of that count
-/// on the same prompts, its last `w` lanes extended; each lane's mixed rows
-/// held to its base rows, the class at each lane count and over the kind's,
-/// in both kinds of round.
-fn hold_the_mixed_class(
-    model: &Model,
-    pool: &SeqPool,
-    prompts: &[Vec<i32>],
-    texts: &[Vec<i32>],
-    rows_off: &[Vec<Vec<u16>>],
-    failures: &mut Vec<String>,
-) {
+/// #717: the mixed rounds' class on the loaded cell. Speculation off writes
+/// the text of each of [`MIXED_PROMPTS`], its rows the uniform cells' window
+/// ([`MAX_TOKENS`]) and its text on to [`MIXED_TEXT_TOKENS`]
+/// ([`continue_texts`]); the decode graphs are captured again under
+/// [`MIXED_ROUNDS`] (the switch removed after, so that a later test of the
+/// binary captures as it would). Then at each lane count of 2 to 7, a leg of
+/// base rounds on the first prompts over the window, as a uniform cell's, and
+/// every mix of that count on the same prompts, its last `w` lanes extended,
+/// riding at its mix until each lane holds the rows its base leg gave it; each
+/// lane's mixed rows held to its base rows, the class at each lane count and
+/// over the kind's, in both kinds of round, the near tie read over the uniform
+/// cells' base rows of the kind, `base_widest` (ADR 0106).
+fn hold_the_mixed_class(model: &Model, pool: &SeqPool, frontend: &FrontendSet, base_widest: [f32; 2], failures: &mut Vec<String>) {
     let began = std::time::Instant::now();
+    let mut prompts: Vec<Vec<i32>> = Vec::new();
+    let mut texts: Vec<Vec<i32>> = Vec::new();
+    let mut rows_off: Vec<Vec<Vec<u16>>> = Vec::new();
+    let mut offs: Vec<Seq<'_>> = Vec::new();
+    for (number, prompt) in MIXED_PROMPTS.iter().enumerate() {
+        let what = format!("mixed prompt {number}");
+        let (ids, text, rows, off) = spec_off(model, pool, frontend, &what, prompt, MIXED_SEQ_CONTEXT);
+        assert!(ids.len() + MIXED_TEXT_TOKENS + 2 * (WINDOW as usize + 1) <= MIXED_SEQ_CONTEXT as usize, "{what}: {} prompt tokens", ids.len());
+        prompts.push(ids);
+        texts.push(text);
+        rows_off.push(rows);
+        offs.push(off);
+    }
+    continue_texts(model, pool, &mut offs, &mut texts);
+    drop(offs);
+    for (number, text) in texts.iter().enumerate() {
+        println!("extended_round_class_gpu mixed prompt {number}: {} of text (ended: {})", text.len(), text.last() == Some(&IM_END));
+        assert_eq!(text.len(), MIXED_TEXT_TOKENS + 1, "mixed prompt {number}: its text ended before the {MIXED_TEXT_TOKENS} tokens a mixed leg may ride on");
+    }
+    // The uniform cells' window of each text: the base legs' text, and the
+    // rows a mixed lane holds.
+    let window: Vec<Vec<i32>> = texts.iter().map(|text| text[..=MAX_TOKENS].to_vec()).collect();
+    let texts_took = began.elapsed().as_secs_f64();
+
     // SAFETY (test-only): this binary's tests run one at a time on the card
     // (the profile's --test-threads=1, or one test by name), and the leaf
     // reads the environment on this thread.
@@ -1092,20 +1164,27 @@ fn hold_the_mixed_class(
     }
     let most = MIXES.iter().map(|&(w, n)| (w + n) as usize).max().expect("twelve mixes");
     assert!(prompts.len() >= most, "{} prompts for a mix of {most} lanes", prompts.len());
-    for kind in [Kind::Forced, Kind::Graph] {
+    for (k, kind) in [Kind::Forced, Kind::Graph].into_iter().enumerate() {
         let mut kind_class = Class::default();
         for lanes in 2..=most {
             let group: Vec<usize> = (0..lanes).collect();
-            let what = format!("{kind:?} rounds at {lanes} lanes, prompts {group:?}");
-            let base = leg(model, pool, prompts, texts, &group, Shape::Base, kind, &what);
+            let what = format!("{kind:?} rounds at {lanes} lanes, mixed prompts {group:?}");
+            let base = leg(model, pool, &prompts, &window, &group, Shape::Base, kind, &what);
+            let held: Vec<usize> = base.iter().map(Vec::len).collect();
             let mut width_class = Class::default();
             for &(w, n) in MIXES.iter().filter(|&&(w, n)| (w + n) as usize == lanes) {
                 let extended: Vec<bool> = (0..lanes).map(|l| l >= n as usize).collect();
-                let what = format!("{kind:?} rounds at the mix {w}+{n}, prompts {group:?}");
-                let mixed = mixed_leg(model, pool, prompts, texts, &group, &extended, kind, &what);
+                let what = format!("{kind:?} rounds at the mix {w}+{n}, mixed prompts {group:?}");
+                let (mixed, rounds) = mixed_leg(model, pool, &prompts, &texts, &group, &extended, &held, kind, &what);
+                println!("extended_round_class_gpu {what}: {rounds} rounds at the mix");
                 for (l, &p) in group.iter().enumerate() {
                     let lane = format!("{what}, lane {l} (prompt {p}, {:?})", shape_of(extended[l]));
-                    let lane_class = hold_lane(&lane, "mixed", &texts[p], &rows_off[p], &base[l], &mixed[l], MIXED_MIN_ROWS, failures);
+                    // Every round at the mix: a lane short of its base leg's
+                    // rows means a text ran out first.
+                    if mixed[l].len() < held[l] {
+                        failures.push(format!("{lane}: its leg's texts held {rounds} rounds at the mix, {} of the {} rows its base leg gave it", mixed[l].len(), held[l]));
+                    }
+                    let lane_class = hold_lane(&lane, "mixed", &texts[p], &rows_off[p], &base[l], &mixed[l], failures);
                     width_class.extend(&lane_class);
                 }
             }
@@ -1115,11 +1194,16 @@ fn hold_the_mixed_class(
             kind_class.extend(&width_class);
         }
         // The class: the mixed rows' distance from speculation off's against
-        // the base rows', over every lane of every mix of the kind.
+        // the base rows', over every lane of every mix of the kind; its near
+        // tie over the uniform cells' base rows of the kind, as the extended
+        // rows' is.
         let label = format!("{kind:?} mixed rounds, 2 to {most} lanes");
         kind_class.print(&label, "mixed");
         kind_class.hold_distances(&label, "mixed", failures);
-        kind_class.hold_near_tie(&label, "mixed", failures);
+        kind_class.hold_near_tie(&label, "mixed", base_widest[k], failures);
     }
-    println!("extended_round_class_gpu: the mixed rounds' class took {:.0} s", began.elapsed().as_secs_f64());
+    println!(
+        "extended_round_class_gpu: the mixed rounds' class took {:.0} s, {texts_took:.0} s of it speculation off's texts",
+        began.elapsed().as_secs_f64()
+    );
 }
