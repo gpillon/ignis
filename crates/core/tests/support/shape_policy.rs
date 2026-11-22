@@ -78,6 +78,9 @@ pub fn extends(policy: ShapePolicy, estimate: ShapeEstimate, lanes: &[&Lane]) ->
         return false;
     }
     match policy {
+        // GitHub #715: a `mixed` round has each lane's shape
+        // (`ignis_core::shape_grant::lane_shapes`); no load these tests hold runs it.
+        ShapePolicy::Mixed => unreachable!("the mirror predicts a uniform round; `mixed` gives each lane its own"),
         ShapePolicy::All => lanes.iter().all(|lane| lane.asks),
         ShapePolicy::Aggregate if lanes.len() == 1 => lanes[0].asks,
         ShapePolicy::Aggregate => {

@@ -580,6 +580,11 @@ struct ignis_seq {
   // neighbours, which a restore changes as it changes them.
   std::array<std::uint8_t, IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS> shape_rounds{};
   std::uint64_t shape_rounds_recorded = 0;
+  // GitHub #715 (spec #711): the verify rounds in a row this sequence asked the extended shape and
+  // ran at the base shape, which breaks a tie in the shape policy `mixed`'s grant
+  // (kernel/src/round_shape.h `grant`): 0 after a round at the extended shape or one it did not ask
+  // it of. Host-only and never a section, as the recent rounds: left at 0 where they are emptied.
+  std::uint32_t shape_refused_rounds = 0;
   // The shared prefix this sequence claims (P4-10, GitHub #126), or null.
   // One reference is held for as long as this handle lives; `shared_pages`
   // restates its page count so every capacity question here can be answered

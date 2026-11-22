@@ -1652,6 +1652,7 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
   std::uint32_t shape_policy = IGNIS_SHAPE_POLICY_AGGREGATE;
   std::uint32_t shape_estimate_rounds = 0;
   std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> shape_period_ratios{};
+  std::array<std::uint32_t, ignis::round_layout::kMixes> shape_mixed_period_ratios{};
   ignis::RopeScaling rope_scaling{};
   uint32_t retained_device_slots = 0;
   if (options != nullptr) {
@@ -1687,6 +1688,8 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     shape_policy = options->shape_policy;
     shape_estimate_rounds = options->shape_estimate_rounds;
     std::copy_n(options->shape_period_ratios, shape_period_ratios.size(), shape_period_ratios.begin());
+    // GitHub #715: and the cost table's mixed entries.
+    std::copy_n(options->shape_mixed_period_ratios, shape_mixed_period_ratios.size(), shape_mixed_period_ratios.begin());
     // GitHub #714: the pool's device retained slots, for the mixed graphs' plan.
     retained_device_slots = options->retained_device_slots;
   }
@@ -1813,25 +1816,32 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
     }
     // GitHub #690: and a shape policy it does not know, a window past the rounds a lane keeps or a
     // period ratio outside 1..2, by name.
-    if (const char *field = ignis::round_shape::policy_of(shape_policy, shape_estimate_rounds,
-                                                          shape_period_ratios.data(), out.shape_policy)) {
+    if (const char *field =
+            ignis::round_shape::policy_of(shape_policy, shape_estimate_rounds, shape_period_ratios.data(),
+                                          shape_mixed_period_ratios.data(), out.shape_policy)) {
       const std::string name(field);
       std::string value = name == "shape_policy" ? std::to_string(shape_policy)
                           : name == "shape_estimate_rounds" ? std::to_string(shape_estimate_rounds)
                                                             : std::string();
-      if (name == "shape_period_ratios") {
-        for (std::size_t i = 0; i < shape_period_ratios.size(); ++i) {
-          value += (i == 0 ? "" : ",") + std::to_string(shape_period_ratios[i]);
+      const auto listed = [&value](const auto &ratios) {
+        for (std::size_t i = 0; i < ratios.size(); ++i) {
+          value += (i == 0 ? "" : ",") + std::to_string(ratios[i]);
         }
+      };
+      if (name == "shape_period_ratios") {
+        listed(shape_period_ratios);
+      }
+      if (name == "shape_mixed_period_ratios") {
+        listed(shape_mixed_period_ratios);
       }
       set_error("ignis_model_load: " + name + " " + value +
-                (name == "shape_policy" ? " is not 0 (aggregate) or 1 (all)"
+                (name == "shape_policy" ? " is not 0 (aggregate), 1 (all) or 2 (mixed)"
                  : name == "shape_estimate_rounds"
                      ? " must be in 1.." + std::to_string(IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS) +
                            " (0: the default), the rounds a lane keeps"
                      : " must each be in " + std::to_string(ignis::round_shape::kPeriodRatioMinMilli) + ".." +
                            std::to_string(ignis::round_shape::kPeriodRatioMaxMilli) +
-                           " thousandths (0: that lane count's default)"));
+                           " thousandths (0: that entry's default)"));
       return nullptr;
     }
   }
@@ -1885,7 +1895,10 @@ std::unique_ptr<ignis_model> validate_and_bind(const struct ignis_bound_tensor *
       !load_switch(ignis::fp8_exception::w8a8_tile16, fp8_w8a8_tile16) ||
       !load_switch(ignis::dflash2_small_t::append_kv_only, dflash2_append_kv_only) ||
       !load_switch(ignis::dflash2_small_t::small_t_fill, dflash2_small_t_fill) ||
-      !load_switch(ignis::mixed_graphs::asked, out.mixed_rounds_asked)) {
+      // GitHub #715: unset, the shape policy asks, where it is `mixed`.
+      !load_switch(
+          [&out] { return ignis::mixed_graphs::asked(out.shape_policy.policy == ignis::round_shape::Policy::kMixed); },
+          out.mixed_rounds_asked)) {
     return nullptr;
   }
 
@@ -3211,6 +3224,11 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
         // GitHub #689, #690: the thresholds its rounds' shape rule reads, and their policy.
         model->shape_rule = load.shape_rule;
         model->shape_policy = load.shape_policy;
+        // GitHub #715: `mixed` where the load runs mixed rounds, `aggregate` anywhere else.
+        if (model->shape_policy.policy == ignis::round_shape::Policy::kMixed &&
+            !ignis::mixed_graphs::holds_mixed_rounds(true, model->is_trellis_body, sizes.extended_window)) {
+          model->shape_policy.policy = ignis::round_shape::Policy::kAggregate;
+        }
       }
     } catch (const std::exception &e) {
       set_error(std::string("ignis_model_load: drafter round allocation failed: ") + e.what());

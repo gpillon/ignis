@@ -10,6 +10,8 @@
 //! purpose: the GPU load test compares the leaf's reported VRAM against this
 //! arithmetic, so the two cannot drift silently.
 
+pub use crate::shape_grant::PeriodTable;
+
 /// The widest draft window DFlash2 accepts: GitHub #687 (spec #684), 15, two
 /// round shapes past [`BASE_SHAPE_DRAFT_TOKENS`] ([`Speculation::round_shapes`]),
 /// where the reference's `--spec-draft-tokens` range for the 27B DFlash2
@@ -542,33 +544,40 @@ impl Default for ShapeRule {
 }
 
 /// GitHub #690 (spec #684): the **shape policy** on a DFlash2 load with an
-/// extended round shape (`kernel/src/round_shape.h` `policy_extends`): how
-/// the lanes' asks of the [`ShapeRule`] become a verify round's shape. A
-/// round of 5 to 8 lanes runs at the base shape under either. The server's
-/// `spec.shape_policy`.
+/// extended round shape (`kernel/src/round_shape.h` `grant`): how the lanes'
+/// asks of the [`ShapeRule`] become each lane's shape in a verify round
+/// ([`crate::shape_grant::lane_shapes`]). The server's `spec.shape_policy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShapePolicy {
-    /// At one lane, the lane's ask. At 2 to 4 lanes, extended when the drafts
-    /// the asking lanes are expected to take past the base window exceed
-    /// what the wider round costs every lane in it ([`ShapeEstimate`]). The
-    /// default.
+    /// At one lane, the lane's ask. At 2 to 4 lanes, every lane extended when
+    /// the drafts the asking lanes are expected to take past the base window
+    /// exceed what the wider round costs every lane in it
+    /// ([`ShapeEstimate`]); at 5 to 8, the base shape. The default.
     #[default]
     Aggregate,
-    /// Extended only when every lane in the round asks: no lane pays for
-    /// another.
+    /// Every lane extended only when every lane in the round asks, at 1 to 4
+    /// lanes: no lane pays for another.
     All,
+    /// GitHub #715 (spec #711): at one lane, the lane's ask; at 2 to 7 lanes
+    /// each asking lane granted the extended shape on its own, the highest
+    /// expected gain first, when it beats what its 8 more columns cost every
+    /// lane, within 64 columns, so that a round may be mixed. Only on the
+    /// NVFP4 body at a window of [`crate::lane_lines::MIXED_ROUND_WINDOW`]
+    /// ([`Speculation::shape_policy_runs`]); any other load runs `aggregate`.
+    Mixed,
 }
 
 impl ShapePolicy {
     /// The operator's spellings (`--spec-shape-policy`).
-    pub const NAMES: [&'static str; 2] = ["aggregate", "all"];
+    pub const NAMES: [&'static str; 3] = ["aggregate", "all", "mixed"];
 
-    /// Parse the operator's spelling, naming both on a refusal.
+    /// Parse the operator's spelling, naming each on a refusal.
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw.trim() {
             "aggregate" => Ok(Self::Aggregate),
             "all" => Ok(Self::All),
-            other => Err(format!("unknown shape policy `{other}` (expected aggregate or all)")),
+            "mixed" => Ok(Self::Mixed),
+            other => Err(format!("unknown shape policy `{other}` (expected aggregate, all or mixed)")),
         }
     }
 
@@ -576,6 +585,7 @@ impl ShapePolicy {
         match self {
             Self::Aggregate => "aggregate",
             Self::All => "all",
+            Self::Mixed => "mixed",
         }
     }
 
@@ -584,6 +594,7 @@ impl ShapePolicy {
         match self {
             Self::Aggregate => 0,
             Self::All => 1,
+            Self::Mixed => 2,
         }
     }
 }
@@ -594,16 +605,15 @@ pub const SHAPE_ESTIMATE_MAX_ROUNDS: u32 = 64;
 
 /// GitHub #690: what [`ShapePolicy::Aggregate`] reads beside the lanes' asks:
 /// the recent verify rounds of its own each lane's expectations are read over
-/// (the server's `spec.shape_estimate_rounds`), and the extended round's
-/// period over the base round's at 1 to [`EXTENDED_SHAPE_MAX_LANES`] lanes, in
-/// thousandths (`spec.shape_period_ratios`; the one-lane entry is not read, a
-/// lane alone running at the shape it asks). The window's default is
-/// provisional; the ratios' are measured on the RTX 5090
-/// ([`Self::DEFAULT_PERIOD_RATIOS_MILLI`]).
+/// (the server's `spec.shape_estimate_rounds`), and the cost table
+/// (`spec.shape_period_ratios`, [`PeriodTable`]; GitHub #715: by lane count
+/// and extended lanes, of which `aggregate` reads the uniform entries and
+/// [`ShapePolicy::Mixed`] every one). The window's default is provisional;
+/// the table's is [`PeriodTable::NVFP4`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShapeEstimate {
     rounds: u32,
-    period_ratios_milli: [u32; EXTENDED_SHAPE_MAX_LANES as usize],
+    period_table: PeriodTable,
 }
 
 impl ShapeEstimate {
@@ -612,52 +622,40 @@ impl ShapeEstimate {
     /// once in 17 rounds -- under 2% of its rate at two lanes -- and a lane
     /// whose text turns predictable waits at most 16 rounds.
     pub const DEFAULT_ROUNDS: u32 = 16;
-    /// 1.128, 1.29, 1.363 and 1.344 at 1 to 4 lanes: measured on the RTX
-    /// 5090 on the GPU clock (round timing), FP8 exception weights, the
-    /// `hq-e8-2b` cache, the default cost levers and route, the extended
-    /// round's period over the base round's at the same lane count and a
-    /// matched context, pooled over two orders. At 3 and 4 lanes the card's
-    /// 575 W power limit lowers the extended round's clock, so 3 lanes
-    /// measured above 4 in either order (not a slip); and the ratio grows with
-    /// context, these being its value at about 3.5-5K tokens.
-    pub const DEFAULT_PERIOD_RATIOS_MILLI: [u32; EXTENDED_SHAPE_MAX_LANES as usize] = [1128, 1290, 1363, 1344];
-    /// The narrowest and widest ratio taken: an extended round costs at
-    /// least a base round and at most twice one, for at most twice its
-    /// columns.
-    pub const PERIOD_RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = 1000..=2000;
+    /// The default table's uniform entries, at 1 to 4 lanes
+    /// ([`PeriodTable::NVFP4`]).
+    pub const DEFAULT_PERIOD_RATIOS_MILLI: [u32; EXTENDED_SHAPE_MAX_LANES as usize] = PeriodTable::NVFP4.uniform();
+    /// The narrowest and widest ratio taken ([`PeriodTable::RATIO_MILLI_RANGE`]).
+    pub const PERIOD_RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = PeriodTable::RATIO_MILLI_RANGE;
 
-    /// `rounds` in `1..=`[`SHAPE_ESTIMATE_MAX_ROUNDS`] and every ratio in
-    /// [`Self::PERIOD_RATIO_MILLI_RANGE`]; the refusal names which and its
-    /// range.
-    pub fn new(rounds: u32, period_ratios_milli: [u32; EXTENDED_SHAPE_MAX_LANES as usize]) -> Result<Self, String> {
+    /// `rounds` in `1..=`[`SHAPE_ESTIMATE_MAX_ROUNDS`], the refusal naming
+    /// its range; the table is checked where it is made ([`PeriodTable`]).
+    pub fn new(rounds: u32, period_table: PeriodTable) -> Result<Self, String> {
         if !(1..=SHAPE_ESTIMATE_MAX_ROUNDS).contains(&rounds) {
             return Err(format!(
                 "the shape policy's estimate window of {rounds} rounds is not in 1..={SHAPE_ESTIMATE_MAX_ROUNDS}"
             ));
         }
-        if let Some(lanes) = period_ratios_milli.iter().position(|ratio| !Self::PERIOD_RATIO_MILLI_RANGE.contains(ratio)) {
-            return Err(format!(
-                "the shape policy's period ratio at {} lane{} ({}) is not in 1..=2",
-                lanes + 1,
-                if lanes == 0 { "" } else { "s" },
-                f64::from(period_ratios_milli[lanes]) / 1000.0
-            ));
-        }
-        Ok(Self { rounds, period_ratios_milli })
+        Ok(Self { rounds, period_table })
     }
 
     pub fn rounds(&self) -> u32 {
         self.rounds
     }
 
+    /// The table's uniform entries, at 1 to 4 lanes.
     pub fn period_ratios_milli(&self) -> [u32; EXTENDED_SHAPE_MAX_LANES as usize] {
-        self.period_ratios_milli
+        self.period_table.uniform()
+    }
+
+    pub fn period_table(&self) -> PeriodTable {
+        self.period_table
     }
 }
 
 impl Default for ShapeEstimate {
     fn default() -> Self {
-        Self { rounds: Self::DEFAULT_ROUNDS, period_ratios_milli: Self::DEFAULT_PERIOD_RATIOS_MILLI }
+        Self { rounds: Self::DEFAULT_ROUNDS, period_table: PeriodTable::NVFP4 }
     }
 }
 
@@ -723,6 +721,25 @@ impl Speculation {
 
     pub fn shape_policy(&self) -> ShapePolicy {
         self.shape_policy
+    }
+
+    /// GitHub #715 (spec #711): whether a load of this option on the 27B's
+    /// NVFP4 body (`trellis` false; the trellis bodies run no mixed round
+    /// yet) can run a mixed round: DFlash2 at
+    /// [`crate::lane_lines::MIXED_ROUND_WINDOW`] drafts alone
+    /// (`kernel/src/mixed_graphs.h` `holds_mixed_rounds`).
+    pub fn holds_mixed_rounds(&self, trellis: bool) -> bool {
+        self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens == crate::lane_lines::MIXED_ROUND_WINDOW && !trellis
+    }
+
+    /// The shape policy a load of this option runs: its own, but `mixed`
+    /// where the load cannot run a mixed round ([`Self::holds_mixed_rounds`]),
+    /// which runs `aggregate`, as the leaf resolves it at load.
+    pub fn shape_policy_runs(&self, trellis: bool) -> ShapePolicy {
+        match self.shape_policy {
+            ShapePolicy::Mixed if !self.holds_mixed_rounds(trellis) => ShapePolicy::Aggregate,
+            policy => policy,
+        }
     }
 
     pub fn shape_estimate(&self) -> ShapeEstimate {
@@ -1033,13 +1050,17 @@ mod tests {
         assert_eq!(number("kDefaultEnterAccepted"), ShapeRule::DEFAULT_ENTER_ACCEPTED);
         assert_eq!(number("kDefaultStayAccepted"), ShapeRule::DEFAULT_STAY_ACCEPTED);
         assert_eq!(number("kDefaultEstimateRounds"), ShapeEstimate::DEFAULT_ROUNDS);
-        let ratios: Vec<u32> = constant("kDefaultPeriodRatios")
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .split(',')
-            .map(|ratio| ratio.trim().parse().unwrap_or_else(|e| panic!("kDefaultPeriodRatios: {e}")))
-            .collect();
-        assert_eq!(ratios, ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI);
+        let ratios = |name: &str| -> Vec<u32> {
+            constant(name)
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .split(',')
+                .map(|ratio| ratio.trim().parse().unwrap_or_else(|e| panic!("{name}: {e}")))
+                .collect()
+        };
+        assert_eq!(ratios("kDefaultPeriodRatios"), ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI);
+        // GitHub #715: and the cost table's mixed entries, in the mixes' order.
+        assert_eq!(ratios("kDefaultMixedPeriodRatios"), PeriodTable::NVFP4.mixed());
         assert_eq!(
             number("kPeriodRatioMinMilli")..=number("kPeriodRatioMaxMilli"),
             ShapeEstimate::PERIOD_RATIO_MILLI_RANGE

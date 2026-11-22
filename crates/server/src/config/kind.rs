@@ -930,47 +930,67 @@ impl FieldKind for ShapePolicyKind {
     }
 }
 
-/// The shape policy's period ratios (GitHub #690): four decimal numbers,
-/// `,`- or `;`-separated (a file's list of four), the extended round's period
-/// over the base round's at 1 to 4 lanes, each from 1 to 2, kept as
-/// thousandths as [`Decimal`] keeps one.
+/// The shape policy's cost table (GitHub #690, #715,
+/// [`ignis_core::PeriodTable`]): at 1 to 7 lanes, the period of the round
+/// with 1, 2, ... of them extended over the base round's, each from 1 to 2,
+/// kept as thousandths as [`Decimal`] keeps one. Written as its seven rows,
+/// `/`-separated, each row's ratios `,`- or `;`-separated (a file's list of
+/// seven lists): 1, 2, 3, 4, 3, 2 and 1 ratios, as many as the lanes' 64
+/// columns hold extended lanes. The four-value form of earlier builds, the
+/// extended round's ratio at 1 to 4 lanes (a file's list of four), is still
+/// taken as the uniform entries, every other entry its default.
 pub struct PeriodRatios;
 
+impl PeriodRatios {
+    /// A row's ratios, each from 1 to 2.
+    fn ratios(row: &str, raw: &str) -> Result<Vec<u32>, String> {
+        row.split([',', ';'])
+            .map(|ratio| {
+                Decimal::thousandths(ratio.trim())
+                    .filter(|milli| ShapeEstimate::PERIOD_RATIO_MILLI_RANGE.contains(milli))
+                    .ok_or_else(|| format!("expects ratios from 1 to 2, got `{raw}`"))
+            })
+            .collect()
+    }
+}
+
 impl FieldKind for PeriodRatios {
-    type Value = [u32; 4];
-    const TAG: &'static str = "ratio,ratio,ratio,ratio";
+    type Value = ignis_core::PeriodTable;
+    const TAG: &'static str = "cost table";
 
     fn parse(raw: &str) -> Result<Self::Value, String> {
-        let ratios: Vec<&str> = raw.split([',', ';']).map(str::trim).collect();
-        let mut table = [0u32; 4];
-        if ratios.len() != table.len() {
-            return Err(format!("expects four ratios, at 1, 2, 3 and 4 lanes, got `{raw}`"));
+        let rows: Vec<&str> = raw.split('/').collect();
+        if rows.len() == 1 {
+            let uniform: [u32; 4] = Self::ratios(raw, raw)?.try_into().map_err(|_| {
+                format!("expects the table's seven rows, at 1 to 7 lanes, `/`-separated, or four ratios at 1, 2, 3 and 4 lanes, got `{raw}`")
+            })?;
+            return ignis_core::PeriodTable::with_uniform(uniform);
         }
-        for (entry, ratio) in table.iter_mut().zip(ratios) {
-            *entry = Decimal::thousandths(ratio)
-                .filter(|milli| ShapeEstimate::PERIOD_RATIO_MILLI_RANGE.contains(milli))
-                .ok_or_else(|| format!("expects four ratios from 1 to 2, got `{raw}`"))?;
-        }
-        Ok(table)
+        let rows = rows.into_iter().map(|row| Self::ratios(row, raw)).collect::<Result<Vec<_>, _>>()?;
+        ignis_core::PeriodTable::from_rows(&rows).map_err(|e| format!("{e}, got `{raw}`"))
     }
 
     fn render(value: &Self::Value) -> Value {
-        Value::Array(value.iter().map(|&milli| Decimal::written(milli)).collect())
+        Value::Array(value.rows().iter().map(|row| Value::Array(row.iter().map(|&milli| Decimal::written(milli)).collect())).collect())
     }
 
     fn file_text(value: &Value) -> Result<Option<String>, String> {
+        let ratio = |item: &Value| match item {
+            Value::Number(n) => Ok(n.to_string()),
+            Value::String(s) => Ok(s.clone()),
+            _ => Err("lists something that is not a ratio".to_owned()),
+        };
+        let row = |items: &[Value]| items.iter().map(ratio).collect::<Result<Vec<_>, _>>().map(|row| row.join(","));
         match value {
-            Value::Array(items) => Ok(Some(
+            // The table's rows, each a list; or the four-value form, a list of ratios.
+            Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_array) => Ok(Some(
                 items
                     .iter()
-                    .map(|item| match item {
-                        Value::Number(n) => Ok(n.to_string()),
-                        Value::String(s) => Ok(s.clone()),
-                        _ => Err("lists something that is not a ratio".to_owned()),
-                    })
+                    .map(|item| row(item.as_array().map(Vec::as_slice).unwrap_or_default()))
                     .collect::<Result<Vec<_>, _>>()?
-                    .join(","),
+                    .join("/"),
             )),
+            Value::Array(items) => row(items).map(Some),
             other => scalar_text(other),
         }
     }

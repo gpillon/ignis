@@ -306,19 +306,23 @@ probability to the drafter's, so the text keeps the model's distribution. See
 [speculative decoding](../concepts/speculative-decoding.md#acceptance-under-sampling).
 
 **Shape policy.** From 0.11.0, on a DFlash2 load past 7 drafts, how a verify
-round of 1 to 4 lanes takes its shape from what its requests ask
-(`--spec-shape-policy`): `aggregate`, the default, extended when the drafts the
-asking requests are expected to take past position 7 exceed what the wider round
-costs every request in it, from each request's own recent rounds; `all`,
-extended only when every request asks, so no request pays for another. A request
-alone runs at the shape it asks under either. See
+round's lanes take their shapes from what its requests ask
+(`--spec-shape-policy`): `aggregate`, the default, a round of 1 to 4 lanes
+extended when the drafts the asking requests are expected to take past position
+7 exceed what the wider round costs every request in it, from each request's own
+recent rounds; `all`, extended only when every request asks, so no request pays
+for another; `mixed`, each asking request of 2 to 7 granted the extended shape on
+its own when its expected gain beats what its columns cost every request, so a
+round may mix both shapes (on the NVFP4 artifact at 15 drafts; elsewhere it runs
+`aggregate`). A request alone runs at the shape it asks under each. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Shape rule.** From 0.11.0, on a DFlash2 load past 7 drafts, what each request
 asks of its next verify round from its own earlier rounds: the *extended shape*
 after a base round that took all 7 drafts, while its extended rounds take 6 or
 more (`--spec-shape-enter-accepted`, `--spec-shape-stay-accepted`), the *base
-shape* otherwise. The *shape policy* turns a round's asks into its shape. See
+shape* otherwise. The *shape policy* turns a round's asks into each request's
+shape. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Scope.** A model family's own section of a field: `qwen38` for the 27B,
