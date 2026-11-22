@@ -1135,7 +1135,7 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
     }
     let measured: u64 = stats.mixed_graph_bytes.iter().sum();
     if asked && !held.is_empty() {
-        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0);
+        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0, load.body());
         println!(
             "round_identity_gpu {label}: arm `{}`: the mixed graphs of {} mixes, verify nodes {verify:?}, append nodes {append:?}, \
              bytes {:?}: {measured} B measured, {} B planned; verify roots {:?}, memset nodes {:?}",
@@ -1154,7 +1154,7 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
 /// (`ignis_core::lane_lines::mixed_graphs`), on either body (#720): none at
 /// the trellis body's 16 GB load's 2 lanes.
 fn mixes_held(load: &Load) -> Vec<(u32, u32)> {
-    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0).mixes
+    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0, load.body()).mixes
 }
 
 /// #712: a digest of a session's tokens, every lane's in order (FNV-1a over

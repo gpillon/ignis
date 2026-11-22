@@ -130,8 +130,8 @@ Why each:
   --spec-draft-tokens 15 --spec-shape-policy mixed`, the shape options refused
   without a named `--spec-backend`; every profile gives `aggregate`, which asks
   for none) holds the graphs of all twelve mixes at these
-  eight lanes, with or without a device retained slot: 64 MiB, at most 114 KV
-  pages (7,296 tokens) of the pool
+  eight lanes, with or without a device retained slot: 66 MiB, at most 118 KV
+  pages (7,552 tokens) of the pool
   ([the VRAM plan](vram-plan.md#what-the-plan-counts)).
   `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
   to measure a window past 7, so `rtxpro6000` keeps 7.
@@ -212,7 +212,7 @@ Why each:
 - **Mixed rounds off**, as on every profile. From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on for the 27B; its eight lanes hold all twelve mixes, the
-  plan's line for their graphs 64 MiB, as on `rtx5090`. Neither the window
+  plan's line for their graphs 66 MiB, as on `rtx5090`. Neither the window
   past 7 nor the mixed rounds are measured on this card.
 
 ### `rtx-16gb`
@@ -267,7 +267,8 @@ Why each:
   retained slot hold no mix, and every round a mix would be granted runs at
   the shape `aggregate` gives it. One device retained slot
   (`--reuse-retained-device 1`, a lane's state out of the KV pool) holds the
-  1+1 mix, its graphs 10 MiB (18 KV pages) more.
+  1+1 mix, its graphs planned at 16 MiB (29 KV pages) more; that shape is
+  planned, not yet run on a card.
 - **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
   2,048 would cost about 0.4 GB of KV pool. The solo width is pinned to it for
   the same reason: on an RTX 40 card in a 16 GiB budget less 1 GiB, `auto`
@@ -426,10 +427,9 @@ Why each:
   table, provisional until a run on one of these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   These eight lanes hold all twelve mixes, with or without the two device
-  retained slots: the plan's line for their graphs is 64 MiB, at most 114 KV
-  pages (7,296 tokens) of the pool, and two captures took 68 and 70 MiB on
-  the RTX 5090 (this artifact's verify graphs are about 200 nodes larger than
-  the NVFP4 artifact's). Their rounds are held on the RTX 5090 to the
+  retained slots: the plan's line for their graphs is 70 MiB, at most 125 KV
+  pages (8,000 tokens) of the pool, the most two captures took on the RTX
+  5090. Their rounds are held on the RTX 5090 to the
   reference's tokens at these lanes; whether they are faster on a 24 GB card
   is not measured.
 - **A million tokens of context.** Measured as the 16 GB numbers were: the

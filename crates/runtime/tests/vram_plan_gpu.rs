@@ -728,7 +728,7 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
                 asking(true);
                 let asked = planned_with(wide, lanes, retained);
                 asking(false);
-                let mirror = ignis_core::lane_lines::mixed_graphs(Some(wide), true, lanes, retained);
+                let mirror = ignis_core::lane_lines::mixed_graphs(Some(wide), true, lanes, retained, ignis_artifact::Body27b::Nvfp4);
                 let what = format!("{window} drafts at {lanes} lanes and {retained} device retained slots");
                 assert_eq!(unasked.mixed_graphs, 0, "{what}: no mixed graph unasked");
                 assert_eq!(asked.mixed_graphs, mirror.bytes, "{what}: the leaf's mixed graphs line is the CPU's {:?}", mirror.mixes);
@@ -758,7 +758,7 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
         }
     }
     assert_eq!(
-        ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), true, N_DECODE_LANES as u32, 0).mixes.len(),
+        ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), true, N_DECODE_LANES as u32, 0, ignis_artifact::Body27b::Nvfp4).mixes.len(),
         12,
         "the `rtx5090` profile's lanes hold every mix"
     );
@@ -914,7 +914,13 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
             unsafe { std::env::remove_var(MIXED_ROUNDS) };
             asked
         };
-        let mirror = ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), true, profile.lanes, profile.retained_device_slots);
+        let mirror = ignis_core::lane_lines::mixed_graphs(
+            Some(at_window(15)),
+            true,
+            profile.lanes,
+            profile.retained_device_slots,
+            ignis_artifact::Body27b::Trellis,
+        );
         assert_eq!(asked.mixed_graphs, mirror.bytes, "{}: the trellis body's mixed graphs", profile.label);
         let want = if profile.lanes == 2 { 0 } else { ignis_core::lane_lines::MIXES.len() };
         assert_eq!(mirror.mixes.len(), want, "{}: the mixes the trellis body's plan holds", profile.label);

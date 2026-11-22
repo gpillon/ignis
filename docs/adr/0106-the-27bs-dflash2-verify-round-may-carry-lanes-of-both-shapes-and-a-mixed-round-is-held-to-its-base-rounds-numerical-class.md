@@ -74,14 +74,11 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   append graph of its mix, both or neither, captured at load for every mix the load holds where mixed rounds are asked;
   a mix with no graph runs its rounds at the uniform shape `aggregate` would choose, counted and logged, never eagerly
   and never refused. The graphs are the plan's line `mixed_graphs`, in the leaf's reservations and their mirror in the
-  core: 5 MiB a mix and 4 MiB beside them, in whole 2 MiB pages, as the RTX 5090 measured them at capture and on the
-  process's WDDM counter, 64 MiB for the twelve (at most 114 KV pages fewer at the `rtx5090` default) and 0 on a load
-  that captures none. The driver keeps the graphs' pages after a teardown, so a reload adds the line back. Measured
-  again with the mixed graph build (#718), the device's free memory fell by 69,206,016 B over the twelve's captures,
-  2 MiB past the line's 67,108,864 (60,817,408 without the build), while the process's counter at a reload stayed
-  within the plan; the line stands as #714 measured it, that page left to the owner. On the trellis body at 8 lanes
-  (#720) the twelve's verify graphs are 1,418 to 1,454 nodes and two captures took 71,303,168 and 73,400,320 B, 4 and
-  6 MiB past the same line, which also stands, left to the owner. This amends
+  core, a measured size of each body: the twelve at 8 lanes at what the RTX 5090 measured their captures to take with
+  the mixed graph build, as the device's free memory before them less after them, 69,206,016 B (66 MiB, two runs) on the
+  NVFP4 body and at most 73,400,320 B (70 MiB) on the trellis body, and 5 MiB less a mix fewer (one mix's capture took 4
+  to 10 MiB), in whole 2 MiB pages; 0 on a load that captures none. The driver keeps the graphs' pages after a teardown,
+  so a reload adds the line back. This amends
   [ADR 0030](0030-device-memory-reserved-at-load.md) as
   [ADR 0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)
   did for the fifteenth line, by a new ADR rather than an edit in place, which only the owner decides.

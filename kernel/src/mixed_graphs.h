@@ -22,17 +22,17 @@ namespace ignis::mixed_graphs {
 // one's stride over the backing both shapes' records share (`ignis_mixed_round_refusal`).
 inline constexpr std::uint32_t kWindow = 15;
 
-// The device memory a load's mixed graphs take: 5 MiB a mix (its verify graph of 1,215 to 1,260
-// nodes and its append graph of 37 to 43, on the 27B's NVFP4 body at 8 lanes, BF16 or FP8 exception
-// weights) and 4 MiB beside them, in whole 2 MiB pages. Measured on the RTX 5090 (2026-11-22, driver
-// 610.88) as the device's free memory before each mix's capture less after it, the twelve in
-// kMixTable's order: 8, 4, 6, 4, 4, 6, 6, 4, 6, 4, 4 and 6 MiB, 62 MiB in all, which 2 MiB beside
-// them holds at every count from one mix to twelve; and on the process's WDDM counter, where the
-// twelve's load held up to 2,088,960 B more past its plan than the same load without them, and the
-// driver held 67,112,960 B more (64 MiB and 4 KiB) once each was torn down: one page more, so that
-// the line is never short of what the process holds.
+// The device memory a load's mixed graphs take, as the RTX 5090 measured the twelve's captures at
+// 8 lanes with the mixed graph build (2026-11-22, driver 610.88), the device's free memory before
+// them less after them: 69,206,016 B (66 MiB, two runs) on the NVFP4 body, its verify graphs of
+// 1,215 to 1,260 nodes and its append graphs of 37 to 43; 71,303,168 and 73,400,320 B (68 and 70
+// MiB) on the trellis body, its verify graphs of 1,418 to 1,454 nodes; one mix's capture 4 to 10
+// MiB, in the driver's 2 MiB pages. The line holds the twelve at each body's largest reading and
+// each mix fewer at 5 MiB less: 5 MiB a mix beside 6 MiB on the NVFP4 body and 10 MiB on the
+// trellis body, in whole 2 MiB pages.
 inline constexpr std::uint64_t kBytesPerMix = std::uint64_t{5} << 20;
-inline constexpr std::uint64_t kFirstMixBytes = std::uint64_t{4} << 20;
+inline constexpr std::uint64_t kFirstMixBytes = std::uint64_t{6} << 20;
+inline constexpr std::uint64_t kTrellisFirstMixBytes = std::uint64_t{10} << 20;
 inline constexpr std::uint64_t kPageBytes = std::uint64_t{2} << 20;
 
 // The measurement switch IGNIS_MIXED_ROUNDS (ADR 0093's kind), read at each load and at each capture
@@ -76,8 +76,9 @@ inline std::uint32_t planned(bool asked, bool dflash2, std::uint32_t window, std
   return mask;
 }
 
-// The bytes of the mixes `mask` names: the plan's `mixed_graphs` line.
-inline std::uint64_t bytes_of(std::uint32_t mask) {
+// The bytes of the mixes `mask` names on the trellis body (`trellis_body`) or the NVFP4 body: the
+// plan's `mixed_graphs` line.
+inline std::uint64_t bytes_of(std::uint32_t mask, bool trellis_body) {
   std::uint64_t mixes = 0;
   for (std::uint32_t m = 0; m < round_layout::kMixes; ++m) {
     mixes += (mask >> m) & 1u;
@@ -85,7 +86,8 @@ inline std::uint64_t bytes_of(std::uint32_t mask) {
   if (mixes == 0) {
     return 0;
   }
-  return (kFirstMixBytes + mixes * kBytesPerMix + kPageBytes - 1) / kPageBytes * kPageBytes;
+  const std::uint64_t first = trellis_body ? kTrellisFirstMixBytes : kFirstMixBytes;
+  return (first + mixes * kBytesPerMix + kPageBytes - 1) / kPageBytes * kPageBytes;
 }
 
 } // namespace ignis::mixed_graphs

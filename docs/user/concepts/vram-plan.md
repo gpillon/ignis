@@ -72,12 +72,10 @@ Flash-Next). The lines include:
   (`mixed_graphs`): a verify graph and a drafter graph for each mix of extended
   and base lanes the load's lanes and its pool hold (a mix of `w` extended
   lanes beside `n` base lanes takes `2w + n` of the pool's slots, the lanes'
-  and the device retained slots'), 5 MiB a mix and 4 MiB more, in 2 MiB pages,
-  as the RTX 5090 measured them on the NVFP4 artifact (62 MiB for the twelve
-  at capture, a page more on the process's own counter): all twelve at 8
-  lanes, 64 MiB, at most 114 KV pages, on either artifact (the trellis
-  artifact's twelve took 68 and 70 MiB in two captures). 0 on every other
-  load. The driver keeps their pages once the load
+  and the device retained slots'): all twelve at 8 lanes at what the RTX 5090
+  measured their captures to take, 66 MiB (at most 118 KV pages) on the NVFP4
+  artifact and 70 MiB (125) on the trellis artifact, and 5 MiB less a mix
+  fewer, in 2 MiB pages. 0 on every other load. The driver keeps their pages once the load
   is gone, so a reload adds them back as it adds back the CUDA context
   ([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md));
 - the **drafter**, when one is loaded: DFlash2's weights, its window in every

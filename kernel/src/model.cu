@@ -2620,7 +2620,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   sizes.mixed_graph_mask = ignis::mixed_graphs::planned(
       options.mixed_rounds_asked, two_shapes, sizes.extended_window, lanes,
       static_cast<std::int64_t>(lanes) + options.retained_device_slots);
-  sizes.mixed_graphs = ignis::mixed_graphs::bytes_of(sizes.mixed_graph_mask);
+  sizes.mixed_graphs = ignis::mixed_graphs::bytes_of(sizes.mixed_graph_mask, model.is_trellis_body);
   return sizes;
 }
 
@@ -2650,7 +2650,7 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   out.tma_descriptor_bytes = model.tma_descriptors != nullptr ? model.tma_descriptors->bytes() : 0;
   // GitHub #714: the mixed graphs the load planned; the driver holds them, not a buffer of its own.
-  out.mixed_graphs_bytes = ignis::mixed_graphs::bytes_of(model.mixed_planned_mask);
+  out.mixed_graphs_bytes = ignis::mixed_graphs::bytes_of(model.mixed_planned_mask, model.is_trellis_body);
   // GitHub #687: a load's extended shape holds the base shape's buffers and
   // none of its own, so the base shape's are every byte of both.
   if (model.base_shape != nullptr) {
