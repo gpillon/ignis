@@ -62,13 +62,17 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream);
 // buffers and its scratch the drafter's arena from its base, so one capture
 // serves every round at the width. GitHub #686: at shape `verify`, whose
 // buffers it reads; the caller keeps the graph with that shape's. 0 with
-// `*out_exec` set, or -1 with `*error` and nothing held.
+// `*out_exec` set, or -1 with `*error` and nothing held. GitHub #712: and
+// `*out_nodes` the graph's node count (`ignis_program_stats`), 0 where the
+// capture failed or the runtime cannot say.
 int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width,
-                       cudaGraphExec_t *out_exec, std::string *error);
+                       cudaGraphExec_t *out_exec, std::uint32_t *out_nodes, std::string *error);
 
-// The append at `width` lanes after a round at shape `verify`: that shape's
-// graph where the latest capture made one, eagerly otherwise. Throws on a
+// The append after a round at shape `verify` laid out as `layout`
+// (GitHub #712): that shape's graph at the round's width where the latest
+// capture made one and the round is uniform, eagerly otherwise. Throws on a
 // failed launch, as the eager append does.
-void append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width);
+void append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                  const ignis::round_layout::Layout &layout);
 
 } // namespace ignis::deferred_verify

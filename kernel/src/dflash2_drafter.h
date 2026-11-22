@@ -85,6 +85,8 @@ void ignis_dflash2_propose(ignis_model *model, ignis_seq_pool *pool, IgnisVerify
 // The verify round's half of the append: the committed columns' feature
 // taps (`verify.features`, written by the traversal) at the round's
 // positions, `verify.append_counts` columns per lane (staged by the
-// caller after the cut), into each lane's window; `shape` is the round's.
+// caller after the cut), into each lane's window; `verify` is the round's
+// shape. GitHub #712: `layout` its lanes' places in those buffers
+// (kernel/src/round_layout.h), a group's lanes at a time.
 void ignis_dflash2_append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
-                                std::uint32_t width);
+                                const ignis::round_layout::Layout &layout);

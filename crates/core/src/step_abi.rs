@@ -62,8 +62,9 @@ pub struct IgnisDecodeOptions {
     /// gives.
     pub forced_shape_window: u32,
     /// GitHub #689: the verify round's shape, 0 the base shape or 1 the
-    /// extended one; null asks for nothing.
-    pub out_round_shape: *mut u32,
+    /// extended one. GitHub #712: each lane's, `[batch]`; null asks for
+    /// nothing.
+    pub out_lane_shapes: *mut u32,
     /// GitHub #690: how many of the verify round's lanes asked the extended
     /// shape going into it; null asks for nothing.
     pub out_shape_asks: *mut u32,
@@ -191,8 +192,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, host_cut_context), 104);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_drafts), 112);
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_shape_window), 120);
-        // GitHub #689: the round's shape, after the forced shape.
-        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_round_shape), 128);
+        // GitHub #689: the round's shape, after the forced shape (#712: each lane's).
+        assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_lane_shapes), 128);
         // GitHub #690: how many lanes asked it, last.
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_shape_asks), 136);
     }

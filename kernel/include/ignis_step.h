@@ -519,6 +519,9 @@ struct ignis_round_shape_stats {
   uint64_t verify_folds_in_flight;
   uint64_t verify_rounds;
   uint64_t eager_verify_rounds;
+  /* GitHub #712: entry w-1 the node count of the shape's drafter append graph
+   * for exact width w; 0 for a width with no append graph. */
+  uint32_t drafter_append_graph_nodes[IGNIS_DECODE_MAX_BATCH];
 };
 
 /* Runtime counters for the real program entry points.  `kernel_count` is
@@ -856,11 +859,13 @@ struct ignis_decode_options {
    * refuses them). NULL: the drafter's proposals, as always. */
   const int32_t *forced_drafts; /* [batch_size][speculative_window], or NULL */
   uint32_t forced_shape_window; /* 0, or the window of the shape a teacher-forced round runs at */
-  /* GitHub #689 (spec #684): receives the verify round's shape, one for all
-   * its lanes: 0 the base shape -- every round of a load of one shape -- or 1
-   * the extended shape of a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS
-   * drafts. NULL asks for nothing; a plain round writes nothing. */
-  uint32_t *out_round_shape;
+  /* GitHub #689 (spec #684): receives the verify round's shape. GitHub #712
+   * (spec #711): each lane's, `[batch_size]`: entry i 0 where lane i ran at
+   * the base shape -- every lane of a load of one shape -- or 1 at the
+   * extended shape of a DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS
+   * drafts. NULL asks for nothing; a plain round, and Flash-Next's verify
+   * round, write nothing. */
+  uint32_t *out_lane_shapes;
   /* GitHub #690 (spec #684): receives how many of the verify round's lanes
    * asked the extended shape going into it, the asks its shape was chosen
    * from (kernel/src/round_shape.h `asks_extended`), before the round's
@@ -874,7 +879,8 @@ struct ignis_decode_options {
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #267 appended
  * `forced_tokens` after every field the serving path sets, GitHub #590 the
  * host cut after it, GitHub #692 the forced drafts and shape after that,
- * GitHub #689 the round's shape after them and GitHub #690 its asks last. */
+ * GitHub #689 the round's shape after them (GitHub #712: each lane's) and
+ * GitHub #690 its asks last. */
 static_assert(sizeof(struct ignis_decode_options) == 144 &&
                   offsetof(struct ignis_decode_options, out_logits) == 72 &&
                   offsetof(struct ignis_decode_options, forced_tokens) == 80 &&
@@ -883,7 +889,7 @@ static_assert(sizeof(struct ignis_decode_options) == 144 &&
                   offsetof(struct ignis_decode_options, host_cut_context) == 104 &&
                   offsetof(struct ignis_decode_options, forced_drafts) == 112 &&
                   offsetof(struct ignis_decode_options, forced_shape_window) == 120 &&
-                  offsetof(struct ignis_decode_options, out_round_shape) == 128 &&
+                  offsetof(struct ignis_decode_options, out_lane_shapes) == 128 &&
                   offsetof(struct ignis_decode_options, out_shape_asks) == 136,
               "ignis_decode_options drifted from crates/core/src/step_abi.rs IgnisDecodeOptions");
 #endif

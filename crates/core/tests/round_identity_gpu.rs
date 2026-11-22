@@ -169,6 +169,11 @@
 //! width-1 decode graph, which is the reference's. #681: each `gdn-gating-*`
 //! arm's capture reports the home its switch names
 //! (`ProgramStats::gdn_gating`), and its graphs copy as the reference's do.
+//! #712: on every load the reference's verify and drafter append graphs, each
+//! round shape's at each width, are printed, and held node for node to main's
+//! where [`MAIN_GRAPH_NODES`] names the load, on a card of compute capability
+//! 12 ([`uniform_graph_nodes`]); a digest of the reference's tokens is printed
+//! beside them, so that two builds' runs say whether they commit one text.
 //!
 //! # Narrow runs
 //!
@@ -551,6 +556,45 @@ const MAIN_COPIES: u32 = 64 + 3 * 48;
 const RESIDUAL_COPIES: u32 = 64;
 const DRAFTER_COPIES: u32 = 5 + 1 + 16;
 
+/// #712: a load's uniform verify graphs and drafter append graphs as main
+/// captures them with every switch unset, node for node, on a card of compute
+/// capability 12: for each round shape the load builds, the base shape first,
+/// the verify graph's nodes and the append graph's at each width (entry
+/// `w - 1`; 0 past the shape's lanes, and for the append on a load that
+/// captures none). Keyed by the session's label, the load and its exception
+/// weights; [`uniform_graph_nodes`] holds the reference's capture to it.
+struct GraphNodes {
+    label: &'static str,
+    shapes: &'static [ShapeNodes],
+}
+
+struct ShapeNodes {
+    verify: [u32; 8],
+    append: [u32; 8],
+}
+
+const MAIN_GRAPH_NODES: &[GraphNodes] = &[
+    GraphNodes { label: "nvfp4-dflash2 bf16", shapes: &[BASE_BF16] },
+    GraphNodes { label: "nvfp4-dflash2 fp8", shapes: &[BASE_FP8] },
+    GraphNodes { label: "nvfp4-mtp bf16", shapes: &[ShapeNodes { verify: [1125, 1077, 1077, 1077, 1077, 1077, 1077, 1077], append: [0; 8] }] },
+    GraphNodes { label: "nvfp4-mtp fp8", shapes: &[ShapeNodes { verify: [1125, 1086, 1086, 1086, 1086, 1086, 1086, 1086], append: [0; 8] }] },
+    GraphNodes {
+        label: "nvfp4-dflash2-w15 bf16",
+        shapes: &[BASE_BF16, ShapeNodes { verify: [1042, 1047, 1078, 1068, 0, 0, 0, 0], append: EXTENDED_APPEND }],
+    },
+    GraphNodes {
+        label: "nvfp4-dflash2-w15 fp8",
+        shapes: &[BASE_FP8, ShapeNodes { verify: [1051, 1056, 1087, 1077, 0, 0, 0, 0], append: EXTENDED_APPEND }],
+    },
+];
+/// The NVFP4 body's DFlash2 rounds at 7 drafts, a 7-draft load's and a
+/// 15-draft load's base shape alike, under each exception setting; and the
+/// append after an extended round of 1-4 lanes.
+const BASE_BF16: ShapeNodes = ShapeNodes { verify: [1058, 1010, 1015, 1015, 1046, 1046, 1051, 1036], append: BASE_APPEND };
+const BASE_FP8: ShapeNodes = ShapeNodes { verify: [1058, 1019, 1024, 1024, 1055, 1055, 1060, 1045], append: BASE_APPEND };
+const BASE_APPEND: [u32; 8] = [32, 32, 32, 32, 38, 38, 38, 32];
+const EXTENDED_APPEND: [u32; 8] = [32, 32, 38, 32, 0, 0, 0, 0];
+
 /// Plain rounds, then verify rounds, at each width of the session.
 const PLAIN_ROUNDS: u32 = 4;
 const VERIFY_ROUNDS: u32 = 4;
@@ -810,6 +854,48 @@ fn copy_free_graphs(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, label
     assert!(copies[1..].iter().all(|&c| c == wide), "{label}: arm `{}`: widths 2-{lanes} copy {wide} nodes", arm.name);
     let verify = DRAFTER_COPIES + if wide_free { 0 } else { RESIDUAL_COPIES };
     assert!(verify_copies.iter().all(|&c| c == verify), "{label}: arm `{}`: the verify graphs copy {verify} nodes", arm.name);
+}
+
+/// #712: the reference's verify and drafter append graphs, each shape's at
+/// each width, printed on every load and held to [`MAIN_GRAPH_NODES`] where it
+/// names the load on a card of compute capability 12: a round that takes each
+/// lane's layout captures, at a uniform layout, main's graphs.
+fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
+    if arm.name != REFERENCE.name {
+        return;
+    }
+    let (_, (major, _)) = CudaDevice::identity(0).unwrap_or_else(|e| panic!("{label}: device identity: {e}"));
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{label}: stats: {e}"));
+    for shape in stats.shapes() {
+        println!(
+            "round_identity_gpu {label}: the reference's shape at {} drafts: verify graph nodes {:?}, append graph nodes {:?}",
+            shape.window, shape.verify_graph_nodes, shape.drafter_append_graph_nodes
+        );
+    }
+    let Some(main) = MAIN_GRAPH_NODES.iter().find(|nodes| nodes.label == label) else {
+        return;
+    };
+    if major != 12 {
+        return;
+    }
+    assert_eq!(stats.shapes().len(), main.shapes.len(), "{label}: the round shapes main captures");
+    for (shape, want) in stats.shapes().iter().zip(main.shapes) {
+        assert_eq!(shape.verify_graph_nodes, want.verify, "{label}: the verify graphs' nodes at {} drafts", shape.window);
+        assert_eq!(shape.drafter_append_graph_nodes, want.append, "{label}: the append graphs' nodes at {} drafts", shape.window);
+    }
+}
+
+/// #712: a digest of a session's tokens, every lane's in order (FNV-1a over
+/// each token and each lane's end), printed for the reference so that two
+/// builds' logs say whether they commit the same text.
+fn digest(sessions: &[Committed]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for token in sessions.iter().flatten().flat_map(|lane| lane.iter().copied().chain([i32::MIN])) {
+        for byte in token.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 /// #688: the route the arm's extended rounds attend on. On a load of two
@@ -1102,6 +1188,7 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         let want = if defers_verify(load, arm) { every } else { 0 };
         assert_eq!(append, want, "{label}: {}: the drafter's append graphs", arm.name);
         copy_free_graphs(model, pool, load, arm, label);
+        uniform_graph_nodes(model, pool, arm, label);
     }
     round_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));
     extended_attention(model, load, arm, label);
@@ -1218,6 +1305,7 @@ fn hold(device: &mut CudaDevice, reader: &Reader, load: &Load, exceptions: Excep
             arms.iter().filter(|arm| !arm.graphs).map(|&arm| (arm, run(model, pool, load, script, arm, label))).collect();
         let reference = run(model, pool, load, script, &REFERENCE, label);
         assert_ne!(reference[0], reference[1], "{label}: the sampled lanes commit the greedy lanes' tokens: their settings never reached the sampler");
+        println!("round_identity_gpu {label}: the reference's tokens, greedy and sampled lanes: digest {:016x}", digest(&reference));
         let mut compared = 0;
         let mut hold_arm = |arm: &Arm, sessions: Vec<Committed>| {
             for (((kind, _), want), got) in KINDS.iter().zip(&reference).zip(&sessions) {

@@ -181,11 +181,12 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
 //
 // GitHub #686: at the round's shape `verify`, which every call below is handed.
 int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
-                                     uint32_t width, LinearPolicyMode mode) {
+                                     const ignis::round_layout::Layout &layout, LinearPolicyMode mode) {
   if (model == nullptr || pool == nullptr) {
     set_error("ignis_verify_graph: null argument");
     return -1;
   }
+  const uint32_t width = layout.lanes();
   // GitHub #687: the shape's own lanes, the load's decode lanes at its base
   // shape and no more than IGNIS_EXTENDED_SHAPE_MAX_LANES at an extended one.
   if (width == 0 || width > verify.lanes) {
@@ -239,7 +240,7 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     if (verify.forced_drafts != nullptr) {
       const cudaError_t err =
           cudaMemcpyAsync(verify.drafts->p, verify.forced_drafts,
-                          static_cast<std::size_t>(k) * width * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                          static_cast<std::size_t>(layout.drafts()) * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                           model->stream);
       if (err != cudaSuccess) {
         set_error(std::string("ignis_verify_graph: cudaMemcpyAsync(forced drafts) failed: ") +
@@ -247,8 +248,29 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
         return -1;
       }
     }
-    ninfer::ops::speculative_prepare_verify_inputs(anchors, drafts, base_positions, extents,
-                                                   verify_ids, positions, model->stream);
+    // GitHub #712: a group's lanes at a time, at its columns and drafts.
+    for (const ignis::round_layout::Group &group : layout.groups) {
+      if (group.lanes == 0) {
+        continue;
+      }
+      const auto lanes = static_cast<std::int32_t>(group.lanes);
+      const auto window = static_cast<std::int32_t>(group.window);
+      const auto lane_rows = [&](const ninfer::Tensor &all) {
+        return ninfer::Tensor(static_cast<std::int32_t *>(all.data) + group.first_lane, ninfer::DType::I32,
+                              {lanes, 1, 1, 1});
+      };
+      const auto column_rows = [&](const ninfer::Tensor &all) {
+        return ninfer::Tensor(static_cast<std::int32_t *>(all.data) + group.first_column, ninfer::DType::I32,
+                              {window + 1, lanes, 1, 1});
+      };
+      const ninfer::Tensor group_drafts(static_cast<std::int32_t *>(drafts.data) + group.first_draft,
+                                        ninfer::DType::I32, {window, lanes, 1, 1});
+      ninfer::Tensor group_ids = column_rows(verify_ids);
+      ninfer::Tensor group_positions = column_rows(positions);
+      ninfer::ops::speculative_prepare_verify_inputs(lane_rows(anchors), group_drafts, lane_rows(base_positions),
+                                                     lane_rows(extents), group_ids, group_positions,
+                                                     model->stream);
+    }
 
     const ninfer::Tensor ids(verify.verify_ids->p, ninfer::DType::I32, {columns, 1, 1, 1});
     ninfer::Tensor left =
@@ -431,8 +453,9 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, Ign
               cudaGetErrorString(err));
     return -1;
   }
-  const bool ok =
-      ignis_verify_graph_run_batch(model, pool, verify, width, LinearPolicyMode::kEngineDefault) == 0;
+  const bool ok = ignis_verify_graph_run_batch(model, pool, verify,
+                                               ignis::round_layout::uniform(width, verify.window, verify.extended()),
+                                               LinearPolicyMode::kEngineDefault) == 0;
   cudaGraph_t graph = nullptr;
   const cudaError_t end_err = cudaStreamEndCapture(model->stream, &graph);
   if (end_err != cudaSuccess) {
@@ -718,6 +741,7 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
         cudaGraphExecDestroy(held->append_exec[width - 1]);
         held->append_exec[width - 1] = nullptr;
       }
+      held->append_nodes[width - 1] = 0;
     }
   }
   // GitHub #336: the widths the load's lanes serve, and no wider: a round
@@ -771,7 +795,7 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     for (uint32_t width = 1; width <= held->lanes; ++width) {
       std::string error;
       if (ignis::deferred_verify::capture_append(model, pool, *held, width, &held->append_exec[width - 1],
-                                                 &error) != 0) {
+                                                 &held->append_nodes[width - 1], &error) != 0) {
         set_error("ignis_decode_graph_capture: the drafter's append at " + std::to_string(held->window) +
                   " drafts, width " + std::to_string(width) + ": " + error);
       }

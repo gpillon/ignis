@@ -262,10 +262,12 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
 // after readback. Everything it reads or writes is a stable model-owned
 // address, so the same call records a verify graph and runs a round eagerly.
 // GitHub #686: `verify` is the round's shape, handed down to everything the
-// pass calls. Returns 0 on success, -1 on a leaf/kernel error (see
+// pass calls. GitHub #712: `layout` its lanes' places in the round's buffers
+// (kernel/src/round_layout.h), a uniform round of its width at that shape.
+// Returns 0 on success, -1 on a leaf/kernel error (see
 // `ignis_decode_graph_last_error`).
 int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
-                                     uint32_t width, LinearPolicyMode mode);
+                                     const ignis::round_layout::Layout &layout, LinearPolicyMode mode);
 
 // The Qwen 3.8 topology's GQA layers sit at index 3, 7, 11, ... (every 4th);
 // this is the same relative-index formula `ignis_gqa_layer_step` and

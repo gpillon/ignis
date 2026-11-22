@@ -2160,7 +2160,10 @@ struct UncommittedRingColumns {
 
 // P5-04 (GitHub #153): one verify round over `batch_size` lanes at the
 // window `k` of its shape `verify` (GitHub #686: the caller's choice, handed
-// to everything the round calls; spec 05, "The verify round"). The device-side pass is
+// to everything the round calls; spec 05, "The verify round"), its lanes laid
+// out in the round's buffers by `layout` (GitHub #712, kernel/src/round_layout.h:
+// each lane's window, column base and draft base, which every site below that
+// reads a lane's columns or drafts takes). The device-side pass is
 // `ignis_verify_graph_run_batch` (kernel/src/decode_graph.cu), replayed from
 // the width's verify graph when one is ready and enqueued directly
 // otherwise; this function stages its inputs, reads its outputs back, and
@@ -2191,20 +2194,26 @@ struct UncommittedRingColumns {
 // every lane's state once the fold is queued, not confirmed; a fault in it
 // surfaces at the next leaf call that waits on the device.
 int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
-                         ignis_seq *const *sequences, uint64_t batch_size,
+                         const ignis::round_layout::Layout &layout, ignis_seq *const *sequences, uint64_t batch_size,
                          const ignis_sampling_params *sampling, const ignis_decode_options &options,
                          int32_t *out_token_ids) {
   const std::uint32_t k = verify.window;
-  const std::uint32_t lane_columns = k + 1;
   // GitHub #689: whether the round is at its load's extended shape.
   const bool extended = verify.extended();
+  // GitHub #712: a round of one shape, every lane at its window. A round of
+  // both needs a traversal of both shapes at once, which this leaf has not.
+  if (layout.lanes() != batch_size || !layout.uniform() || layout.window_of(0) != k ||
+      layout.extended(0) != extended) {
+    set_error("ignis_program_decode: a verify round's layout is not one of its " + std::to_string(batch_size) +
+              " lanes at its round shape's " + std::to_string(k) + " drafts");
+    return -1;
+  }
   // GitHub #687: the caller's arrays are strided by the load's window
   // (`speculative_window`), the round's buffers by its shape's: equal on a
   // load of one shape, and on a load of two at its extended shape; a base
   // round there reads the first 8 of each lane's 16 and writes as many.
   const std::uint32_t caller_k = options.speculative_window;
   const std::uint32_t caller_columns = caller_k + 1;
-  const auto batch = static_cast<std::int32_t>(batch_size);
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   // GitHub #619: what fills the round's proposal follows the load's drafter.
   // One in the leaf proposes every lane's drafts itself, inside the verify
@@ -2261,19 +2270,21 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
                 "loaded with " + std::string(ignis_drafter_name(model->drafter)));
       return -1;
     }
-    forced_draft_rows.resize(static_cast<std::size_t>(k) * batch_size);
+    forced_draft_rows.resize(layout.drafts());
     for (uint64_t i = 0; i < batch_size; ++i) {
       if (samples(i)) {
         set_error("ignis_program_decode: forced_drafts ride greedy lanes; lane " + std::to_string(i) +
                   " samples at temperature > 0");
         return -1;
       }
-      std::copy_n(options.forced_drafts + i * caller_k, k, forced_draft_rows.data() + i * k);
+      const auto lane = static_cast<std::uint32_t>(i);
+      std::copy_n(options.forced_drafts + i * caller_k, layout.window_of(lane),
+                  forced_draft_rows.data() + layout.draft_of(lane));
     }
   }
 
   std::vector<std::int32_t> anchors(batch_size, 0);
-  std::vector<std::int32_t> drafts(static_cast<std::size_t>(k) * batch_size, 0);
+  std::vector<std::int32_t> drafts(layout.drafts(), 0);
   std::vector<std::int32_t> base_positions(batch_size, 0);
   std::vector<std::int32_t> extents(batch_size, 0);
   std::vector<std::int32_t> valid_columns(batch_size, 1);
@@ -2281,8 +2292,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
   // GitHub #195: on a vision load, the columns' rotation positions -- the
   // same `base + min(j, extent)` the traversal derives, plus the lane's own
   // `rope_delta`. Empty (and unstaged) on every other load.
-  std::vector<std::int32_t> rope_positions(
-      verify.rope_positions == nullptr ? 0 : static_cast<std::size_t>(lane_columns) * batch_size, 0);
+  std::vector<std::int32_t> rope_positions(verify.rope_positions == nullptr ? 0 : layout.columns(), 0);
   std::vector<ninfer::ops::SamplingConfig> configs(batch_size);
   try {
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -2303,7 +2313,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       // The lane's extent: never more drafts than proposed, than its budget
       // leaves after the anchor, or than its context leaves after the
       // anchor. 0 is the fallback step inside this same round.
-      uint64_t extent = k;
+      const auto lane = static_cast<std::uint32_t>(i);
+      uint64_t extent = layout.window_of(lane);
       if (!in_leaf && options.drafts == nullptr) {
         extent = 0;
       } else if (!in_leaf && options.draft_counts != nullptr) {
@@ -2325,14 +2336,14 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       slots[i] = seq->slot;
       configs[i] = to_sampling_config(sampling[i], pool->token_counts_for(seq->slot));
       for (uint64_t j = 0; j < extent && !in_leaf; ++j) {
-        drafts[i * k + j] = options.drafts[i * caller_k + j];
+        drafts[layout.draft_of(lane) + j] = options.drafts[i * caller_k + j];
       }
       // The lane's rotation positions: the traversal's own column rule with
       // the sequence's delta added. A text sequence's delta is 0, so the two
       // matrices are equal and nothing about a text round changes.
       if (!rope_positions.empty()) {
-        for (std::uint32_t j = 0; j < lane_columns; ++j) {
-          rope_positions[i * lane_columns + j] =
+        for (std::uint32_t j = 0; j < layout.window_of(lane) + 1; ++j) {
+          rope_positions[layout.column_of(lane) + j] =
               base_positions[i] + std::min<std::int32_t>(static_cast<std::int32_t>(j), extents[i]) +
               seq->rope_delta;
         }
@@ -2458,9 +2469,11 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     // caller's row; a pageable copy staged before the call returns.
     std::vector<std::int32_t> forced_rows;
     if (forced_on_device) {
-      forced_rows.resize(static_cast<std::size_t>(lane_columns) * batch_size);
+      forced_rows.resize(layout.columns());
       for (uint64_t i = 0; i < batch_size; ++i) {
-        std::copy_n(options.forced_tokens + i * caller_columns, lane_columns, forced_rows.data() + i * lane_columns);
+        const auto lane = static_cast<std::uint32_t>(i);
+        std::copy_n(options.forced_tokens + i * caller_columns, layout.window_of(lane) + 1,
+                    forced_rows.data() + layout.column_of(lane));
       }
       const std::size_t forced_bytes = forced_rows.size() * sizeof(std::int32_t);
       forced_device = std::make_unique<ninfer::DeviceBuffer>(forced_bytes);
@@ -2506,13 +2519,12 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
                   cudaGetErrorString(err));
         return -1;
       }
-    } else if (ignis_verify_graph_run_batch(model, pool, verify, static_cast<uint32_t>(batch_size),
-                                            LinearPolicyMode::kEngineDefault) != 0) {
+    } else if (ignis_verify_graph_run_batch(model, pool, verify, layout, LinearPolicyMode::kEngineDefault) != 0) {
       set_error(std::string("ignis_program_decode: ") + ignis_decode_graph_last_error());
       return -1;
     }
 
-    std::vector<std::int32_t> licensed(static_cast<std::size_t>(lane_columns) * batch_size, 0);
+    std::vector<std::int32_t> licensed(layout.columns(), 0);
     std::vector<std::int32_t> accepted(batch_size, 0);
     cudaError_t err = cudaSuccess;
     // GitHub #676: through the slot, behind the ticket.
@@ -2574,8 +2586,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
         // GitHub #577 (test-only): a sampling lane forced on the device has
         // its verdict already, the recording's run by the forced coin; one
         // that is not the recording's is the device's fault, and refused.
+        const auto lane = static_cast<std::uint32_t>(i);
         if (forced_on_device && samples(i)) {
-          if (!ignis_teacher_forced_run_is_recorded(licensed.data() + i * lane_columns, forced, accepted[i],
+          if (!ignis_teacher_forced_run_is_recorded(licensed.data() + layout.column_of(lane), forced, accepted[i],
                                                    extents[i])) {
             set_error("ignis_program_decode: lane " + std::to_string(i) + "'s forced verdict on the device "
                       "licensed a run that is not its recording (" + std::to_string(accepted[i]) +
@@ -2585,8 +2598,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
           continue;
         }
         const IgnisForcedVerdict verdict = ignis_teacher_forced_verdict(
-            anchors[i], drafts.data() + i * k, forced, extents[i], static_cast<std::int32_t>(model->vocab),
-            sampling[i].stop_ids, sampling[i].stop_id_count, licensed.data() + i * lane_columns);
+            anchors[i], drafts.data() + layout.draft_of(lane), forced, extents[i],
+            static_cast<std::int32_t>(model->vocab), sampling[i].stop_ids, sampling[i].stop_id_count,
+            licensed.data() + layout.column_of(lane));
         if (verdict.refused) {
           set_error("ignis_program_decode: lane " + std::to_string(i) + "'s forced token " +
                     std::to_string(forced[verdict.accepted]) + " after its " +
@@ -2608,7 +2622,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     const std::uint8_t *host_cut_lanes = options.host_cut != nullptr ? options.host_cut_lanes : nullptr;
     std::vector<ninfer::ops::GdnReplayFoldRow> fold_rows(batch_size);
     std::vector<std::int32_t> selectors(batch_size, 0);
-    std::vector<std::int32_t> run(lane_columns, 0);
+    std::vector<std::int32_t> run(layout.widest_lane_columns(), 0);
     for (uint64_t i = 0; i < batch_size; ++i) {
       const std::int32_t n = accepted[i];
       if (n < 0 || n > extents[i]) {
@@ -2616,7 +2630,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
                   " accepted drafts for an extent of " + std::to_string(extents[i]));
         return -1;
       }
-      const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
+      const std::int32_t *lane_licensed = licensed.data() + layout.column_of(static_cast<std::uint32_t>(i));
       // run[j]: j == 0 the anchor, else licensed[j-1] (= the j-th draft,
       // accepted); run length n + 1 before the cut, and licensed[n] -- the
       // correction/bonus token -- the successor of its last.
@@ -2711,12 +2725,24 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
 
     // The fold: every GDN layer's slot and conv taps rebuilt from the
     // committed prefix of this round's records, in one vendored call over
-    // every lane. A zero-length commit is that op's own strict no-op; this
-    // round never asks for one (c >= 1), the anchor is always committed.
-    ninfer::ops::gdn_replay_fold(verify.records, pool->gdn_pool.all_layers_view(),
-                                 std::span<const ninfer::ops::GdnReplayFoldRow>(fold_rows.data(),
-                                                                                batch_size),
-                                 model->stream);
+    // every lane of a group (GitHub #712), at its shape's records: a uniform
+    // round's one group, at the round's. A zero-length commit is that op's
+    // own strict no-op; this round never asks for one (c >= 1), the anchor is
+    // always committed.
+    for (const ignis::round_layout::Group &group : layout.groups) {
+      if (group.lanes == 0) {
+        continue;
+      }
+      const IgnisVerifyRound *const shape = ignis_round_shape_at(*model, group.window);
+      if (shape == nullptr) {
+        set_error("ignis_program_decode: no round shape of this load drafts " + std::to_string(group.window));
+        return -1;
+      }
+      ninfer::ops::gdn_replay_fold(shape->records, pool->gdn_pool.all_layers_view(),
+                                   std::span<const ninfer::ops::GdnReplayFoldRow>(
+                                       fold_rows.data() + group.first_lane, group.lanes),
+                                   model->stream);
+    }
 
     // GitHub #621: the MTP head's rows the run licenses, [P - 1, P - 1 + c)
     // in each lane, built again from the continuation hidden, the round's
@@ -2728,16 +2754,18 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     // the lane's rope delta, as the chain's and the target's columns did.
     std::vector<std::int32_t> head_rotation;
     if (mtp) {
-      head_rows.resize(static_cast<std::size_t>(lane_columns) * batch_size);
+      head_rows.resize(layout.columns());
       if (!rope_positions.empty()) {
         head_rotation.resize(head_rows.size());
       }
       for (uint64_t i = 0; i < batch_size; ++i) {
-        for (std::uint32_t j = 0; j < lane_columns; ++j) {
-          head_rows[i * lane_columns + j] =
+        const auto lane = static_cast<std::uint32_t>(i);
+        for (std::uint32_t j = 0; j < layout.window_of(lane) + 1; ++j) {
+          const std::size_t column = layout.column_of(lane) + j;
+          head_rows[column] =
               base_positions[i] - 1 + std::min<std::int32_t>(static_cast<std::int32_t>(j), committed[i] - 1);
           if (!head_rotation.empty()) {
-            head_rotation[i * lane_columns + j] = head_rows[i * lane_columns + j] + sequences[i]->rope_delta;
+            head_rotation[column] = head_rows[column] + sequences[i]->rope_delta;
           }
         }
       }
@@ -2755,12 +2783,23 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
     if (!stage(*verify.selectors, selectors.data(), lane_bytes, "verify selectors") || !flush("verify selectors")) {
       return -1;
     }
-    const ninfer::Tensor hidden_columns(verify.hidden->p, ninfer::DType::BF16,
-                                        {hidden, static_cast<std::int32_t>(lane_columns), batch, 1});
-    const ninfer::Tensor selector_tensor(verify.selectors->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    ninfer::Tensor selected(verify.selected_hidden->p, ninfer::DType::BF16, {hidden, batch, 1, 1});
-    ninfer::ops::speculative_select_accepted_hidden(hidden_columns, selector_tensor, selected,
-                                                    model->stream);
+    // GitHub #712: a group's lanes at a time, at its columns.
+    const std::size_t hidden_bytes = static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
+    for (const ignis::round_layout::Group &group : layout.groups) {
+      if (group.lanes == 0) {
+        continue;
+      }
+      const auto lanes = static_cast<std::int32_t>(group.lanes);
+      const ninfer::Tensor hidden_columns(
+          static_cast<std::uint8_t *>(verify.hidden->p) + group.first_column * hidden_bytes, ninfer::DType::BF16,
+          {hidden, static_cast<std::int32_t>(group.lane_columns()), lanes, 1});
+      const ninfer::Tensor selector_tensor(static_cast<std::int32_t *>(verify.selectors->p) + group.first_lane,
+                                           ninfer::DType::I32, {lanes, 1, 1, 1});
+      ninfer::Tensor selected(static_cast<std::uint8_t *>(verify.selected_hidden->p) + group.first_lane * hidden_bytes,
+                              ninfer::DType::BF16, {hidden, lanes, 1, 1});
+      ninfer::ops::speculative_select_accepted_hidden(hidden_columns, selector_tensor, selected,
+                                                      model->stream);
+    }
 
     // P5-05 (GitHub #155): the committed columns' feature taps into each
     // lane's window -- its whole committed run, or nothing for a lane at
@@ -2779,9 +2818,9 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       }
       // GitHub #676: from its graph, on a round that stages.
       if (staging != nullptr) {
-        ignis::deferred_verify::append_round(model, pool, verify, static_cast<std::uint32_t>(batch_size));
+        ignis::deferred_verify::append_round(model, pool, verify, layout);
       } else {
-        ignis_dflash2_append_round(model, pool, verify, static_cast<std::uint32_t>(batch_size));
+        ignis_dflash2_append_round(model, pool, verify, layout);
       }
       const std::size_t column_bytes =
           kDflash2TapLayers.size() * static_cast<std::size_t>(hidden) * sizeof(std::uint16_t);
@@ -2792,7 +2831,8 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
         carried_taps[i].resize(column_bytes);
         const cudaError_t copied = cudaMemcpyAsync(
             carried_taps[i].data(),
-            static_cast<const std::uint8_t *>(verify.features->p) + i * lane_columns * column_bytes,
+            static_cast<const std::uint8_t *>(verify.features->p) +
+                layout.column_of(static_cast<std::uint32_t>(i)) * column_bytes,
             column_bytes, cudaMemcpyDeviceToHost, model->stream);
         if (copied != cudaSuccess) {
           set_error(std::string("ignis_program_decode: cudaMemcpyAsync(anchor taps) failed: ") +
@@ -2820,7 +2860,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
         continue;
       }
       const std::int32_t produced = accepted[i] + 1;
-      const std::int32_t *lane_licensed = licensed.data() + i * lane_columns;
+      const std::int32_t *lane_licensed = licensed.data() + layout.column_of(static_cast<std::uint32_t>(i));
       for (std::int32_t j = committed[i]; j < produced; ++j) {
         // GitHub #577: a forced lane's pad after a stop (-1) was never
         // counted; every other licensed token is a vocabulary id.
@@ -2908,7 +2948,7 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       if (host_cut_lanes != nullptr && host_cut_lanes[i] != 0 && !redirected[i]) {
         ignis_kept_scores &kept = sequences[i]->kept;
         kept.source = IgnisKeptSource::kVerifyLogits;
-        kept.column = static_cast<std::int32_t>(i * lane_columns) + committed[i] - 1;
+        kept.column = static_cast<std::int32_t>(layout.column_of(static_cast<std::uint32_t>(i))) + committed[i] - 1;
         kept.epoch = verify.kept_epoch;
         kept.position = base_positions[i] + committed[i] - 1;
         kept.counted = configs[i].temperature > 0.0f && configs[i].token_counts != nullptr;
@@ -2943,17 +2983,20 @@ int32_t run_verify_round(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRo
       // next round (kernel/src/round_shape.h), from this round's shape, its
       // extent and the drafts the target accepted -- not what a stop or the
       // host's cut kept: the drafts' quality, not the grammar's.
+      // GitHub #712: at the lane's own shape.
+      const bool lane_extended = layout.extended(static_cast<std::uint32_t>(i));
       if (model->extended_shape != nullptr) {
         ignis_seq &seq = *sequences[i];
         seq.asks_extended_shape = ignis::round_shape::asks_extended(model->shape_rule, seq.asks_extended_shape,
-                                                                    extended, extents[i], accepted[i]);
+                                                                    lane_extended, extents[i], accepted[i]);
         // GitHub #690: and the round, for the shape policy's estimate of the lane.
-        ignis::round_shape::record_round(seq.shape_rounds, seq.shape_rounds_recorded, extended, extents[i],
+        ignis::round_shape::record_round(seq.shape_rounds, seq.shape_rounds_recorded, lane_extended, extents[i],
                                          accepted[i]);
       }
-    }
-    if (options.out_round_shape != nullptr) {
-      *options.out_round_shape = extended ? 1 : 0;
+      // GitHub #712: and each lane's shape, for the core.
+      if (options.out_lane_shapes != nullptr) {
+        options.out_lane_shapes[i] = lane_extended ? 1 : 0;
+      }
     }
     model->last_step_kernel_count = model->layers.size();
     model->last_step_graph_launches = use_graph ? 1 : 0;
@@ -3156,8 +3199,11 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
         }
       }
       const auto began = std::chrono::steady_clock::now();
+      // GitHub #712: every lane at the round's shape.
+      const ignis::round_layout::Layout layout =
+          ignis::round_layout::uniform(static_cast<std::uint32_t>(batch_size), shape->window, shape->extended());
       const int32_t rc =
-          run_verify_round(model, pool, *shape, sequences, batch_size, sampling, *options, out_token_ids);
+          run_verify_round(model, pool, *shape, layout, sequences, batch_size, sampling, *options, out_token_ids);
       if (rc != 0) {
         return rc;
       }
@@ -3696,6 +3742,7 @@ ignis_round_shape_stats round_shape_stats(const IgnisVerifyRound &shape, const I
     }
     if (shape.append_exec[width - 1] != nullptr) {
       out.drafter_append_graph_ready_mask |= 1u << (width - 1);
+      out.drafter_append_graph_nodes[width - 1] = shape.append_nodes[width - 1];
     }
   }
   out.verify_folds_in_flight = shape.folds_in_flight;
