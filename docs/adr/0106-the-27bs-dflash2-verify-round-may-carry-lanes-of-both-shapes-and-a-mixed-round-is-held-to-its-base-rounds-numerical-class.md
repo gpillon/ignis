@@ -54,22 +54,22 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   A load whose latest capture ran under `IGNIS_MIXED_ROUNDS=0` takes `aggregate`'s uniform choice too.
 - **The cost table.** `spec.shape_period_ratios` becomes a table by lane count (1 to 7) and extended lanes, each entry
   the period of the round with that many lanes extended over the base round at the same lane count; `aggregate` reads
-  its uniform entries at 1 to 4 lanes, today's measured 1.128, 1.290, 1.363 and 1.344, and `mixed` reads every entry.
-  Its defaults are each body's, measured on the RTX 5090 with the final build, the NVFP4 body's (#721) and the trellis
-  body's (#720; indicatively a trellis body's extended round costs 1.35 to 1.40 times its base round at one lane,
-  against 1.13 on the NVFP4 body). Each body's default is chosen at load, where the body is known
-  (`PeriodTable::of_load`): a table the operator or a profile named stands on either body, and the four-value form's
-  mixed entries are the loaded body's. Until a run measures the trellis body's, its default is derived (#720): its
-  uniform entries the NVFP4 body's excess over 1 scaled by 2.93 (0.375 over 0.128, the one-lane ratios), capped at 2;
-  its mixed entries that excess scaled by 2.09, what the trellis body's base round's 8 more columns cost at one and two
-  lanes against the NVFP4 body's (1.218 over 1.104). Until #721 lands the NVFP4 body's: four of its mixed entries, 1+1,
-  1+3, 2+2 and 1+5, are those mixes' periods measured with their graph build (#718), and each of the other eight is the
-  measured base round of the mix's columns over the base round at its lane count, a mixed round with its graph build
-  having been measured to cost what a base round of its columns costs; the three mixes of 64 columns, where no base
-  round of 8 lanes was measured, are one 8-column step past 56. Every entry is measured against measured rounds, never
-  read off a line between lane counts: the base round's cost rises in steps with its columns (5 lanes 24,668 us and 7
-  lanes 29,770, where a line between lane counts said 23.9 and 27.7 ms). The four-value form stays accepted as the
-  uniform entries.
+  its uniform entries at 1 to 4 lanes and `mixed` reads every entry. Its default, `auto`, is the loaded body's own
+  table, resolved at load where the body is known (`PeriodTableSetting::of_body`), as `model.exception_weights` and
+  `model.rope_scaling` resolve theirs under ADR 0046's one declaration: a table named whole stands on either body, the
+  four-value form's mixed entries are the loaded body's, and the four-value form at its earlier default reads as `auto`,
+  so a file an earlier build generated names no table. The NVFP4 body's: its uniform entries the RTX 5090's measured
+  1.128, 1.290, 1.363 and 1.344; four of its mixed entries, 1+1, 1+3, 2+2 and 1+5, those mixes' periods measured with
+  their graph build, and each of the other eight the measured base round of the mix's columns over the base round at its
+  lane count, a mixed round with its graph build having been measured to cost what a base round of its columns costs
+  (the three mixes of 64 columns, where no base round of 8 lanes was measured, one 8-column step past 56). The trellis
+  body's keeps the NVFP4 body's uniform entries, so that `aggregate` there reads what it read before mixed rounds; its
+  mixed entries scale the NVFP4 body's excess over 1 by 2.09, what the trellis body's base round's 8 more columns cost
+  at one and two lanes against the NVFP4 body's (1.218 over 1.104), each held no higher than the uniform entry at its
+  lane count and no lower than the mix of one fewer extended lane, so that no step of the grant is free. Both are
+  provisional until measured against measured rounds of the same columns, never read off a line between lane counts: the
+  base round's cost rises in steps with its columns (5 lanes 24,668 us and 7 lanes 29,770, where a line between lane
+  counts said 23.9 and 27.7 ms). The four-value form stays accepted as the uniform entries.
 - **The mixed graphs, a sixteenth line of the VRAM plan** (#714). A mixed round replays a verify graph and a drafter
   append graph of its mix, both or neither, captured at load for every mix the load holds where mixed rounds are asked;
   a mix with no graph runs its rounds at the uniform shape `aggregate` would choose, counted and logged, never eagerly

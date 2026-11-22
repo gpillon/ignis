@@ -938,8 +938,9 @@ impl FieldKind for ShapePolicyKind {
 /// seven lists): 1, 2, 3, 4, 3, 2 and 1 ratios, as many as the lanes' 64
 /// columns hold extended lanes. The four-value form of earlier builds, the
 /// extended round's ratio at 1 to 4 lanes (a file's list of four), is still
-/// taken as the uniform entries, every other entry its default: GitHub #720,
-/// the loaded body's (`ignis_core::PeriodTable::of_load`).
+/// taken as the uniform entries, every other entry the loaded body's. GitHub
+/// #720: `auto`, the default, is the loaded body's own table
+/// ([`ignis_core::PeriodTableSetting`]).
 pub struct PeriodRatios;
 
 impl PeriodRatios {
@@ -956,28 +957,32 @@ impl PeriodRatios {
 }
 
 impl FieldKind for PeriodRatios {
-    type Value = ignis_core::PeriodTable;
+    type Value = ignis_core::PeriodTableSetting;
     const TAG: &'static str = "cost table";
 
     fn parse(raw: &str) -> Result<Self::Value, String> {
+        if raw.trim().eq_ignore_ascii_case("auto") {
+            return Ok(ignis_core::PeriodTableSetting::Auto);
+        }
         let rows: Vec<&str> = raw.split('/').collect();
         if rows.len() == 1 {
             let uniform: [u32; 4] = Self::ratios(raw, raw)?.try_into().map_err(|_| {
-                format!("expects the table's seven rows, at 1 to 7 lanes, `/`-separated, or four ratios at 1, 2, 3 and 4 lanes, got `{raw}`")
+                format!("expects `auto`, the table's seven rows, at 1 to 7 lanes, `/`-separated, or four ratios at 1, 2, 3 and 4 lanes, got `{raw}`")
             })?;
-            return ignis_core::PeriodTable::with_uniform(uniform);
+            return ignis_core::PeriodTableSetting::uniform(uniform);
         }
         let rows = rows.into_iter().map(|row| Self::ratios(row, raw)).collect::<Result<Vec<_>, _>>()?;
-        ignis_core::PeriodTable::from_rows(&rows).map_err(|e| format!("{e}, got `{raw}`"))
+        ignis_core::PeriodTable::from_rows(&rows).map(ignis_core::PeriodTableSetting::Table).map_err(|e| format!("{e}, got `{raw}`"))
     }
 
     fn render(value: &Self::Value) -> Value {
-        // GitHub #720: the four-value form as it was given, so that its mixed entries stay the
-        // body's a load takes.
-        if value.uniform_only() {
-            return Value::Array(value.uniform().iter().map(|&milli| Decimal::written(milli)).collect());
+        let ratios = |row: &[u32]| Value::Array(row.iter().map(|&milli| Decimal::written(milli)).collect());
+        match value {
+            ignis_core::PeriodTableSetting::Auto => Value::String("auto".to_owned()),
+            // The four-value form as it was given, so that its mixed entries stay the loaded body's.
+            ignis_core::PeriodTableSetting::Uniform(uniform) => ratios(uniform),
+            ignis_core::PeriodTableSetting::Table(table) => Value::Array(table.rows().iter().map(|row| ratios(row)).collect()),
         }
-        Value::Array(value.rows().iter().map(|row| Value::Array(row.iter().map(|&milli| Decimal::written(milli)).collect())).collect())
     }
 
     fn file_text(value: &Value) -> Result<Option<String>, String> {

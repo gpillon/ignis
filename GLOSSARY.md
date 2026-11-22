@@ -1243,8 +1243,8 @@ less one) times the tokens every lane is expected to take, or, without an
 estimate, whenever the columns allow; never past 64 columns, so a round may be
 a **mixed round**. The **cost table** (`spec.shape_period_ratios`) holds each
 round's period over the base round's by lane count (1..7) and extended lanes;
-`aggregate` reads its uniform entries; its default is the loaded body's own
-(#720: the NVFP4 body's or the trellis body's, `PeriodTable::of_load`). `mixed`
+`aggregate` reads its uniform entries; its default, `auto`, is the loaded body's
+own (#720: the NVFP4 body's or the trellis body's, `PeriodTableSetting::of_body`). `mixed`
 runs at 15 drafts alone, on either body (#720; any other load runs
 `aggregate`) and asks for the mixed graphs
 there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any

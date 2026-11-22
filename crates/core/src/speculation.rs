@@ -10,7 +10,7 @@
 //! purpose: the GPU load test compares the leaf's reported VRAM against this
 //! arithmetic, so the two cannot drift silently.
 
-pub use crate::shape_grant::PeriodTable;
+pub use crate::shape_grant::{PeriodTable, PeriodTableSetting};
 
 /// The widest draft window DFlash2 accepts: GitHub #687 (spec #684), 15, two
 /// round shapes past [`BASE_SHAPE_DRAFT_TOKENS`] ([`Speculation::round_shapes`]),
@@ -609,11 +609,12 @@ pub const SHAPE_ESTIMATE_MAX_ROUNDS: u32 = 64;
 /// (`spec.shape_period_ratios`, [`PeriodTable`]; GitHub #715: by lane count
 /// and extended lanes, of which `aggregate` reads the uniform entries and
 /// [`ShapePolicy::Mixed`] every one). The window's default is provisional;
-/// the table's is [`PeriodTable::NVFP4`].
+/// GitHub #720: the table is the setting, which a load resolves on its body
+/// ([`Self::period_table`]), the body's own by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShapeEstimate {
     rounds: u32,
-    period_table: PeriodTable,
+    period_table: PeriodTableSetting,
 }
 
 impl ShapeEstimate {
@@ -629,8 +630,10 @@ impl ShapeEstimate {
     pub const PERIOD_RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = PeriodTable::RATIO_MILLI_RANGE;
 
     /// `rounds` in `1..=`[`SHAPE_ESTIMATE_MAX_ROUNDS`], the refusal naming
-    /// its range; the table is checked where it is made ([`PeriodTable`]).
-    pub fn new(rounds: u32, period_table: PeriodTable) -> Result<Self, String> {
+    /// its range; the table is checked where it is made ([`PeriodTable`],
+    /// [`PeriodTableSetting::uniform`]).
+    pub fn new(rounds: u32, period_table: impl Into<PeriodTableSetting>) -> Result<Self, String> {
+        let period_table = period_table.into();
         if !(1..=SHAPE_ESTIMATE_MAX_ROUNDS).contains(&rounds) {
             return Err(format!(
                 "the shape policy's estimate window of {rounds} rounds is not in 1..={SHAPE_ESTIMATE_MAX_ROUNDS}"
@@ -643,25 +646,21 @@ impl ShapeEstimate {
         self.rounds
     }
 
-    /// The table's uniform entries, at 1 to 4 lanes.
-    pub fn period_ratios_milli(&self) -> [u32; EXTENDED_SHAPE_MAX_LANES as usize] {
-        self.period_table.uniform()
-    }
-
-    pub fn period_table(&self) -> PeriodTable {
+    /// The table as it was given.
+    pub fn period_table_setting(&self) -> PeriodTableSetting {
         self.period_table
     }
 
-    /// GitHub #720: the same window over `period_table`, checked where it
-    /// was made ([`PeriodTable`]).
-    pub fn with_period_table(self, period_table: PeriodTable) -> Self {
-        Self { period_table, ..self }
+    /// GitHub #720: the table a load of `body` runs
+    /// ([`PeriodTableSetting::of_body`]).
+    pub fn period_table(&self, body: ignis_artifact::Body27b) -> PeriodTable {
+        self.period_table.of_body(body)
     }
 }
 
 impl Default for ShapeEstimate {
     fn default() -> Self {
-        Self { rounds: Self::DEFAULT_ROUNDS, period_table: PeriodTable::NVFP4 }
+        Self { rounds: Self::DEFAULT_ROUNDS, period_table: PeriodTableSetting::Auto }
     }
 }
 

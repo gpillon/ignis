@@ -245,13 +245,11 @@ lanes they differ in who pays the wider round:
 
 The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
 the round's period with 1, 2, ... of them extended over the base round's) are
-each artifact's own unless you name a table (four ratios alone take the
-artifact's mixed entries beside them). The trellis artifact's are derived,
-none of them measured on it yet, and indicative for the 16 GB and 24 GB cards
-until a run on one: its extended round at one lane costs about 1.35 to 1.40
-times its base round on the RTX 5090, against the NVFP4 artifact's 1.13, so
-its extended lanes cost more and are granted less often
-([the configuration reference](../reference/configuration.md#specshape_period_ratios)).
+each artifact's own (`auto`) unless you name a table (four ratios alone take
+the artifact's mixed entries beside them). The trellis artifact's keeps the
+NVFP4 artifact's uniform entries beside derived mixed ones, provisional until
+a run on it
+([the configuration reference](../configuration/context-and-speculation.md)).
 The NVFP4 artifact's are
 the RTX 5090's: the uniform entries measured with the extended round's cost
 levers on, at about 3.5-5K tokens of context, 1.128, 1.29, 1.363 and 1.344 at

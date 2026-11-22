@@ -526,7 +526,9 @@ pub fn text_readout_keys(reader: &Reader) -> u32 {
 /// ADR 0016's production defaults) when the load selects none of
 /// speculation, vision, a scaled rotary table, a text readout's room or
 /// fewer decode lanes than the leaf's eight, so such a load is exactly what
-/// it was before any of them existed.
+/// it was before any of them existed. GitHub #720: the cost table it
+/// crosses is the one a load of `body` runs
+/// ([`crate::speculation::ShapeEstimate::period_table`]).
 fn load_options(
     speculation: Option<Speculation>,
     vision: Option<Vision>,
@@ -535,6 +537,7 @@ fn load_options(
     prefill_attention: PrefillAttention,
     prefill_linear: PrefillLinear,
     decode_lanes: u32,
+    body: ignis_artifact::Body27b,
 ) -> Option<ffi::IgnisModelLoadOptions> {
     (speculation.is_some()
         || vision.is_some()
@@ -577,10 +580,10 @@ fn load_options(
             shape_stay_accepted: speculation.map_or(0, |s| s.shape_rule().stay_accepted()),
             shape_policy: speculation.map_or(0, |s| s.shape_policy().abi_code()),
             shape_estimate_rounds: speculation.map_or(0, |s| s.shape_estimate().rounds()),
-            shape_period_ratios: speculation.map_or([0; 4], |s| s.shape_estimate().period_ratios_milli()),
+            shape_period_ratios: speculation.map_or([0; 4], |s| s.shape_estimate().period_table(body).uniform()),
             // GitHub #714: set by the loads that name their pool's slots.
             retained_device_slots: 0,
-            shape_mixed_period_ratios: speculation.map_or([0; 12], |s| s.shape_estimate().period_table().mixed()),
+            shape_mixed_period_ratios: speculation.map_or([0; 12], |s| s.shape_estimate().period_table(body).mixed()),
         }
     })
 }
@@ -1044,7 +1047,7 @@ pub fn load_qwen38_27b_with_pool_slots(
     )?;
     let topology = ModelConfig::qwen38_27b().topology_abi();
     let options = with_retained_device_slots(
-        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes),
+        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes, ignis_artifact::body_27b(reader)),
         retained_device_slots,
     );
 
@@ -1138,7 +1141,7 @@ pub fn plan_qwen38_27b_reservations_with_pool_slots(
     )?;
     let topology = ModelConfig::qwen38_27b().topology_abi();
     let options = with_retained_device_slots(
-        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes),
+        load_options(speculation, vision, rope_scaling, text_readout_keys(reader), prefill_attention, prefill_linear, decode_lanes, ignis_artifact::body_27b(reader)),
         retained_device_slots,
     );
 
@@ -1553,6 +1556,7 @@ impl FlashNextPlanCall {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ignis_artifact::Body27b;
     use crate::vision::VisionResidency;
 
     /// GitHub #302: the descriptors this loader builds for the artifact
@@ -1771,15 +1775,15 @@ mod tests {
             model_scope(None, Some(host), ExceptionWeights::Bf16),
             ModelScope { draft: None, vision: true, vision_residency: VisionResidency::Host, fp8_exceptions: false }
         );
-        let options = load_options(None, Some(host), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let options = load_options(None, Some(host), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(options.vision_residency, 1);
-        let default = load_options(None, Some(Vision::new(4096).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let default = load_options(None, Some(Vision::new(4096).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!(default.vision_residency, 1, "GitHub #416: host by default");
         let device = Vision::new(4096).unwrap().with_residency(VisionResidency::Device);
-        let device = load_options(None, Some(device), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let device = load_options(None, Some(device), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(device.vision_residency, 0, "a zeroed field: the device, today's load");
-        let text = load_options(None, None, RopeScaling::NONE, 4_554, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let text = load_options(None, None, RopeScaling::NONE, 4_554, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(text.vision_residency, 0, "no vision, no residency");
     }
 
@@ -1789,37 +1793,37 @@ mod tests {
     #[test]
     fn a_load_with_neither_option_crosses_a_null_options_pointer() {
         assert_eq!(
-            load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES),
+            load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4),
             None,
             "today's load, byte for byte"
         );
         // GitHub #227: `none` and an explicit factor of 1 are the same
         // no-op, and neither is worth an options struct.
-        assert_eq!(load_options(None, None, RopeScaling::parse("yarn:1").unwrap(), 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES), None);
+        assert_eq!(load_options(None, None, RopeScaling::parse("yarn:1").unwrap(), 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4), None);
     }
 
     /// GitHub #275: an artifact calibrated for `locate` reserves the text
     /// readout's room, and that alone is worth an options struct.
     #[test]
     fn a_text_readouts_room_crosses_the_options_struct() {
-        let options = load_options(None, None, RopeScaling::NONE, 4_554, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let options = load_options(None, None, RopeScaling::NONE, 4_554, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(options.attention_text_max_keys, 4_554);
         assert_eq!(options.vision_max_tokens, 0);
-        let vision = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 4_554, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let vision = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 4_554, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!((vision.vision_max_tokens, vision.attention_text_max_keys), (8192, 4_554));
     }
 
     #[test]
     fn a_vision_only_load_crosses_the_envelope_with_no_speculation() {
         let options =
-            load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+            load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(options.size as usize, std::mem::size_of::<ffi::IgnisModelLoadOptions>());
         assert_eq!(options.speculative_backend, 0);
         assert_eq!(options.draft_tokens, 0);
         assert_eq!(options.vision_max_tokens, 8192);
 
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let without_vision = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let without_vision = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(without_vision.vision_max_tokens, 0);
         assert_eq!(without_vision.draft_tokens, 7);
         // Every load sends the rope scalars; with no scaling they are the
@@ -1833,7 +1837,7 @@ mod tests {
         // and a YaRN-only load would have crossed a NULL pointer -- serving
         // the linear table while the operator asked for a scaled one.
         let scaling = RopeScaling::parse("yarn:4,t=0.25,bf=16,bs=2").unwrap();
-        let options = load_options(None, None, scaling, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let options = load_options(None, None, scaling, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(options.speculative_backend, 0);
         assert_eq!(options.vision_max_tokens, 0);
         assert_eq!(options.rope_scaling_factor, 4.0);
@@ -1854,7 +1858,7 @@ mod tests {
         let scaling = RopeScaling::parse("yarn:2.25,t=0.25,bf=16,bs=2").unwrap();
         let options = flash_next_options(3, std::ptr::null_mut(), None, scaling, None);
         assert_eq!(scalars(&options), [2.25, 0.25, 16.0, 2.0]);
-        assert_eq!(scalars(&options), scalars(&load_options(None, None, scaling, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options")), "the 27B's");
+        assert_eq!(scalars(&options), scalars(&load_options(None, None, scaling, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options")), "the 27B's");
         let none = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, None);
         assert_eq!(scalars(&none), [0.0, 0.1, 32.0, 1.0], "the factor 0 is the leaf's linear table");
         assert_eq!((none.decode_lanes, none.speculative_backend), (3, 0));
@@ -1863,15 +1867,15 @@ mod tests {
     #[test]
     fn a_vision_item_bound_crosses_beside_the_envelope() {
         let bounded = Vision::new(32_768).unwrap().with_item_max_tokens(16_384);
-        let options = load_options(None, Some(bounded), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let options = load_options(None, Some(bounded), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(options.vision_max_tokens, 32_768, "the envelope is still the request's");
         assert_eq!(options.vision_item_max_tokens, 16_384);
         // No bound named: 0, which the leaf reads as "the envelope".
-        let unbounded = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let unbounded = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!(unbounded.vision_item_max_tokens, 0);
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let text = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let text = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(text.vision_item_max_tokens, 0, "no vision, no item bound");
     }
 
@@ -1880,12 +1884,12 @@ mod tests {
     #[test]
     fn the_draft_rule_and_the_drafters_settings_cross_with_the_speculation() {
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let fixed = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let fixed = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!((fixed.draft_rule, fixed.drafter_temperature_factor, fixed.drafter_top_p), (0, 0.9, 0.95));
         let drafter = crate::speculation::DrafterSampling { temperature_factor_milli: 1250, top_p_milli: 800 };
         let sampled = spec.with_draft_rule(crate::speculation::DraftRule::Sampled, drafter);
-        let options = load_options(Some(sampled), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let options = load_options(Some(sampled), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!((options.draft_rule, options.drafter_temperature_factor, options.drafter_top_p), (1, 1.25, 0.8));
         assert_eq!(options.speculative_backend, 1);
@@ -1895,19 +1899,26 @@ mod tests {
             .unwrap()
             .with_shape_rule(crate::speculation::ShapeRule::new(5, 12).unwrap())
             .unwrap();
-        let options = load_options(Some(wide), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let options = load_options(Some(wide), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!((options.draft_tokens, options.shape_enter_accepted, options.shape_stay_accepted), (15, 5, 12));
         // GitHub #690: and the shape policy, `aggregate` at its defaults unless named.
         assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (0, 16, [1128, 1290, 1363, 1344]));
         // GitHub #715: and the cost table's mixed entries, the defaults unless named.
         assert_eq!(options.shape_mixed_period_ratios, [1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336]);
+        // GitHub #720: on the trellis body, that body's own table.
+        let trellis = load_options(Some(wide), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Trellis)
+            .expect("options");
+        assert_eq!(
+            (trellis.shape_period_ratios, trellis.shape_mixed_period_ratios),
+            ([1128, 1290, 1363, 1344], [1290, 1251, 1288, 1161, 1194, 1224, 1363, 1344, 1433, 1504, 1344, 1702])
+        );
         let all = wide.with_shape_policy(
             crate::speculation::ShapePolicy::All,
-            crate::speculation::ShapeEstimate::new(8, crate::speculation::PeriodTable::with_uniform([1000, 1200, 1300, 2000]).unwrap())
+            crate::speculation::ShapeEstimate::new(8, crate::speculation::PeriodTableSetting::uniform([1000, 1200, 1300, 2000]).unwrap())
                 .unwrap(),
         );
-        let options = load_options(Some(all), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let options = load_options(Some(all), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (1, 8, [1000, 1200, 1300, 2000]));
         let rows: Vec<Vec<u32>> = (1..=7).map(|lanes| vec![1500; crate::speculation::PeriodTable::row_entries(lanes) as usize]).collect();
@@ -1915,28 +1926,28 @@ mod tests {
             crate::speculation::ShapePolicy::Mixed,
             crate::speculation::ShapeEstimate::new(16, crate::speculation::PeriodTable::from_rows(&rows).unwrap()).unwrap(),
         );
-        let options = load_options(Some(mixed), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let options = load_options(Some(mixed), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!((options.shape_policy, options.shape_period_ratios, options.shape_mixed_period_ratios), (2, [1500; 4], [1500; 12]));
     }
 
     #[test]
     fn the_prefill_linear_and_the_integer_band_cross_as_their_abi_codes() {
-        let dense = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::Int8, LANES).expect("options");
+        let dense = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::Int8, LANES, Body27b::Nvfp4).expect("options");
         assert_eq!((dense.prefill_linear, dense.prefill_attention), (1, 0));
-        let band = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Int8, PrefillLinear::Fp16, LANES).expect("options");
+        let band = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Int8, PrefillLinear::Fp16, LANES, Body27b::Nvfp4).expect("options");
         assert_eq!((band.prefill_linear, band.prefill_attention), (0, 2));
-        let fused = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::Fp16, LANES)
+        let fused = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::Fp16, LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!(fused.prefill_linear, 0, "the fused prefill is the NULL options' own");
     }
 
     #[test]
     fn the_prefill_attention_option_crosses_only_when_it_is_not_the_default() {
-        assert_eq!(load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES), None, "8-bit is the NULL options' own");
-        let fp16 = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp16, PrefillLinear::default(), LANES).expect("options");
+        assert_eq!(load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4), None, "8-bit is the NULL options' own");
+        let fp16 = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp16, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(fp16.prefill_attention, 1);
-        let with_vision = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let with_vision = load_options(None, Some(Vision::new(8192).unwrap()), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!(with_vision.prefill_attention, 0);
         let flash = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, None);
@@ -1958,7 +1969,7 @@ mod tests {
         };
         let flash = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, Some(vision));
         assert_eq!(fields(&flash), (8192, 50_000_000, 4096, 1));
-        let ours = load_options(None, Some(vision), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+        let ours = load_options(None, Some(vision), RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4)
             .expect("options");
         assert_eq!(fields(&flash), fields(&ours), "the 27B's");
         let text = flash_next_options(3, std::ptr::null_mut(), None, RopeScaling::NONE, None);
@@ -1971,15 +1982,15 @@ mod tests {
     #[test]
     fn the_27bs_decode_lanes_cross_only_when_fewer_than_eight() {
         for lanes in 1..LANES {
-            let options = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), lanes).expect("options");
+            let options = load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), lanes, Body27b::Nvfp4).expect("options");
             assert_eq!((options.decode_lanes, options.speculative_backend, options.vision_max_tokens), (lanes, 0, 0));
             assert!(options.residency.is_null() && options.draft_row_budget == 0 && options.mtp_expert_slots.is_null());
         }
-        assert_eq!(load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES), None);
+        assert_eq!(load_options(None, None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4), None);
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
-        let eight = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES).expect("options");
+        let eight = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Nvfp4).expect("options");
         assert_eq!(eight.decode_lanes, LANES);
-        let two = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), 2).expect("options");
+        let two = load_options(Some(spec), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), 2, Body27b::Nvfp4).expect("options");
         assert_eq!((two.decode_lanes, two.draft_tokens), (2, 7));
     }
 

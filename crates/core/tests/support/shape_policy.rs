@@ -72,9 +72,11 @@ impl Lane {
 }
 
 /// Whether a round of `lanes` runs at the extended shape under `policy`, the
-/// switch unset: never past the extended shape's 4 lanes.
-pub fn extends(policy: ShapePolicy, estimate: ShapeEstimate, lanes: &[&Lane]) -> bool {
-    if lanes.len() > estimate.period_ratios_milli().len() {
+/// switch unset, on a load of `body` (GitHub #720: the cost table its body
+/// runs): never past the extended shape's 4 lanes.
+pub fn extends(policy: ShapePolicy, estimate: ShapeEstimate, body: ignis_artifact::Body27b, lanes: &[&Lane]) -> bool {
+    let ratios = estimate.period_table(body).uniform();
+    if lanes.len() > ratios.len() {
         return false;
     }
     match policy {
@@ -91,7 +93,7 @@ pub fn extends(policy: ShapePolicy, estimate: ShapeEstimate, lanes: &[&Lane]) ->
             let full_base_round = u64::from(BASE_SHAPE_DRAFT_TOKENS + 1) * 1000;
             let tokens: u64 = estimates.iter().map(|&(_, (rounds, tokens, _, _))| if rounds == 0 { full_base_round } else { tokens * 1000 / rounds }).sum();
             let gain: u64 = estimates.iter().filter(|(asks, _)| *asks).map(|&(_, (_, _, extended, extra))| extra * 1000 / extended).sum();
-            let ratio = u64::from(estimate.period_ratios_milli()[lanes.len() - 1]);
+            let ratio = u64::from(ratios[lanes.len() - 1]);
             estimates.iter().any(|(asks, _)| *asks) && gain * 1000 > (ratio - 1000) * tokens
         }
     }
