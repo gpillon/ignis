@@ -73,6 +73,12 @@ published at different moments, and a wait on one of them races the others.
 The download route tests waited for `on_disk` complete, then asserted
 `download` none, and failed about once in a hundred runs (7ac1011f).
 
+## A test CI cannot have
+
+A new test that reads a fixture only the owner's machine holds says, in its
+doc comment, why CI cannot have it, since a small committed fixture would let
+CI run it (`docs/agents/testing.md`, "The gate").
+
 ## After a merge or a rebase
 
 The checks are `make check`, which compiles the code behind the `cuda` feature

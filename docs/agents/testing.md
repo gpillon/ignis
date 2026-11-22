@@ -6,6 +6,14 @@ until the test suite is green.
 
 ## The gate
 
+A test runs on CI whenever CI can run it. The owner's machine runs only what
+CI cannot have (the card, private data, artifacts too large for a runner,
+timing runs), each class at its one moment: the GPU profile before `main`
+moves on a change that touches the GPU, the machine-local targets at a
+release, the speech legs by hand. A new test that needs a fixture from the
+owner's machine first asks whether a small committed fixture would let CI run
+it.
+
 - While working, run only the change's own tests: Rust ones through
   `cargo test`'s filter (`cargo test -p <crate> --test <file> <name>`), GPU
   ones through the profile's single-test mode (below). The whole suite runs
