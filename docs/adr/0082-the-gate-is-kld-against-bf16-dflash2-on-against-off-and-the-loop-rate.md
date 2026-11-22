@@ -23,7 +23,9 @@ gate. On 2026-11-08 the owner made it the official one.
   checkpoint run layer by layer: KL(BF16 ‖ engine) over the full vocabulary, the mean over every position, with top-1
   and a window-bootstrap 95% CI beside it (`tools/kld-gate`, `ref_kld.py` and `gate1.py`). A fine-tune is scored
   against its own BF16, with `gate1.py`'s two cross terms, which show that the gate measured the fine-tune and not the
-  base. Where the card cannot run the checkpoint, the reference is the BF16 model's 64 most probable tokens per
+  base: each holds when the 95% CI of its difference from the matched pair is above 0, its count of windows above
+  reported, not required (edited 2026-11-22, #725).
+  Where the card cannot run the checkpoint, the reference is the BF16 model's 64 most probable tokens per
   position, built once on the RTX 5090 (`ref_top64.py`, `score_top64.py`). That figure is a lower bound of the full
   KLD, so its limit comes from a top-64 figure of the RTX 5090, never from a full-vocabulary one.
 - **DFlash2 on against off.** With the drafter on, decode tok/s beats off in each of the nine decode cells #340

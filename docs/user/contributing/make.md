@@ -23,6 +23,7 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make metrics` | Scrape the metrics listener (on by default; a server started with `METRICS=0` has none). |
 | `make test` / `test-all` / `ci` | `cargo test` / plus web typecheck, vitest and the connector skill's script tests / what a CI job runs. |
 | `make test-connector` | From 0.11.0: the connector skill's script tests, `node --test` in `connector/`; Node alone, no `npm`. |
+| `make test-machine-local` | From 0.11.0: the test targets `mk/machine-local-tests.txt` lists, which read a fixture only the owner's machine holds and skip on CI, run for real; once per release, before the tag ([Cutting a release](releases.md)). CPU only, no GPU lock; it ends with the skip lines the tests printed. |
 | `make grammar-venv` | From 0.11.0: the Python venv at `.scratch/grammar-venv` with the independent JSON Schema validator the structured-output tests check every served answer with. Without it those checks are skipped, saying so; CI installs it, and there a missing one fails them. |
 | `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card, the GPU lock's holder among it / refuse when it is held / the explicit GPU test profile, whole or (from 0.11.0) only the tests it is given. |
 | `make gpu-run CMD="…"` | From 0.11.0: one sh line under the GPU lock, for GPU work no other target runs (an example run in process, a server started by hand for a bench): waits for the lock up to `GPU_LOCK_WAIT` seconds, runs the guard, then the command as written (`$HOME` reaches sh, not make). |
