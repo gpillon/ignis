@@ -6,6 +6,14 @@ until the test suite is green.
 
 ## The gate
 
+A test runs on CI whenever CI can run it. The owner's machine runs only what
+CI cannot have (the card, private data, artifacts too large for a runner,
+timing runs), each class at its one moment: the GPU profile before `main`
+moves on a change that touches the GPU, the machine-local targets at a
+release, the speech legs by hand. A new test that needs a fixture from the
+owner's machine first asks whether a small committed fixture would let CI run
+it.
+
 - While working, run only the change's own tests: Rust ones through
   `cargo test`'s filter (`cargo test -p <crate> --test <file> <name>`), GPU
   ones through the profile's single-test mode (below). The whole suite runs
@@ -15,14 +23,24 @@ until the test suite is green.
   (`artifact`, `bench`, `core`, `grammar`, `logging`, `runtime`, `server`,
   `speech`, `vendor`). CI runs exactly this on
   Linux and on Windows, in four shards per host that together run every test
-  target once (`mk/test-shard.sh`, `make test-shard-selftest`), and nothing
-  is published until both legs are green; the release builds run beside them
-  (`.github/workflows/release.yml`, ADR 0086). That is
+  target once (`mk/test-shard.sh`, `make test-shard-selftest`). Beside them
+  the `network` job runs, on Linux, the one `#[ignore]`d test that needs only
+  the network: the speech catalog's smallest entry downloaded from Hugging
+  Face and checked against its pins (`crates/server/tests/speech_catalog_hf.rs`,
+  #709). Nothing is published until both legs and that job are green; the
+  release builds run beside them (`.github/workflows/release.yml`, ADR 0086). That is
   possible only because the default suite is CPU-only; everything below about
   the GPU profile stays on the machine with the 5090.
 - Machine-local smoke tests skip gracefully when their fixture is
   absent (e.g. `crates/artifact/tests/real_artifact.rs` needs the
-  artifact in `F:\ai\q38`). A skip counts as green; a failure does not.
+  artifact in `F:\ai\q38`). A skip counts as green; a failure does not. So
+  on CI they are green and never run: they run for real once per release,
+  on the owner's machine before the tag, through `make test-machine-local`
+  (`docs/user/contributing/releases.md`), not at the end of a change. Their
+  targets are listed in `mk/machine-local-tests.txt`, and
+  `crates/server/tests/machine_local_tests.rs` fails on a target that is not
+  `cuda`-gated, prints a skip, and is neither listed nor exempt with its
+  reason (#709).
 - **Exception — compute work: a skip is never green.** For anything on the
   forward pass (the kernel leaf, the step ABI, the program), a test that
   self-skips on a busy GPU or on a kernel error proves nothing; that pattern
@@ -737,6 +755,20 @@ mk/cuda-build-check.sh --require '86;120a' <binary>...`.
    `logits-capture` adds the one GPU test the profile never builds
    (`flash_next_rope_logits_gpu.rs`, bit-exact on the card that recorded
    its capture, ADR 0059), which nothing else would compile.
-4. kernel changes: `kernel/build.ps1` clean + the leaf's op tests green +
-   the GPU profile green on a free 5090 (`scripts/gpu-profile.ps1` —
-   preflight passed, `IGNIS_GPU_PROFILE=1` for the run — never a skip)
+4. a change that touches the GPU: the full GPU profile green on the commit
+   `main` moves to, beside the green `ci/<n>` run (`make gpu-profile`, which
+   takes the GPU lock and waits for it — preflight passed,
+   `IGNIS_GPU_PROFILE=1` for the run — never a skip); a kernel change also
+   needs `kernel/build.ps1` clean and the leaf's op tests green. A change
+   touches the GPU when one of its changed files is under `kernel/`, is a
+   `*_gpu.rs` test, or is a Rust file that contains `feature = "cuda"`, so
+   whoever lands it reads the answer off the diff, with no judgement: any
+   line of output means the profile runs, none means it does not (#709).
+
+   ```sh
+   git diff --name-only main... | grep -E '^kernel/|_gpu\.rs$'
+   git diff --name-only --diff-filter=d main... -- '*.rs' | xargs -r grep -l 'feature = "cuda"'
+   ```
+
+   `AGENTS.md`'s GPU rule applies: an agent whose own model is served from
+   the card hands the run to the user.

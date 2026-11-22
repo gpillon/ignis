@@ -20,6 +20,18 @@ make version-check               # all four files agree, before you tag
 `version-bump` edits and stops there: the commit and the tag are printed, not
 run, because pushing a `v*` tag publishes a release.
 
+Before the tag is pushed, from 0.11.0, the machine-local tests run for real on
+the owner's machine, on the commit the tag will name. The test targets
+`mk/machine-local-tests.txt` lists read an artifact, a tokenizer, a recording
+or a venv only that machine holds, so on CI they print a skip and pass; no
+other run has them. A red test stops the release. The run is CPU only and
+takes no GPU lock, and it ends with every skip line the tests printed, where a
+fixture the machine lacks shows.
+
+```
+make test-machine-local          # every listed target, as cargo test runs it
+```
+
 What the release changed is drafted from the range, not written from memory:
 
 ```
@@ -34,7 +46,9 @@ what the range can prove, not by what matters most.
 
 `.github/workflows/release.yml` runs the CPU-only test suite on Linux and
 Windows, split into four shards per host that together run every test once,
-and builds the GPU engine for both hosts beside it — on every push to `main`
+and, beside them, the one ignored test a runner can run, which downloads the
+speech catalog's smallest entry from Hugging Face and checks it against its
+pins; it builds the GPU engine for both hosts beside them — on every push to `main`
 or a `ci/**` branch. Nothing is published until the tests pass: a push to
 `main` then moves the `develop` image and prerelease, and a `ci/**` branch
 publishes nothing. A `v*` tag — which must match

@@ -73,12 +73,18 @@ published at different moments, and a wait on one of them races the others.
 The download route tests waited for `on_disk` complete, then asserted
 `download` none, and failed about once in a hundred runs (7ac1011f).
 
+## A test CI cannot have
+
+A new test that reads a fixture only the owner's machine holds says, in its
+doc comment, why CI cannot have it (`docs/agents/testing.md`, "The gate").
+
 ## After a merge or a rebase
 
 The checks are `make check`, which compiles the code behind the `cuda` feature
 unless it runs with `CUDA=0` (`cargo test` never does), and the suite's run on
 `ci/<n>`. The rest
-of what a change needs, a kernel change's GPU legs among it, is
+of what a change needs, the GPU profile of a change that touches the GPU
+among it, is
 `docs/agents/testing.md`'s "Done means". Resolving a conflict reformats
 nothing.
 
