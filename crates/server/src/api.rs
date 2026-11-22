@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::extract::{Request, State};
+use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -221,6 +222,9 @@ pub fn router(state: Arc<Server>) -> Router {
 fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
     let (router, mut document) = OpenApiRouter::with_openapi(crate::openapi::ApiDoc::openapi())
         .routes(routes!(list_models))
+        .routes(routes!(retrieve_model))
+        .routes(routes!(load_model))
+        .routes(routes!(unload_model))
         // Spec model-switch/01: replace the loaded model.
         .routes(routes!(switch_model))
         // Spec playground/05: the models a switch can go to or fetch.
@@ -281,6 +285,9 @@ fn v1_parts() -> (Router<Arc<Server>>, utoipa::openapi::OpenApi) {
         // harness's side.
         .routes(routes!(crate::connector::skill::skill))
         .route("/v1/models", options(cors_preflight))
+        .route("/v1/models/{model}", options(cors_preflight))
+        .route("/v1/ignis/models/load", options(cors_preflight))
+        .route("/v1/ignis/models/unload", options(cors_preflight))
         .route("/v1/models/switch", options(cors_preflight))
         .route("/v1/models/catalog", options(cors_preflight))
         .route("/v1/models/remove", options(cors_preflight))
@@ -702,7 +709,7 @@ pub(crate) fn load_refused(server: &Server, refusal: crate::model_switch::LoadRe
             "server_error",
             "model_load_failed",
             format!(
-                "{} was unloaded while idle and loading a model again failed, so the request was not served: {reason}",
+                "{} was unloaded and loading a model again failed, so the request was not served: {reason}",
                 server.active().model_id()
             ),
         ),
@@ -2792,6 +2799,143 @@ async fn list_models(State(server): State<Arc<Server>>) -> Json<ModelList> {
     Json(list)
 }
 
+/// `GET /v1/models/{model}`, OpenAI's retrieve (GitHub #723): the entry
+/// `GET /v1/models` lists under `model`, read the way that listing is, so it
+/// neither loads the model nor counts as its use.
+#[utoipa::path(
+    get, path = "/v1/models/{model}", tag = "models",
+    operation_id = "retrieve_model", summary = "Retrieve one servable model",
+    description = "The entry `GET /v1/models` lists under the id, the same fields: the active model, unloaded or not, the speech model when it can serve, and every model a request naming it would switch to. Reading it neither loads the model nor counts as its use, so a client polling it does not keep the model loaded.",
+    params(("model" = String, Path, description = "A model id `GET /v1/models` lists.")),
+    responses(
+        (status = 200, description = "The entry `GET /v1/models` lists under the id.", body = ModelInfo),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 404, description = "`GET /v1/models` lists no model under the id (`model_not_found`).", body = ApiError),
+        (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`), or a switch is under way (`model_switching`, with `Retry-After`).", body = ApiError),
+    ),
+)]
+async fn retrieve_model(State(server): State<Arc<Server>>, axum::extract::Path(model): axum::extract::Path<String>) -> Response {
+    let listed = Arc::clone(&server);
+    let wanted = model.clone();
+    let entry = tokio::task::spawn_blocking(move || models_now(&listed).data.into_iter().find(|entry| entry.id == wanted))
+        .await.expect("listing the models does not panic");
+    match entry {
+        Some(entry) => Json(entry).into_response(),
+        None => unknown_model(&server, &model),
+    }
+}
+
+/// The body of `POST /v1/ignis/models/load` and `POST
+/// /v1/ignis/models/unload` (GitHub #723): the active model's id. Neither
+/// route selects another model; a switch does.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct ModelLifecycleRequest {
+    /// The active model's id, the one `GET /v1/models` lists first, whether it
+    /// serves or is unloaded.
+    model: String,
+}
+
+/// What `POST /v1/ignis/models/load` and `POST /v1/ignis/models/unload`
+/// answer once done: the model, and the status it was left in.
+#[derive(Serialize, ToSchema)]
+struct ModelLifecycleResponse {
+    /// The active model's id.
+    model: String,
+    /// `serving` after a load, `unloaded` after an unload.
+    status: &'static str,
+}
+
+/// The active model's id from a lifecycle route's body: `400 invalid_json`
+/// for a body that does not parse or carries another field, and `404
+/// model_not_found` for any other id, since these routes never switch.
+fn lifecycle_model(server: &Server, body: Result<Json<ModelLifecycleRequest>, JsonRejection>) -> Result<String, Response> {
+    let Json(body) = body.map_err(|rejection| error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "invalid_json", rejection.body_text()))?;
+    let active = server.active().model_id();
+    if body.model != active {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "model_not_found",
+            "model_not_found",
+            format!("{} is not the active model ({active}): this route loads and unloads the active model, and POST /v1/models/switch selects another", body.model),
+        ));
+    }
+    Ok(body.model)
+}
+
+/// `409 model_busy`: a lifecycle route found the model in a state it does
+/// not change, and changed nothing.
+fn model_busy(message: &str) -> Response {
+    error_response(StatusCode::CONFLICT, "invalid_request_error", "model_busy", message)
+}
+
+/// `POST /v1/ignis/models/load` (GitHub #723, ADR 0105): load the active
+/// model out of `unloaded` the way a request that needs it does
+/// ([`crate::model_switch::ensure_loaded`]), and answer once it serves,
+/// without generating. Counted as use from its id's check to its answer, so
+/// the idle clock never unloads what it just loaded.
+#[utoipa::path(
+    post, path = "/v1/ignis/models/load", tag = "models",
+    operation_id = "ignis_load_model", summary = "Load the active model without generating",
+    description = "An ignis extension, not an OpenAI operation. Loads the active model when it is unloaded, as the next request that needs it would, and answers once it serves; a model that serves already is answered at once and nothing is loaded again. Calls and requests arriving during that load wait for the same load. It never selects another model: `POST /v1/models/switch` does. Under the same API key as inference; a call refused for its key loads nothing.",
+    request_body = ModelLifecycleRequest,
+    responses(
+        (status = 200, description = "The active model serves (`status: serving`).", body = ModelLifecycleResponse),
+        (status = 400, description = "The body does not parse or carries a field other than `model` (`invalid_json`).", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 404, description = "`model` is not the active model (`model_not_found`).", body = ApiError),
+        (status = 409, description = "A switch or an unload began between the load and the answer (`model_busy`); nothing was changed by this call.", body = ApiError),
+        (status = 503, description = "The load failed (`model_load_failed`, with its reason: the next call or request tries again); or the loaded model's first traversal has not run yet (`server_not_ready`); or a switch is under way (`model_switching`, with `Retry-After`); or the server is stopping (`server_stopping`, with `Retry-After`).", body = ApiError),
+    ),
+)]
+async fn load_model(State(server): State<Arc<Server>>, body: Result<Json<ModelLifecycleRequest>, JsonRejection>) -> Response {
+    let model = match lifecycle_model(&server, body) {
+        Ok(model) => model,
+        Err(refused) => return refused,
+    };
+    let _using = server.usage.admit();
+    if let Err(refusal) = crate::model_switch::ensure_loaded(&server, None).await {
+        return load_refused(&server, refusal);
+    }
+    if !matches!(*server.status(), ModelStatus::Serving) || server.active().model_id() != model {
+        return model_busy("the model is not serving: a switch or an unload began after the load; send it again");
+    }
+    Json(ModelLifecycleResponse { model, status: "serving" }).into_response()
+}
+
+/// `POST /v1/ignis/models/unload` (GitHub #723, ADR 0105): unload the active
+/// model now, as the idle clock does when it is due
+/// ([`crate::idle::unload_unused`]), and answer once its teardown is done.
+/// Nothing resident already, and no teardown still under way, is the same
+/// answer: what the call asks for holds.
+#[utoipa::path(
+    post, path = "/v1/ignis/models/unload", tag = "models",
+    operation_id = "ignis_unload_model", summary = "Unload the active model now",
+    description = "An ignis extension, not OpenAI's model deletion: no file is touched. Unloads the active model the way idle unload does — VRAM, pinned host memory and KV-RAM freed, the process and the API up, `GET /v1/models` listing it `unloaded` under the same id — and answers once the teardown is done. The next request that needs the model loads it again, as after an idle unload; so does `POST /v1/ignis/models/load`. A model unloaded already, or whose load out of `unloaded` failed, is answered at once. Never ends a request: one admitted, waiting or running refuses the call. The speech model is not touched. Under the same API key as inference.",
+    request_body = ModelLifecycleRequest,
+    responses(
+        (status = 200, description = "Nothing of the model is resident (`status: unloaded`).", body = ModelLifecycleResponse),
+        (status = 400, description = "The body does not parse or carries a field other than `model` (`invalid_json`).", body = ApiError),
+        (status = 401, description = "The server was started with `--server-api-key` and the request carried no matching bearer token.", body = ApiError),
+        (status = 404, description = "`model` is not the active model (`model_not_found`).", body = ApiError),
+        (status = 409, description = "A request is admitted, waiting or running on the model; or a load, a reload or another unload holds it; or it was not loaded from an artifact and could not be loaded again (`model_busy`). Nothing was changed.", body = ApiError),
+        (status = 503, description = "The loaded model's first traversal has not run yet (`server_not_ready`), or a switch is under way (`model_switching`, with `Retry-After`).", body = ApiError),
+    ),
+)]
+async fn unload_model(State(server): State<Arc<Server>>, body: Result<Json<ModelLifecycleRequest>, JsonRejection>) -> Response {
+    let model = match lifecycle_model(&server, body) {
+        Ok(model) => model,
+        Err(refused) => return refused,
+    };
+    let meant = |active: &crate::ActiveModel| active.model_id() == model;
+    let unloaded = crate::idle::unload_unused(&server, std::time::Duration::ZERO, meant, |_| crate::model_switch::UnloadCause::Requested).await;
+    let settled = server.status().is_unloaded() && !server.switcher.as_ref().is_some_and(|switcher| switcher.running().is_some());
+    if !unloaded && !settled {
+        return model_busy("the model is in use, a load or another unload holds it, or it has no artifact to load again; nothing was unloaded");
+    }
+    Json(ModelLifecycleResponse { model, status: "unloaded" }).into_response()
+}
+
 /// What `GET /v1/models` answers now.
 fn models_now(server: &Server) -> ModelList {
     // The status first: a switch publishes the new model before it stores
@@ -3425,7 +3569,7 @@ Tool calls come back whole -- one complete `tool_calls` delta per call -- becaus
         (status = 409, description = "The model that would serve the request is the image model: the one loaded, with no `model` naming a text model to switch to, or the one `model` names (`model_kind_mismatch`, naming both kinds and the loaded id). Or `model` names a catalog entry this card cannot load, and no entry that answers to it can: by its class (`model_above_card_class`, naming the entry's class and the card's, ADR 0064) or by its GPU generation, alone or with its class (`model_above_gpu_generation`, naming the generation the entry needs and the card's name, compute capability and generation, ADR 0079): refused before anything loads or switches, the loaded model serving on.", body = ApiError),
         (status = 413, description = "The prompt is longer than this server's `--model-max-context`.", body = ApiError),
         (status = 500, description = "A non-streaming request the engine could not run (`engine_error`): it ended the request with an error, or let it go without a finish. Never a deadline, which is the 504.", body = ApiError),
-        (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`, with `Retry-After`: when a lane is expected to free, 1 to 60 s); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`); or the model was unloaded while idle and loading it again failed (`model_load_failed`); or the server began to stop while the request waited for a switch or a load (`server_stopping`, with `Retry-After`).", body = ApiError),
+        (status = 503, description = "The engine is at capacity and the request was not admitted (`engine_full`, with `Retry-After`: when a lane is expected to free, 1 to 60 s); or a model switch is under way (`model_switching`, with `Retry-After`); or the switch this request's `model` began did not land (`model_switch_failed`); or the model was unloaded, while idle or on request, and loading it again failed (`model_load_failed`); or the server began to stop while the request waited for a switch or a load (`server_stopping`, with `Retry-After`).", body = ApiError),
         (status = 504, description = "The engine did not finish a non-streaming request within `--server-request-timeout`, under `--server-timeout-reply error` (`request_timeout`). Under `partial`, the default, such a request is answered `200` with what it generated, `finish_reason: \"length\"`, and the header `ignis-stopped-by: request_timeout`.", body = ApiError),
     ),
 )]
@@ -4792,6 +4936,7 @@ mod tests {
             // They report state: a page polling them must neither keep the
             // model loaded nor load it again (AC 5).
             ("GET", "/v1/models"),
+            ("GET", "/v1/models/{model}"),
             ("GET", "/v1/models/catalog"),
             ("GET", "/v1/config"),
             ("GET", "/v1/config/fields"),
@@ -4799,6 +4944,11 @@ mod tests {
             // They drive a switch or a reload, which holds the switch's slot.
             ("POST", "/v1/models/switch"),
             ("PATCH", "/v1/config"),
+            // They load or unload the model themselves (GitHub #723): the
+            // load counts its own use while it waits, and the unload takes
+            // the count's lock as the idle clock does.
+            ("POST", "/v1/ignis/models/load"),
+            ("POST", "/v1/ignis/models/unload"),
             // A removal deletes files beside the model, never its own (GitHub #380).
             ("POST", "/v1/models/remove"),
             // A download fetches files beside the model (GitHub #376).

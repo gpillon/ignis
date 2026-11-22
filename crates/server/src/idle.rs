@@ -25,6 +25,11 @@
 //! use is now: the clock starts when the model is serving and unused, never
 //! from a timestamp gone stale meanwhile. The unload itself and the load that
 //! ends it are the model switch's (`crate::model_switch`), on its slot.
+//!
+//! **On request** (GitHub #723, ADR 0105). `POST /v1/ignis/models/unload`
+//! unloads the model the clock's way at once, under the same checks
+//! ([`unload_unused`]), and `POST /v1/ignis/models/load` loads it again the
+//! way a request that needs it does.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -182,10 +187,37 @@ async fn tick_once(server: &Server) {
         server.usage.touch();
         return;
     }
-    let due = server
-        .usage
-        .when_idle(after, |idle| crate::model_switch::claim_unload(server).map(|unloading| (unloading, idle)));
-    if let Some((unloading, idle)) = due {
-        crate::model_switch::unload(server, unloading, crate::model_switch::UnloadCause::Idle(idle)).await;
-    }
+    unload_unused(server, after, |_| true, crate::model_switch::UnloadCause::Idle).await;
+}
+
+/// Unload the active model when `meant` says it is the one to unload,
+/// nothing is in flight or waiting on it, and its last use is at least
+/// `after` ago, all read **under the count's lock** ([`Usage::when_idle`])
+/// so no request is admitted onto the engine being torn down; then wait for
+/// the teardown. `cause` turns how long the model went unused into why it
+/// was unloaded, for its log line. True when this call unloaded it; false
+/// when it was in use, not serving, not loaded from an artifact, or a
+/// switch, a load or another unload held the switch's slot
+/// ([`crate::model_switch::claim_unload_if`]). The clock's due unload is
+/// this, and so is `POST /v1/ignis/models/unload` (GitHub #723), with no
+/// wait.
+pub(crate) async fn unload_unused(
+    server: &Server,
+    after: Duration,
+    meant: impl FnOnce(&crate::ActiveModel) -> bool,
+    cause: impl FnOnce(Duration) -> crate::model_switch::UnloadCause,
+) -> bool {
+    // The model's work is read before the switch's lock is taken: an image
+    // model's job queue has a lock of its own.
+    let due = server.usage.when_idle(after, |idle| {
+        if !server.active().in_flight().is_idle() {
+            return None;
+        }
+        crate::model_switch::claim_unload_if(server, meant).map(|unloading| (unloading, idle))
+    });
+    let Some((unloading, idle)) = due else {
+        return false;
+    };
+    crate::model_switch::unload(server, unloading, cause(idle)).await;
+    true
 }

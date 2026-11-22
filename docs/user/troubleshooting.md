@@ -494,9 +494,19 @@ with `switching: {from, to}`. Retry. If it keeps happening, see
 ### `409 switch_in_progress`
 
 A second `POST /v1/models/switch` while one runs, or a switch sent while an
-idle unload was tearing the model down. Wait until `GET /v1/models` says
-`serving` (or `unloaded`) and send it again
+idle unload, or one a client asked for, was tearing the model down. Wait until
+`GET /v1/models` says `serving` (or `unloaded`) and send it again
 ([Idle unload](api/idle-unload.md)).
+
+### `409 model_busy`
+
+From 0.11.0, `POST /v1/ignis/models/unload` found the model in use — a request
+admitted, waiting or running on it — or a load, a reload or another unload
+under way, or a model not loaded from an artifact, which could not be loaded
+again; or `POST /v1/ignis/models/load` saw a switch or an unload begin before
+it answered. Nothing was changed and no request was ended. Send it again once
+the requests are answered, or `GET /v1/models` says `serving` or `unloaded`
+([Unloading and loading on request](api/idle-unload.md#unloading-and-loading-on-request)).
 
 ### `409 vision_companion_missing`
 
@@ -520,8 +530,9 @@ again. The `reason` says why; for a host-RAM refusal it is the message above.
 `GET /v1/models` shows `status: "failed"` with a `reason` and `last_switch`
 with the outcome (`refused`, `restored` or `failed`).
 
-`model_load_failed`: the model was unloaded while idle and loading it again
-failed. The next request tries again ([Switching models](api/model-switching.md),
+`model_load_failed`: the model was unloaded, while idle or on request, and
+loading it again failed. The next request, or `POST /v1/ignis/models/load`,
+tries again ([Switching models](api/model-switching.md),
 [Idle unload](api/idle-unload.md)).
 
 ### `503 server_stopping`

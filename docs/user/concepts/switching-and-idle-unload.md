@@ -140,6 +140,13 @@ request tries again.
 An unload and the load after it are logged (`ignis.model.unloaded`,
 `ignis.model.reloaded`) but are not switches: `last_switch` is left as it was.
 
+### On request
+
+From 0.11.0 a client need not wait for the idle time: `POST
+/v1/ignis/models/unload` unloads the model the same way at once, refused while
+anything uses it, and `POST /v1/ignis/models/load` loads it again without a
+generation ([Unloading and loading on request](../api/idle-unload.md#unloading-and-loading-on-request)).
+
 ### Why this design
 
 The decision weighed three alternatives and rejected each:
