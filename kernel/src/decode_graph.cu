@@ -755,8 +755,8 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
   model->mixed_capture_asked = true;
   const std::int64_t slots = pool->gdn_pool.slot_count();
   const std::uint32_t planned =
-      ignis::mixed_graphs::planned(true, model->drafter == IgnisDrafter::kDflash2, model->is_trellis_body,
-                                   model->extended_shape->window, model->decode_lanes, slots);
+      ignis::mixed_graphs::planned(true, model->drafter == IgnisDrafter::kDflash2, model->extended_shape->window,
+                                   model->decode_lanes, slots);
   // GitHub #714 (test-only): the mix the test seam fails, once.
   const int fault = model->mixed_capture_fault;
   model->mixed_capture_fault = -1;

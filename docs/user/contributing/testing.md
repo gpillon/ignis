@@ -453,7 +453,11 @@ runs from its own. `vram_plan_gpu` holds the leaf's `mixed_graphs` line to
 `ignis_core::lane_lines::mixed_graphs` at 1, 2, 4, 5 and 8 lanes and 0 to 2
 device retained slots and prints its bytes and KV pages; `vram_reload_gpu`
 reloads a load that holds the twelve, which plans within 1% of its pages and
-holds no more past its plan than the same load without them.
+holds no more past its plan than the same load without them. From #720
+`trellis-24gb-w15-rule`, the trellis artifact at 15 drafts and 8 lanes under
+the shape rule, ends its sessions with the same mixed rounds, all twelve mixes
+captured where an arm asks; `trellis-16gb-w15-rule`'s 2 lanes and no retained
+slot hold no mix, and its mixed arms capture none.
 `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` has the `mixed-round-timing` arm first
 ride two greedy lanes `n` rounds at the uniform extended shape, `n` at the mix
 and `n` at the uniform base shape, so that the round timing prints a `verify
@@ -475,6 +479,21 @@ build's comparison, the arms' runs alternated:
 
 ```sh
 make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2-w15 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
+```
+
+From #720, `IGNIS_ROUND_IDENTITY_TIMING_TABLE=1` beside
+`IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=<n>` has a timing arm ride every cell of
+the cost table in place of those rides: at each lane count of the load, `n`
+rounds at the base shape, then `n` at each count of extended lanes 64 columns
+hold (the last lanes extended, all of them the uniform extended round), each
+after a capture again, so that each cell prints a line here and then its own
+`verify`, `verify extended` or `verify mixed` lines. An entry is its cell's
+period over the base round's at its lane count, and each mix stands beside the
+base round of its columns. One run is one leg of the table's measurement on
+its load, the NVFP4 artifact's or the trellis artifact's:
+
+```sh
+make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=trellis-24gb-w15-rule IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 IGNIS_ROUND_IDENTITY_TIMING_TABLE=1 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
 ```
 
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the

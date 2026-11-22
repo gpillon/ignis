@@ -961,7 +961,7 @@ struct ignis_decode_options {
    * to. It rides a live or a
    * teacher-forced round (its forced tokens and drafts read at each lane's
    * own shape), GitHub #716: and a live one a host cut (`host_cut`); a load
-   * of one shape, `forced_shape_window`, a trellis body (#720), a window but
+   * of one shape, `forced_shape_window`, a window but
    * 15 and a pool without the base fold's spare slots refuse a mixed round by
    * name. NULL: the round's shape is
    * chosen as any round's. */

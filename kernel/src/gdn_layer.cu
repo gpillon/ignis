@@ -682,9 +682,6 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
     // its shape's records: the extended group's from row 0 of the extended shape's, the base
     // group's from row 2w of the mixed base records, the base group on the branch beside the other.
     if (mixed != nullptr) {
-      if (model->is_trellis_body) {
-        throw std::invalid_argument("a mixed round on a trellis body");
-      }
       const ninfer::Tensor conv_weight_flat = weight_tensor(
           w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
       const auto group_records = [&](const ignis::round_layout::Group &group) {
@@ -705,13 +702,22 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
           extended_records.conv.slice(2, static_cast<std::int32_t>(gdn_layer) * extended_records.spec.record_capacity, 1)
               .data,
           ninfer::DType::BF16, {conv_channels, T, 1, 1});
-      const ninfer::ops::LinearPolicy policy = ignis_policy_for(w.query_key_value_z.qtype, mode);
-      const std::size_t projection_bytes = ninfer::ops::gdn_input_proj_workspace_capacity_bytes(
-          w.query_key_value_z.qtype, w.query_key_value_z.n, w.query_key_value_z.k, policy, T, T);
-      const ninfer::DeviceSpan projection_storage =
-          model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(projection_bytes, 1));
-      ninfer::DeviceArena projection_workspace(projection_storage);
-      ninfer::ops::gdn_input_proj(h, w.query_key_value_z, record_flat, zbuf, policy, projection_workspace, stream);
+      if (model->is_trellis_body) {
+        // GitHub #720: on the trellis body, its projection into the same rows, as the uniform
+        // round's trellis arm below projects into its own.
+        ignis::trellis_body::linear(*model, w.trellis.in_proj_qkv, h, record_flat.data,
+                                    static_cast<uint32_t>(conv_channels), IGNIS_TRELLIS_STORE, stream);
+        ignis::trellis_body::linear(*model, w.trellis.in_proj_z, h, zbuf.data, static_cast<uint32_t>(value_width),
+                                    IGNIS_TRELLIS_STORE, stream);
+      } else {
+        const ninfer::ops::LinearPolicy policy = ignis_policy_for(w.query_key_value_z.qtype, mode);
+        const std::size_t projection_bytes = ninfer::ops::gdn_input_proj_workspace_capacity_bytes(
+            w.query_key_value_z.qtype, w.query_key_value_z.n, w.query_key_value_z.k, policy, T, T);
+        const ninfer::DeviceSpan projection_storage =
+            model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(projection_bytes, 1));
+        ninfer::DeviceArena projection_workspace(projection_storage);
+        ninfer::ops::gdn_input_proj(h, w.query_key_value_z, record_flat, zbuf, policy, projection_workspace, stream);
+      }
       // A group's columns of a flat tensor of `column_bytes` a column, as `shape`, and its rows of a
       // per-lane buffer.
       const auto at = [](const ninfer::Tensor &flat, const ignis::round_layout::Group &group, std::size_t column_bytes,

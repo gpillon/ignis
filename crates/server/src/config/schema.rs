@@ -712,8 +712,8 @@ config_group! {
         /// to 7 lanes, the highest expected gain first, each when the drafts
         /// the lane is expected to take past position 7 exceed what its 8
         /// more columns cost every lane, within 64 columns, so a round may
-        /// mix both shapes (only at 15 drafts on the NVFP4 artifact: any
-        /// other load runs `aggregate`, as its load log says). A lane alone
+        /// mix both shapes (only at 15 drafts, on either artifact: any other
+        /// load runs `aggregate`, as its load log says). A lane alone
         /// runs at the shape it asks under each. Every profile gives
         /// `aggregate`. A speed setting only.
         shape_policy: ShapePolicyKind = ignis_core::ShapePolicy::Aggregate, Validator::OneOf(&ignis_core::ShapePolicy::NAMES),
@@ -731,15 +731,21 @@ config_group! {
         /// columns hold), `/` between rows: what the wider round costs every
         /// lane in it. `aggregate` reads the uniform entries (every lane
         /// extended, at 1 to 4 lanes), `mixed` every one. Four ratios alone,
-        /// the form before the table, are the uniform entries, the rest their
-        /// defaults. The uniform entries and the mixes 1+1, 1+3, 2+2 and 1+5
-        /// are the RTX 5090's measured values (FP8 exception weights, the
-        /// default cost levers, about 3.5-5K tokens of context; the ratio
-        /// grows with context, and the card's power limit puts 3 lanes above
-        /// 4); the other mixes are derived from its measured base rounds of
-        /// the same columns (those of 64 columns, where no base round was
-        /// measured, one step past 56); all pending a measurement of this
-        /// build.
+        /// the form before the table, are the uniform entries, the rest the
+        /// loaded artifact's defaults. The default is the loaded artifact's
+        /// own; the one shown is the NVFP4 artifact's: its uniform entries and
+        /// the mixes 1+1, 1+3, 2+2 and 1+5 are the RTX 5090's measured values
+        /// (FP8 exception weights, the default cost levers, about 3.5-5K
+        /// tokens of context; the ratio grows with context, and the card's
+        /// power limit puts 3 lanes above 4); the other mixes are derived from
+        /// its measured base rounds of the same columns (those of 64 columns,
+        /// where no base round was measured, one step past 56); all pending a
+        /// measurement of this build. The trellis artifact's (the 16 GB and
+        /// 24 GB profiles'), `1.375/1.324,1.85/1.251,1.596,2/1.289,1.464,1.803,2/1.161,1.433,1.702/1.194,1.504/1.224`,
+        /// is derived from the RTX 5090's: its extended round at one lane
+        /// costs about 1.35 to 1.40 times its base round, against the NVFP4
+        /// artifact's 1.13; none of it is measured on that artifact yet, and
+        /// it is indicative for the 16 GB and 24 GB cards until a run on one.
         /// Unmeasured on other cards. The one-lane entry is not read: a lane
         /// alone runs at the shape it asks. A speed setting only.
         shape_period_ratios: PeriodRatios = ignis_core::PeriodTable::NVFP4, NO_RULE, QWEN38_ONLY,

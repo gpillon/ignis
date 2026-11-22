@@ -139,6 +139,12 @@
 //! round attends on ignis's chunks there too; the arm on the vendored chunks
 //! holds the route a card without ignis's route takes.
 //!
+//! #720: `trellis-24gb-w15-rule` is a load of [`MIXED_LOADS`], so its
+//! sessions end with the mixed rounds below, under the shape rule, all twelve
+//! mixes at its 8 lanes; `trellis-16gb-w15-rule`'s pool of 2 lanes and no
+//! retained slot holds no mix (the 1+1 mix's fold wants 3 slots), and the
+//! mixed arms' captures there make none ([`mixed_graph_nodes`]).
+//!
 //! # Loads and weights
 //!
 //! [`LOADS`]: the NVFP4 body with DFlash2 at 7, with its MTP head at the
@@ -240,6 +246,14 @@
 //! that many rounds at 1+3, 2+2 and 1+5 ([`TIMED_MIXES`]), each after a capture
 //! again, so that each mix prints `verify mixed` blocks of its own and a
 //! digest of its text: one leg of the build's timing against its comparison.
+//!
+//! #720: with `IGNIS_ROUND_IDENTITY_TIMING_TABLE=1` beside
+//! `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS`, a timing arm rides every cell of the
+//! cost table in place of those rides ([`time_cost_table`]): at each lane
+//! count, the base round and each count of extended lanes 64 columns hold,
+//! each after a capture again, so that each cell's period on the GPU clock
+//! stands beside the base rounds of every column count, one leg of the
+//! table's measurement on the load (the NVFP4 body's or the trellis body's).
 //!
 //! # Narrow runs
 //!
@@ -391,14 +405,17 @@ const ARMS: &[Arm] = &[
     // #719's arms, below this line.
 
     // #720's arms, below this line.
+    // None: the trellis body's 24 GB load rides the mixed rounds every arm's sessions take
+    // ([`MIXED_LOADS`]), and its 16 GB load, which holds no mix, captures none under the mixed
+    // arms ([`mixed_graph_nodes`]).
 ];
 
 /// #713: the switch that captures the mixed rounds' graphs, read at capture;
-/// the loads whose sessions end with forced mixed rounds; and those rounds:
-/// each a kind of round and the shapes of its two riders, extended where
-/// `true`.
+/// the loads whose sessions end with forced mixed rounds (#720: and the
+/// trellis body's at the 24 GB profile's 8 lanes); and those rounds: each a
+/// kind of round and the shapes of its two riders, extended where `true`.
 const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
-const MIXED_LOADS: [&str; 2] = ["nvfp4-dflash2-w15", "nvfp4-vision-w15"];
+const MIXED_LOADS: [&str; 3] = ["nvfp4-dflash2-w15", "nvfp4-vision-w15", "trellis-24gb-w15-rule"];
 const MIXED_RIDES: [(Round, &[bool]); 3] =
     [(Round::Verify, &[false, true]), (Round::Forced, &[true, false]), (Round::Verify, &[true, false])];
 
@@ -832,10 +849,10 @@ impl Load {
 
     /// #713: whether the load's sessions end with [`MIXED_RIDES`] (#714: and
     /// [`MIX_RIDES`]): a load of [`MIXED_LOADS`] under
-    /// [`ROUND_SHAPE`]`=extended` (not the second test's twins of it, at the
-    /// base shape or at 7 drafts).
+    /// [`ROUND_SHAPE`]`=extended` (#720: or under the shape rule; not the
+    /// second test's twins of it, at the base shape or at 7 drafts).
     fn mixes(&self) -> bool {
-        self.two_shapes() && self.round_shape == Some("extended") && MIXED_LOADS.contains(&self.name) && self.lanes > 2
+        self.two_shapes() && self.round_shape != Some("base") && MIXED_LOADS.contains(&self.name) && self.lanes > 2
     }
 
     /// #689: whether the load's rounds take the shape the shape rule gives
@@ -1077,8 +1094,8 @@ fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
 /// `IGNIS_MIXED_ROUNDS=1`, a verify graph and, where the arm's rounds defer,
 /// a drafter append graph for each mix the load holds (#714: every mix the
 /// plan's rule picks, `ignis_core::lane_lines::mixed_graphs`, on this pool of
-/// the load's lanes and no retained slot: all twelve at 8 lanes on the NVFP4
-/// body at 15 drafts), and no other mix's; none anywhere else. What the
+/// the load's lanes and no retained slot: all twelve at 8 lanes on either
+/// body at 15 drafts, #720), and no other mix's; none anywhere else. What the
 /// captured mixes' graphs took, as the device's free memory reads them, prints
 /// beside the plan's line, held to nothing: the reading moves with anything
 /// else on the card, and an arm's capture after another's may read none,
@@ -1113,7 +1130,7 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
     }
     let measured: u64 = stats.mixed_graph_bytes.iter().sum();
     if asked && !held.is_empty() {
-        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), false, true, load.lanes, 0);
+        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0);
         println!(
             "round_identity_gpu {label}: arm `{}`: the mixed graphs of {} mixes, verify nodes {verify:?}, append nodes {append:?}, \
              bytes {:?}: {measured} B measured, {} B planned; verify roots {:?}, memset nodes {:?}",
@@ -1129,9 +1146,10 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
 
 /// #714: the mixes whose graphs a capture asking for them makes on the load
 /// and the test's pool (its lanes, no retained slot): the plan's rule
-/// (`ignis_core::lane_lines::mixed_graphs`), on the NVFP4 body.
+/// (`ignis_core::lane_lines::mixed_graphs`), on either body (#720): none at
+/// the trellis body's 16 GB load's 2 lanes.
 fn mixes_held(load: &Load) -> Vec<(u32, u32)> {
-    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), load.artifact != NVFP4, true, load.lanes, 0).mixes
+    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0).mixes
 }
 
 /// #712: a digest of a session's tokens, every lane's in order (FNV-1a over
@@ -1557,43 +1575,7 @@ fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script
         if at >= 3 {
             capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
         }
-        let width = extended.len();
-        let lanes = vec![VerifyLane::greedy(&[]); width];
-        let mut ridden = 0;
-        let mut tokens = vec![0u64; width];
-        let mut first: Option<Committed> = None;
-        while ridden < rounds {
-            let mut riders: Vec<Seq<'_>> = (0..width)
-                .map(|lane| {
-                    let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: timing alloc: {e}"));
-                    prefill(model, pool, &mut seq, &script.prompts[lane], greedy(lane), false, label);
-                    seq
-                })
-                .collect();
-            let mut text: Committed = vec![Vec::new(); width];
-            let mut used = (0..width).map(|lane| script.prompts[lane].len()).max().unwrap_or(0) as u32;
-            while ridden < rounds && used + 2 * (load.window + 1) <= load.context() {
-                let mut refs: Vec<&mut Seq<'_>> = riders.iter_mut().collect();
-                let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, extended)
-                    .unwrap_or_else(|e| panic!("{label}: timing at {extended:?}: {e}"));
-                used += runs.iter().map(|run| run.tokens.len() as u32).max().unwrap_or(0);
-                for (lane, run) in runs.iter().enumerate() {
-                    tokens[lane] += run.tokens.len() as u64;
-                    text[lane].extend(&run.tokens);
-                }
-                ridden += 1;
-            }
-            first.get_or_insert(text);
-        }
-        let per_round: Vec<String> = tokens.iter().map(|&lane| format!("{:.2}", lane as f64 / f64::from(ridden.max(1)))).collect();
-        let first = first.unwrap_or_default();
-        println!(
-            "round_identity_gpu {label}: {ridden} timed rounds of {width} lanes at {extended:?}, {} tokens a round, \
-             digest {:016x} of the first lanes' text",
-            per_round.join(" and "),
-            digest(std::slice::from_ref(&first))
-        );
-        texts.push(first);
+        texts.push(ride_timed(model, pool, load, script, rounds, extended, label));
     }
     // Each lane's text at each pair of the two-lane rounds.
     let names = ["uniform extended", "mixed", "uniform base"];
@@ -1608,6 +1590,74 @@ fn time_mixed_rounds(model: &Model, pool: &SeqPool, load: &Load, script: &Script
                 one.len(),
                 other.len()
             );
+        }
+    }
+}
+
+/// #713, #718: `rounds` greedy verify rounds of as many fresh lanes as
+/// `extended` names, each lane extended where it says, a fresh set prefilled
+/// whenever a lane nears its context; prints each lane's tokens a round and a
+/// digest of the first set's text, which it returns.
+fn ride_timed(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, extended: &[bool], label: &str) -> Committed {
+    let width = extended.len();
+    let lanes = vec![VerifyLane::greedy(&[]); width];
+    let mut ridden = 0;
+    let mut tokens = vec![0u64; width];
+    let mut first: Option<Committed> = None;
+    while ridden < rounds {
+        let mut riders: Vec<Seq<'_>> = (0..width)
+            .map(|lane| {
+                let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: timing alloc: {e}"));
+                prefill(model, pool, &mut seq, &script.prompts[lane], greedy(lane), false, label);
+                seq
+            })
+            .collect();
+        let mut text: Committed = vec![Vec::new(); width];
+        let mut used = (0..width).map(|lane| script.prompts[lane].len()).max().unwrap_or(0) as u32;
+        while ridden < rounds && used + 2 * (load.window + 1) <= load.context() {
+            let mut refs: Vec<&mut Seq<'_>> = riders.iter_mut().collect();
+            let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, extended)
+                .unwrap_or_else(|e| panic!("{label}: timing at {extended:?}: {e}"));
+            used += runs.iter().map(|run| run.tokens.len() as u32).max().unwrap_or(0);
+            for (lane, run) in runs.iter().enumerate() {
+                tokens[lane] += run.tokens.len() as u64;
+                text[lane].extend(&run.tokens);
+            }
+            ridden += 1;
+        }
+        first.get_or_insert(text);
+    }
+    let per_round: Vec<String> = tokens.iter().map(|&lane| format!("{:.2}", lane as f64 / f64::from(ridden.max(1)))).collect();
+    let first = first.unwrap_or_default();
+    println!(
+        "round_identity_gpu {label}: {ridden} timed rounds of {width} lanes at {extended:?}, {} tokens a round, \
+         digest {:016x} of the first lanes' text",
+        per_round.join(" and "),
+        digest(std::slice::from_ref(&first))
+    );
+    first
+}
+
+/// #720 (opt-in, `IGNIS_ROUND_IDENTITY_TIMING_TABLE=1` beside
+/// `IGNIS_ROUND_IDENTITY_TIMING_ROUNDS`, in place of [`time_mixed_rounds`]'s
+/// rides): every cell of the cost table, each against measured base rounds of
+/// the same columns. At each lane count of 1 to the load's lanes, after a
+/// capture again, which starts the round timing's blocks afresh, `rounds`
+/// rounds at the base shape, then, each after a capture again, as many at each
+/// count of extended lanes the round's 64 columns hold at that lane count (its
+/// last lanes extended; all of them the uniform extended round), so that each
+/// cell prints `verify`, `verify extended` or `verify mixed` blocks of its own
+/// after its line here: an entry is its cell's period over the base round's at
+/// its lane count, and a mix of `w` extended lanes stands beside the base round
+/// of `w` lanes more, its columns. Nothing is compared.
+fn time_cost_table(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, label: &str) {
+    for width in 1..=load.lanes {
+        let cells = 0..=ignis_core::PeriodTable::row_entries(width);
+        for extended in cells {
+            let shapes: Vec<bool> = (0..width).map(|lane| lane >= width - extended).collect();
+            capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
+            println!("round_identity_gpu {label}: the cost table's cell of {width} lanes, {extended} of them extended");
+            ride_timed(model, pool, load, script, rounds, &shapes, label);
         }
     }
 }
@@ -1858,7 +1908,12 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         let timed = arm.switches.contains(&("IGNIS_ROUND_TIMING", "1")) && arm.switches.contains(&(MIXED_ROUNDS, "1"));
         let rounds = std::env::var("IGNIS_ROUND_IDENTITY_TIMING_ROUNDS").ok().and_then(|value| value.parse::<u32>().ok());
         if let (true, true, Some(rounds)) = (timed, load.mixes(), rounds) {
-            time_mixed_rounds(model, pool, load, script, rounds, label);
+            // #720: or every cell of the cost table, where asked.
+            if std::env::var("IGNIS_ROUND_IDENTITY_TIMING_TABLE").is_ok_and(|value| value == "1") {
+                time_cost_table(model, pool, load, script, rounds, label);
+            } else {
+                time_mixed_rounds(model, pool, load, script, rounds, label);
+            }
         }
     }
     round_shape_stats(model, pool, load, &format!("{label}: {}", arm.name));

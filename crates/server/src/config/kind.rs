@@ -938,7 +938,8 @@ impl FieldKind for ShapePolicyKind {
 /// seven lists): 1, 2, 3, 4, 3, 2 and 1 ratios, as many as the lanes' 64
 /// columns hold extended lanes. The four-value form of earlier builds, the
 /// extended round's ratio at 1 to 4 lanes (a file's list of four), is still
-/// taken as the uniform entries, every other entry its default.
+/// taken as the uniform entries, every other entry its default: GitHub #720,
+/// the loaded body's (`ignis_core::PeriodTable::of_load`).
 pub struct PeriodRatios;
 
 impl PeriodRatios {
@@ -971,6 +972,11 @@ impl FieldKind for PeriodRatios {
     }
 
     fn render(value: &Self::Value) -> Value {
+        // GitHub #720: the four-value form as it was given, so that its mixed entries stay the
+        // body's a load takes.
+        if value.uniform_only() {
+            return Value::Array(value.uniform().iter().map(|&milli| Decimal::written(milli)).collect());
+        }
         Value::Array(value.rows().iter().map(|row| Value::Array(row.iter().map(|&milli| Decimal::written(milli)).collect())).collect())
     }
 

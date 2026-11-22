@@ -670,8 +670,6 @@ fn cuda_scheduler_for(
 ) -> Result<(Box<dyn ignis_core::Scheduler>, crate::metrics::LoadReservations, EngineShape, String), LoadError> {
     let second_tail_cut = crate::config::arch::second_tail_cut_for_load().map_err(LoadError::LoadFailed)?;
     let shape = load_shape(config, vision_item_bound).with_second_tail_cut(config.basis.family(), second_tail_cut);
-    // GitHub #715: whether the 27B's artifact is a trellis body, which runs no mixed round yet.
-    let mut trellis = false;
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
         ModelFamily::FlashNext => crate::runtime::flash_next_load(
@@ -687,9 +685,11 @@ fn cuda_scheduler_for(
         .map_err(|error| LoadError::from_flash_next(error, config)),
         ModelFamily::Qwen38_27b => {
             // An artifact whose body cannot be read fails its load below.
+            let mut shape = shape;
             if let Ok(body) = crate::loader::body_27b(artifact) {
                 log_exception_weights(config, &shape, body);
-                trellis = body != ignis_artifact::Body27b::Nvfp4;
+                // GitHub #720: the cost table of its body, where none is given.
+                shape.speculation = with_the_bodys_cost_table(config, shape.speculation, body);
             }
             crate::runtime::qwen27b_load(
                 artifact,
@@ -727,7 +727,7 @@ fn cuda_scheduler_for(
         // GitHub #336: the 27B's are a load setting too.
         decode_lanes = shape.decode_lanes_for(family),
         kv_format = shape.kv_format.as_str(),
-        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation), trellis),
+        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation)),
         vision = %shape.vision.map_or_else(
             || "off".to_owned(),
             |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
@@ -779,10 +779,11 @@ impl LoadSpeculation {
 /// GitHub #690: a load of two round shapes then names the shape rule's
 /// thresholds and the shape policy with its window and its period ratios,
 /// which no other load reads. GitHub #715: the policy is the one the load
-/// runs on its body (`trellis` for the trellis artifacts), with the one it was
-/// given beside it where they differ.
+/// runs, with the one it was given beside it where they differ. GitHub #720:
+/// the table is the one the load runs on its body
+/// ([`with_the_bodys_cost_table`]).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn speculation_text(family: ModelFamily, speculation: LoadSpeculation, trellis: bool) -> String {
+fn speculation_text(family: ModelFamily, speculation: LoadSpeculation) -> String {
     let speculation = match speculation {
         LoadSpeculation::MtpWindowZero => return "off (mtp draft_tokens=0)".to_owned(),
         LoadSpeculation::Runs(Some(s)) if crate::config::the_27bs_mtp(Some(family), Some(s.backend())) => {
@@ -809,7 +810,7 @@ fn speculation_text(family: ModelFamily, speculation: LoadSpeculation, trellis: 
             let (rule, estimate) = (s.shape_rule(), s.shape_estimate());
             // GitHub #715: the policy the load runs, and the one it was given where they differ
             // (`mixed` on a load that runs no mixed round runs `aggregate`).
-            let runs = s.shape_policy_runs(trellis);
+            let runs = s.shape_policy_runs();
             let given = if runs == s.shape_policy() { String::new() } else { format!(" shape_policy_given={}", s.shape_policy().as_str()) };
             format!(
                 "{line} shape_enter_accepted={} shape_stay_accepted={} shape_policy={}{given} shape_estimate_rounds={} shape_period_ratios={}",
@@ -821,6 +822,29 @@ fn speculation_text(family: ModelFamily, speculation: LoadSpeculation, trellis: 
             )
         },
     )
+}
+
+/// GitHub #720 (spec #711): `speculation` over the cost table a 27B load of
+/// `body` runs ([`ignis_core::PeriodTable::of_load`]): the one the operator or
+/// a profile gave (`spec.shape_period_ratios`), the four-value form's mixed
+/// entries the body's; with none given, the body's own, the trellis body's on
+/// a trellis artifact. A config file that writes the default gives none, as
+/// one `config generate` wrote names every field.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn with_the_bodys_cost_table(
+    config: &crate::config::Config,
+    speculation: Option<ignis_core::Speculation>,
+    body: ignis_artifact::Body27b,
+) -> Option<ignis_core::Speculation> {
+    use crate::config::arch::GivenBy;
+    let resolution = config.basis.resolution();
+    let given = resolution.named_by_operator("spec", "shape_period_ratios")
+        || GivenBy::of(resolution.origin("spec", "shape_period_ratios")) == GivenBy::Profile;
+    speculation.map(|s| {
+        let estimate = s.shape_estimate();
+        let table = ignis_core::PeriodTable::of_load(given.then(|| estimate.period_table()), body);
+        s.with_shape_policy(s.shape_policy(), estimate.with_period_table(table))
+    })
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
@@ -1101,15 +1125,15 @@ mod tests {
         let the_27b = ModelFamily::Qwen38_27b;
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec)), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec))),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let sampled = spec.with_draft_rule(DraftRule::Sampled, DrafterSampling { temperature_factor_milli: 1000, top_p_milli: 875 });
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled)), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled))),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=sampled drafter_temperature_factor=1 drafter_top_p=0.875"
         );
-        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None), false), "off");
+        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None)), "off");
     }
 
     /// GitHub #690 (spec #684, user story 25): a load of two round shapes
@@ -1118,7 +1142,7 @@ mod tests {
     /// drafts or fewer reads none of them, and its line is what it was.
     /// GitHub #715: the cost table's seven rows, and the policy the load runs:
     /// `mixed` where it runs mixed rounds, `aggregate` with the `mixed` it was
-    /// given beside it on the trellis body or at 8 to 14 drafts.
+    /// given beside it at 8 to 14 drafts (GitHub #720: on either body).
     #[test]
     fn the_load_log_names_a_two_shape_loads_shape_rule_and_shape_policy() {
         use ignis_core::{PeriodTable, ShapeEstimate, ShapePolicy, ShapeRule, Speculation, SpeculativeBackend};
@@ -1126,7 +1150,7 @@ mod tests {
         let table = |uniform| PeriodTable::with_uniform(uniform).unwrap();
         let wide = Speculation::new(SpeculativeBackend::Dflash2, 15).unwrap();
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide)), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide))),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=7 shape_stay_accepted=6 shape_policy=aggregate shape_estimate_rounds=16 \
              shape_period_ratios=1.128/1.155,1.29/1.12,1.285,1.363/1.138,1.222,1.384,1.344/1.077,1.207,1.336/1.093,1.241/1.107"
@@ -1136,16 +1160,16 @@ mod tests {
             .unwrap()
             .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, table([1000, 1200, 1250, 2000])).unwrap());
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(all)), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(all))),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=5 shape_stay_accepted=12 shape_policy=all shape_estimate_rounds=8 \
              shape_period_ratios=1/1.155,1.2/1.12,1.285,1.25/1.138,1.222,1.384,2/1.077,1.207,1.336/1.093,1.241/1.107"
         );
-        let line = |draft_tokens: u32, trellis: bool| {
+        let line = |draft_tokens: u32| {
             let mixed = Speculation::new(SpeculativeBackend::Dflash2, draft_tokens)
                 .unwrap()
                 .with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::new(16, table([1100, 1200, 1300, 1400])).unwrap());
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(mixed)), trellis)
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(mixed)))
         };
         let shapes = |draft_tokens: u32, policy: &str| {
             format!(
@@ -1154,16 +1178,50 @@ mod tests {
                  shape_period_ratios=1.1/1.155,1.2/1.12,1.285,1.3/1.138,1.222,1.384,1.4/1.077,1.207,1.336/1.093,1.241/1.107"
             )
         };
-        assert_eq!(line(15, false), shapes(15, "mixed"), "the NVFP4 body at 15 drafts runs `mixed`");
-        assert_eq!(line(15, true), shapes(15, "aggregate shape_policy_given=mixed"), "the trellis body runs `aggregate`");
-        assert_eq!(line(10, false), shapes(10, "aggregate shape_policy_given=mixed"), "10 drafts run `aggregate`");
+        assert_eq!(line(15), shapes(15, "mixed"), "15 drafts run `mixed`, on either body (#720)");
+        assert_eq!(line(10), shapes(10, "aggregate shape_policy_given=mixed"), "10 drafts run `aggregate`");
         let seven = Speculation::new(SpeculativeBackend::Dflash2, 7)
             .unwrap()
             .with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::new(8, table([1000, 1200, 1250, 2000])).unwrap());
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven)), false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven))),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
+    }
+
+    /// GitHub #720 (spec #711): a 27B load runs its body's cost table, the
+    /// trellis body's on a trellis artifact and the NVFP4 body's on the NVFP4
+    /// one, unless one is named, which either body runs; a config file that
+    /// writes the default names none. Its load log names the table it runs.
+    #[test]
+    fn a_27b_load_runs_its_bodys_cost_table_unless_one_is_named() {
+        use ignis_artifact::Body27b;
+        let ratios = |flags: &[&str], file: Option<&str>, body| {
+            let mut args: Vec<String> = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"].iter().chain(flags).map(|f| f.to_string()).collect();
+            let files = crate::config::file::testing::MemFiles::with(&[("c.yaml", file.unwrap_or(""))]);
+            if file.is_some() {
+                args.extend(["--config".to_owned(), "c.yaml".to_owned()]);
+            }
+            let crate::config::ConfigOutcome::Config(config) = crate::config::resolve_with(&args, |_| None, &files).unwrap() else { unreachable!() };
+            let config = config.for_family(ModelFamily::Qwen38_27b).unwrap();
+            let line = speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(with_the_bodys_cost_table(&config, config.speculation, body)));
+            line.split_once("shape_period_ratios=").map(|(_, table)| table.to_owned()).unwrap_or_else(|| panic!("{line}"))
+        };
+        let trellis = "1.375/1.324,1.85/1.251,1.596,2/1.289,1.464,1.803,2/1.161,1.433,1.702/1.194,1.504/1.224";
+        let nvfp4 = "1.128/1.155,1.29/1.12,1.285,1.363/1.138,1.222,1.384,1.344/1.077,1.207,1.336/1.093,1.241/1.107";
+        assert_eq!(ratios(&[], None, Body27b::Trellis), trellis, "the trellis body's default");
+        assert_eq!(ratios(&[], None, Body27b::Nvfp4), nvfp4, "the NVFP4 body's default");
+        let named = "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5";
+        for body in [Body27b::Trellis, Body27b::Nvfp4] {
+            assert_eq!(ratios(&["--spec-shape-period-ratios", named], None, body), named, "{body:?}: the named table");
+            assert_eq!(ratios(&["--spec-shape-period-ratios", nvfp4], None, body), nvfp4, "{body:?}: the NVFP4 table, named");
+        }
+        // The four-value form: its uniform entries beside the body's mixed ones.
+        let four = ["--spec-shape-period-ratios", "1.1,1.2,1.3,1.4"];
+        assert_eq!(ratios(&four, None, Body27b::Trellis), "1.1/1.324,1.2/1.251,1.596,1.3/1.289,1.464,1.803,1.4/1.161,1.433,1.702/1.194,1.504/1.224");
+        assert_eq!(ratios(&four, None, Body27b::Nvfp4), "1.1/1.155,1.2/1.12,1.285,1.3/1.138,1.222,1.384,1.4/1.077,1.207,1.336/1.093,1.241/1.107");
+        let written = format!("spec:\n  qwen38:\n    shape_period_ratios: [{}]\n", "[1.128], [1.155, 1.29], [1.12, 1.285, 1.363], [1.138, 1.222, 1.384, 1.344], [1.077, 1.207, 1.336], [1.093, 1.241], [1.107]");
+        assert_eq!(ratios(&[], Some(&written), Body27b::Trellis), trellis, "a file at the default names no table");
     }
 
     /// GitHub #623: the 27B's MTP load names its drafter and its window, and
@@ -1173,10 +1231,10 @@ mod tests {
     fn the_load_log_names_the_27bs_mtp_drafter_and_its_window() {
         use ignis_core::{DraftRule, DrafterSampling, Speculation, SpeculativeBackend};
         let mtp = Speculation::new(SpeculativeBackend::Mtp, 5).unwrap().with_draft_rule(DraftRule::Fixed, DrafterSampling::default());
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp)), false), "mtp draft_tokens=5");
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero, false), "off (mtp draft_tokens=0)");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp))), "mtp draft_tokens=5");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero), "off (mtp draft_tokens=0)");
         assert_eq!(
-            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp)), false),
+            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp))),
             "mtp draft_tokens=5 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let config = |flags: &[&str]| {

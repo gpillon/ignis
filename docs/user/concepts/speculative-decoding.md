@@ -232,9 +232,10 @@ lanes they differ in who pays the wider round:
   64 columns, so it holds one to three extended requests beside one to six at
   the base shape (or every one extended at 2 to 4 lanes). A JSON answer
   beside three conversations can then draft 15 while they draft 7. Mixed rounds
-  run only on the NVFP4 artifact at 15 drafts: any other load runs `mixed` as
-  `aggregate`, and its load log says so (`shape_policy=aggregate
-  shape_policy_given=mixed`). A request held to a grammar is granted as any
+  run only at 15 drafts, on either artifact (the trellis artifact the 16 GB and
+  24 GB profiles load too, [Built-in profiles](profiles.md#rtx-24gb)): any
+  other load runs `mixed` as `aggregate`, and its load log says so
+  (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a grammar is granted as any
   other: the grammar's check cuts its run at its first miss at the shape it
   was granted, in a mixed round too. Every profile gives `aggregate`;
   `mixed` is opt-in until its served gate passes. A mix whose graphs the load
@@ -244,6 +245,14 @@ lanes they differ in who pays the wider round:
 
 The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
 the round's period with 1, 2, ... of them extended over the base round's) are
+each artifact's own unless you name a table (four ratios alone take the
+artifact's mixed entries beside them). The trellis artifact's are derived,
+none of them measured on it yet, and indicative for the 16 GB and 24 GB cards
+until a run on one: its extended round at one lane costs about 1.35 to 1.40
+times its base round on the RTX 5090, against the NVFP4 artifact's 1.13, so
+its extended lanes cost more and are granted less often
+([the configuration reference](../reference/configuration.md#specshape_period_ratios)).
+The NVFP4 artifact's are
 the RTX 5090's: the uniform entries measured with the extended round's cost
 levers on, at about 3.5-5K tokens of context, 1.128, 1.29, 1.363 and 1.344 at
 1 to 4 lanes; of the mixed entries 1+1, 1+3, 2+2 and 1+5 measured (1.155,

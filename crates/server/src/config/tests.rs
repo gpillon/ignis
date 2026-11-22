@@ -2029,8 +2029,9 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
         (
             serde_json::json!("all"),
             serde_json::json!(8),
-            // GitHub #715: written as the table, the four ratios its uniform entries.
-            serde_json::json!([[1.0], [1.155, 1.2], [1.12, 1.285, 1.25], [1.138, 1.222, 1.384, 2.0], [1.077, 1.207, 1.336], [1.093, 1.241], [1.107]])
+            // GitHub #720: written as the four ratios it was given, so that its mixed entries stay the
+            // loaded body's (GitHub #715 wrote the table, the NVFP4 body's mixed entries beside them).
+            serde_json::json!([1.0, 1.2, 1.25, 2.0])
         ),
         "{document}"
     );
@@ -2039,6 +2040,7 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
         let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
         let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(policy(&read), Some((ShapePolicy::All, 8, [1000, 1200, 1250, 2000])), "{name}");
+        assert!(read.speculation.unwrap().shape_estimate().period_table().uniform_only(), "{name}: read back as the four-value form");
     }
     // Outside the fields' ranges, and a table that is not four ratios.
     for (flag, raw) in [

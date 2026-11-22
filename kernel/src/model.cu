@@ -2618,7 +2618,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   // GitHub #714 (spec #711): the mixed rounds' graphs, each mix the capture makes them for over a
   // pool of the lanes' and the device retained slots' GDN slots.
   sizes.mixed_graph_mask = ignis::mixed_graphs::planned(
-      options.mixed_rounds_asked, two_shapes, model.is_trellis_body, sizes.extended_window, lanes,
+      options.mixed_rounds_asked, two_shapes, sizes.extended_window, lanes,
       static_cast<std::int64_t>(lanes) + options.retained_device_slots);
   sizes.mixed_graphs = ignis::mixed_graphs::bytes_of(sizes.mixed_graph_mask);
   return sizes;
@@ -3226,7 +3226,7 @@ extern "C" int32_t ignis_model_load(const struct ignis_bound_tensor *tensors, ui
         model->shape_policy = load.shape_policy;
         // GitHub #715: `mixed` where the load runs mixed rounds, `aggregate` anywhere else.
         if (model->shape_policy.policy == ignis::round_shape::Policy::kMixed &&
-            !ignis::mixed_graphs::holds_mixed_rounds(true, model->is_trellis_body, sizes.extended_window)) {
+            !ignis::mixed_graphs::holds_mixed_rounds(true, sizes.extended_window)) {
           model->shape_policy.policy = ignis::round_shape::Policy::kAggregate;
         }
       }
