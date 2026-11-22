@@ -728,7 +728,7 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
                 asking(true);
                 let asked = planned_with(wide, lanes, retained);
                 asking(false);
-                let mirror = ignis_core::lane_lines::mixed_graphs(Some(wide), false, true, lanes, retained);
+                let mirror = ignis_core::lane_lines::mixed_graphs(Some(wide), true, lanes, retained);
                 let what = format!("{window} drafts at {lanes} lanes and {retained} device retained slots");
                 assert_eq!(unasked.mixed_graphs, 0, "{what}: no mixed graph unasked");
                 assert_eq!(asked.mixed_graphs, mirror.bytes, "{what}: the leaf's mixed graphs line is the CPU's {:?}", mirror.mixes);
@@ -758,7 +758,7 @@ fn a_two_shape_loads_round_lines_are_the_cpus_at_every_lanes_count() {
         }
     }
     assert_eq!(
-        ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), false, true, N_DECODE_LANES as u32, 0).mixes.len(),
+        ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), true, N_DECODE_LANES as u32, 0).mixes.len(),
         12,
         "the `rtx5090` profile's lanes hold every mix"
     );
@@ -904,7 +904,8 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
         let planned = |speculation: Speculation| planned_at(speculation, profile.lanes);
         let base = planned(seven);
         assert!(base.trellis_workspace > 0, "{}: a trellis body plans its workspace", profile.label);
-        // GitHub #714: the trellis body runs no mixed round yet, so it plans no mixed graph when asked.
+        // GitHub #714, #720: the trellis body plans the mixed graphs the CPU does when asked: none at
+        // `rtx-16gb`'s 2 lanes and no device retained slot, all twelve at `rtx-24gb`'s 8.
         let asked = {
             let _switch = MIXED_ROUNDS_HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // SAFETY (test-only): as in the NVFP4 body's test, under the same lock.
@@ -913,7 +914,10 @@ fn a_two_shape_trellis_loads_round_lines_are_the_cpus_at_the_profiles_lanes() {
             unsafe { std::env::remove_var(MIXED_ROUNDS) };
             asked
         };
-        assert_eq!(asked.mixed_graphs, 0, "{}: the trellis body's mixed graphs", profile.label);
+        let mirror = ignis_core::lane_lines::mixed_graphs(Some(at_window(15)), true, profile.lanes, profile.retained_device_slots);
+        assert_eq!(asked.mixed_graphs, mirror.bytes, "{}: the trellis body's mixed graphs", profile.label);
+        let want = if profile.lanes == 2 { 0 } else { ignis_core::lane_lines::MIXES.len() };
+        assert_eq!(mirror.mixes.len(), want, "{}: the mixes the trellis body's plan holds", profile.label);
         for (window, two_lane_decode_round) in [(8, 331_776), (12, 1_658_880), (15, 2_654_208)] {
             let wide = at_window(window);
             let at = planned(wide);

@@ -313,7 +313,7 @@ extended when the drafts the asking requests are expected to take past position
 recent rounds; `all`, extended only when every request asks, so no request pays
 for another; `mixed`, each asking request of 2 to 7 granted the extended shape on
 its own when its expected gain beats what its columns cost every request, so a
-round may mix both shapes (on the NVFP4 artifact at 15 drafts; elsewhere it runs
+round may mix both shapes (at 15 drafts, on either artifact; elsewhere it runs
 `aggregate`). A request alone runs at the shape it asks under each. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 

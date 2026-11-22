@@ -93,7 +93,8 @@
 //! ([`ignis_core::lane_lines::MIXES`]), and is held to the base round's
 //! class as the extended round is, with the same method, margins and
 //! windows. On the same load (no new load: the NVFP4 cell's, [`Cell::mixed`];
-//! a trellis body runs none), speculation off writes the text of seven
+//! a trellis body's, which runs them from #720, waits on the owner's reading of
+//! its first run), speculation off writes the text of seven
 //! prompts of its own ([`MIXED_PROMPTS`]), one a lane, its rows over a uniform
 //! cell's window ([`MAX_TOKENS`]) and its text on past it
 //! ([`MIXED_TEXT_TOKENS`]), and the decode graphs are captured again under
@@ -300,7 +301,7 @@ struct Cell {
     artifact: &'static str,
     exceptions: ExceptionWeights,
     /// #717: whether the mixed rounds' class is held on it too. A trellis
-    /// body runs no mixed round yet (#720).
+    /// body runs them from #720, its cell's class there waiting on the owner.
     mixed: bool,
 }
 

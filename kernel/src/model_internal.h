@@ -1124,18 +1124,15 @@ void ignis_each_group(ignis_model &model, const ignis::round_layout::Layout &lay
 }
 
 // GitHub #713 (spec #711): why this load cannot run a mixed round of `layout` over a pool of
-// `slot_count` slots, or null where it can: a DFlash2 load of two round shapes on the NVFP4 body;
-// one of the twelve mixes, within the load's lanes and its extended shape's; each group's GDN
-// records over the round's columns in the records of its shape (a window of 15,
+// `slot_count` slots, or null where it can: a DFlash2 load of two round shapes, on either body
+// (GitHub #720); one of the twelve mixes, within the load's lanes and its extended shape's; each
+// group's GDN records over the round's columns in the records of its shape (a window of 15,
 // kernel/src/round_layout.h `records_hold`); and the slots the base group's fold takes, its leading
 // rows' beside its lanes'.
 inline const char *ignis_mixed_round_refusal(const ignis_model &model, std::int64_t slot_count,
                                              const ignis::round_layout::Layout &layout) {
   if (model.drafter != IgnisDrafter::kDflash2 || model.base_shape == nullptr || model.extended_shape == nullptr) {
     return "a mixed round runs on a DFlash2 load of two round shapes";
-  }
-  if (model.is_trellis_body) {
-    return "a trellis body runs no mixed round";
   }
   if (ignis::round_layout::mix_index(layout) < 0) {
     return "its lanes make none of the twelve mixes";

@@ -561,8 +561,8 @@ pub enum ShapePolicy {
     /// GitHub #715 (spec #711): at one lane, the lane's ask; at 2 to 7 lanes
     /// each asking lane granted the extended shape on its own, the highest
     /// expected gain first, when it beats what its 8 more columns cost every
-    /// lane, within 64 columns, so that a round may be mixed. Only on the
-    /// NVFP4 body at a window of [`crate::lane_lines::MIXED_ROUND_WINDOW`]
+    /// lane, within 64 columns, so that a round may be mixed. Only
+    /// at a window of [`crate::lane_lines::MIXED_ROUND_WINDOW`], on either body
     /// ([`Speculation::shape_policy_runs`]); any other load runs `aggregate`.
     Mixed,
 }
@@ -651,6 +651,12 @@ impl ShapeEstimate {
     pub fn period_table(&self) -> PeriodTable {
         self.period_table
     }
+
+    /// GitHub #720: the same window over `period_table`, checked where it
+    /// was made ([`PeriodTable`]).
+    pub fn with_period_table(self, period_table: PeriodTable) -> Self {
+        Self { period_table, ..self }
+    }
 }
 
 impl Default for ShapeEstimate {
@@ -723,21 +729,21 @@ impl Speculation {
         self.shape_policy
     }
 
-    /// GitHub #715 (spec #711): whether a load of this option on the 27B's
-    /// NVFP4 body (`trellis` false; the trellis bodies run no mixed round
-    /// yet) can run a mixed round: DFlash2 at
-    /// [`crate::lane_lines::MIXED_ROUND_WINDOW`] drafts alone
-    /// (`kernel/src/mixed_graphs.h` `holds_mixed_rounds`).
-    pub fn holds_mixed_rounds(&self, trellis: bool) -> bool {
-        self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens == crate::lane_lines::MIXED_ROUND_WINDOW && !trellis
+    /// GitHub #715 (spec #711): whether a load of this option on the 27B can
+    /// run a mixed round: DFlash2 at
+    /// [`crate::lane_lines::MIXED_ROUND_WINDOW`] drafts alone, on either body
+    /// (GitHub #720: the trellis body's too;
+    /// `kernel/src/mixed_graphs.h` `holds_mixed_rounds`).
+    pub fn holds_mixed_rounds(&self) -> bool {
+        self.backend == SpeculativeBackend::Dflash2 && self.draft_tokens == crate::lane_lines::MIXED_ROUND_WINDOW
     }
 
     /// The shape policy a load of this option runs: its own, but `mixed`
     /// where the load cannot run a mixed round ([`Self::holds_mixed_rounds`]),
     /// which runs `aggregate`, as the leaf resolves it at load.
-    pub fn shape_policy_runs(&self, trellis: bool) -> ShapePolicy {
+    pub fn shape_policy_runs(&self) -> ShapePolicy {
         match self.shape_policy {
-            ShapePolicy::Mixed if !self.holds_mixed_rounds(trellis) => ShapePolicy::Aggregate,
+            ShapePolicy::Mixed if !self.holds_mixed_rounds() => ShapePolicy::Aggregate,
             policy => policy,
         }
     }

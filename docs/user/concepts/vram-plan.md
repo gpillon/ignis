@@ -64,7 +64,7 @@ Flash-Next). The lines include:
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;
-- from 0.11.0, on a 27B DFlash2 load of the NVFP4 artifact at 15 drafts that
+- from 0.11.0, on a 27B DFlash2 load of either artifact at 15 drafts that
   asks for mixed rounds (rounds whose lanes take both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes);
   `--spec-shape-policy mixed` asks, or the measurement switch
@@ -73,9 +73,11 @@ Flash-Next). The lines include:
   and base lanes the load's lanes and its pool hold (a mix of `w` extended
   lanes beside `n` base lanes takes `2w + n` of the pool's slots, the lanes'
   and the device retained slots'), 5 MiB a mix and 4 MiB more, in 2 MiB pages,
-  as the RTX 5090 measured them (62 MiB for the twelve at capture, a page more
-  on the process's own counter): all twelve at 8 lanes, 64 MiB, at most 114
-  KV pages. 0 on every other load. The driver keeps their pages once the load
+  as the RTX 5090 measured them on the NVFP4 artifact (62 MiB for the twelve
+  at capture, a page more on the process's own counter): all twelve at 8
+  lanes, 64 MiB, at most 114 KV pages, on either artifact (the trellis
+  artifact's twelve took 68 and 70 MiB in two captures). 0 on every other
+  load. The driver keeps their pages once the load
   is gone, so a reload adds them back as it adds back the CUDA context
   ([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md));
 - the **drafter**, when one is loaded: DFlash2's weights, its window in every

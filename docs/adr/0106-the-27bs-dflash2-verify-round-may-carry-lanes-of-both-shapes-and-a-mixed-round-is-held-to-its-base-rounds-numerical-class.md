@@ -48,8 +48,8 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
 - **Its default.** `aggregate` on every profile. The `rtx5090` profile's becomes `mixed` only in the commit that
   records the served gate's pass (#722: a JSON answer beside three conversations at four lanes at least 10% faster
   together than the build of #684, no conversation lane more than 15% below it). The trellis bodies keep `aggregate`
-  until a run on a 16 GB or 24 GB card. A load given `mixed` that holds no mix, of DFlash2 at 8 to 14 drafts or of a
-  trellis body, runs `aggregate`, and its startup line names both; at 7 drafts or fewer `mixed` is taken and changes
+  until a run on a 16 GB or 24 GB card; given `mixed`, a trellis body at 15 drafts runs it (#720). A load given `mixed`
+  that holds no mix, of DFlash2 at 8 to 14 drafts, runs `aggregate`, and its startup line names both; at 7 drafts or fewer `mixed` is taken and changes
   nothing, the load holding one shape; the 27B's MTP head refuses it by name, as it refuses every shape policy (#690).
   A load whose latest capture ran under `IGNIS_MIXED_ROUNDS=0` takes `aggregate`'s uniform choice too.
 - **The cost table.** `spec.shape_period_ratios` becomes a table by lane count (1 to 7) and extended lanes, each entry
@@ -57,7 +57,12 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   its uniform entries at 1 to 4 lanes, today's measured 1.128, 1.290, 1.363 and 1.344, and `mixed` reads every entry.
   Its defaults are each body's, measured on the RTX 5090 with the final build, the NVFP4 body's (#721) and the trellis
   body's (#720; indicatively a trellis body's extended round costs 1.35 to 1.40 times its base round at one lane,
-  against 1.13 on the NVFP4 body). Until #721 lands the one default is the NVFP4 body's: four of its mixed entries, 1+1,
+  against 1.13 on the NVFP4 body). Each body's default is chosen at load, where the body is known
+  (`PeriodTable::of_load`): a table the operator or a profile named stands on either body, and the four-value form's
+  mixed entries are the loaded body's. Until a run measures the trellis body's, its default is derived (#720): its
+  uniform entries the NVFP4 body's excess over 1 scaled by 2.93 (0.375 over 0.128, the one-lane ratios), capped at 2;
+  its mixed entries that excess scaled by 2.09, what the trellis body's base round's 8 more columns cost at one and two
+  lanes against the NVFP4 body's (1.218 over 1.104). Until #721 lands the NVFP4 body's: four of its mixed entries, 1+1,
   1+3, 2+2 and 1+5, are those mixes' periods measured with their graph build (#718), and each of the other eight is the
   measured base round of the mix's columns over the base round at its lane count, a mixed round with its graph build
   having been measured to cost what a base round of its columns costs; the three mixes of 64 columns, where no base
@@ -74,7 +79,9 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   that captures none. The driver keeps the graphs' pages after a teardown, so a reload adds the line back. Measured
   again with the mixed graph build (#718), the device's free memory fell by 69,206,016 B over the twelve's captures,
   2 MiB past the line's 67,108,864 (60,817,408 without the build), while the process's counter at a reload stayed
-  within the plan; the line stands as #714 measured it, that page left to the owner. This amends
+  within the plan; the line stands as #714 measured it, that page left to the owner. On the trellis body at 8 lanes
+  (#720) the twelve's verify graphs are 1,418 to 1,454 nodes and two captures took 71,303,168 and 73,400,320 B, 4 and
+  6 MiB past the same line, which also stands, left to the owner. This amends
   [ADR 0030](0030-device-memory-reserved-at-load.md) as
   [ADR 0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)
   did for the fifteenth line, by a new ADR rather than an edit in place, which only the owner decides.
@@ -180,5 +187,7 @@ In ADR 0030, the plan's sixteenth line, `mixed_graphs`.
 - The mixed checks add no load: they ride the NVFP4 cell's load after its uniform ones, five to six minutes more (323 s
   on 2026-11-22, 36 s of it speculation off's texts; the NVFP4 test 431 s, where the first reading's took 304 to 314). A
   mixed prompt must run past the 1,408 tokens a leg may ride on, or the test fails before its legs.
-- The bounds are the RTX 5090's on the NVFP4 body under FP8 exception weights over hq-e8-2b. A trellis body's mixed
-  rounds are held by #720 before they run there.
+- The bounds are the RTX 5090's on the NVFP4 body under FP8 exception weights over hq-e8-2b. A trellis body runs mixed
+  rounds from #720, held to the round identity test's tokens at 8 lanes; its class test's mixed section, read once on
+  its cell (2026-11-22), sits inside every bound of the row and the likelihood and past five relative clauses of the
+  class, which waits on the owner's reading.

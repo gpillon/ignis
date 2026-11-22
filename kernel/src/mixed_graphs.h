@@ -1,13 +1,14 @@
 // ignis kernel leaf - GitHub #714 (spec #711): the mixed graphs a 27B load captures and plans -- OURS.
 // Host-side: the switch that asks for them, the rule that picks the mixes, their bytes.
 //
-// A DFlash2 load of the NVFP4 body at 15 drafts holds a verify graph and a drafter append graph for
-// each mix of kMixTable (kernel/src/round_layout.h) it can run, when mixed rounds are asked: `w + n`
-// lanes within the load's decode lanes, and the base group's fold within the pool's GDN slots (the
-// decode lanes and the device retained slots), its `2w` leading rows that commit nothing on slots no
-// base lane holds, beside its `n` lanes. Every other load captures none, and its plan holds none. The
-// VRAM plan's `mixed_graphs` line is the planned mixes' bytes, at the figure one mix's graphs were
-// measured to take; crates/core/src/lane_lines.rs `mixed_graphs` mirrors it.
+// A DFlash2 load at 15 drafts, of either body (GitHub #720), holds a verify graph and a drafter
+// append graph for each mix of kMixTable (kernel/src/round_layout.h) it can run, when mixed rounds
+// are asked: `w + n` lanes within the load's decode lanes, and the base group's fold within the
+// pool's GDN slots (the decode lanes and the device retained slots), its `2w` leading rows that
+// commit nothing on slots no base lane holds, beside its `n` lanes. Every other load captures none,
+// and its plan holds none. The VRAM plan's `mixed_graphs` line is the planned mixes' bytes, at the
+// figure one mix's graphs were measured to take; crates/core/src/lane_lines.rs `mixed_graphs`
+// mirrors it.
 #pragma once
 
 #include <cstdint>
@@ -42,11 +43,11 @@ inline bool asked(bool policy_mixed) {
   return named_switch("IGNIS_MIXED_ROUNDS", policy_mixed, {{"0", false}, {"1", true}});
 }
 
-// GitHub #715: whether a load runs mixed rounds at all: DFlash2 (`dflash2`) on the NVFP4 body (not
-// `trellis`, which runs none yet) at kWindow drafts. The shape policy `mixed` runs as `aggregate`
+// GitHub #715: whether a load runs mixed rounds at all: DFlash2 (`dflash2`) at kWindow drafts, on
+// either body (GitHub #720: the trellis body's too). The shape policy `mixed` runs as `aggregate`
 // anywhere else, and no mixed graph is planned or captured there.
-inline bool holds_mixed_rounds(bool dflash2, bool trellis, std::uint32_t window) {
-  return dflash2 && !trellis && window == kWindow;
+inline bool holds_mixed_rounds(bool dflash2, std::uint32_t window) {
+  return dflash2 && window == kWindow;
 }
 
 // GitHub #718: the measurement switch IGNIS_MIXED_GRAPH_BUILD (ADR 0093's kind), read at each capture
@@ -57,12 +58,11 @@ inline bool holds_mixed_rounds(bool dflash2, bool trellis, std::uint32_t window)
 inline bool built() { return named_switch("IGNIS_MIXED_GRAPH_BUILD", true, {{"0", false}, {"1", true}}); }
 
 // The mixes a load captures and plans (bit m for kMixTable[m]): where mixed rounds are `asked`, on a
-// DFlash2 load (`dflash2`) of the NVFP4 body (not `trellis`, which runs no mixed round yet) at
-// kWindow drafts, each mix whose lanes fit the load's `lanes` and whose base group's fold fits the
-// pool's `gdn_slots`; 0 anywhere else.
-inline std::uint32_t planned(bool asked, bool dflash2, bool trellis, std::uint32_t window, std::uint32_t lanes,
+// DFlash2 load (`dflash2`) at kWindow drafts, each mix whose lanes fit the load's `lanes` and whose
+// base group's fold fits the pool's `gdn_slots`; 0 anywhere else.
+inline std::uint32_t planned(bool asked, bool dflash2, std::uint32_t window, std::uint32_t lanes,
                              std::int64_t gdn_slots) {
-  if (!asked || !holds_mixed_rounds(dflash2, trellis, window)) {
+  if (!asked || !holds_mixed_rounds(dflash2, window)) {
     return 0;
   }
   std::uint32_t mask = 0;

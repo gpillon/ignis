@@ -64,6 +64,10 @@ pub const MIXED_MAX_LANES: u32 = 7;
 pub struct PeriodTable {
     uniform: [u32; EXTENDED_SHAPE_MAX_LANES as usize],
     mixed: [u32; MIXES.len()],
+    /// GitHub #720: whether the mixed entries are the load's body's, taken
+    /// where the load knows its body ([`Self::of_load`]): the four-value
+    /// form's, which gives the uniform entries alone ([`Self::with_uniform`]).
+    body_mixed: bool,
 }
 
 impl PeriodTable {
@@ -72,9 +76,9 @@ impl PeriodTable {
     /// its columns.
     pub const RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = 1000..=2000;
 
-    /// The NVFP4 body's table on the RTX 5090, the one default every load
-    /// reads until the trellis body has its own (GitHub #720) and a
-    /// measurement of the final build replaces it (GitHub #721).
+    /// The NVFP4 body's table on the RTX 5090, the default of a load of that
+    /// body ([`Self::of_body`]) until a measurement of the final build
+    /// replaces it (GitHub #721).
     ///
     /// The uniform entries, 1.128, 1.29, 1.363 and 1.344 at 1 to 4 lanes:
     /// measured on the GPU clock (round timing), FP8 exception weights, the
@@ -98,7 +102,62 @@ impl PeriodTable {
         uniform: [1128, 1290, 1363, 1344],
         // MIXES' order: 1+1, 1+2, 1+3, 1+4, 1+5, 1+6, 2+1, 2+2, 2+3, 2+4, 3+1, 3+2.
         mixed: [1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336],
+        body_mixed: false,
     };
+
+    /// GitHub #720 (spec #711): the trellis body's table, the default of a
+    /// load of the 16 GB artifact the `rtx-16gb` and `rtx-24gb` profiles load
+    /// ([`Self::of_body`]). Provisional: no entry is measured on this body yet;
+    /// each scales the excess of [`Self::NVFP4`]'s entry over 1 by what the
+    /// RTX 5090 recorded of this body against that one, pending a run on the
+    /// GPU clock (round timing) against measured base rounds of the same
+    /// columns, and a 16 GB or 24 GB card's own.
+    ///
+    /// The uniform entries scale by 2.93: the trellis body's extended round
+    /// at one lane costs about 1.35 to 1.40 times its base round on the RTX
+    /// 5090 (spec #711), 1.375 of it, where the NVFP4 body's costs 1.128
+    /// (0.375 over 0.128): 1.375, 1.85, and 2.06 and 2.01 at 3 and 4 lanes,
+    /// taken at the table's widest, 2.
+    ///
+    /// The mixed entries, which on the NVFP4 body are a base round of the
+    /// mix's columns over the base round at its lane count, scale by 2.09:
+    /// the trellis body's base round costs 1.218 times as much at 2 lanes as
+    /// at one (17.62 over 14.47 ms at 8K tokens of context,
+    /// `docs/findings/2026-10-24-27b-16gb-speed-estimate.md`), the NVFP4
+    /// body's 1.104 (16,468 over 14,915 us,
+    /// `docs/findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md`),
+    /// so a round's 8 more columns cost this body 2.09 times the NVFP4 body's
+    /// excess (0.218 over 0.104).
+    pub const TRELLIS: Self = Self {
+        uniform: [1375, 1850, 2000, 2000],
+        // MIXES' order: 1+1, 1+2, 1+3, 1+4, 1+5, 1+6, 2+1, 2+2, 2+3, 2+4, 3+1, 3+2.
+        mixed: [1324, 1251, 1289, 1161, 1194, 1224, 1596, 1464, 1433, 1504, 1803, 1702],
+        body_mixed: false,
+    };
+
+    /// GitHub #720 (spec #711): the one place a 27B load's table is chosen,
+    /// once its body is known: with none `given` (`spec.shape_period_ratios`
+    /// left to its default), `body`'s own, [`Self::NVFP4`] or
+    /// [`Self::TRELLIS`]; a given one as it is, but for the four-value form's
+    /// mixed entries, which are `body`'s.
+    pub fn of_load(given: Option<Self>, body: ignis_artifact::Body27b) -> Self {
+        let own = match body {
+            ignis_artifact::Body27b::Nvfp4 => Self::NVFP4,
+            ignis_artifact::Body27b::Trellis => Self::TRELLIS,
+        };
+        match given {
+            None => own,
+            Some(given) if given.body_mixed => Self { uniform: given.uniform, ..own },
+            Some(given) => given,
+        }
+    }
+
+    /// GitHub #720: whether the table is the four-value form's, its mixed
+    /// entries the load's body's ([`Self::of_load`]), until a load takes
+    /// them: [`Self::NVFP4`]'s stand in for them.
+    pub const fn uniform_only(&self) -> bool {
+        self.body_mixed
+    }
 
     /// The entries a row of `lanes` lanes holds: one for each count of
     /// extended lanes the round's columns hold, 1 to `min(lanes, 8 - lanes)`.
@@ -135,9 +194,10 @@ impl PeriodTable {
 
     /// The table whose uniform entries are `uniform` (at 1 to 4 lanes, the
     /// four-value form of `spec.shape_period_ratios` before the table), every
-    /// mixed entry the default's.
+    /// mixed entry the default's: GitHub #720, the body's a load takes
+    /// ([`Self::of_load`]), [`Self::NVFP4`]'s until then.
     pub fn with_uniform(uniform: [u32; EXTENDED_SHAPE_MAX_LANES as usize]) -> Result<Self, String> {
-        let table = Self { uniform, ..Self::NVFP4 };
+        let table = Self { uniform, body_mixed: true, ..Self::NVFP4 };
         table.check()?;
         Ok(table)
     }
