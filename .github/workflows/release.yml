@@ -27,10 +27,11 @@
 # Nothing is published before the tests pass (ADR 0086, which amends ADR
 # 0032; GitHub #552). The `test` job runs the CPU-only suite on both hosts --
 # `cargo test` never touches the GPU on its own (docs/agents/testing.md),
-# which is exactly what makes it runnable on a runner with no card in it. The
-# builds run beside it, and every job that publishes (the image, the
-# `develop` prerelease, the release) needs it. The GPU profile stays on the
-# machine with the 5090.
+# which is exactly what makes it runnable on a runner with no card in it --
+# and the `network` job runs the one `#[ignore]`d test that needs only the
+# network (#709). The builds run beside them, and every job that publishes
+# (the image, the `develop` prerelease, the release) needs both. The GPU
+# profile stays on the machine with the 5090.
 #
 # The Linux tarball and the container image are one job and one compile (ADR
 # 0032, revised): the Containerfile's `artifacts` stage holds exactly the
@@ -332,6 +333,36 @@ jobs:
         if: matrix.host == 'linux' && matrix.shard == 1
         working-directory: connector
         run: node --test
+
+  # The one `#[ignore]`d test a runner can run (GitHub #709): it needs only the
+  # network, downloading the speech catalog's smallest entry (about 1 GB) from
+  # huggingface.co and checking every file against its pin. The other ignored
+  # tests need the card, the owner's disks or hours alone on a machine. It
+  # stays `#[ignore]`d, so the shards and the GPU profile leave it out; it runs
+  # here, beside them, on the dependencies shard 1 caches, and it gates what
+  # they gate: every job that publishes needs it. A test holds it to this
+  # shape (crates/server/tests/ci_pipeline.rs).
+  network:
+    name: test (linux, network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-cpu-shards
+          save-if: false
+
+      - name: The smallest speech entry downloads and matches its pins
+        run: cargo test --workspace --locked --target x86_64-unknown-linux-gnu --test speech_catalog_hf -- --ignored --exact the_smallest_speech_entry_downloads_and_verifies_against_its_pins
 
   # The workspace compiles on a Mac (GitHub #496): arm64, the hardware a Metal
   # backend would run on (#439). macOS is not a target, so this checks and
@@ -739,7 +770,7 @@ jobs:
   # attestation included (`--all`), with its digests unchanged. A `v*` tag
   # pushes <version>, <major>.<minor> and latest, main pushes `develop`.
   image:
-    needs: [version, test, linux]
+    needs: [version, test, network, linux]
     if: github.repository == 'gpillon/ignis' && (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     permissions:
@@ -785,7 +816,7 @@ jobs:
 
   # Both hosts, or no release; and the tests (ADR 0086).
   release:
-    needs: [version, test, linux, windows]
+    needs: [version, test, network, linux, windows]
     if: github.repository == 'gpillon/ignis' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -870,7 +901,7 @@ jobs:
   # `--latest=false` and `--prerelease`: this is never the repository's
   # "latest" release, which stays the newest v* tag.
   prerelease:
-    needs: [version, test, linux, windows]
+    needs: [version, test, network, linux, windows]
     if: github.repository == 'gpillon/ignis' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

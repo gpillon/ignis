@@ -34,7 +34,9 @@ what the range can prove, not by what matters most.
 
 `.github/workflows/release.yml` runs the CPU-only test suite on Linux and
 Windows, split into four shards per host that together run every test once,
-and builds the GPU engine for both hosts beside it — on every push to `main`
+and, beside them, the one ignored test a runner can run, which downloads the
+speech catalog's smallest entry from Hugging Face and checks it against its
+pins; it builds the GPU engine for both hosts beside them — on every push to `main`
 or a `ci/**` branch. Nothing is published until the tests pass: a push to
 `main` then moves the `develop` image and prerelease, and a `ci/**` branch
 publishes nothing. A `v*` tag — which must match

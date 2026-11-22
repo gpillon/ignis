@@ -110,7 +110,9 @@ fn the_builds_run_beside_the_tests_and_whatever_publishes_waits_for_them() {
     publishing.sort();
     assert_eq!(publishing, ["image", "prerelease", "release"], "the jobs that publish");
     for name in publishing {
-        assert!(needs(job(jobs, name)).iter().any(|need| need == "test"), "job `{name}` publishes without waiting for the tests");
+        for tests in ["test", "network"] {
+            assert!(needs(job(jobs, name)).iter().any(|need| need == tests), "job `{name}` publishes without waiting for the `{tests}` job");
+        }
     }
     // The image pushed is the one the `linux` job built, from its archive.
     let image = job(jobs, "image");
@@ -218,6 +220,50 @@ fn every_test_shard_installs_the_grammar_validator_before_the_suite() {
     }
     let run = text(steps[install], "run").unwrap();
     assert!(run.contains("IGNIS_GRAMMAR_CHECK_PYTHON=") && run.contains("GITHUB_ENV"), "the tests are handed its Python: {run}");
+}
+
+/// GitHub #709: the one `#[ignore]`d test CI can run, the speech catalog's
+/// download, runs in a job of its own on Linux beside the shards (the test
+/// job runs the suite through mk/test-shard.sh alone), on the shards' cached
+/// dependencies. The test it names is still there and still `#[ignore]`d:
+/// `--exact` on a name that matches nothing runs no test and passes.
+#[test]
+fn the_speech_catalogs_download_runs_in_a_job_of_its_own_beside_the_shards() {
+    let workflow = workflow();
+    let jobs = jobs(&workflow);
+    let network = job(jobs, "network");
+    assert_eq!(text(network, "runs-on"), Some("ubuntu-latest"));
+    assert!(needs(network).is_empty(), "the network job runs beside the shards: {:?}", needs(network));
+    let test = job(jobs, "test");
+    assert_eq!(get(network, "env"), get(test, "env"), "the network job builds with the shards' profile settings");
+    let cache = |job: &Mapping| -> Mapping {
+        steps(job)
+            .into_iter()
+            .find(|step| text(step, "uses").is_some_and(|uses| uses.starts_with("Swatinem/rust-cache@")))
+            .and_then(|step| get(step, "with").and_then(Value::as_mapping).cloned())
+            .expect("the job restores the cargo cache")
+    };
+    let (ours, shards) = (cache(network), cache(test));
+    assert_eq!(get(&ours, "shared-key"), get(&shards, "shared-key"), "the network job restores the shards' dependencies");
+    assert_eq!(get(&ours, "save-if").map(condition).as_deref(), Some("false"), "shard 1 saves the cache, not the network job");
+
+    let runs: Vec<&str> = steps(network).iter().filter_map(|step| text(step, "run")).collect();
+    let tests: Vec<&str> = runs.iter().copied().filter(|run| run.contains("cargo test")).collect();
+    assert_eq!(tests.len(), 1, "the network job runs one cargo test: {runs:?}");
+    let command: Vec<&str> = tests[0].split_whitespace().collect();
+    let after = |flag: &str| command.iter().position(|word| *word == flag).and_then(|at| command.get(at + 1)).copied();
+    assert_eq!(after("--test"), Some("speech_catalog_hf"), "{command:?}");
+    assert!(command.contains(&"--ignored") && command.contains(&"--exact"), "{command:?}");
+    let name = *command.last().unwrap();
+
+    let source = read("crates/server/tests/speech_catalog_hf.rs");
+    let lines: Vec<&str> = source.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(&format!("fn {name}(")))
+        .unwrap_or_else(|| panic!("speech_catalog_hf.rs has no test `{name}`, so the network job runs none"));
+    let mut attributes = lines[..at].iter().rev().take_while(|line| line.trim_start().starts_with("#[") || line.trim_start().starts_with("///"));
+    assert!(attributes.any(|line| line.contains("#[ignore")), "`{name}` is no longer #[ignore]d, and the shards run it too");
 }
 
 /// The vendored Swagger UI against the pin in web/package.json (ADR 0036,

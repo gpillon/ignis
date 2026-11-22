@@ -15,9 +15,12 @@ until the test suite is green.
   (`artifact`, `bench`, `core`, `grammar`, `logging`, `runtime`, `server`,
   `speech`, `vendor`). CI runs exactly this on
   Linux and on Windows, in four shards per host that together run every test
-  target once (`mk/test-shard.sh`, `make test-shard-selftest`), and nothing
-  is published until both legs are green; the release builds run beside them
-  (`.github/workflows/release.yml`, ADR 0086). That is
+  target once (`mk/test-shard.sh`, `make test-shard-selftest`). Beside them
+  the `network` job runs, on Linux, the one `#[ignore]`d test that needs only
+  the network: the speech catalog's smallest entry downloaded from Hugging
+  Face and checked against its pins (`crates/server/tests/speech_catalog_hf.rs`,
+  #709). Nothing is published until both legs and that job are green; the
+  release builds run beside them (`.github/workflows/release.yml`, ADR 0086). That is
   possible only because the default suite is CPU-only; everything below about
   the GPU profile stays on the machine with the 5090.
 - Machine-local smoke tests skip gracefully when their fixture is
