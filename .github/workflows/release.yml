@@ -266,6 +266,13 @@ jobs:
         shell: bash
         run: bash mk/swagger-ui-check-selftest.sh
 
+      # `make test-machine-local`'s script (GitHub #709), which runs the
+      # machine-local tests at a release, on a temp list and a stand-in cargo.
+      - name: Machine-local tests script selftest
+        if: matrix.shard == 1
+        shell: bash
+        run: bash mk/test-machine-local-selftest.sh
+
       # `make doctor`'s CUDA checks on Linux (GitHub #498), on fake roots.
       - name: Linux doctor selftest
         if: matrix.shard == 1

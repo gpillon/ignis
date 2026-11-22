@@ -25,7 +25,14 @@ until the test suite is green.
   the GPU profile stays on the machine with the 5090.
 - Machine-local smoke tests skip gracefully when their fixture is
   absent (e.g. `crates/artifact/tests/real_artifact.rs` needs the
-  artifact in `F:\ai\q38`). A skip counts as green; a failure does not.
+  artifact in `F:\ai\q38`). A skip counts as green; a failure does not. So
+  on CI they are green and never run: they run for real once per release,
+  on the owner's machine before the tag, through `make test-machine-local`
+  (`docs/user/contributing/releases.md`), not at the end of a change. Their
+  targets are listed in `mk/machine-local-tests.txt`, and
+  `crates/server/tests/machine_local_tests.rs` fails on a target that is not
+  `cuda`-gated, prints a skip, and is neither listed nor exempt with its
+  reason (#709).
 - **Exception — compute work: a skip is never green.** For anything on the
   forward pass (the kernel leaf, the step ABI, the program), a test that
   self-skips on a busy GPU or on a kernel error proves nothing; that pattern

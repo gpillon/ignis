@@ -551,6 +551,14 @@ $(DOCS_DEPS): docs/site/package.json docs/site/package-lock.json
 test: ## cargo test, workspace-wide (CPU only, never touches the GPU)
 	$(CARGO) test --workspace $(CARGO_TARGET)
 
+# The test targets that read a fixture only the owner's machine holds, listed
+# in mk/machine-local-tests.txt (GitHub #709): on CI they print a skip and
+# pass, here they run for real. Once per release, before the tag
+# (docs/user/contributing/releases.md); CPU only, so it takes no GPU lock.
+.PHONY: test-machine-local
+test-machine-local: ## The machine-local test targets, run for real: once per release, before the tag (CPU only)
+	@CARGO='$(CARGO)' bash mk/test-machine-local.sh $(CARGO_TARGET)
+
 .PHONY: test-web
 test-web: $(WEB_DEPS) ## Playground unit tests (vitest)
 	$(NPM) --prefix web run test
@@ -666,6 +674,12 @@ doctor-selftest: ## Test make doctor's CUDA checks on Linux, mk/linux/doctor.sh
 .PHONY: test-shard-selftest
 test-shard-selftest: ## Test the CI test job's shard plan, mk/test-shard.sh
 	@bash mk/test-shard-selftest.sh
+
+# A temp list and a stand-in cargo, so it builds nothing; the release
+# workflow's test job runs it on both hosts.
+.PHONY: test-machine-local-selftest
+test-machine-local-selftest: ## Test make test-machine-local's script, mk/test-machine-local.sh
+	@bash mk/test-machine-local-selftest.sh
 
 # The GPU lock and the scripts around it on stand-ins under a temp directory
 # (GitHub #707): no card, no build, and neither the machine's lock nor the

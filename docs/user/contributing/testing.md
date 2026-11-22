@@ -25,7 +25,11 @@ both legs are green ([ADR 0032](../../adr/0032-release-through-the-container-bui
 A machine-local smoke test whose fixture is absent skips, and a skip counts as
 green — except for compute work: a test on the forward pass that skips on a
 busy GPU or a kernel error proves nothing, so those tests live in the GPU
-profile instead.
+profile instead. On CI every machine-local test skips, so from 0.11.0 they run
+for real once per release, on the owner's machine before the tag
+(`make test-machine-local`, [Cutting a release](releases.md)); their targets
+are listed in `mk/machine-local-tests.txt`, and `cargo test` fails on a test
+that skips and is neither listed there nor exempt with its reason.
 
 `cargo test` also holds two things that are not Rust behaviour:
 

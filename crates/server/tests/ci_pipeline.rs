@@ -191,6 +191,7 @@ fn the_test_job_runs_every_shard_of_the_count_it_gives_the_script() {
         "bash mk/cuda-build-check-selftest.sh",
         "bash mk/linux/doctor-selftest.sh",
         "bash mk/swagger-ui-check-selftest.sh",
+        "bash mk/test-machine-local-selftest.sh",
     ] {
         let step = steps(test).into_iter().find(|step| text(step, "run").map(str::trim) == Some(selftest));
         let step = step.unwrap_or_else(|| panic!("the test job runs `{selftest}`"));

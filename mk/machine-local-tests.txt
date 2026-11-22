@@ -1,0 +1,56 @@
+# The machine-local test targets (GitHub #709): CPU-only and not #[ignore]d,
+# they read a fixture only the owner's machine holds and print a skip where it
+# is absent, so on CI they always skip. `make test-machine-local`
+# (mk/test-machine-local.sh) runs every target listed here, as `cargo test`
+# runs it, once per release, before the tag
+# (docs/user/contributing/releases.md).
+#
+# One line per target: its path from the repo root. A target that prints a
+# skip for another cause is exempt through a line that names it:
+#   exempt <path>: <reason>
+# crates/server/tests/machine_local_tests.rs holds this list to every test
+# target under crates/*/tests/ that is not cuda-gated and prints a skip.
+
+crates/artifact/tests/chat_render.rs
+crates/artifact/tests/flash_next_artifact.rs
+crates/artifact/tests/flash_next_converter_fixture.rs
+crates/artifact/tests/generation_opener.rs
+crates/artifact/tests/nvfp4_27b.rs
+crates/artifact/tests/one_tokenization.rs
+crates/artifact/tests/qwen_image.rs
+crates/artifact/tests/real_artifact.rs
+crates/artifact/tests/real_frontend.rs
+crates/artifact/tests/rmsnorm_weight_convention.rs
+crates/artifact/tests/sidecar_verify.rs
+crates/artifact/tests/system_block.rs
+crates/artifact/tests/trellis_27b.rs
+crates/artifact/tests/vision_processor.rs
+crates/bench/tests/flash_next_references_real.rs
+crates/bench/tests/ttft_image_real_frontend.rs
+crates/core/tests/expert_residency_study_replay.rs
+crates/core/tests/flash_next_vision_companion.rs
+crates/core/tests/grid_label_rectangle.rs
+crates/grammar/tests/real_tokenizer.rs
+crates/grammar/tests/tool_calls_real_tokenizer.rs
+crates/server/tests/checkpoint_lineage.rs
+crates/server/tests/decide_locate_prompt.rs
+crates/server/tests/decide_part_ends.rs
+crates/server/tests/decide_prompt_tail.rs
+crates/server/tests/image_encoder_input.rs
+crates/server/tests/instruction_policies.rs
+crates/server/tests/locate_segments.rs
+crates/server/tests/media_omitted_real_template.rs
+crates/server/tests/multimodal_boundaries.rs
+crates/server/tests/responses_real_template.rs
+crates/server/tests/schema_description_real_template.rs
+crates/server/tests/slot_alphabet.rs
+crates/server/tests/tokenize_http.rs
+crates/server/tests/tool_choice_real_tokenizer.rs
+crates/vendor/tests/repository_manifest.rs
+
+exempt crates/grammar/tests/tool_arguments.rs: skips only without the grammar validator, which CI installs (and fails without)
+exempt crates/server/tests/structured_output_http.rs: skips only without the grammar validator, which CI installs (and fails without)
+exempt crates/server/tests/speech_diarizer_models.rs: skips only on a CPU without AVX2, which CI runners have
+exempt crates/core/tests/expert_residency_partial_exclusive.rs: its machine-local test, the pool study, is #[ignore]d
+exempt crates/core/tests/flash_next_ngram_table_real.rs: its one test is #[ignore]d
+exempt crates/runtime/tests/kv_disk_volume_contention.rs: its one test is #[ignore]d
