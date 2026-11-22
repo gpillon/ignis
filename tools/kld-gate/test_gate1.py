@@ -81,7 +81,8 @@ def test_a_cross_term_above_the_matched_pair_on_average_with_its_ci_reaching_0_s
     # The vanilla artifact sits below the matched pair in windows 1 and 2, above on average (2.1 / 0.72 of the
     # matched pair's position sums). A resample of those two windows alone (1 in 16) puts the difference below 0,
     # more often than the CI's 2.5%: the gate may have measured the base.
-    code, report = run(tmp_path, world(tmp_path, (0.02, 0.06, 0.05, 0.03), cross_artifact=(0.3, 0.03, 0.03, 0.3)),
+    matched = (0.02, 0.06, 0.05, 0.03)
+    code, report = run(tmp_path, world(tmp_path, matched, cross_artifact=(0.3, 0.03, 0.03, 0.3)),
                        "--limit", "0.0590", "--baseline", "0.04916")
     assert (code, report["verdict"], report["stop"]) == (3, "PASS", True)
     x = report["cross"]["cross_artifact"]
