@@ -24,8 +24,10 @@ struct Block {
 };
 
 // The blocks of a kind of round, one per round shape (`IGNIS_ROUND_SHAPES_MAX`): the base shape's
-// first, which is every plain round's and every verify round's of a load of one shape.
-using Blocks = std::array<Block, IGNIS_ROUND_SHAPES_MAX>;
+// first, which is every plain round's and every verify round's of a load of one shape. GitHub #713:
+// and one more after them, `kMixedBlock`, every mixed round's whatever its mix.
+inline constexpr std::size_t kMixedBlock = IGNIS_ROUND_SHAPES_MAX;
+using Blocks = std::array<Block, IGNIS_ROUND_SHAPES_MAX + 1>;
 
 // One timed round at round shape `shape`, and the next timed round of its kind, launched
 // `to_next_ms` after this one's launch and `gap_ms` after its end: the round's span (the event

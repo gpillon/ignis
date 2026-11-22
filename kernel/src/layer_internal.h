@@ -228,13 +228,18 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
 // is the round's shape, whose window, staging and records they read.
 // GitHub #680: the same pointer as `in_residual` and `out_residual` asks for
 // the copy-free form, as in the decode bodies above: the layer adds into its
-// input in place.
+// input in place. GitHub #713: `layout` the round's lanes in its buffers
+// (kernel/src/round_layout.h): a uniform round's `layout.lanes()` lanes at
+// `verify`'s window, as before; a mixed round's (`verify` its base shape)
+// attend and record a group at a time, each on the route a uniform round of
+// its shape and lanes takes and into its shape's records, the base group on
+// the branch beside the extended group (`ignis_each_group`).
 int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
-                                        uint32_t layer, uint32_t width, const void *in_residual,
-                                        void *out_residual, LinearPolicyMode mode);
+                                        uint32_t layer, const ignis::round_layout::Layout &layout,
+                                        const void *in_residual, void *out_residual, LinearPolicyMode mode);
 int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
-                                        uint32_t layer, uint32_t width, const void *in_residual,
-                                        void *out_residual, LinearPolicyMode mode);
+                                        uint32_t layer, const ignis::round_layout::Layout &layout,
+                                        const void *in_residual, void *out_residual, LinearPolicyMode mode);
 
 // GitHub #111: one decode round's whole forward pass -- embedding,
 // every decoder layer's graph-safe body once at `width`-wide batch, final

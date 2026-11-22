@@ -495,6 +495,12 @@ const char *ignis_step_last_error(void);
  * its extended shape. */
 #define IGNIS_ROUND_SHAPES_MAX 2
 
+/* GitHub #713 (spec #711): the mixes a mixed verify round takes, w extended
+ * lanes beside n base lanes at 64 columns or fewer: (1,1)..(1,6),
+ * (2,1)..(2,4), (3,1) and (3,2), in that order (kernel/src/round_layout.h
+ * `kMixTable`). */
+#define IGNIS_ROUND_MIXES 12
+
 /* GitHub #686: one round shape's verify round, as `ignis_program_stats`
  * reports it: the shape's draft window (a round at it is `window + 1` columns
  * a lane); its verify graphs, their node counts and their copy nodes, and its
@@ -584,6 +590,13 @@ struct ignis_program_stats {
    * `shapes[0]`'s. */
   uint32_t round_shapes;
   struct ignis_round_shape_stats shapes[IGNIS_ROUND_SHAPES_MAX];
+  /* GitHub #713 (spec #711): entry m the node count of the verify graph and
+   * of the drafter append graph of mix m (IGNIS_ROUND_MIXES' order) as the
+   * latest capture made them under IGNIS_MIXED_ROUNDS=1; 0 for a mix with no
+   * graph, under the switch unset or `0`, and on every load but a DFlash2
+   * load of two round shapes. */
+  uint32_t mixed_verify_graph_nodes[IGNIS_ROUND_MIXES];
+  uint32_t mixed_append_graph_nodes[IGNIS_ROUND_MIXES];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
@@ -872,6 +885,23 @@ struct ignis_decode_options {
    * outcome moves them: 0 on a 27B load of one shape. NULL asks for nothing;
    * a plain round, and Flash-Next's verify round, write nothing. */
   uint32_t *out_shape_asks;
+  /* GitHub #713 (spec #711) -- test-only, the seam that forces a round's mix
+   * on a DFlash2 load of two round shapes; no serving caller sets it.
+   * `[batch_size]`: 1 where lane i runs at the extended shape, 0 where it runs
+   * at the base shape, whatever IGNIS_ROUND_SHAPE, the rule or the policy
+   * would choose. Every lane at one shape is that uniform round (the extended
+   * one at most its lanes); lanes at both are a mixed round of the mix
+   * (w, n) they make, one of the twelve that fit 64 columns, its extended
+   * lanes first in the round's rows (the caller's order within each group)
+   * and every output written back at the caller's index: from its mix's
+   * graphs where IGNIS_MIXED_ROUNDS=1 captured them and the round is not
+   * forced on the device, eagerly otherwise. It rides a live or a
+   * teacher-forced round (its forced tokens and drafts read at each lane's
+   * own shape); a load of one shape, a host cut, `forced_shape_window`, a
+   * trellis body (#720), a window but 15 and a pool without the base fold's
+   * spare slots refuse a mixed round by name. NULL: the round's shape is
+   * chosen as any round's. */
+  const uint8_t *forced_lane_shapes;
 };
 
 #ifdef __cplusplus
@@ -879,9 +909,9 @@ struct ignis_decode_options {
  * crates/core/src/step_abi.rs's mirror test, on CPU): GitHub #267 appended
  * `forced_tokens` after every field the serving path sets, GitHub #590 the
  * host cut after it, GitHub #692 the forced drafts and shape after that,
- * GitHub #689 the round's shape after them (GitHub #712: each lane's) and
- * GitHub #690 its asks last. */
-static_assert(sizeof(struct ignis_decode_options) == 144 &&
+ * GitHub #689 the round's shape after them (GitHub #712: each lane's),
+ * GitHub #690 its asks and GitHub #713 the forced lane shapes last. */
+static_assert(sizeof(struct ignis_decode_options) == 152 &&
                   offsetof(struct ignis_decode_options, out_logits) == 72 &&
                   offsetof(struct ignis_decode_options, forced_tokens) == 80 &&
                   offsetof(struct ignis_decode_options, host_cut_lanes) == 88 &&
@@ -890,7 +920,8 @@ static_assert(sizeof(struct ignis_decode_options) == 144 &&
                   offsetof(struct ignis_decode_options, forced_drafts) == 112 &&
                   offsetof(struct ignis_decode_options, forced_shape_window) == 120 &&
                   offsetof(struct ignis_decode_options, out_lane_shapes) == 128 &&
-                  offsetof(struct ignis_decode_options, out_shape_asks) == 136,
+                  offsetof(struct ignis_decode_options, out_shape_asks) == 136 &&
+                  offsetof(struct ignis_decode_options, forced_lane_shapes) == 144,
               "ignis_decode_options drifted from crates/core/src/step_abi.rs IgnisDecodeOptions");
 #endif
 

@@ -37,11 +37,21 @@
 //   8. The round timing where shapes alternate (kernel/src/round_timing.h): each round's period
 //      and gap are its own, to the next round's launch whatever its shape, so each shape's periods
 //      are its rounds' and a run's periods sum to its wall time.
+//   9. A mixed round's layout and its GDN records (#713, kernel/src/round_layout.h): each group's
+//      columns, drafts and record rows; at 15 drafts, over the vendored planner's own layouts of
+//      the 27B's records at 2 and 8 lanes, every mix's extended and base rows in every layer and
+//      plane disjoint and inside the backing the two shapes share; at 10 and 8 drafts no base
+//      layout has the extended one's stride, the base shape's own collides with it, and the round
+//      is refused; the base fold's leading rows on slots no base lane holds.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE -- but nothing here needs a GPU.
 
+#include "round_layout.h"
 #include "round_shape.h"
 #include "round_timing.h"
+
+#include "core/gdn_replay_records.h"
+#include "core/layout.h"
 
 #include <algorithm>
 #include <array>
@@ -697,10 +707,163 @@ void check_the_round_timing() {
   const double wall = pre[shapes.size() - 1] - pre[0];
   check(std::fabs(periods - wall) < 0.01, "the periods sum to the run's wall time (" + std::to_string(periods) +
                                               " ms against " + std::to_string(wall) + ")");
-  // A shape past the blocks' is the base shape's, never out of bounds.
+  // A shape past the blocks' is the base shape's, never out of bounds; #713: the one past the round
+  // shapes' is the mixed rounds' own.
   ignis::round_timing::Blocks spare;
-  ignis::round_timing::add(spare, IGNIS_ROUND_SHAPES_MAX, 1.0f, 2.0f, 1.0f);
+  ignis::round_timing::add(spare, IGNIS_ROUND_SHAPES_MAX + 1, 1.0f, 2.0f, 1.0f);
   check(spare[0].span.size() == 1, "a shape past the blocks counts as the base shape");
+  ignis::round_timing::add(spare, ignis::round_timing::kMixedBlock, 1.0f, 2.0f, 1.0f);
+  check(spare[ignis::round_timing::kMixedBlock].span.size() == 1 && spare[0].span.size() == 1,
+        "a mixed round counts in the mixed rounds' block");
+}
+
+// Table 9: a mixed round's layout, and its records over the vendored planner's layouts.
+ninfer::GdnReplayRecordSpec records_27b(std::int32_t capacity, std::int32_t width) {
+  ninfer::GdnReplayRecordSpec spec{};
+  spec.layers = 48;
+  spec.record_capacity = capacity;
+  spec.width = width;
+  spec.conv_channels = 10240;
+  spec.qk_heads = 16;
+  spec.value_heads = 48;
+  spec.key_dim = 128;
+  spec.value_dim = 128;
+  return spec;
+}
+
+struct Span {
+  std::size_t begin;
+  std::size_t end;
+};
+
+// The bytes of rows [first, first + rows) of every layer in each of the four planes of `layout`.
+void row_spans(const ninfer::GdnReplayRecordLayout &layout, std::uint32_t first, std::uint32_t rows,
+               std::vector<Span> &out) {
+  const std::int32_t capacity = layout.spec.record_capacity;
+  const std::size_t outer = static_cast<std::size_t>(layout.spec.layers) * capacity;
+  for (const ninfer::TensorRegion *plane : {&layout.conv, &layout.key, &layout.value, &layout.gate}) {
+    const std::size_t row_bytes = plane->region.bytes / outer;
+    for (std::int32_t layer = 0; layer < layout.spec.layers; ++layer) {
+      for (std::uint32_t r = first; r < first + rows; ++r) {
+        const std::size_t at = plane->region.offset + (static_cast<std::size_t>(layer) * capacity + r) * row_bytes;
+        out.push_back(Span{at, at + row_bytes});
+      }
+    }
+  }
+}
+
+bool disjoint_within(std::vector<Span> spans, std::size_t backing) {
+  std::sort(spans.begin(), spans.end(), [](const Span &a, const Span &b) { return a.begin < b.begin; });
+  for (std::size_t i = 0; i < spans.size(); ++i) {
+    if (spans[i].end > backing || (i + 1 < spans.size() && spans[i].end > spans[i + 1].begin)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+ninfer::GdnReplayRecordLayout plan(const ninfer::GdnReplayRecordSpec &spec, std::size_t &bytes) {
+  ninfer::LayoutBuilder builder;
+  const ninfer::GdnReplayRecordLayout layout = ninfer::plan_gdn_replay_records(builder, spec);
+  bytes = builder.finish(256, "records");
+  return layout;
+}
+
+void check_the_mixed_layout() {
+  using ignis::round_layout::Layout;
+  using ignis::round_layout::layout_of;
+  const Layout one_one = layout_of(1, kWindow, 1, kBase);
+  check(one_one.columns() == 24 && one_one.drafts() == 22 && !one_one.uniform(), "1+1 at 15: 24 columns, 22 drafts");
+  check(one_one.column_of(0) == 0 && one_one.draft_of(0) == 0 && one_one.groups[0].first_record_row == 0 &&
+            one_one.column_of(1) == 16 && one_one.draft_of(1) == 15 && one_one.groups[1].first_record_row == 2,
+        "1+1 at 15: the extended lane at column 0, draft 0, record row 0; the base lane at 16, 15, row 2");
+  const Layout at_ten = layout_of(1, 10, 1, kBase);
+  check(at_ten.column_of(1) == 11 && at_ten.draft_of(1) == 10 && at_ten.groups[1].first_record_row == 2,
+        "1+1 at 10: the base lane's columns from 11, its drafts from 10, its records from row 2");
+  const Layout two_four = layout_of(2, kWindow, 4, kBase);
+  check(two_four.column_of(5) == 56 && two_four.draft_of(5) == 51 && two_four.groups[1].first_record_row == 4,
+        "2+4 at 15: the last base lane at column 56, draft 51; the base records from row 4");
+  check(ignis::round_layout::mix_index(one_one) == 0 && ignis::round_layout::mix_index(layout_of(3, 15, 2, 7)) == 11 &&
+            ignis::round_layout::mix_index(layout_of(4, 15, 1, 7)) < 0 &&
+            ignis::round_layout::mix_index(ignis::round_layout::uniform(2, 15, true)) < 0,
+        "the twelve mixes: 1+1 first, 3+2 last, none of 4+1 or a uniform round");
+  for (const auto &mix : ignis::round_layout::kMixTable) {
+    check(layout_of(mix[0], kWindow, mix[1], kBase).columns() <= ignis::round_layout::kMaxColumns,
+          "mix " + std::to_string(mix[0]) + "+" + std::to_string(mix[1]) + " fits 64 columns");
+  }
+
+  // At 15 drafts: a load of 2 lanes and one of 8, the extended records at min(lanes, 4) rows of 16,
+  // the base shape's at `lanes` rows of 8, one backing the larger; the mixed base layout at the
+  // extended one's stride.
+  for (const std::uint32_t lanes : {2u, 8u}) {
+    const std::uint32_t capacity = std::min(lanes, 4u);
+    const std::uint32_t base_capacity = ignis::round_layout::mixed_base_record_capacity(capacity, 16, 8, 8);
+    const std::string at = std::to_string(lanes) + " lanes at 15";
+    check(base_capacity == 2 * capacity, at + ": the base layout of " + std::to_string(base_capacity) + " rows");
+    std::size_t extended_bytes = 0;
+    std::size_t own_bytes = 0;
+    std::size_t base_bytes = 0;
+    const ninfer::GdnReplayRecordLayout extended =
+        plan(records_27b(static_cast<std::int32_t>(capacity), 16), extended_bytes);
+    (void)plan(records_27b(static_cast<std::int32_t>(lanes), 8), own_bytes);
+    const ninfer::GdnReplayRecordLayout base = plan(records_27b(static_cast<std::int32_t>(base_capacity), 8), base_bytes);
+    const std::size_t backing = std::max(extended_bytes, own_bytes);
+    check(base_bytes <= backing && base.conv.region.offset == extended.conv.region.offset &&
+              base.key.region.offset == extended.key.region.offset &&
+              base.value.region.offset == extended.value.region.offset &&
+              base.gate.region.offset == extended.gate.region.offset,
+          at + ": the mixed base layout's planes start where the extended one's do, inside the backing");
+    std::uint32_t mixes = 0;
+    for (const auto &mix : ignis::round_layout::kMixTable) {
+      if (mix[0] > capacity || mix[0] + mix[1] > lanes) {
+        continue;
+      }
+      ++mixes;
+      const Layout layout = layout_of(mix[0], kWindow, mix[1], kBase);
+      std::vector<Span> spans;
+      row_spans(extended, layout.groups[0].first_record_row, layout.groups[0].lanes, spans);
+      row_spans(base, layout.groups[1].first_record_row, layout.groups[1].lanes, spans);
+      const std::string name = at + ", mix " + std::to_string(mix[0]) + "+" + std::to_string(mix[1]);
+      check(ignis::round_layout::records_hold(layout, capacity, base_capacity) && disjoint_within(spans, backing),
+            name + ": every layer's extended and base rows, in all four planes, apart and inside the backing");
+    }
+    check(mixes == (lanes == 2 ? 1u : 12u), at + ": " + std::to_string(mixes) + " mixes fit the load");
+  }
+
+  // At 10 and 8 drafts no base layout has the extended stride (4 x 11, 2 x 11, 4 x 9, 2 x 9 columns
+  // a layer); the base shape's own layout puts a 1+1 round's base rows over extended rows of another
+  // layer, and its row 2 is not the base lane's column 11.
+  for (const std::uint32_t window : {10u, 8u}) {
+    for (const std::uint32_t capacity : {2u, 4u}) {
+      check(ignis::round_layout::mixed_base_record_capacity(capacity, window + 1, 8, 8) == 0,
+            std::to_string(capacity) + " extended rows at " + std::to_string(window) + " drafts: no base layout");
+    }
+  }
+  std::size_t extended_bytes = 0;
+  std::size_t own_bytes = 0;
+  const ninfer::GdnReplayRecordLayout extended_ten = plan(records_27b(4, 11), extended_bytes);
+  const ninfer::GdnReplayRecordLayout own = plan(records_27b(8, 8), own_bytes);
+  std::vector<Span> spans;
+  row_spans(extended_ten, 0, 1, spans);
+  row_spans(own, 2, 1, spans);
+  check(!disjoint_within(spans, std::max(extended_bytes, own_bytes)),
+        "1+1 at 10 over the base shape's own layout: base rows land on extended rows");
+  check(!ignis::round_layout::records_hold(at_ten, 4, 8), "1+1 at 10: refused, its row 2 is not its column 11");
+
+  // The base fold's leading rows.
+  std::array<std::int32_t, 4> out{};
+  const std::array<std::int32_t, 4> held = {0, 1, 2, 3};
+  const std::int32_t five = 5;
+  const std::int32_t zero = 0;
+  const std::int32_t one = 1;
+  check(ignis::round_layout::leading_fold_slots(&five, 1, 2, 8, out.data()) && out[0] == 0 && out[1] == 1,
+        "leading fold rows beside a base lane in slot 5: slots 0 and 1");
+  check(ignis::round_layout::leading_fold_slots(&zero, 1, 2, 8, out.data()) && out[0] == 1 && out[1] == 2,
+        "beside a base lane in slot 0: slots 1 and 2");
+  check(ignis::round_layout::leading_fold_slots(held.data(), 4, 4, 8, out.data()) && out[0] == 4 && out[3] == 7,
+        "2+4's four leading rows beside base lanes in 0..3: slots 4..7");
+  check(!ignis::round_layout::leading_fold_slots(&one, 1, 2, 2, out.data()),
+        "a pool of 2 slots has no 2 leading rows beside a base lane: refused");
 }
 
 } // namespace
@@ -716,6 +879,7 @@ int main() {
   check_a_pairs_course();
   check_the_switch();
   check_the_round_timing();
+  check_the_mixed_layout();
   if (g_failed != 0) {
     std::fprintf(stderr, "round_shape: %d check(s) failed\n", g_failed);
     return EXIT_FAILURE;

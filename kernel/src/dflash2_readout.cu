@@ -155,7 +155,8 @@ extern "C" int32_t ignis_dflash2_readout(struct ignis_model *model, struct ignis
     const Dflash2ProposalReadout sink{readout->out_candidate_ids, readout->out_candidate_logits,
                                       readout->out_scores, readout->out_drafter_logits,
                                       draws ? readout->out_q : nullptr};
-    ignis_dflash2_propose(model, pool, verify, 1, &sink);
+    ignis_dflash2_propose(model, pool, verify, ignis::round_layout::uniform(1, verify.window, verify.extended()),
+                          &sink);
   } catch (const std::exception &e) {
     (void)cudaStreamSynchronize(stream);
     return fail(std::string("ignis_dflash2_readout: ") + e.what());
@@ -206,6 +207,12 @@ extern "C" int32_t ignis_verify_readout_logits(struct ignis_model *model, uint32
                 shape_windows(*model));
   }
   const IgnisVerifyRound *const latest = ignis_latest_verify_shape(*model);
+  // GitHub #713: a mixed round writes the buffer at each of its groups' strides, on the base shape's
+  // handle: read at one stride, its rows would be another lane's.
+  if (latest != nullptr && model->mixed_kept_epoch != 0 && latest->kept_epoch == model->mixed_kept_epoch) {
+    return fail("ignis_verify_readout_logits: the latest verify round was mixed: its lanes' rows are at each of "
+                "its groups' strides, not at one shape's");
+  }
   if (latest != nullptr && latest != verify) {
     return fail("ignis_verify_readout_logits: the latest verify round ran the round shape of " +
                 std::to_string(latest->window) + " drafts, not the one of " + std::to_string(window) +

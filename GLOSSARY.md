@@ -1149,9 +1149,10 @@ How wide a round's batch is per lane: one column in a **decode round**,
 (ADR 0016), so the two shapes can rank two near-equal tokens differently: a
 speculative and a plain decode of the same prompt are not byte-identical,
 by design. Of a verify round (#686, #687): its window and the most lanes it
-runs, the **base shape** or the **extended shape**, one for all its lanes,
-chosen before the round launches and handed to it; each shape has its own
-verify and drafter-append graphs per lane count.
+runs, the **base shape** or the **extended shape**, each lane's, chosen before
+the round launches and handed to it; each shape has its own verify and
+drafter-append graphs per lane count. A round whose lanes take both is a
+**mixed round** (#713); `all` and `aggregate` give every lane of a round one.
 
 **Base shape**:
 The 27B's verify round at 8 columns a lane (7 drafts) at every lane count up
@@ -1172,6 +1173,23 @@ record of either shape is current only while no later round of either has
 written the logits they share. Its one-lane attention runs the vendored
 chunked small-T loop, never the prompt route. Not "wide" or "narrow": those
 are the **Near-tie**'s computations.
+
+**Mixed round**:
+A **verify round** of a DFlash2 load past 7 drafts whose lanes take both
+**round shapes** (#711, #713): a mix of `w` lanes at the **extended shape**
+(1..3, the extended group) beside `n` at the **base shape** (1..6, the base
+group), at 2..7 lanes and 64 columns or fewer, one of twelve: (1,1)..(1,6),
+(2,1)..(2,4), (3,1), (3,2). The extended lanes come first in the round's rows
+and its outputs go back in the caller's order, nothing moved on the device;
+the base group's columns start where the extended group's end. Ops that see
+only columns run once over the round's columns, ops that see lanes once a
+group, the base group on a branch beside the extended one. Each group's GDN
+records lie in its shape's records over the backing both share, base lane `s`
+at row `2w + s`, and its fold runs behind `2w` leading rows that commit
+nothing; only at 15 drafts are a group's record rows its columns, so a load
+at another window holds no mix. Until the **shape policy** grants one, a test
+forces a round's mix (`forced_lane_shapes`), from the mix's graphs where
+`IGNIS_MIXED_ROUNDS=1` captured them and eagerly otherwise.
 
 **Shape rule**:
 What a lane of a DFlash2 load past 7 drafts asks of its next **verify round**,

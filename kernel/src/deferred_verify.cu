@@ -200,8 +200,9 @@ cudaError_t end(VerifyStaging &staging, cudaStream_t stream) {
   return cudaEventRecord(staging.used_by[static_cast<std::size_t>(staging.slot)], stream);
 }
 
-int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify, std::uint32_t width,
-                       cudaGraphExec_t *out_exec, std::uint32_t *out_nodes, std::string *error) {
+int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
+                       const ignis::round_layout::Layout &layout, cudaGraphExec_t *out_exec, std::uint32_t *out_nodes,
+                       std::string *error) {
   *out_exec = nullptr;
   *out_nodes = 0;
   cudaError_t err = cudaStreamBeginCapture(model->stream, cudaStreamCaptureModeThreadLocal);
@@ -211,8 +212,7 @@ int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVeri
   }
   std::string failed;
   try {
-    ignis_dflash2_append_round(model, pool, verify,
-                               ignis::round_layout::uniform(width, verify.window, verify.extended()));
+    ignis_dflash2_append_round(model, pool, verify, layout);
   } catch (const std::exception &e) {
     failed = e.what();
   }
@@ -246,7 +246,10 @@ int32_t capture_append(ignis_model *model, ignis_seq_pool *pool, const IgnisVeri
 
 void append_round(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
                   const ignis::round_layout::Layout &layout) {
-  const cudaGraphExec_t exec = layout.uniform() ? verify.append_exec[layout.lanes() - 1] : nullptr;
+  const int mix = ignis::round_layout::mix_index(layout);
+  const cudaGraphExec_t exec = layout.uniform() ? verify.append_exec[layout.lanes() - 1]
+                               : mix >= 0       ? model->mixed_append_exec[static_cast<std::size_t>(mix)]
+                                                : nullptr;
   if (exec == nullptr) {
     ignis_dflash2_append_round(model, pool, verify, layout);
     return;

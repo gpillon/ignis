@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
@@ -419,19 +420,30 @@ int32_t run_gqa_layer(ignis_model *model, ignis_seq_pool *pool, ignis_seq *seq,
 // shape (kernel/src/round_shape.h), whose attention runs in chunks of the
 // small-T tile below (GitHub #688, kernel/src/extended_attention.h); every
 // other round's is exactly as before.
+//
+// GitHub #713: `mixed`, a mixed verify round's layout (kernel/src/round_layout.h), whose
+// columns are its groups' and whose attention and KV append run once a group, each on the route
+// a uniform round of the group's shape and lanes takes, with a workspace of its own, the base
+// group on the branch beside the extended group; null for every other round.
 int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t layer,
                             uint32_t width, std::int32_t lane_tokens, const void *positions_ptr,
                             const void *rope_positions_ptr,
                             const void *valid_columns_ptr, void *in_residual, void *out_residual,
-                            uint32_t gqa_layer, LinearPolicyMode mode, bool extended_round, const char *op) {
+                            uint32_t gqa_layer, LinearPolicyMode mode, bool extended_round, const char *op,
+                            const ignis::round_layout::Layout *mixed = nullptr) {
   constexpr std::int32_t kHeadDim = 256;
   constexpr std::int32_t kQHeads = kIgnisGqaQHeads;
   constexpr std::int32_t kKvHeads = 4;
 
   // The batch's rows are the lanes; every row carries `lane_tokens`
-  // columns, lane-major, so the activations are `columns` wide.
+  // columns, lane-major, so the activations are `columns` wide. GitHub #713:
+  // a mixed round's lanes carry their groups' columns, which its views below
+  // take as one row of all of them (its attention views each group apart).
   const auto batch = static_cast<std::int32_t>(width);
-  const std::int32_t columns = lane_tokens * batch;
+  const std::int32_t columns =
+      mixed != nullptr ? static_cast<std::int32_t>(mixed->columns()) : lane_tokens * batch;
+  const std::int32_t view_tokens = mixed != nullptr ? columns : lane_tokens;
+  const std::int32_t view_batch = mixed != nullptr ? 1 : batch;
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto q_width = kHeadDim * kQHeads;
   const auto kv_width = kHeadDim * kKvHeads;
@@ -483,7 +495,7 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     const ninfer::Tensor positions(const_cast<void *>(positions_ptr), ninfer::DType::I32,
                                    {columns, 1, 1, 1});
     const ninfer::Tensor positions_rows(const_cast<void *>(positions_ptr), ninfer::DType::I32,
-                                        {lane_tokens, batch, 1, 1});
+                                        {view_tokens, view_batch, 1, 1});
     // GitHub #178: what the columns rotate at, staged at its own stable
     // address on a vision load (`position + rope_delta`); the positions
     // above otherwise.
@@ -518,8 +530,8 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     ninfer::ops::qk_norm_rope(query_tokens, key_tokens, q_norm, k_norm, model->rms_norm_eps,
                               rotation_positions, rope, rotated_query_tokens, rotated_key_tokens,
                               stream);
-    ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, lane_tokens, batch});
-    ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, lane_tokens, batch});
+    ninfer::Tensor rotated_query_heads = rotated_query.view({kHeadDim, kQHeads, view_tokens, view_batch});
+    ninfer::Tensor rotated_key_heads = rotated_key.view({kHeadDim, kKvHeads, view_tokens, view_batch});
 
     // ADR 0019: the pool-wide block-table matrix (every physical slot, a
     // fixed address independent of round composition) with `kv_table_rows`
@@ -536,7 +548,7 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
         ignis_kv_batch_layer_view(pool, static_cast<std::int32_t>(gqa_layer));
     const ninfer::Tensor kv_table_rows(model->decode_graph_slots->p, ninfer::DType::I32,
                                        {batch, 1, 1, 1});
-    ninfer::Tensor value_heads = value.view({kHeadDim, kKvHeads, lane_tokens, batch});
+    ninfer::Tensor value_heads = value.view({kHeadDim, kKvHeads, view_tokens, view_batch});
     // A fixed, conservative envelope (ADR 0019): `max_visible_keys` is a
     // host launch-resource promise for workspace sizing and kernel-route
     // selection, not the causal mask (the mask comes from `positions`
@@ -562,60 +574,92 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // with planes sized for the whole context that a decode load does not
     // reserve. At two lanes or more the query is the vendored chunked route's.
     const std::int32_t small_t_tile = ninfer::ops::detail::gqa_small_t_chunk_tokens(batch_cache.dtype);
-    const bool in_chunks = ignis::extended_attention::in_chunks(extended_round, lane_tokens, small_t_tile);
-    const std::size_t attention_workspace_bytes =
-        in_chunks && batch == 1
-            ? ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, 1, 1,
-                                                                  small_t_tile)
-            : ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, batch,
-                                                                  lane_tokens, lane_tokens);
-    const ninfer::DeviceSpan attention_workspace_storage =
-        model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(attention_workspace_bytes, 1));
-    // Graph-safe (ADR 0019): the predicate is the pool's KV format, fixed for
-    // the life of the load (ADR 0022), so which nodes this body records does
-    // not depend on anything a replay can change.
-    cudaError_t error = cudaSuccess;
-    if (ignis_gqa_workspace_needs_zeroing(batch_cache.dtype)) {
-      error = cudaMemsetAsync(attention_workspace_storage.data, 0,
-                              attention_workspace_storage.bytes, stream);
-      if (error != cudaSuccess) {
-        set_error(std::string(op) + ": cudaMemsetAsync(attention workspace) failed: " +
-                  cudaGetErrorString(error));
-        return -1;
+    // GitHub #713: a call's workspace, `lanes` lanes of `tokens` columns at the extended shape
+    // where `extended`, and the call itself on the route the load and that shape take, on `on`.
+    const auto workspace_bytes = [&](bool extended, std::int32_t tokens, std::int32_t lanes) {
+      return ignis::extended_attention::in_chunks(extended, tokens, small_t_tile) && lanes == 1
+                 ? ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, 1, 1,
+                                                                       small_t_tile)
+                 : ninfer::ops::gqa_attention_workspace_capacity_bytes(kQHeads, batch_cache.dtype, envelope, lanes,
+                                                                       tokens, tokens);
+    };
+    const auto attend = [&](bool extended, std::int32_t tokens, std::int32_t lanes, const ninfer::Tensor &q,
+                            const ninfer::Tensor &k, const ninfer::Tensor &v, const ninfer::Tensor &at,
+                            const ninfer::Tensor &valid, const ninfer::Tensor &rows, const ninfer::Tensor &gate_in,
+                            ninfer::DeviceSpan storage, ninfer::Tensor &out, cudaStream_t on) {
+      // Graph-safe (ADR 0019): the predicate is the pool's KV format, fixed for
+      // the life of the load (ADR 0022), so which nodes this body records does
+      // not depend on anything a replay can change.
+      if (ignis_gqa_workspace_needs_zeroing(batch_cache.dtype)) {
+        const cudaError_t zeroed = cudaMemsetAsync(storage.data, 0, storage.bytes, on);
+        if (zeroed != cudaSuccess) {
+          throw std::runtime_error(std::string("cudaMemsetAsync(attention workspace) failed: ") +
+                                   cudaGetErrorString(zeroed));
+        }
       }
-    }
-    ninfer::DeviceArena attention_workspace(attention_workspace_storage);
-    ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, lane_tokens, batch});
-    const ninfer::Tensor gate_heads = gate.view({kHeadDim, kQHeads, lane_tokens, batch});
-    // GitHub #572 (spec #570): on the route the load chose, the same call, the same workspace and
-    // the same bytes out; ignis's route over hq-e8-2b on a Blackwell card. Graph-safe (ADR 0019):
-    // the choice is fixed for the load and the call's shape for the width, so a capture records the
-    // nodes every replay runs.
-    if (model->hq_decode_attention_ours &&
-        ignis::hq_decode_attention::serves(kQHeads, lane_tokens, batch, batch_cache.dtype, envelope)) {
-      ignis::hq_decode_attention::attend(
-          rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
-          kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
-          attention_heads, stream);
-    } else if (in_chunks) {
-      // GitHub #688: an extended round's call, at 1..4 lanes (past the tile, so never the call
-      // above), runs the one chunk loop (kernel/src/extended_attention.h): its chunks on ignis's
-      // route where the load takes that route for its base rounds, on the vendored chunks elsewhere
-      // and under IGNIS_EXTENDED_ATTENTION=vendored as the latest capture read it (the unset switch
-      // before a load's first). Fixed until the next capture, so a replay runs the nodes its
-      // capture recorded.
-      const ignis::extended_attention::Route route = ignis::extended_attention::route_of(
-          model->hq_decode_attention_ours, model->extended_attention,
-          ignis::hq_decode_attention::serves_chunked(kQHeads, lane_tokens, batch_cache.dtype));
-      ignis::extended_attention::attend(
-          route, rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
-          kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
-          attention_heads, stream);
+      ninfer::DeviceArena workspace(storage);
+      // GitHub #572 (spec #570): on the route the load chose, the same call, the same workspace and
+      // the same bytes out; ignis's route over hq-e8-2b on a Blackwell card. Graph-safe (ADR 0019):
+      // the choice is fixed for the load and the call's shape for the width, so a capture records the
+      // nodes every replay runs.
+      if (model->hq_decode_attention_ours &&
+          ignis::hq_decode_attention::serves(kQHeads, tokens, lanes, batch_cache.dtype, envelope)) {
+        ignis::hq_decode_attention::attend(q, k, v, at, valid, rows, gate_in, attention_scale, batch_cache, envelope,
+                                           workspace, out, on);
+      } else if (ignis::extended_attention::in_chunks(extended, tokens, small_t_tile)) {
+        // GitHub #688: an extended round's call, at 1..4 lanes (past the tile, so never the call
+        // above), runs the one chunk loop (kernel/src/extended_attention.h): its chunks on ignis's
+        // route where the load takes that route for its base rounds, on the vendored chunks elsewhere
+        // and under IGNIS_EXTENDED_ATTENTION=vendored as the latest capture read it (the unset switch
+        // before a load's first). Fixed until the next capture, so a replay runs the nodes its
+        // capture recorded.
+        const ignis::extended_attention::Route route = ignis::extended_attention::route_of(
+            model->hq_decode_attention_ours, model->extended_attention,
+            ignis::hq_decode_attention::serves_chunked(kQHeads, tokens, batch_cache.dtype));
+        ignis::extended_attention::attend(route, q, k, v, at, valid, rows, gate_in, attention_scale, batch_cache,
+                                          envelope, workspace, out, on);
+      } else {
+        ninfer::ops::gqa_attention(q, k, v, at, valid, rows, gate_in, attention_scale, batch_cache, envelope,
+                                   workspace, out, on);
+      }
+    };
+    if (mixed == nullptr) {
+      const ninfer::DeviceSpan attention_workspace_storage = model->decode_graph_scratch->alloc_bytes(
+          std::max<std::size_t>(workspace_bytes(extended_round, lane_tokens, batch), 1));
+      ninfer::Tensor attention_heads = attention.view({kHeadDim, kQHeads, lane_tokens, batch});
+      const ninfer::Tensor gate_heads = gate.view({kHeadDim, kQHeads, lane_tokens, batch});
+      attend(extended_round, lane_tokens, batch, rotated_query_heads, rotated_key_heads, value_heads, positions_rows,
+             valid_columns, kv_table_rows, gate_heads, attention_workspace_storage, attention_heads, stream);
     } else {
-      ninfer::ops::gqa_attention(
-          rotated_query_heads, rotated_key_heads, value_heads, positions_rows, valid_columns,
-          kv_table_rows, gate_heads, attention_scale, batch_cache, envelope, attention_workspace,
-          attention_heads, stream);
+      // GitHub #713: each group's workspace first, apart, so that the two may run side by side.
+      std::array<ninfer::DeviceSpan, 2> workspaces{};
+      for (std::size_t i = 0; i < mixed->groups.size(); ++i) {
+        const ignis::round_layout::Group &group = mixed->groups[i];
+        workspaces[i] = model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(
+            workspace_bytes(group.extended, static_cast<std::int32_t>(group.lane_columns()),
+                            static_cast<std::int32_t>(group.lanes)),
+            1));
+      }
+      ignis_each_group(*model, *mixed, [&](const ignis::round_layout::Group &group, cudaStream_t on) {
+        const auto tokens = static_cast<std::int32_t>(group.lane_columns());
+        const auto lanes = static_cast<std::int32_t>(group.lanes);
+        const auto heads = [&](const ninfer::Tensor &flat, std::int32_t width_rows, std::int32_t count) {
+          return ninfer::Tensor(static_cast<std::uint8_t *>(flat.data) +
+                                    static_cast<std::size_t>(group.first_column) * width_rows * sizeof(std::uint16_t),
+                                ninfer::DType::BF16, {kHeadDim, count, tokens, lanes});
+        };
+        const auto lane_words = [&](const void *all, std::size_t first, std::initializer_list<std::int32_t> shape) {
+          return ninfer::Tensor(const_cast<std::int32_t *>(static_cast<const std::int32_t *>(all) + first),
+                                ninfer::DType::I32, shape);
+        };
+        ninfer::Tensor out = heads(attention, q_width, kQHeads);
+        attend(group.extended, tokens, lanes, heads(rotated_query, q_width, kQHeads),
+               heads(rotated_key, kv_width, kKvHeads), heads(value, kv_width, kKvHeads),
+               lane_words(positions_ptr, group.first_column, {tokens, lanes, 1, 1}),
+               lane_words(valid_columns_ptr, group.first_lane, {lanes, 1, 1, 1}),
+               lane_words(model->decode_graph_slots->p, group.first_lane, {lanes, 1, 1, 1}),
+               heads(gate, q_width, kQHeads), workspaces[group.extended ? 0 : 1], out, on);
+      });
     }
 
     ninfer::Tensor residual(out_residual, ninfer::DType::BF16, {hidden, columns, 1, 1});
@@ -624,7 +668,7 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
     // already (the input RMSNorm above was its only other reader), so only
     // distinct buffers copy it.
     if (out_residual != in_residual) {
-      error = cudaMemcpyAsync(out_residual, in_residual,
+      const cudaError_t error = cudaMemcpyAsync(out_residual, in_residual,
                               static_cast<std::size_t>(hidden) * columns * sizeof(uint16_t),
                               cudaMemcpyDeviceToDevice, stream);
       if (error != cudaSuccess) {
@@ -798,8 +842,9 @@ int32_t ignis_gqa_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
 // once per GQA layer per round by `ignis_verify_graph_run_batch`
 // (kernel/src/decode_graph.cu) under capture, replay or eager alike.
 int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
-                                        uint32_t layer, uint32_t width, const void *in_residual,
-                                        void *out_residual, LinearPolicyMode mode) {
+                                        uint32_t layer, const ignis::round_layout::Layout &layout,
+                                        const void *in_residual, void *out_residual, LinearPolicyMode mode) {
+  const uint32_t width = layout.lanes();
   if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
     set_error("ignis_gqa_layer_verify: null argument");
     return -1;
@@ -826,7 +871,7 @@ int32_t ignis_gqa_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
   return run_gqa_layer_batch(model, pool, layer, width, static_cast<std::int32_t>(verify.window + 1),
                              verify.positions->p, rotation, verify.valid_columns->p,
                              const_cast<void *>(in_residual), out_residual, gqa_layer, mode, verify.extended(),
-                             "ignis_gqa_layer_verify");
+                             "ignis_gqa_layer_verify", layout.uniform() ? nullptr : &layout);
 }
 
 extern "C" int32_t ignis_gqa_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,

@@ -43,6 +43,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
@@ -180,6 +181,15 @@ int32_t ignis_decode_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, u
 // position alone -- G3's isolation property, kept by construction.
 //
 // GitHub #686: at the round's shape `verify`, which every call below is handed.
+//
+// GitHub #713 (spec #711): one traversal for every layout. A mixed round (`verify` its base shape,
+// whose buffers both shapes hold) runs the ops that see only columns once over its columns -- the
+// embedding, every norm, linear and MLP, the taps, the output head and its argmax -- and the ops
+// that see lanes once a group on its slice: the drafter's lane ops, the verify inputs, the GQA
+// attention and KV append and the GDN conv record and recurrence (each group on the route a
+// uniform round of its shape and lanes takes), the base group on the branch beside the extended
+// one (`ignis_each_group`); and the accept once a group, one after the other, on the workspace the
+// groups share. A uniform round makes the calls it always made.
 int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
                                      const ignis::round_layout::Layout &layout, LinearPolicyMode mode) {
   if (model == nullptr || pool == nullptr) {
@@ -195,23 +205,16 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
               " drafts");
     return -1;
   }
-  const auto k = static_cast<std::int32_t>(verify.window);
-  const std::int32_t lane_columns = k + 1;
-  const auto batch = static_cast<std::int32_t>(width);
-  const std::int32_t columns = lane_columns * batch;
+  if (!layout.uniform() && (model->drafter != IgnisDrafter::kDflash2 || model->extended_shape == nullptr ||
+                            &verify != model->base_shape.get())) {
+    set_error("ignis_verify_graph: a mixed round is a DFlash2 load's, on its base shape's buffers");
+    return -1;
+  }
+  const auto columns = static_cast<std::int32_t>(layout.columns());
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto vocab = static_cast<std::int32_t>(model->vocab);
   ninfer::DeviceArena::Scope scope = model->decode_graph_scratch->scope();
   try {
-    // Column 0 of every lane is its anchor, columns 1..extent its drafts,
-    // the tail the anchor again; positions `base + min(j, extent)`.
-    const ninfer::Tensor anchors(verify.anchors->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    const ninfer::Tensor drafts(verify.drafts->p, ninfer::DType::I32, {k, batch, 1, 1});
-    const ninfer::Tensor base_positions(verify.base_positions->p, ninfer::DType::I32,
-                                        {batch, 1, 1, 1});
-    const ninfer::Tensor extents(verify.extents->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    ninfer::Tensor verify_ids(verify.verify_ids->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
-    ninfer::Tensor positions(verify.positions->p, ninfer::DType::I32, {lane_columns, batch, 1, 1});
     // GitHub #619: the proposal seam, filled by the load's drafter before
     // the verify inputs read the drafts -- one pass, inside the same graph.
     // DFlash2's forward writes this round's drafts from each lane's window
@@ -220,7 +223,7 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     // the verify substrate alone's were staged by the round from its caller.
     switch (model->drafter) {
     case IgnisDrafter::kDflash2:
-      ignis_dflash2_propose(model, pool, verify, width);
+      ignis_dflash2_propose(model, pool, verify, layout);
       break;
     case IgnisDrafter::kMtp: {
       std::string head_error;
@@ -248,29 +251,31 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
         return -1;
       }
     }
-    // GitHub #712: a group's lanes at a time, at its columns and drafts.
-    for (const ignis::round_layout::Group &group : layout.groups) {
-      if (group.lanes == 0) {
-        continue;
-      }
-      const auto lanes = static_cast<std::int32_t>(group.lanes);
-      const auto window = static_cast<std::int32_t>(group.window);
-      const auto lane_rows = [&](const ninfer::Tensor &all) {
-        return ninfer::Tensor(static_cast<std::int32_t *>(all.data) + group.first_lane, ninfer::DType::I32,
-                              {lanes, 1, 1, 1});
-      };
-      const auto column_rows = [&](const ninfer::Tensor &all) {
-        return ninfer::Tensor(static_cast<std::int32_t *>(all.data) + group.first_column, ninfer::DType::I32,
-                              {window + 1, lanes, 1, 1});
-      };
-      const ninfer::Tensor group_drafts(static_cast<std::int32_t *>(drafts.data) + group.first_draft,
-                                        ninfer::DType::I32, {window, lanes, 1, 1});
-      ninfer::Tensor group_ids = column_rows(verify_ids);
-      ninfer::Tensor group_positions = column_rows(positions);
-      ninfer::ops::speculative_prepare_verify_inputs(lane_rows(anchors), group_drafts, lane_rows(base_positions),
-                                                     lane_rows(extents), group_ids, group_positions,
-                                                     model->stream);
-    }
+    // Column 0 of every lane is its anchor, columns 1..extent its drafts,
+    // the tail the anchor again; positions `base + min(j, extent)`. GitHub
+    // #712: a group's lanes at a time, at its columns and drafts: its rows of
+    // a per-lane buffer, of a column buffer and of the drafts.
+    using Group = ignis::round_layout::Group;
+    const auto lane_rows = [](const ninfer::DeviceBuffer &all, const Group &group) {
+      return ninfer::Tensor(static_cast<std::int32_t *>(all.p) + group.first_lane, ninfer::DType::I32,
+                            {static_cast<std::int32_t>(group.lanes), 1, 1, 1});
+    };
+    const auto column_rows = [](const ninfer::DeviceBuffer &all, const Group &group) {
+      return ninfer::Tensor(static_cast<std::int32_t *>(all.p) + group.first_column, ninfer::DType::I32,
+                            {static_cast<std::int32_t>(group.lane_columns()), static_cast<std::int32_t>(group.lanes), 1,
+                             1});
+    };
+    const auto draft_rows = [](const ninfer::DeviceBuffer &all, const Group &group) {
+      return ninfer::Tensor(static_cast<std::int32_t *>(all.p) + group.first_draft, ninfer::DType::I32,
+                            {static_cast<std::int32_t>(group.window), static_cast<std::int32_t>(group.lanes), 1, 1});
+    };
+    ignis_each_group(*model, layout, [&](const Group &group, cudaStream_t on) {
+      ninfer::Tensor group_ids = column_rows(*verify.verify_ids, group);
+      ninfer::Tensor group_positions = column_rows(*verify.positions, group);
+      ninfer::ops::speculative_prepare_verify_inputs(lane_rows(*verify.anchors, group), draft_rows(*verify.drafts, group),
+                                                     lane_rows(*verify.base_positions, group),
+                                                     lane_rows(*verify.extents, group), group_ids, group_positions, on);
+    });
 
     const ninfer::Tensor ids(verify.verify_ids->p, ninfer::DType::I32, {columns, 1, 1, 1});
     ninfer::Tensor left =
@@ -290,8 +295,8 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     for (uint32_t layer = 0; layer < model->layers.size(); ++layer) {
       void *out = in_place ? left.data : right.data;
       const int32_t rc = model->layers[layer].kind == IGNIS_LAYER_GQA
-          ? ignis_gqa_layer_run_body_verify(model, pool, verify, layer, width, left.data, out, mode)
-          : ignis_gdn_layer_run_body_verify(model, pool, verify, layer, width, left.data, out, mode);
+          ? ignis_gqa_layer_run_body_verify(model, pool, verify, layer, layout, left.data, out, mode)
+          : ignis_gdn_layer_run_body_verify(model, pool, verify, layer, layout, left.data, out, mode);
       if (rc != 0) {
         const char *detail = model->layers[layer].kind == IGNIS_LAYER_GQA
             ? ignis_gqa_layer_last_error()
@@ -349,38 +354,50 @@ int32_t ignis_verify_graph_run_batch(ignis_model *model, ignis_seq_pool *pool, I
     // the target argmax agrees with and takes the target argmax at the
     // divergence; the sampling branch (temperature > 0) is the
     // distribution-preserving rule over the same columns. Its outputs are
-    // read back by the caller after the round.
-    const ninfer::Tensor targets_rows(verify.target_tokens->p, ninfer::DType::I32,
-                                      {lane_columns, batch, 1, 1});
-    const ninfer::Tensor logits_rows(verify.logits->p, ninfer::DType::BF16,
-                                     {vocab, lane_columns, batch, 1});
-    ninfer::Tensor lengths(verify.lengths->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    ninfer::Tensor anchors_out(verify.anchors->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    ninfer::Tensor licensed_tokens(verify.licensed_tokens->p, ninfer::DType::I32,
-                                   {lane_columns, batch, 1, 1});
-    ninfer::Tensor licensed_counts(verify.licensed_counts->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    ninfer::Tensor accepted(verify.accepted->p, ninfer::DType::I32, {batch, 1, 1, 1});
-    ninfer::DeviceArena::Scope accept_scope = verify.accept_workspace->scope();
+    // read back by the caller after the round. GitHub #713: a group's lanes
+    // at a time, one group after the other on the workspace they share.
     const auto *configs = static_cast<const ninfer::ops::SamplingConfig *>(model->sampling_decode_configs->p);
-    if (verify.sampled_draft) {
-      // GitHub #576 (ADR 0090): under the sampled draft the accept is ours
-      // -- the sampling lanes take their drafts by the ratio of p to the q
-      // their draw kept (one-hot on a verify-only load's drafts), the greedy
-      // lanes by today's rule -- with the vendored accept's outputs.
-      ignis_sampled_accept(targets_rows, logits_rows, drafts, extents, lengths, anchors_out, licensed_tokens,
-                           licensed_counts, accepted, vocab, configs,
-                           verify.draft_candidates != nullptr
-                               ? static_cast<const std::int32_t *>(verify.draft_candidates->p)
-                               : nullptr,
-                           verify.draft_q != nullptr ? static_cast<const float *>(verify.draft_q->p) : nullptr,
-                           *verify.accept_workspace, model->stream,
-                           // GitHub #577 (test-only): a teacher-forced round's
-                           // recording, set only while one runs eagerly.
-                           verify.forced_tokens);
-    } else {
-      ninfer::ops::speculative_accept_greedy_drafts(targets_rows, logits_rows, drafts, extents, lengths,
-                                                    anchors_out, licensed_tokens, licensed_counts, accepted,
-                                                    vocab, configs, *verify.accept_workspace, model->stream);
+    for (const Group &group : layout.groups) {
+      if (group.lanes == 0) {
+        continue;
+      }
+      const ninfer::Tensor targets_rows = column_rows(*verify.target_tokens, group);
+      const ninfer::Tensor logits_rows(
+          static_cast<std::uint8_t *>(verify.logits->p) +
+              static_cast<std::size_t>(group.first_column) * vocab * sizeof(std::uint16_t),
+          ninfer::DType::BF16,
+          {vocab, static_cast<std::int32_t>(group.lane_columns()), static_cast<std::int32_t>(group.lanes), 1});
+      const ninfer::Tensor drafts = draft_rows(*verify.drafts, group);
+      const ninfer::Tensor extents = lane_rows(*verify.extents, group);
+      ninfer::Tensor lengths = lane_rows(*verify.lengths, group);
+      ninfer::Tensor anchors_out = lane_rows(*verify.anchors, group);
+      ninfer::Tensor licensed_tokens = column_rows(*verify.licensed_tokens, group);
+      ninfer::Tensor licensed_counts = lane_rows(*verify.licensed_counts, group);
+      ninfer::Tensor accepted = lane_rows(*verify.accepted, group);
+      ninfer::DeviceArena::Scope accept_scope = verify.accept_workspace->scope();
+      if (verify.sampled_draft) {
+        // GitHub #576 (ADR 0090): under the sampled draft the accept is ours
+        // -- the sampling lanes take their drafts by the ratio of p to the q
+        // their draw kept (one-hot on a verify-only load's drafts), the greedy
+        // lanes by today's rule -- with the vendored accept's outputs.
+        const std::size_t draft_words = static_cast<std::size_t>(group.first_draft) * kDflash2SelectorTopK;
+        ignis_sampled_accept(targets_rows, logits_rows, drafts, extents, lengths, anchors_out, licensed_tokens,
+                             licensed_counts, accepted, vocab, configs + group.first_lane,
+                             verify.draft_candidates != nullptr
+                                 ? static_cast<const std::int32_t *>(verify.draft_candidates->p) + draft_words
+                                 : nullptr,
+                             verify.draft_q != nullptr ? static_cast<const float *>(verify.draft_q->p) + draft_words
+                                                       : nullptr,
+                             *verify.accept_workspace, model->stream,
+                             // GitHub #577 (test-only): a teacher-forced round's
+                             // recording, set only while one runs eagerly.
+                             verify.forced_tokens != nullptr ? verify.forced_tokens + group.first_column : nullptr);
+      } else {
+        ninfer::ops::speculative_accept_greedy_drafts(targets_rows, logits_rows, drafts, extents, lengths,
+                                                      anchors_out, licensed_tokens, licensed_counts, accepted,
+                                                      vocab, configs + group.first_lane, *verify.accept_workspace,
+                                                      model->stream);
+      }
     }
     return 0;
   } catch (const std::exception &e) {
@@ -429,10 +446,11 @@ uint32_t copy_node_count(cudaGraph_t graph) {
 
 // P5-04 (GitHub #153): records one width-W verify graph -- exactly
 // `ignis_verify_graph_run_batch`, captured once at shape `verify` (GitHub
-// #686). Same failure handling as the decode capture below.
-int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
-                                   uint32_t width, cudaGraphExec_t *out_exec, uint32_t *out_nodes,
-                                   uint32_t *out_copies) {
+// #686). Same failure handling as the decode capture below. GitHub #713: at
+// `layout`, a uniform round of its width or a mixed round's mix.
+int32_t capture_verify_graph(ignis_model *model, ignis_seq_pool *pool, IgnisVerifyRound &verify,
+                             const ignis::round_layout::Layout &layout, cudaGraphExec_t *out_exec, uint32_t *out_nodes,
+                             uint32_t *out_copies) {
   *out_exec = nullptr;
   *out_nodes = 0;
   *out_copies = 0;
@@ -453,9 +471,7 @@ int32_t capture_verify_graph_width(ignis_model *model, ignis_seq_pool *pool, Ign
               cudaGetErrorString(err));
     return -1;
   }
-  const bool ok = ignis_verify_graph_run_batch(model, pool, verify,
-                                               ignis::round_layout::uniform(width, verify.window, verify.extended()),
-                                               LinearPolicyMode::kEngineDefault) == 0;
+  const bool ok = ignis_verify_graph_run_batch(model, pool, verify, layout, LinearPolicyMode::kEngineDefault) == 0;
   cudaGraph_t graph = nullptr;
   const cudaError_t end_err = cudaStreamEndCapture(model->stream, &graph);
   if (end_err != cudaSuccess) {
@@ -657,6 +673,69 @@ bool read_gdn_gating(ignis_model *model) {
   return true;
 }
 
+// GitHub #713 (spec #711): the mixes this capture makes graphs for under IGNIS_MIXED_ROUNDS=1, of
+// those the load holds (`ignis_mixed_round_refusal`): one extended lane beside one base lane.
+constexpr std::array<std::array<std::uint32_t, 2>, 1> kCapturedMixes = {{{1, 1}}};
+
+// GitHub #713: IGNIS_MIXED_ROUNDS, read at each capture (a measurement switch, ADR 0093's kind):
+// `1` captures a verify graph for each of `kCapturedMixes` that the load holds and, on a load whose
+// verify rounds defer, the drafter's append after it; `0`, or unset until the shape policy names
+// the mixes, none. Every mixed graph of an earlier capture goes first, so a capture under `0` gives
+// their memory back. A mix whose capture fails has no graph -- its rounds run eagerly, the
+// capture's error naming it -- and no capture is refused for it. False (error set) on a value
+// other than `0` or `1`, and where CUDA cannot make the branch a mixed round runs its base group on.
+bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
+  for (std::uint32_t i = 0; i < ignis::round_layout::kMixes; ++i) {
+    for (cudaGraphExec_t *exec : {&model->mixed_verify_exec[i], &model->mixed_append_exec[i]}) {
+      if (*exec != nullptr) {
+        cudaGraphExecDestroy(*exec);
+        *exec = nullptr;
+      }
+    }
+    model->mixed_verify_nodes[i] = 0;
+    model->mixed_append_nodes[i] = 0;
+  }
+  bool captures = false;
+  const auto read = [] { return ignis::named_switch("IGNIS_MIXED_ROUNDS", false, {{"0", false}, {"1", true}}); };
+  if (!capture_switch(read, captures)) {
+    return false;
+  }
+  IgnisVerifyRound *const base = model->base_shape.get();
+  if (!captures || base == nullptr || model->extended_shape == nullptr) {
+    return true;
+  }
+  for (const auto &mix : kCapturedMixes) {
+    const ignis::round_layout::Layout layout =
+        ignis::round_layout::layout_of(mix[0], model->extended_shape->window, mix[1], base->window);
+    if (ignis_mixed_round_refusal(*model, pool->gdn_pool.slot_count(), layout) != nullptr) {
+      continue;
+    }
+    std::string branch_error;
+    if (model->mixed_branch.stream == nullptr && !model->mixed_branch.create(&branch_error)) {
+      set_error("ignis_decode_graph_capture: IGNIS_MIXED_ROUNDS: " + branch_error);
+      return false;
+    }
+    const auto at = static_cast<std::size_t>(ignis::round_layout::mix_index(layout));
+    const std::string name = std::to_string(mix[0]) + "+" + std::to_string(mix[1]);
+    uint32_t copies = 0;
+    if (capture_verify_graph(model, pool, *base, layout, &model->mixed_verify_exec[at], &model->mixed_verify_nodes[at],
+                             &copies) != 0) {
+      model->mixed_verify_exec[at] = nullptr;
+      model->mixed_verify_nodes[at] = 0;
+      set_error("ignis_decode_graph_capture: the mixed round " + name + "'s verify graph: " + g_last_error);
+      continue;
+    }
+    if (base->defer && base->staging != nullptr) {
+      std::string error;
+      if (ignis::deferred_verify::capture_append(model, pool, *base, layout, &model->mixed_append_exec[at],
+                                                 &model->mixed_append_nodes[at], &error) != 0) {
+        set_error("ignis_decode_graph_capture: the drafter's append after the mixed round " + name + ": " + error);
+      }
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct ignis_seq_pool *pool,
@@ -775,8 +854,8 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     }
     for (uint32_t width = 1; width <= held->lanes; ++width) {
       cudaGraphExec_t exec = nullptr;
-      if (capture_verify_graph_width(model, pool, *held, width, &exec, &held->graph_nodes[width - 1],
-                                     &held->graph_copy_nodes[width - 1]) == 0) {
+      if (capture_verify_graph(model, pool, *held, ignis::round_layout::uniform(width, held->window, held->extended()),
+                               &exec, &held->graph_nodes[width - 1], &held->graph_copy_nodes[width - 1]) == 0) {
         held->graph_exec[width - 1] = exec;
         held->graph_ready[width - 1] = true;
       } else {
@@ -794,12 +873,18 @@ extern "C" int32_t ignis_decode_graph_capture(struct ignis_model *model, struct 
     }
     for (uint32_t width = 1; width <= held->lanes; ++width) {
       std::string error;
-      if (ignis::deferred_verify::capture_append(model, pool, *held, width, &held->append_exec[width - 1],
-                                                 &held->append_nodes[width - 1], &error) != 0) {
+      if (ignis::deferred_verify::capture_append(model, pool, *held,
+                                                 ignis::round_layout::uniform(width, held->window, held->extended()),
+                                                 &held->append_exec[width - 1], &held->append_nodes[width - 1],
+                                                 &error) != 0) {
         set_error("ignis_decode_graph_capture: the drafter's append at " + std::to_string(held->window) +
                   " drafts, width " + std::to_string(width) + ": " + error);
       }
     }
+  }
+  // GitHub #713: and the mixed rounds' graphs where IGNIS_MIXED_ROUNDS asks for them.
+  if (!capture_mixed_graphs(model, pool)) {
+    return -1;
   }
   if (out_capture_micros != nullptr) {
     *out_capture_micros = static_cast<uint64_t>(

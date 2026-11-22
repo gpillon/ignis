@@ -601,12 +601,17 @@ int32_t run_gdn_layer_graph(ignis_model *model, ignis_seq_pool *pool, uint32_t l
 // ops' own contracts. Every address is the pool's, the model's or the verify
 // substrate's, so the body is graph-safe like `run_gdn_layer_graph`.
 // GitHub #686: the substrate is the round's shape, `verify`.
+//
+// GitHub #713: `mixed`, a mixed round's layout (kernel/src/round_layout.h), `verify` then its base
+// shape: its columns are its groups', projected once, and each group's conv record and recurrence
+// run on its lanes into its own shape's records (below); null for a uniform round.
 int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
                              uint32_t layer, uint32_t width, void *in_residual, void *out_residual,
-                             uint32_t gdn_layer, LinearPolicyMode mode) {
+                             uint32_t gdn_layer, LinearPolicyMode mode,
+                             const ignis::round_layout::Layout *mixed = nullptr) {
   const auto W = static_cast<std::int32_t>(verify.window + 1);
   const auto batch = static_cast<std::int32_t>(width);
-  const std::int32_t T = W * batch;
+  const std::int32_t T = mixed != nullptr ? static_cast<std::int32_t>(mixed->columns()) : W * batch;
   const auto hidden = static_cast<std::int32_t>(model->hidden);
   const auto stream = model->stream;
   const GdnLayerWeights &w = model->layers[layer].gdn;
@@ -648,9 +653,11 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
                                     {batch, 1, 1, 1});
     const ninfer::Tensor valid_columns(verify.valid_columns->p, ninfer::DType::I32,
                                        {batch, 1, 1, 1});
-    // This layer's record planes, rows 0..batch-1 = lanes 0..batch-1.
+    // This layer's record planes, rows 0..batch-1 = lanes 0..batch-1 (GitHub #713: a mixed
+    // round's groups take theirs below).
     ninfer::GdnReplayRecordLayer records =
-        verify.records.layer(static_cast<std::int32_t>(gdn_layer), batch);
+        mixed != nullptr ? ninfer::GdnReplayRecordLayer{}
+                         : verify.records.layer(static_cast<std::int32_t>(gdn_layer), batch);
 
     const ninfer::Tensor in(in_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
     const ninfer::Tensor input_norm =
@@ -667,6 +674,104 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
     const ignis::gdn_gating::Gating gating{h, w.a_b_projection, a_log, dt_bias, g, beta};
     std::optional<ignis::gdn_gating::Beside> beside;
     fork_gating(*model, gating, stream, beside);
+
+    // GitHub #713: a mixed round projects its columns once, into the layer's conv records as one flat
+    // [C, T] matrix from its first row -- both groups' records lay the layer's rows over the round's
+    // columns there (kernel/src/round_layout.h `records_hold`) -- as a uniform round of two lanes or
+    // more does into its own, then each group convolves and records its lanes from their rows of
+    // its shape's records: the extended group's from row 0 of the extended shape's, the base
+    // group's from row 2w of the mixed base records, the base group on the branch beside the other.
+    if (mixed != nullptr) {
+      if (model->is_trellis_body) {
+        throw std::invalid_argument("a mixed round on a trellis body");
+      }
+      const ninfer::Tensor conv_weight_flat = weight_tensor(
+          w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
+      const auto group_records = [&](const ignis::round_layout::Group &group) {
+        const ninfer::GdnReplayRecords &all =
+            group.extended ? model->extended_shape->records : model->mixed_base_records;
+        const auto rows = static_cast<std::int32_t>(group.lanes);
+        const std::int32_t outer = static_cast<std::int32_t>(gdn_layer) * all.spec.record_capacity +
+                                   static_cast<std::int32_t>(group.first_record_row);
+        return ninfer::GdnReplayRecordLayer{
+            .conv = all.conv.slice(2, outer, rows).view({all.spec.conv_channels, all.spec.width, rows}),
+            .key = all.key.slice(3, outer, rows),
+            .value = all.value.slice(3, outer, rows),
+            .gate = all.gate.slice(3, outer, rows),
+        };
+      };
+      const ninfer::GdnReplayRecords &extended_records = model->extended_shape->records;
+      ninfer::Tensor record_flat(
+          extended_records.conv.slice(2, static_cast<std::int32_t>(gdn_layer) * extended_records.spec.record_capacity, 1)
+              .data,
+          ninfer::DType::BF16, {conv_channels, T, 1, 1});
+      const ninfer::ops::LinearPolicy policy = ignis_policy_for(w.query_key_value_z.qtype, mode);
+      const std::size_t projection_bytes = ninfer::ops::gdn_input_proj_workspace_capacity_bytes(
+          w.query_key_value_z.qtype, w.query_key_value_z.n, w.query_key_value_z.k, policy, T, T);
+      const ninfer::DeviceSpan projection_storage =
+          model->decode_graph_scratch->alloc_bytes(std::max<std::size_t>(projection_bytes, 1));
+      ninfer::DeviceArena projection_workspace(projection_storage);
+      ninfer::ops::gdn_input_proj(h, w.query_key_value_z, record_flat, zbuf, policy, projection_workspace, stream);
+      // A group's columns of a flat tensor of `column_bytes` a column, as `shape`, and its rows of a
+      // per-lane buffer.
+      const auto at = [](const ninfer::Tensor &flat, const ignis::round_layout::Group &group, std::size_t column_bytes,
+                         ninfer::DType dtype, std::initializer_list<std::int32_t> shape) {
+        return ninfer::Tensor(static_cast<std::uint8_t *>(flat.data) + group.first_column * column_bytes, dtype, shape);
+      };
+      const auto lane_rows = [](const void *all, const ignis::round_layout::Group &group) {
+        return ninfer::Tensor(const_cast<std::int32_t *>(static_cast<const std::int32_t *>(all) + group.first_lane),
+                              ninfer::DType::I32, {static_cast<std::int32_t>(group.lanes), 1, 1, 1});
+      };
+      const std::size_t qk_bytes = static_cast<std::size_t>(qk_width) * sizeof(std::uint16_t);
+      const std::size_t value_bytes = static_cast<std::size_t>(value_width) * sizeof(std::uint16_t);
+      const std::size_t gate_bytes = static_cast<std::size_t>(value_heads) * sizeof(float);
+      ignis_each_group(*model, *mixed, [&](const ignis::round_layout::Group &group, cudaStream_t on) {
+        const auto lane_columns = static_cast<std::int32_t>(group.lane_columns());
+        const auto lanes = static_cast<std::int32_t>(group.lanes);
+        ninfer::Tensor query_group = at(query, group, qk_bytes, ninfer::DType::BF16, {qk_width, lane_columns, lanes, 1});
+        ninfer::Tensor key_group = at(key, group, qk_bytes, ninfer::DType::BF16, {qk_width, lane_columns, lanes, 1});
+        ninfer::Tensor value_group =
+            at(value, group, value_bytes, ninfer::DType::BF16, {value_width, lane_columns, lanes, 1});
+        ninfer::ops::detail::gdn_projected_conv_record_launch(
+            group_records(group).conv, conv_weight_flat, conv_states, lane_rows(verify.valid_columns->p, group),
+            lane_rows(model->decode_graph_slots->p, group), query_group, key_group, value_group, on);
+      });
+      gates_before_recurrence(*model, gating, stream, beside);
+      ignis_each_group(*model, *mixed, [&](const ignis::round_layout::Group &group, cudaStream_t on) {
+        const auto lane_columns = static_cast<std::int32_t>(group.lane_columns());
+        const auto lanes = static_cast<std::int32_t>(group.lanes);
+        const ninfer::GdnReplayRecordLayer group_layer = group_records(group);
+        ninfer::Tensor key_record = group_layer.key;
+        ninfer::Tensor value_record = group_layer.value;
+        ninfer::Tensor gate_record = group_layer.gate;
+        ninfer::Tensor out_group =
+            at(recurrent, group, value_bytes, ninfer::DType::BF16, {head_dim, value_heads, lane_columns, lanes});
+        ninfer::ops::gated_delta_net_replay_record(
+            at(query, group, qk_bytes, ninfer::DType::BF16, {head_dim, qk_heads, lane_columns, lanes}),
+            at(key, group, qk_bytes, ninfer::DType::BF16, {head_dim, qk_heads, lane_columns, lanes}),
+            at(value, group, value_bytes, ninfer::DType::BF16, {head_dim, value_heads, lane_columns, lanes}),
+            at(g, group, gate_bytes, ninfer::DType::FP32, {value_heads, lane_columns, lanes, 1}),
+            at(beta, group, gate_bytes, ninfer::DType::FP32, {value_heads, lane_columns, lanes, 1}), readout_scale,
+            ssm_states, lane_rows(verify.valid_columns->p, group), lane_rows(model->decode_graph_slots->p, group),
+            key_record, value_record, gate_record, out_group, on);
+      });
+      const ninfer::Tensor gdn_norm_flat = weight_tensor(w.norm, ninfer::DType::BF16, {head_dim, 1, 1, 1});
+      ninfer::Tensor gated_flat = gated.view({head_dim, value_heads, T, 1});
+      ninfer::ops::gated_rmsnorm(recurrent.view({head_dim, value_heads, T, 1}), gdn_norm_flat,
+                                 zbuf.view({head_dim, value_heads, T, 1}), model->rms_norm_eps, gated_flat, stream);
+      ninfer::Tensor residual_flat(out_residual, ninfer::DType::BF16, {hidden, T, 1, 1});
+      if (out_residual != in_residual) {
+        const cudaError_t copied = cudaMemcpyAsync(out_residual, in_residual, static_cast<std::size_t>(hidden) * T * 2,
+                                                   cudaMemcpyDeviceToDevice, stream);
+        if (copied != cudaSuccess) {
+          set_error(std::string("ignis_gdn_layer_verify: cudaMemcpyAsync(residual) failed: ") +
+                    cudaGetErrorString(copied));
+          return -1;
+        }
+      }
+      output_and_mlp(*model, w, gated, residual_flat, post, fused, *model->decode_graph_scratch, mode, T, stream);
+      return 0;
+    }
 
     const ninfer::Tensor conv_weight = weight_tensor(
         w.convolution, ninfer::DType::BF16, {conv_channels, kIgnisGdnConvKernel, 1, 1});
@@ -850,8 +955,9 @@ int32_t ignis_gdn_layer_run_body_graph(ignis_model *model, ignis_seq_pool *pool,
 // called once per GDN layer per verify round by
 // `ignis_verify_graph_run_batch` (kernel/src/decode_graph.cu).
 int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool, const IgnisVerifyRound &verify,
-                                        uint32_t layer, uint32_t width, const void *in_residual,
-                                        void *out_residual, LinearPolicyMode mode) {
+                                        uint32_t layer, const ignis::round_layout::Layout &layout,
+                                        const void *in_residual, void *out_residual, LinearPolicyMode mode) {
+  const uint32_t width = layout.lanes();
   if (model == nullptr || pool == nullptr || in_residual == nullptr || out_residual == nullptr) {
     set_error("ignis_gdn_layer_verify: null argument");
     return -1;
@@ -867,7 +973,7 @@ int32_t ignis_gdn_layer_run_body_verify(ignis_model *model, ignis_seq_pool *pool
   }
   const uint32_t gdn_layer = ignis_gdn_relative_layer(layer);
   return run_gdn_layer_record(model, pool, verify, layer, width, const_cast<void *>(in_residual),
-                              out_residual, gdn_layer, mode);
+                              out_residual, gdn_layer, mode, layout.uniform() ? nullptr : &layout);
 }
 
 extern "C" int32_t ignis_gdn_layer_step(struct ignis_model *model, struct ignis_seq_pool *pool,

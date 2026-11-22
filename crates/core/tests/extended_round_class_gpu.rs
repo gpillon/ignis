@@ -358,6 +358,7 @@ fn forced_round(
     let forcing = TeacherForcing {
         shape_window: Some(shape.window()),
         drafts: (kind == Kind::Forced).then_some(draft_refs.as_slice()),
+        lane_shapes: None,
     };
     let before = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}")).shapes()[shape.stats_index()];
     let greedy: Vec<VerifyLane<'_>> = (0..lanes).map(|_| VerifyLane::greedy(&[])).collect();

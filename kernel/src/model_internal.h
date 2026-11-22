@@ -32,6 +32,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 // GitHub #339 (spec 27b-16gb/05a): a trellis body's linears, the 16 GB
@@ -661,7 +663,7 @@ struct RoundTiming {
   std::array<cudaEvent_t, kRing> pre{};
   std::array<cudaEvent_t, kRing> post{};
   // Each slot's round shape: 0, the base shape, for every plain round and every verify round of a
-  // load of one shape; 1 for an extended round.
+  // load of one shape; 1 for an extended round; GitHub #713, `kMixedBlock` for a mixed one.
   std::array<std::uint8_t, kRing> shape{};
   // Rounds whose two events were recorded, and rounds read so far.
   std::uint64_t recorded = 0;
@@ -997,12 +999,100 @@ struct ignis_model {
   // `shape_estimate_rounds`, `shape_period_ratios`), read where a verify
   // round's shape is chosen.
   ignis::round_shape::ShapePolicy shape_policy{};
+  // GitHub #713 (spec #711): a mixed round's base records on a load of two round shapes, the base
+  // shape's record width laid at the extended shape's stride over the one backing both shapes'
+  // records share (kernel/src/round_layout.h `mixed_base_record_capacity`): bound at load where
+  // such a layout exists, `mixed_base_capacity` of its rows, holding no byte of its own; 0 rows
+  // where none does, and no mixed round runs there.
+  ninfer::GdnReplayRecords mixed_base_records;
+  std::uint32_t mixed_base_capacity = 0;
+  // Each mix's verify graph and drafter append graph (`ignis::round_layout::kMixTable`'s order), as
+  // the latest capture made them under IGNIS_MIXED_ROUNDS=1, and their node counts
+  // (`ignis_program_stats`); and the branch a mixed round's base group runs on beside its extended
+  // group, made by the first mixed capture or round and destroyed with the model.
+  std::array<cudaGraphExec_t, ignis::round_layout::kMixes> mixed_verify_exec{};
+  std::array<cudaGraphExec_t, ignis::round_layout::kMixes> mixed_append_exec{};
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_verify_nodes{};
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed_append_nodes{};
+  ignis::flash_next::SideBranch mixed_branch;
+  // The kept-scores stamp (`IgnisVerifyRound::kept_epoch`) of the latest mixed round, which ran on
+  // the base shape's buffers at each group's stride, so that a read of them at one stride refuses.
+  std::uint64_t mixed_kept_epoch = 0;
   // GitHub #302: set on a Flash-Next load, whose program the step ABI's
   // entry points dispatch to. It shares this handle's stream, both scratch
   // arenas, the sampling staging, the decode staging and the decode graphs;
   // none of the 27B's fields above it is bound.
   std::unique_ptr<ignis::flash_next::FlashNextModel, ignis::flash_next::FlashNextModelDeleter> flash_next;
 };
+
+// GitHub #713 (spec #711): `call(group, stream)` for each group of `layout` that holds lanes: a uniform
+// round's one group on the model's stream, as every round of one shape runs; a mixed round's two
+// side by side, the extended group on the model's stream and the base group on `mixed_branch`,
+// forked from it and joined back (in a capture, edges of the graph and no nodes). The branch is
+// joined whatever `call` throws; a mixed round with no branch made throws.
+template <class Call>
+void ignis_each_group(ignis_model &model, const ignis::round_layout::Layout &layout, Call &&call) {
+  if (layout.uniform()) {
+    for (const ignis::round_layout::Group &group : layout.groups) {
+      if (group.lanes > 0) {
+        call(group, model.stream);
+      }
+    }
+    return;
+  }
+  const auto check = [](cudaError_t e, const char *what) {
+    if (e != cudaSuccess) {
+      throw std::runtime_error(std::string("the mixed round's branch (") + what + "): " + cudaGetErrorString(e));
+    }
+  };
+  if (model.mixed_branch.stream == nullptr) {
+    throw std::runtime_error("a mixed round on a load whose mixed branch was not made");
+  }
+  check(cudaEventRecord(model.mixed_branch.fork, model.stream), "fork");
+  check(cudaStreamWaitEvent(model.mixed_branch.stream, model.mixed_branch.fork, 0), "fork");
+  struct Join {
+    ignis_model &model;
+    ~Join() {
+      (void)cudaEventRecord(model.mixed_branch.join, model.mixed_branch.stream);
+      (void)cudaStreamWaitEvent(model.stream, model.mixed_branch.join, 0);
+    }
+  } join{model};
+  call(layout.groups[0], model.stream);
+  call(layout.groups[1], model.mixed_branch.stream);
+}
+
+// GitHub #713 (spec #711): why this load cannot run a mixed round of `layout` over a pool of
+// `slot_count` slots, or null where it can: a DFlash2 load of two round shapes on the NVFP4 body;
+// one of the twelve mixes, within the load's lanes and its extended shape's; each group's GDN
+// records over the round's columns in the records of its shape (a window of 15,
+// kernel/src/round_layout.h `records_hold`); and the slots the base group's fold takes, its leading
+// rows' beside its lanes'.
+inline const char *ignis_mixed_round_refusal(const ignis_model &model, std::int64_t slot_count,
+                                             const ignis::round_layout::Layout &layout) {
+  if (model.drafter != IgnisDrafter::kDflash2 || model.base_shape == nullptr || model.extended_shape == nullptr) {
+    return "a mixed round runs on a DFlash2 load of two round shapes";
+  }
+  if (model.is_trellis_body) {
+    return "a trellis body runs no mixed round";
+  }
+  if (ignis::round_layout::mix_index(layout) < 0) {
+    return "its lanes make none of the twelve mixes";
+  }
+  if (layout.lanes() > model.decode_lanes || layout.groups[0].lanes > model.extended_shape->lanes) {
+    return "its lanes are more than the load's, or its extended lanes more than the extended shape's";
+  }
+  if (model.mixed_base_capacity == 0 ||
+      !ignis::round_layout::records_hold(
+          layout, static_cast<std::uint32_t>(model.extended_shape->records_layout.spec.record_capacity),
+          model.mixed_base_capacity)) {
+    return "the load's GDN records hold no mixed round at its window (at 15 drafts alone a group's record rows "
+           "are its columns)";
+  }
+  if (slot_count < static_cast<std::int64_t>(layout.groups[1].first_record_row + layout.groups[1].lanes)) {
+    return "the pool has too few slots for the base group's fold behind its leading rows";
+  }
+  return nullptr;
+}
 
 // GitHub #692 (spec #684): the load's round shape at a draft window of `window` -- its base shape, or
 // on a DFlash2 load of two its extended shape -- or null where no shape of the load has that window.
