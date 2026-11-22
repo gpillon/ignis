@@ -636,6 +636,11 @@ struct ignis_program_stats {
   uint32_t mixed_verify_graph_memset_nodes[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_roots[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_memset_nodes[IGNIS_ROUND_MIXES];
+  /* GitHub #719 (spec #711): entry m the mixed rounds mix m has run on this load, from its graph or
+   * eagerly (the seam's forced rounds); a round at a mix with no graph that ran at the uniform choice
+   * is in `mixed_fallback_rounds`, not here. All 0 on every load but a DFlash2 load of two round
+   * shapes. */
+  uint64_t mixed_rounds[IGNIS_ROUND_MIXES];
 };
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
@@ -897,7 +902,9 @@ struct ignis_decode_options {
    * host cut: a plain round, a teacher-forced one and a Flash-Next load
    * refuse it (#581). All three NULL: no host cut. GitHub #691: on a DFlash2
    * load of two round shapes the round takes the shape it would without the
-   * host, and the run and the kept column are at that shape's stride. */
+   * host, and the run and the kept column are at that shape's stride. GitHub
+   * #716: in a mixed round (`forced_lane_shapes`) each lane's at its own
+   * group's, and `lane` is the caller's index whatever the lane's row. */
   const uint8_t *host_cut_lanes; /* [batch_size], or NULL */
   int32_t (*host_cut)(void *context, uint64_t lane, const int32_t *run, int32_t run_count);
   void *host_cut_context;
@@ -953,9 +960,10 @@ struct ignis_decode_options {
    * capture asked for them, eagerly, the reference a test holds the graphs
    * to. It rides a live or a
    * teacher-forced round (its forced tokens and drafts read at each lane's
-   * own shape); a load of one shape, a host cut, `forced_shape_window`, a
-   * trellis body (#720), a window but 15 and a pool without the base fold's
-   * spare slots refuse a mixed round by name. NULL: the round's shape is
+   * own shape), GitHub #716: and a live one a host cut (`host_cut`); a load
+   * of one shape, `forced_shape_window`, a trellis body (#720), a window but
+   * 15 and a pool without the base fold's spare slots refuse a mixed round by
+   * name. NULL: the round's shape is
    * chosen as any round's. */
   const uint8_t *forced_lane_shapes;
 };
@@ -1041,7 +1049,8 @@ int32_t ignis_program_decode(struct ignis_model *model, struct ignis_seq_pool *p
  * of a sequence restored, cloned or claimed since: a repair of those is
  * refused. The scores last until a later round or prefill draw writes their
  * column (a verify round's: the next verify round, of either round shape on
- * a DFlash2 load of two, which share the verify logits, GitHub #691), after
+ * a DFlash2 load of two, which share the verify logits, GitHub #691, or a
+ * mixed round of both, GitHub #716), after
  * which a repair is
  * refused as well -- a caller repairs right after the call that drew, before
  * the next call on the model. A Flash-Next load refuses every repair (#581).

@@ -1911,10 +1911,10 @@ pub(crate) fn decimal_text(thousandths: u32) -> String {
     (f64::from(thousandths) / 1000.0).to_string()
 }
 
-/// GitHub #690: the shape policy's period ratios as their flag would spell
-/// them (`1.128,1.29,1.363,1.344`).
-pub(crate) fn ratios_text(ratios: [u32; 4]) -> String {
-    ratios.map(decimal_text).join(",")
+/// GitHub #690: the shape policy's cost table as its flag would spell it
+/// (GitHub #715: its seven rows, `1.128/1.155,1.29/...`).
+pub(crate) fn ratios_text(table: ignis_core::PeriodTable) -> String {
+    table.rows().iter().map(|row| row.iter().map(|&milli| decimal_text(milli)).collect::<Vec<_>>().join(",")).collect::<Vec<_>>().join("/")
 }
 
 /// `--vision-enabled`, `--vision-max-tokens`,

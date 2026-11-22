@@ -43,6 +43,10 @@
 //      plane disjoint and inside the backing the two shapes share; at 10 and 8 drafts no base
 //      layout has the extended one's stride, the base shape's own collides with it, and the round
 //      is refused; the base fold's leading rows on slots no base lane holds.
+//  10. The grant (#715): each lane's shape under `all`, `aggregate` and `mixed` at the default cost
+//      table, on the rows the core's twin holds (crates/core/src/shape_grant.rs): its order, the tie,
+//      the lane without an estimate, the column limit, a step to a cheaper round, one lane, eight
+//      lanes, and the uniform shapes `all` and `aggregate` give on the same lanes; the table's lookup.
 //
 // ADR 0006 / docs/agents/testing.md: no SKIP_RETURN_CODE -- but nothing here needs a GPU.
 
@@ -78,7 +82,10 @@ namespace {
 
 using ignis::round_shape::asks_extended;
 using ignis::round_shape::estimate_of;
+using ignis::round_shape::GrantLane;
+using ignis::round_shape::kMaxLanes;
 using ignis::round_shape::LaneEstimate;
+using ignis::round_shape::period_ratio;
 using ignis::round_shape::Named;
 using ignis::round_shape::Policy;
 using ignis::round_shape::RecentRounds;
@@ -503,7 +510,8 @@ void check_the_policy_options() {
   const std::vector<Row> rows = {
       {"every option 0: the defaults", 0, 0, {0, 0, 0, 0}, nullptr},
       {"`all`", IGNIS_SHAPE_POLICY_ALL, 0, {0, 0, 0, 0}, nullptr},
-      {"a policy that is neither", 2, 0, {0, 0, 0, 0}, "shape_policy"},
+      {"`mixed` (GitHub #715)", IGNIS_SHAPE_POLICY_MIXED, 0, {0, 0, 0, 0}, nullptr},
+      {"a policy it does not know", 3, 0, {0, 0, 0, 0}, "shape_policy"},
       {"a window of 1 round", 0, 1, {0, 0, 0, 0}, nullptr},
       {"the widest window", 0, IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS, {0, 0, 0, 0}, nullptr},
       {"a window past the widest", 0, IGNIS_SHAPE_ESTIMATE_MAX_ROUNDS + 1, {0, 0, 0, 0}, "shape_estimate_rounds"},
@@ -513,7 +521,9 @@ void check_the_policy_options() {
   };
   for (const Row &row : rows) {
     ShapePolicy got{};
-    const char *refused = ignis::round_shape::policy_of(row.policy, row.estimate_rounds, row.ratios.data(), got);
+    const std::array<std::uint32_t, ignis::round_layout::kMixes> mixed{};
+    const char *refused =
+        ignis::round_shape::policy_of(row.policy, row.estimate_rounds, row.ratios.data(), mixed.data(), got);
     check((refused == nullptr) == (row.refused == nullptr) &&
               (row.refused == nullptr || std::string(refused) == row.refused),
           std::string("policy options, ") + row.what + (row.refused == nullptr ? ": taken" : ": refused naming ") +
@@ -521,10 +531,124 @@ void check_the_policy_options() {
   }
   ShapePolicy got{};
   const std::array<std::uint32_t, 4> some = {0, 1100, 0, 1500};
-  check(ignis::round_shape::policy_of(IGNIS_SHAPE_POLICY_ALL, 8, some.data(), got) == nullptr &&
+  std::array<std::uint32_t, ignis::round_layout::kMixes> mixed{};
+  check(ignis::round_shape::policy_of(IGNIS_SHAPE_POLICY_ALL, 8, some.data(), mixed.data(), got) == nullptr &&
             got.policy == Policy::kAll && got.estimate_rounds == 8 &&
             got.period_ratios == std::array<std::uint32_t, 4>{1128, 1100, 1363, 1500},
         "a ratio of 0 is that lane count's default, the others as given");
+  // GitHub #715: the cost table's mixed entries, 0 each's default, refused by their own name.
+  check(got.mixed_period_ratios == ignis::round_shape::kDefaultMixedPeriodRatios,
+        "the mixed entries at their defaults: 1+1 1.155 ... 3+2 1.336");
+  mixed[7] = 1500;
+  check(ignis::round_shape::policy_of(IGNIS_SHAPE_POLICY_MIXED, 0, some.data(), mixed.data(), got) == nullptr &&
+            got.policy == Policy::kMixed && got.mixed_period_ratios[7] == 1500 && got.mixed_period_ratios[0] == 1155,
+        "`mixed` with the 2+2 entry given, the others their defaults");
+  for (const std::uint32_t wrong : {999u, 2001u}) {
+    mixed[11] = wrong;
+    const char *refused = ignis::round_shape::policy_of(IGNIS_SHAPE_POLICY_MIXED, 0, some.data(), mixed.data(), got);
+    check(refused != nullptr && std::string(refused) == "shape_mixed_period_ratios",
+          "a mixed entry of " + std::to_string(wrong) + " thousandths is refused naming its field");
+  }
+}
+
+// GitHub #715 (spec #711): the grant, each lane's shape under the three policies at the default cost
+// table, on the rows crates/core/src/shape_grant.rs holds its twin to (`lane_shapes`), worked there
+// from the spec's rule.
+GrantLane lane(bool asks, std::uint32_t rounds, std::uint32_t tokens, std::uint32_t extended, std::uint32_t extra,
+               std::uint32_t refused) {
+  GrantLane at{};
+  at.asks = asks;
+  at.estimate = LaneEstimate{rounds, tokens, extended, extra};
+  at.refused_rounds = refused;
+  return at;
+}
+
+// A conversation (2 tokens a round, never asking), and a lane asking at 8 tokens a round with 4
+// extended rounds taking `extra` drafts past position 7 each.
+GrantLane conversation() { return lane(false, 16, 32, 0, 0, 0); }
+GrantLane asking(std::uint32_t extra, std::uint32_t refused) { return lane(true, 16, 128, 4, 4 * extra, refused); }
+
+void check_the_grant() {
+  struct Row {
+    const char *what;
+    Policy policy;
+    std::vector<GrantLane> lanes;
+    std::vector<int> want;
+  };
+  const auto seven = [](std::uint32_t at, GrantLane one, std::uint32_t other_at, GrantLane other) {
+    std::vector<GrantLane> lanes(7, conversation());
+    lanes[at] = one;
+    lanes[other_at] = other;
+    return lanes;
+  };
+  const GrantLane fresh = lane(true, 16, 128, 0, 0, 9);
+  const std::vector<Row> rows = {
+      {"the order: at 7 lanes the highest expected extra tokens take the one extended lane", Policy::kMixed,
+       seven(0, lane(true, 16, 32, 4, 12, 0), 2, lane(true, 16, 32, 4, 20, 0)), {0, 0, 1, 0, 0, 0, 0}},
+      {"4 lanes: both pay", Policy::kMixed, {asking(5, 0), conversation(), asking(6, 0), conversation()}, {1, 0, 1, 0}},
+      {"4 lanes: the second step costs less than the first", Policy::kMixed,
+       {asking(2, 0), conversation(), asking(6, 0), conversation()}, {1, 0, 1, 0}},
+      {"4 lanes: 1 extra token does not pay the second step", Policy::kMixed,
+       {asking(1, 0), conversation(), asking(6, 0), conversation()}, {0, 0, 1, 0}},
+      {"the tie: the lane refused longest", Policy::kMixed,
+       seven(1, lane(true, 16, 32, 4, 20, 2), 4, lane(true, 16, 32, 4, 20, 5)), {0, 0, 0, 0, 1, 0, 0}},
+      {"the tie of that too: the caller's order", Policy::kMixed,
+       seven(1, lane(true, 16, 32, 4, 20, 2), 4, lane(true, 16, 32, 4, 20, 2)), {0, 1, 0, 0, 0, 0, 0}},
+      {"no estimate: after the estimated lane, granted when the columns allow", Policy::kMixed,
+       {fresh, asking(7, 0), conversation()}, {1, 1, 0}},
+      {"no round at all", Policy::kMixed, {lane(true, 0, 0, 0, 0, 0), conversation()}, {1, 0}},
+      {"no estimate: after the estimated lane, out of columns at 7", Policy::kMixed,
+       seven(0, fresh, 3, lane(true, 16, 32, 4, 20, 0)), {0, 0, 0, 1, 0, 0, 0}},
+      {"no estimate: the estimated lane refused, granted", Policy::kMixed,
+       seven(0, fresh, 3, lane(true, 16, 32, 4, 4, 0)), {1, 0, 0, 0, 0, 0, 0}},
+      {"the column limit at 5 lanes: 3+2", Policy::kMixed, std::vector<GrantLane>(5, asking(8, 0)), {1, 1, 1, 0, 0}},
+      {"the column limit at 6 lanes: 2+4", Policy::kMixed, std::vector<GrantLane>(6, asking(8, 0)),
+       {1, 1, 0, 0, 0, 0}},
+      {"4 lanes: the uniform extended round", Policy::kMixed, std::vector<GrantLane>(4, asking(8, 0)), {1, 1, 1, 1}},
+      {"2 lanes: both", Policy::kMixed, std::vector<GrantLane>(2, asking(8, 0)), {1, 1}},
+      {"a step to a cheaper round (3+1 to 4 extended)", Policy::kMixed,
+       {asking(8, 0), asking(8, 0), asking(8, 0), asking(0, 0)}, {1, 1, 1, 1}},
+      {"one lane asking, mixed", Policy::kMixed, {asking(0, 0)}, {1}},
+      {"one lane asking, aggregate", Policy::kAggregate, {asking(0, 0)}, {1}},
+      {"one lane asking, all", Policy::kAll, {asking(0, 0)}, {1}},
+      {"one lane not asking, mixed", Policy::kMixed, {lane(false, 16, 128, 4, 32, 0)}, {0}},
+      {"one lane not asking, aggregate", Policy::kAggregate, {lane(false, 16, 128, 4, 32, 0)}, {0}},
+      {"one lane not asking, all", Policy::kAll, {lane(false, 16, 128, 4, 32, 0)}, {0}},
+      {"eight lanes, mixed", Policy::kMixed, std::vector<GrantLane>(8, asking(8, 3)), std::vector<int>(8, 0)},
+      {"eight lanes, aggregate", Policy::kAggregate, std::vector<GrantLane>(8, asking(8, 3)), std::vector<int>(8, 0)},
+      {"eight lanes, all", Policy::kAll, std::vector<GrantLane>(8, asking(8, 3)), std::vector<int>(8, 0)},
+      {"a pair, aggregate: uniform extended", Policy::kAggregate, {asking(6, 0), conversation()}, {1, 1}},
+      {"a pair, all: base", Policy::kAll, {asking(6, 0), conversation()}, {0, 0}},
+      {"a pair, mixed: the asking lane", Policy::kMixed, {asking(6, 0), conversation()}, {1, 0}},
+      {"four, aggregate: 6 pays", Policy::kAggregate,
+       {asking(6, 0), conversation(), conversation(), conversation()}, {1, 1, 1, 1}},
+      {"four, aggregate: 4 does not", Policy::kAggregate,
+       {asking(4, 0), conversation(), conversation(), conversation()}, {0, 0, 0, 0}},
+      {"four, mixed: 4 pays its own lane", Policy::kMixed,
+       {asking(4, 0), conversation(), conversation(), conversation()}, {1, 0, 0, 0}},
+      {"aggregate: a lane without an estimate", Policy::kAggregate,
+       {lane(true, 16, 32, 0, 0, 0), conversation(), conversation()}, {1, 1, 1}},
+      {"all: four asking", Policy::kAll, std::vector<GrantLane>(4, asking(0, 0)), {1, 1, 1, 1}},
+      {"all: five asking", Policy::kAll, std::vector<GrantLane>(5, asking(8, 0)), {0, 0, 0, 0, 0}},
+      {"aggregate: five asking", Policy::kAggregate, std::vector<GrantLane>(5, asking(8, 0)), {0, 0, 0, 0, 0}},
+  };
+  for (const Row &row : rows) {
+    std::array<std::uint8_t, kMaxLanes> extended{};
+    const std::uint32_t granted =
+        ignis::round_shape::grant(policy_of(row.policy), row.lanes.data(), row.lanes.size(), extended.data());
+    bool same = granted == static_cast<std::uint32_t>(std::count(row.want.begin(), row.want.end(), 1));
+    std::string got;
+    for (std::size_t i = 0; i < row.lanes.size(); ++i) {
+      same = same && extended[i] == row.want[i];
+      got += extended[i] != 0 ? "E" : "b";
+    }
+    check(same, std::string("the grant, ") + row.what + ": got " + got);
+  }
+  // The table's lookup: the base round, a mix, the uniform entry.
+  const ShapePolicy defaults{};
+  check(period_ratio(defaults, 4, 0) == 1000 && period_ratio(defaults, 4, 2) == 1222 &&
+            period_ratio(defaults, 4, 4) == 1344 && period_ratio(defaults, 7, 1) == 1107,
+        "the cost table at 4 lanes: 1, 1.222 at 2+2, 1.344 at 4 extended; 1.107 at 1+6");
 }
 
 // One lane through rounds under the default rule and policy, the rule, the record and the round's
@@ -662,11 +786,12 @@ void check_the_switch() {
 }
 
 // Table 7: a run of verify rounds whose shapes alternate, each shape's span and the host's gap
-// after each round fixed, so each shape's true period is known; then a pause.
+// after each round fixed, so each shape's true period is known; then a pause. GitHub #719: and the
+// mixed rounds (round shape 2 here, the mixed block's own in the table) among them.
 void check_the_round_timing() {
-  constexpr float kSpan[2] = {14.4f, 16.6f};  // ms: a base round's graph, an extended round's
+  constexpr float kSpan[3] = {14.4f, 16.6f, 15.2f};  // ms: a base round's graph, an extended round's, a mixed one's
   constexpr float kGap = 0.5f;                // ms: the host between a round's end and the next launch
-  const std::vector<std::uint8_t> shapes = {0, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1};
+  const std::vector<std::uint8_t> shapes = {0, 0, 1, 2, 1, 2, 1, 0, 1, 2, 0, 1, 2, 1, 1, 0, 2, 0, 1, 2, 0, 1};
   std::vector<float> pre;
   std::vector<float> post;
   float clock = 3.0f;
@@ -679,14 +804,14 @@ void check_the_round_timing() {
   pre.push_back(post.back() + 80.0f);
   ignis::round_timing::Blocks blocks;
   for (std::size_t r = 0; r + 1 < pre.size(); ++r) {
-    ignis::round_timing::add(blocks, shapes[r], post[r] - pre[r], pre[r + 1] - pre[r], pre[r + 1] - post[r]);
+    ignis::round_timing::add(blocks, shapes[r] == 2 ? ignis::round_timing::kMixedBlock : shapes[r], post[r] - pre[r], pre[r + 1] - pre[r], pre[r + 1] - post[r]);
   }
   double periods = 0.0;
   std::size_t rounds = 0;
-  for (std::size_t shape = 0; shape < 2; ++shape) {
-    const ignis::round_timing::Block &block = blocks[shape];
+  for (std::size_t shape = 0; shape < 3; ++shape) {
+    const ignis::round_timing::Block &block = blocks[shape == 2 ? ignis::round_timing::kMixedBlock : shape];
     const std::size_t of_shape = static_cast<std::size_t>(std::count(shapes.begin(), shapes.end(), shape));
-    const std::string name = shape == 0 ? "base" : "extended";
+    const std::string name = shape == 0 ? "base" : shape == 1 ? "extended" : "mixed";
     check(block.span.size() == of_shape, name + ": a span for each of its " + std::to_string(of_shape) + " rounds");
     const bool spans = std::all_of(block.span.begin(), block.span.end(),
                                    [&](float us) { return std::fabs(us - kSpan[shape] * 1000.0f) < 1.0f; });
@@ -875,6 +1000,7 @@ int main() {
   check_the_estimates();
   check_aggregate();
   check_the_policy_options();
+  check_the_grant();
   check_a_lanes_course();
   check_a_pairs_course();
   check_the_switch();

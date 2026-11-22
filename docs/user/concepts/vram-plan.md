@@ -67,8 +67,8 @@ Flash-Next). The lines include:
 - from 0.11.0, on a 27B DFlash2 load of the NVFP4 artifact at 15 drafts that
   asks for mixed rounds (rounds whose lanes take both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes);
-  for now only the measurement switch `IGNIS_MIXED_ROUNDS=1` asks,
-  [Testing](../contributing/testing.md)), the **mixed rounds' graphs**
+  `--spec-shape-policy mixed` asks, or the measurement switch
+  `IGNIS_MIXED_ROUNDS=1`, [Testing](../contributing/testing.md)), the **mixed rounds' graphs**
   (`mixed_graphs`): a verify graph and a drafter graph for each mix of extended
   and base lanes the load's lanes and its pool hold (a mix of `w` extended
   lanes beside `n` base lanes takes `2w + n` of the pool's slots, the lanes'

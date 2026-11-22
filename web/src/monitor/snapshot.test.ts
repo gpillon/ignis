@@ -151,9 +151,9 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     const moved = readSnapshot(parseExposition(IGNIS_EXPOSITION));
     // 8 plain counters, 3 reject reasons, 36 retained series (disk's 12 null without the tier), 3 skips, 4 KV-disk, then
     // Flash-Next's 32 expert hit and miss series, 2 prefetch, 2 bytes, 2
-    // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals, the 2 round shapes (#689) and the split rounds (#690)
+    // stall (GitHub #306), 2 n-gram rows, 2 reads, the 3 speculative totals, the 3 round shapes (#689, the mixed one #719) and the split rounds (#690)
     // (GitHub #307), the image jobs' 6 outcomes (timed_out since ADR 0058), images, 4 phases and duration count (GitHub #324), the loop guard's watched, looped, 7 outcomes, tokens and score count with the budget's closes (GitHub #330), the structured output's 3 types (tool since #611) by 3 counters and repair count (#593), the tool calls' 3 outcomes, 6 kinds and strict tools outside the subset (#608) with the values split (#610) and the keys held would close (#641), and 2 histogram counts. The speech model's 8 transcription series, audio seconds and wait count (spec speech/02).
-    expect(counterValues(empty)).toHaveLength(160);
+    expect(counterValues(empty)).toHaveLength(161);
     expect(counterValues(moved).filter((v) => v !== null)).toHaveLength(40);
     const flashNext = readSnapshot(parseExposition(FLASH_NEXT_EXPOSITION));
     expect(counterValues(flashNext).filter((v) => v !== null)).toHaveLength(82);
@@ -220,7 +220,11 @@ ignis_retained_state_hits_total{tier="tape",kind="prefix"} 1
     const shapes = (...lines: string[]) => readSnapshot(parseExposition(`${FLASH_NEXT_EXPOSITION}${spec}\n${lines.join("\n")}\n`));
     const shaped = shapes('ignis_speculative_shape_rounds_total{shape="base"} 7', 'ignis_speculative_shape_rounds_total{shape="extended"} 3');
     expect(shaped.unknown).toEqual([]);
-    expect(shaped.speculation?.shapeRounds).toEqual({ base: 7, extended: 3 });
+    expect(shaped.speculation?.shapeRounds).toEqual({ base: 7, extended: 3, mixed: null });
+    // The mixed shape (#719) is read too, where a server prints it.
+    const mixed = shapes('ignis_speculative_shape_rounds_total{shape="base"} 7', 'ignis_speculative_shape_rounds_total{shape="extended"} 3', 'ignis_speculative_shape_rounds_total{shape="mixed"} 5');
+    expect(mixed.unknown).toEqual([]);
+    expect(mixed.speculation?.shapeRounds).toEqual({ base: 7, extended: 3, mixed: 5 });
     expect(shapes('ignis_speculative_shape_rounds_total{shape="narrow"} 1').unknown).toHaveLength(1);
     // The split rounds (#690) are read too, a counter with no label, and not unknown; one with a label is.
     const split = shapes('ignis_speculative_shape_rounds_total{shape="base"} 7', 'ignis_speculative_shape_rounds_total{shape="extended"} 3', "ignis_speculative_shape_split_rounds_total 4");

@@ -194,9 +194,10 @@ from what each lane's own earlier rounds did, the **shape rule**:
 - a base round its token budget cut short changes nothing.
 
 The **shape policy** (`--spec-shape-policy`) then turns the lanes' asks into
-the round's shape. A request alone runs at the shape it asks, and a round of 5
-to 8 lanes at the base shape, under either policy. At 2 to 4 lanes they differ
-in who pays the wider round:
+each lane's shape. A request alone runs at the shape it asks, and a round of 8
+lanes at the base shape, under every policy. `aggregate` and `all` give a
+round one shape for all its lanes, at the base shape from 5 lanes on; at 2 to 4
+lanes they differ in who pays the wider round:
 
 - `aggregate`, the default, runs the round extended when the drafts its asking
   requests are expected to take past position 7 exceed what the wider round
@@ -219,12 +220,39 @@ in who pays the wider round:
   pays the wider round for another: beside a conversation the JSON answer
   then goes extended only in the rounds where the conversation asks too
   (10.6% of that pair's rounds), and the conversation keeps its speed.
+- `mixed` (from 0.11.0) grants the extended shape request by request, so a
+  round may carry both shapes, a **mixed round**: at 2 to 7 lanes the asking
+  requests are taken one by one, the highest expected extra tokens first (at a
+  tie the one refused longest), and each is granted when the drafts it is
+  expected to take past position 7 exceed what its 8 more columns cost every
+  request in the round: the round's period with it extended over the round's
+  without it, less one, times the tokens every request is expected to take. A
+  request that asks with no extended round among its last rounds comes after
+  the others and is granted whenever the columns allow. A round never passes
+  64 columns, so it holds one to three extended requests beside one to six at
+  the base shape (or every one extended at 2 to 4 lanes). A JSON answer
+  beside three conversations can then draft 15 while they draft 7. Mixed rounds
+  run only on the NVFP4 artifact at 15 drafts: any other load runs `mixed` as
+  `aggregate`, and its load log says so (`shape_policy=aggregate
+  shape_policy_given=mixed`). A request held to a grammar is granted as any
+  other: the grammar's check cuts its run at its first miss at the shape it
+  was granted, in a mixed round too. Every profile gives `aggregate`;
+  `mixed` is opt-in until its served gate passes. A mix whose graphs the load
+  does not hold (a two-lane load without a retained device slot holds none,
+  [the configuration reference](../configuration/context-and-speculation.md))
+  runs at the uniform shape `aggregate` gives it.
 
-The ratios are measured on the RTX 5090 with the extended round's cost levers
-on, at about 3.5-5K tokens of context: 1.128, 1.29, 1.363 and 1.344 at 1 to 4
-lanes. The ratio grows with context, and at 3 and 4 lanes the card's power
-limit lowers the extended round's clock, so 3 lanes reads above 4. On other
-cards they are unmeasured, and the window is provisional. A request held to a
+The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
+the round's period with 1, 2, ... of them extended over the base round's) are
+the RTX 5090's: the uniform entries measured with the extended round's cost
+levers on, at about 3.5-5K tokens of context, 1.128, 1.29, 1.363 and 1.344 at
+1 to 4 lanes; of the mixed entries 1+1, 1+3, 2+2 and 1+5 measured (1.155,
+1.138, 1.222, 1.093) and the other eight derived from its base rounds of the
+same columns (the three of 64 columns, where no base round was measured, one
+8-column step past 56), all pending a measurement of this build. The ratio grows with
+context, and at 3 and 4 lanes the card's power limit lowers the extended
+round's clock, so 3 lanes reads above 4. On other cards they are unmeasured,
+and the window is provisional. A request held to a
 grammar (`response_format`, a held tool's
 calls) asks as any other does: its rounds take the shape the rule and the
 policy give them, the grammar's check cuts each run at its first miss at that
@@ -235,7 +263,8 @@ takes all 7, so it stays at the base shape and decodes as at 7 drafts (a
 greedy answer can differ at a near-tie where the shape changes, below). A
 request evicted and restored keeps what it asked; its recent rounds for
 `aggregate` start again. `/metrics` counts the rounds at each shape
-(`ignis_speculative_shape_rounds_total`), the rounds of two requests or more
+(`ignis_speculative_shape_rounds_total`: `base`, `extended`, and `mixed` for
+the lanes of a round that ran at both, each counted once, at one of the three), the rounds of two requests or more
 some but not all of which asked the extended shape, at whichever shape they
 ran (`ignis_speculative_shape_split_rounds_total`, counted on each request's
 rounds as the others are), and, per position up to the window, the drafts

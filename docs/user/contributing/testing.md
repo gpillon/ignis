@@ -338,18 +338,22 @@ the other. They are no configuration fields: `GET /v1/config` and
   every mix the load holds, whatever the shape policy says (a mix of `w`
   extended lanes beside `n` base lanes within the lanes, and its `2w + n`
   within the pool's slots, the lanes' and the device retained slots': all
-  twelve at 8 lanes); `0`, or unset, captures none and gives back an earlier
-  capture's. The VRAM plan reads it too, at the plan and the load, and plans
+  twelve at 8 lanes); `0` captures none and gives back an earlier capture's;
+  unset, the shape policy decides: `mixed` captures them, `aggregate` and
+  `all` none. The VRAM plan reads it too, at the plan and the load, and plans
   those graphs as its `mixed_graphs` line, so set it before the start for a
-  load to hold them inside its plan. No served round is mixed yet: the round
-  identity test forces a round's mix through the step ABI's test seam
-  (`forced_lane_shapes`), and such a round replays the mix's graph where one
-  was captured, runs eagerly where no capture asked for the mixed graphs, and
-  where the capture asked and could not make that mix's graphs runs at the
+  load to hold them inside its plan. Under `--spec-shape-policy mixed` the
+  grant mixes served rounds (`0` turns that off: the load runs `aggregate`);
+  the round identity test forces a round's mix through the step ABI's test
+  seam (`forced_lane_shapes`), and such a round replays the mix's graph where
+  one was captured, runs eagerly where no capture asked for the mixed graphs,
+  and where the capture asked and could not make that mix's graphs (as a
+  granted round where the pool's slots hold none of that mix) runs at the
   uniform round shape `aggregate` would choose, counted by reason in the
   program's stats (`mixed_fallback_rounds`) and named at load by
   `ignis.runtime.mixed_graph_capture_incomplete`. The stats report each mix's
-  graph nodes and the device memory its capture took. A load at another
+  graph nodes, the device memory its capture took and the mixed rounds it ran
+  (`mixed_rounds`). A load at another
   window, a trellis artifact, an MTP load and Flash-Next capture none. Any
   other value refuses the load, naming the variable.
 - `IGNIS_MIXED_GRAPH_BUILD=0` (from 0.11.0) gives the 27B's mixed rounds,
@@ -432,7 +436,15 @@ a mix to the uniform base round, the uniform extended round and another mix,
 a teacher-forced mix of five lanes, and a mix of five lanes with a snapshot
 and a restore of each right after it: every arm holds them to the reference,
 and each capture that asks for the mixed graphs reports all twelve, their
-measured bytes within the plan's line. The `mixed-capture-failure` arm is not
+measured bytes within the plan's line. From #716 those lanes then ride mixed
+rounds with lanes held to a grammar, the host cutting each held lane's run one
+token short, held lanes in both groups beside a free lane: the
+host is handed exactly the held lanes, by the caller's index, and each is
+repaired right after its round (with greedy lanes a repair permitting every
+token first draws the pending token again, the argmax of the lane's own
+column); a repair after a mixed round the lane sat out is refused, and a
+teacher-forced mix of the held lanes follows. Every arm holds them to the
+reference, and none falls back. The `mixed-capture-failure` arm is not
 held to the reference: a test seam (`ignis_decode_graph_fail_mixed_capture`,
 `step::fail_mixed_capture`) fails the 2+1 mix's capture, whose forced round
 then runs at the uniform shape `aggregate` gives its three lanes, from that

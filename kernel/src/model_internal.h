@@ -1028,6 +1028,9 @@ struct ignis_model {
   std::array<std::uint64_t, ignis::round_layout::kMixes> mixed_graph_bytes{};
   std::array<std::uint64_t, IGNIS_MIXED_FALLBACK_REASONS> mixed_fallback_rounds{};
   int mixed_capture_fault = -1;
+  // GitHub #719: the mixed rounds run, by mix, from the load's start (a round at a mix with no graph
+  // that ran at the uniform choice is a fallback above, not counted here).
+  std::array<std::uint64_t, ignis::round_layout::kMixes> mixed_rounds{};
   // The kept-scores stamp (`IgnisVerifyRound::kept_epoch`) of the latest mixed round, which ran on
   // the base shape's buffers at each group's stride, so that a read of them at one stride refuses.
   std::uint64_t mixed_kept_epoch = 0;

@@ -1166,7 +1166,8 @@ sizes.
 **Extended shape**:
 On a DFlash2 load whose **draft window** is 8..15, the 27B's verify round at
 the window + 1 columns a lane, at 1..4 lanes, so that a round never carries
-more than 64 columns (#687). It runs on the **base shape**'s buffers (a load
+more than 64 columns (#687); 1..3 lanes of a **mixed round** at 15 drafts
+(#715). It runs on the **base shape**'s buffers (a load
 plans what a 7-draft load plans, plus the wider drafts, at 8 lanes) with its
 own layout over them, its own host-mapped staging and its own graphs; a kept
 record of either shape is current only while no later round of either has
@@ -1190,10 +1191,12 @@ Each group's GDN
 records lie in its shape's records over the backing both share, base lane `s`
 at row `2w + s`, and its fold runs behind `2w` leading rows that commit
 nothing; only at 15 drafts are a group's record rows its columns, so a load
-at another window holds no mix. Until the **shape policy** grants one, a test
-forces a round's mix (`forced_lane_shapes`), from the mix's graphs where
-`IGNIS_MIXED_ROUNDS=1` captured them and eagerly where no capture asked for
-them. A load that asks captures every mix its lanes and its pool's GDN slots
+at another window holds no mix. A lane held to a grammar rides one as any
+lane does (#716): the host cut reads its run, and the repair after it the
+scores it kept, at its own group's columns. The **shape policy** `mixed` grants one
+(#715); a test forces a round's mix (`forced_lane_shapes`), from the mix's
+graphs where a capture made them and eagerly where no capture asked for them.
+A load that asks (`mixed`, or `IGNIS_MIXED_ROUNDS=1`) captures every mix its lanes and its pool's GDN slots
 hold (a mix takes `2w + n` slots, the lanes' and the device retained slots':
 all twelve at 8 lanes), a line of the VRAM plan (`mixed_graphs`, #714); a mix
 whose capture failed runs its rounds at the uniform shape `aggregate` would
@@ -1211,8 +1214,9 @@ an extended round it asks while that round took at least
 `spec.shape_stay_accepted` (6). It reads what the target accepted, never what
 a stop or a grammar's cut kept, and no confidence from the drafter. The ask is
 the sequence's: a snapshot and a restore carry it, a prefix or checkpoint
-claim starts without it. The **shape policy** turns a round's asks into its
-shape; a round of 5..8 lanes is never extended.
+claim starts without it. The **shape policy** turns a round's asks into each
+lane's shape; a round of 8 lanes is never extended, and under `aggregate` and
+`all` neither is one of 5..7 (#715: `mixed` extends lanes there).
 `IGNIS_ROUND_SHAPE=base|extended` forces either shape over both, for
 measurement.
 
@@ -1230,7 +1234,20 @@ extended round among them is granted one, so the estimate has one to read. A
 lane that does not ask then runs the round's 16 columns too and pays for its
 neighbour. The lane's recent rounds are host state, not a section: a restore
 or a claim starts them afresh, the ask kept. A round of 5..8 lanes is at the
-**base shape** under both.
+**base shape** under both. `mixed` (#715): at one lane the lane's ask; at 2..7
+lanes the **grant** takes the asking lanes one by one (those with an estimate
+first, the highest expected extra tokens first, at a tie the lane refused
+longest), each granted the **extended shape** when its expected extra tokens
+exceed (the period of the round with it extended over the round without it,
+less one) times the tokens every lane is expected to take, or, without an
+estimate, whenever the columns allow; never past 64 columns, so a round may be
+a **mixed round**. The **cost table** (`spec.shape_period_ratios`) holds each
+round's period over the base round's by lane count (1..7) and extended lanes;
+`aggregate` reads its uniform entries. `mixed` runs on the NVFP4 body at 15
+drafts alone (any other load runs `aggregate`) and asks for the mixed graphs
+there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
+other (#716), and a round whose mix the load holds no graph of runs the uniform
+shape `aggregate` gives it. Every profile defaults to `aggregate`.
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify

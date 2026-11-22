@@ -477,6 +477,8 @@ inline void ignis_seq_apply_progress(ignis_seq &seq, const ignis_seq_progress_im
   // handle's own are another life's.
   seq.shape_rounds = {};
   seq.shape_rounds_recorded = 0;
+  // GitHub #715: nor how long the handle's own asks were refused.
+  seq.shape_refused_rounds = 0;
 }
 
 /* The physical KV pages a snapshot of `seq` captures: the pages its written

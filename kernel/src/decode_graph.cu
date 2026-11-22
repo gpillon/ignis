@@ -715,9 +715,10 @@ bool read_mixed_graph_build(ignis_model *model) {
 // kind, kernel/src/mixed_graphs.h `asked`): `1` captures a verify graph and, on a load whose verify
 // rounds defer, the drafter's append after it for each mix the load holds (GitHub #714: every mix of
 // kMixTable whose lanes fit the load's and whose base group's fold fits the pool's GDN slots,
-// `ignis::mixed_graphs::planned`, the mixes the load's plan holds); `0`, or unset until the shape
-// policy names the mixes, none. Every mixed graph of an earlier capture goes first, so a capture
-// under `0` gives their memory back. A mix whose capture fails has no graph -- its verify graph is
+// `ignis::mixed_graphs::planned`, the mixes the load's plan holds); `0` none; GitHub #715: unset,
+// the mixes of a load whose shape policy is `mixed`, and none under `aggregate` or `all`. Every
+// mixed graph of an earlier capture goes first, so a capture under `0` gives their memory back.
+// A mix whose capture fails has no graph -- its verify graph is
 // released where its append graph fails, so a mix is both or neither -- its rounds run at the
 // uniform choice (kernel/src/step.cu), its bit is in `mixed_failed_mask` and the capture's error
 // names it, and no capture is refused for it. Each captured mix's bytes are the device's free
@@ -742,7 +743,9 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
   model->mixed_failed_mask = 0;
   model->mixed_capture_asked = false;
   bool captures = false;
-  if (!capture_switch(ignis::mixed_graphs::asked, captures)) {
+  // GitHub #715: unset, the shape policy asks, where the load runs `mixed`.
+  const bool policy_mixed = model->shape_policy.policy == ignis::round_shape::Policy::kMixed;
+  if (!capture_switch([policy_mixed] { return ignis::mixed_graphs::asked(policy_mixed); }, captures)) {
     return false;
   }
   IgnisVerifyRound *const base = model->base_shape.get();

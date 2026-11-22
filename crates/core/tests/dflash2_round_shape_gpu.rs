@@ -11,12 +11,15 @@
 //! extent and accept, that a round runs the shape its lanes' asks give it,
 //! that the lanes limit is the extended shape's, that what a lane asks is
 //! the sequence's, not the handle's, and that the policy reads each lane's
-//! own recent rounds. Those are here, on two loads of one materialized
+//! own recent rounds. Those are here, on three loads of one materialized
 //! artifact: the NVFP4 body, DFlash2 at 15 under the sampled draft, hq-e8-2b,
 //! FP8 exception weights, 8 lanes, the rule at its default thresholds and
 //! `IGNIS_ROUND_SHAPE` unset unless a round names it; the first load under
 //! the policy `all` (parts 1 to 5), the second under `aggregate`, the default
-//! (part 5).
+//! (part 5); GitHub #715 (spec #711): a third under `mixed` (part 6). Each
+//! load's capture, with `IGNIS_MIXED_ROUNDS` unset, makes the mixed rounds'
+//! graphs of every mix its 8 lanes hold under `mixed`, and none under `all` or
+//! `aggregate`.
 //!
 //! The rounds are live and greedy, on a text the drafter predicts far ahead
 //! (counting), so the accept is the text's, not the test's: the test keeps a
@@ -57,6 +60,14 @@
 //!    a base round and nothing past them (a low one, still asking): under
 //!    `aggregate` its granted round is extended and every round after base,
 //!    its window holding that round; under `all` every round is base.
+//! 6. **The grant on forced accepts** (#715): the same two courses under
+//!    `mixed`. The lane's first round asking is granted beside the base one,
+//!    a 1+1 mixed round; the high gain stays 1+1, and a live round after it
+//!    replays the 1+1 graph (#716: with the granted lane held to a grammar,
+//!    its run handed to the host, which keeps it whole); the low gain is
+//!    refused from then on; no round falls back. Captured again under
+//!    `IGNIS_MIXED_ROUNDS=0`, the load holds no mixed graph and a fresh
+//!    pair's granted round runs at the uniform shape `aggregate` gives it.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a **skip**; under the profile the same
@@ -77,7 +88,7 @@ use ignis_core::model_load::{load_qwen38_27b_with_decode_lanes, model_scope, Mod
 use ignis_core::seq::{snapshot_format_version, Seq, SeqPool, SeqPoolBudget};
 use ignis_core::step::{
     capture_decode_graphs, decode_program_verify_cut, decode_program_verify_forced_with, decode_program_verify_runs,
-    prefill_program_sampled, LaneVerifyRun, SamplingParams, TeacherForcing, VerifyLane,
+    prefill_program_sampled, program_stats, LaneVerifyRun, SamplingParams, TeacherForcing, VerifyLane,
 };
 use ignis_core::{
     DraftRule, DrafterSampling, ExceptionWeights, KvFormat, PrefillAttention, PrefillLinear, RopeScaling, ShapeEstimate, ShapePolicy,
@@ -96,6 +107,9 @@ const CHUNK: u32 = 128;
 const CONTEXT: u32 = 1536;
 /// The switch that forces a round's shape over the rule.
 const ROUND_SHAPE: &str = "IGNIS_ROUND_SHAPE";
+/// #715: the switch that captures the mixed rounds' graphs whatever the
+/// policy says, or none (`0`); unset, the shape policy decides.
+const MIXED_ROUNDS: &str = "IGNIS_MIXED_ROUNDS";
 /// The token budget of an exit: the anchor and 3 drafts, fewer than the stay
 /// threshold an extended round could take.
 const EXIT_BUDGET: u32 = 4;
@@ -199,7 +213,9 @@ fn shape(extended: bool) -> &'static str {
 /// rule and policy choose, lane i's drafts agreeing with its recording for
 /// its first `agree[i]`, so that the target accepts that many of a window
 /// that long: its shape, each lane's accept held to what the forcing gives
-/// it. The recordings walk `text` from `at`.
+/// it. The recordings walk `text` from `at`. A round of one shape for all
+/// its lanes ([`forced_lane_shapes`] for each lane's).
+#[allow(clippy::too_many_arguments)]
 fn forced_round(
     model: &Model,
     pool: &SeqPool,
@@ -210,6 +226,28 @@ fn forced_round(
     failures: &mut Vec<String>,
     what: &str,
 ) -> bool {
+    let shapes = forced_lane_shapes(model, pool, seqs, agree, text, at, failures, what);
+    // #713: each lane reports its own shape, the round's one under `all` and
+    // `aggregate`, which never mix.
+    let extended = shapes.iter().all(|&lane| lane);
+    if shapes.iter().any(|&lane| lane != extended) {
+        failures.push(format!("{what}: a mixed round under a policy that never mixes"));
+    }
+    extended
+}
+
+/// #715: [`forced_round`]'s round, each lane's shape, extended where `true`.
+#[allow(clippy::too_many_arguments)]
+fn forced_lane_shapes(
+    model: &Model,
+    pool: &SeqPool,
+    seqs: &mut [&mut Seq<'_>],
+    agree: &[u32],
+    text: &[i32],
+    at: usize,
+    failures: &mut Vec<String>,
+    what: &str,
+) -> Vec<bool> {
     let recordings: Vec<Vec<i32>> = (0..seqs.len())
         .map(|lane| (0..=WINDOW as usize).map(|j| text[(at + 3 * lane + j) % text.len()]).collect())
         .collect();
@@ -228,12 +266,6 @@ fn forced_round(
     let forcing = TeacherForcing { shape_window: None, drafts: Some(&draft_refs), lane_shapes: None };
     let runs = decode_program_verify_forced_with(model, pool, seqs, &lanes, WINDOW, &recording_refs, forcing)
         .unwrap_or_else(|e| panic!("{what}: {e}"));
-    // #713: each lane reports its own shape, the round's one under `all` and
-    // `aggregate`, which never mix.
-    let extended = runs.iter().all(|run| run.extended);
-    if runs.iter().any(|run| run.extended != extended) {
-        failures.push(format!("{what}: a mixed round under a policy that never mixes"));
-    }
     for (lane, (run, &agree)) in runs.iter().zip(agree).enumerate() {
         let window = if run.extended { WINDOW } else { BASE_WINDOW };
         let accepted = run.tokens.len() as u32 - 1;
@@ -245,7 +277,148 @@ fn forced_round(
             ));
         }
     }
-    extended
+    runs.iter().map(|run| run.extended).collect()
+}
+
+/// #715 (spec #711): the mixed rounds' graphs a load's capture made, held to
+/// what its shape policy asks with `IGNIS_MIXED_ROUNDS` unset: under `mixed`
+/// every mix the load's 8 lanes and its pool's GDN slots hold (all twelve,
+/// `ignis_core::lane_lines::mixed_graphs`), under `aggregate` and `all` none.
+fn mixed_graphs_captured(model: &Model, pool: &SeqPool, spec: Speculation, failures: &mut Vec<String>) {
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("stats: {e}"));
+    let asked = spec.shape_policy() == ShapePolicy::Mixed;
+    let held = ignis_core::lane_lines::mixed_graphs(Some(spec), false, asked, LANES, 0).mixes;
+    let what = format!("`{}`", spec.shape_policy().as_str());
+    println!(
+        "dflash2_round_shape_gpu {what}: mixed graphs asked {}, verify nodes {:?}, append nodes {:?}",
+        stats.mixed_graphs_asked, stats.mixed_verify_graph_nodes, stats.mixed_append_graph_nodes
+    );
+    if stats.mixed_graphs_asked != asked {
+        failures.push(format!("{what}: the capture asked for the mixed graphs: {}", stats.mixed_graphs_asked));
+    }
+    if asked && held.len() != ignis_core::lane_lines::MIXES.len() {
+        failures.push(format!("{what}: 8 lanes hold all twelve mixes, not {held:?}"));
+    }
+    for (at, mix) in ignis_core::lane_lines::MIXES.iter().enumerate() {
+        let captured = held.contains(mix);
+        if (stats.mixed_verify_graph_nodes[at] > 0, stats.mixed_append_graph_nodes[at] > 0) != (captured, captured) {
+            failures.push(format!(
+                "{what}: the {}+{} mix's graphs: {} verify nodes, {} append nodes, where the policy captures {}",
+                mix.0,
+                mix.1,
+                stats.mixed_verify_graph_nodes[at],
+                stats.mixed_append_graph_nodes[at],
+                if captured { "them" } else { "none" }
+            ));
+        }
+    }
+}
+
+/// #715: part 6 on the load under `mixed`: two fresh lanes through part 5's
+/// courses, each lane's shape held to the grant's. The lane that asks first
+/// has no estimate and is granted its extended round beside the base one, a
+/// mixed round of 1+1; with a high expected gain (every draft) every round
+/// after stays 1+1, and a live round after them is the 1+1 replayed from its
+/// graph (a teacher-forced round runs eagerly), #716: the granted lane held to
+/// a grammar, the host handed its run alone, by its caller's index, and
+/// keeping it whole, so the round is the one it would be without the host
+/// (a held lane is granted as any other); with a low one (7, nothing
+/// past them) the grant refuses it from then on. No round falls back to the uniform
+/// choice. Then the mixed graphs are captured again under
+/// `IGNIS_MIXED_ROUNDS=0` and none is left: the same lanes' next round runs
+/// at the uniform shape `aggregate` gives them, both extended.
+fn the_grant_on_forced_accepts(model: &Model, pool: &SeqPool, prompt: &[i32], failures: &mut Vec<String>) {
+    const ROUNDS: usize = 6;
+    let mixed_before = program_stats(model, pool).unwrap_or_else(|e| panic!("part 6: stats: {e}")).mixed_rounds;
+    // Lane 1 asks beside lane 0, so the granted round's rows are not the caller's order.
+    let (granted, refused) = ([false, true], [false, false]);
+    let courses: [(&str, u32, [[bool; 2]; ROUNDS]); 2] = [
+        ("a high expected gain", WINDOW, [refused, granted, granted, granted, granted, granted]),
+        ("a low expected gain", BASE_WINDOW, [refused, granted, refused, refused, refused, refused]),
+    ];
+    for (case, agree, shapes) in courses {
+        let mut lanes: Vec<Seq<'_>> = (0..2)
+            .map(|lane| {
+                let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("part 6: alloc lane {lane}: {e}"));
+                prefill_program_sampled(model, pool, &mut seq, prompt, 0, SamplingParams::greedy(), None)
+                    .unwrap_or_else(|e| panic!("part 6: prefill lane {lane}: {e}"));
+                seq
+            })
+            .collect();
+        let [a, b] = &mut lanes[..] else { unreachable!("two lanes") };
+        for (at, want) in shapes.iter().enumerate() {
+            let what = format!("part 6, `mixed`, {case} beside a lane that takes 2: round {at}");
+            let got = forced_lane_shapes(model, pool, &mut [&mut *a, &mut *b], &[2, agree], prompt, 5 * at, failures, &what);
+            println!("dflash2_round_shape_gpu {what}: {got:?}");
+            if got != want {
+                failures.push(format!("{what}: ran {got:?} where the grant gives {want:?}"));
+            }
+        }
+        // A teacher-forced round runs eagerly: a live round of the same lanes, the
+        // asking lane's estimate paying its grant and the other not asking, is the
+        // grant's 1+1 replayed from its graph. #716: the granted lane held to a
+        // grammar, whose run the host keeps whole.
+        if shapes[ROUNDS - 1] == granted {
+            let what = format!("part 6, `mixed`, {case}: a live round, lane 1 held to a grammar");
+            let lanes = vec![VerifyLane::greedy(&[]); 2];
+            let mut handed = Vec::new();
+            let mut cut = |lane: usize, run: &[i32]| -> usize {
+                handed.push(lane);
+                run.len()
+            };
+            let runs = decode_program_verify_cut(model, pool, &mut [&mut *a, &mut *b], &lanes, WINDOW, &[false, true], &mut cut)
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("{what}: stats: {e}"));
+            let got: Vec<(bool, u32)> = runs.iter().map(|run| (run.extended, run.extent)).collect();
+            println!("dflash2_round_shape_gpu {what}: {got:?}, graph launches {}, the host handed lanes {handed:?}", stats.graph_launches);
+            if got != [(false, BASE_WINDOW), (true, WINDOW)] || stats.graph_launches != 1 {
+                failures.push(format!(
+                    "{what}: ran {got:?} with {} graph launches, not the 1+1 round from its graph",
+                    stats.graph_launches
+                ));
+            }
+            if handed != [1] {
+                failures.push(format!("{what}: the host was handed lanes {handed:?}, not the held lane 1 alone"));
+            }
+        }
+    }
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("part 6: stats: {e}"));
+    // GitHub #719: the program's stats count the rounds each mix ran: the high course's five granted
+    // rounds and its live one, the low course's one, all at 1+1 (the first of the mixes).
+    let mixed: Vec<u64> = stats.mixed_rounds.iter().zip(mixed_before).map(|(after, before)| after - before).collect();
+    if mixed[0] != 7 || mixed[1..].iter().any(|&rounds| rounds != 0) {
+        failures.push(format!("part 6: the mixed rounds each mix ran: {mixed:?}, not seven at 1+1"));
+    }
+    if stats.mixed_fallback_rounds != [0, 0] {
+        failures.push(format!("part 6: rounds fell back to the uniform choice: {:?}", stats.mixed_fallback_rounds));
+    }
+    // Mixed off by a re-capture on the same load: the high-gain course's
+    // first two rounds again, the lane that asks with no estimate granted the
+    // uniform extended round `aggregate` gives it, not a mix.
+    set(MIXED_ROUNDS, Some("0"));
+    capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("part 6: capture under {MIXED_ROUNDS}=0: {e}"));
+    set(MIXED_ROUNDS, None);
+    let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("part 6: stats: {e}"));
+    if stats.mixed_graphs_asked || stats.mixed_verify_graph_nodes.iter().any(|&nodes| nodes > 0) {
+        failures.push(format!("part 6: {MIXED_ROUNDS}=0 left mixed graphs: {:?}", stats.mixed_verify_graph_nodes));
+    }
+    let mut lanes: Vec<Seq<'_>> = (0..2)
+        .map(|lane| {
+            let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("part 6: alloc lane {lane}: {e}"));
+            prefill_program_sampled(model, pool, &mut seq, prompt, 0, SamplingParams::greedy(), None)
+                .unwrap_or_else(|e| panic!("part 6: prefill lane {lane}: {e}"));
+            seq
+        })
+        .collect();
+    let [a, b] = &mut lanes[..] else { unreachable!("two lanes") };
+    for (at, want) in [refused, [true, true]].iter().enumerate() {
+        let what = format!("part 6, `mixed` with the mixed graphs off: round {at}");
+        let got = forced_lane_shapes(model, pool, &mut [&mut *a, &mut *b], &[WINDOW, 2], prompt, 5 * at, failures, &what);
+        println!("dflash2_round_shape_gpu {what}: {got:?}");
+        if got != want {
+            failures.push(format!("{what}: ran {got:?} where `aggregate` gives {want:?}"));
+        }
+    }
 }
 
 /// #690: part 5 on a load under `policy`: two fresh lanes through the
@@ -370,11 +543,14 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
         )
         .unwrap_or_else(|e| panic!("pool: {e}"));
         set(ROUND_SHAPE, None);
+        set(MIXED_ROUNDS, None);
         capture_decode_graphs(&model, &pool).unwrap_or_else(|e| panic!("capture: {e}"));
         (model, pool)
     };
     {
         let (model, pool) = load(spec);
+        // #715: `all` captures no mixed graph.
+        mixed_graphs_captured(&model, &pool, spec, &mut failures);
         let fresh = |what: &str| {
             let mut seq = pool.alloc(CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
             prefill_program_sampled(&model, &pool, &mut seq, &prompt, 0, SamplingParams::greedy(), None)
@@ -587,7 +763,16 @@ fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and
     }
     {
         let (model, pool) = load(aggregate);
+        // #715: nor does `aggregate`.
+        mixed_graphs_captured(&model, &pool, aggregate, &mut failures);
         the_policy_on_forced_accepts(&model, &pool, ShapePolicy::Aggregate, &prompt, &mut failures);
+    }
+    // 6. #715: `mixed` captures every mix's graphs and grants lane by lane.
+    {
+        let mixed = aggregate.with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::default());
+        let (model, pool) = load(mixed);
+        mixed_graphs_captured(&model, &pool, mixed, &mut failures);
+        the_grant_on_forced_accepts(&model, &pool, &prompt, &mut failures);
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));

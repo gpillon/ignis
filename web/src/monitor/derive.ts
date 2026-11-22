@@ -200,6 +200,8 @@ export type Speculation = {
   byPosition: (number | null)[];
   /** Verify rounds run at the extended shape over all verify rounds, in the window (#689); null where the shape family is not printed or no round ran. */
   extendedShare: number | null;
+  /** Verify rounds that were mixed rounds over all verify rounds, in the window (#719); null where the server does not print the mixed shape or no round ran. */
+  mixedShare: number | null;
 };
 
 /**
@@ -766,6 +768,8 @@ export function deriveSpeculation(points: Point[], since: number): Speculation {
   );
   const baseRounds = increaseOver(points, (s) => s.speculation?.shapeRounds?.base ?? null, since);
   const extendedRounds = increaseOver(points, (s) => s.speculation?.shapeRounds?.extended ?? null, since);
+  const mixedRounds = increaseOver(points, (s) => s.speculation?.shapeRounds?.mixed ?? null, since);
+  const shapedRounds = baseRounds !== null && extendedRounds !== null ? baseRounds + extendedRounds + (mixedRounds ?? 0) : null;
   return {
     rounds,
     drafted,
@@ -774,7 +778,8 @@ export function deriveSpeculation(points: Point[], since: number): Speculation {
     tokensPerRound:
       rounds.window !== null && accepted.window !== null && rounds.window > 0 ? (rounds.window + accepted.window) / rounds.window : null,
     byPosition,
-    extendedShare: shareOf(extendedRounds, baseRounds !== null && extendedRounds !== null ? baseRounds + extendedRounds : null),
+    extendedShare: shareOf(extendedRounds, shapedRounds),
+    mixedShare: shareOf(mixedRounds, shapedRounds),
   };
 }
 

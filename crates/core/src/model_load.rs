@@ -147,6 +147,11 @@ pub(crate) mod ffi {
         /// beside the lanes': read to plan the mixed graphs alone; 0 on
         /// Flash-Next.
         pub retained_device_slots: u32,
+        /// GitHub #715: the cost table's mixed entries, in
+        /// [`crate::lane_lines::MIXES`]' order, in thousandths
+        /// ([`crate::speculation::PeriodTable::mixed`]), read by the shape
+        /// policy `mixed` alone; 0 is each's default.
+        pub shape_mixed_period_ratios: [u32; 12],
     }
 
     /// 1:1 with `struct ignis_moe_slot` (`kernel/include/ignis_moe.h`): an
@@ -575,6 +580,7 @@ fn load_options(
             shape_period_ratios: speculation.map_or([0; 4], |s| s.shape_estimate().period_ratios_milli()),
             // GitHub #714: set by the loads that name their pool's slots.
             retained_device_slots: 0,
+            shape_mixed_period_ratios: speculation.map_or([0; 12], |s| s.shape_estimate().period_table().mixed()),
         }
     })
 }
@@ -1303,6 +1309,7 @@ fn flash_next_options(
         shape_estimate_rounds: 0,
         shape_period_ratios: [0; 4],
         retained_device_slots: 0,
+        shape_mixed_period_ratios: [0; 12],
     }
 }
 
@@ -1893,13 +1900,24 @@ mod tests {
         assert_eq!((options.draft_tokens, options.shape_enter_accepted, options.shape_stay_accepted), (15, 5, 12));
         // GitHub #690: and the shape policy, `aggregate` at its defaults unless named.
         assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (0, 16, [1128, 1290, 1363, 1344]));
+        // GitHub #715: and the cost table's mixed entries, the defaults unless named.
+        assert_eq!(options.shape_mixed_period_ratios, [1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336]);
         let all = wide.with_shape_policy(
             crate::speculation::ShapePolicy::All,
-            crate::speculation::ShapeEstimate::new(8, [1000, 1200, 1300, 2000]).unwrap(),
+            crate::speculation::ShapeEstimate::new(8, crate::speculation::PeriodTable::with_uniform([1000, 1200, 1300, 2000]).unwrap())
+                .unwrap(),
         );
         let options = load_options(Some(all), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
             .expect("options");
         assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (1, 8, [1000, 1200, 1300, 2000]));
+        let rows: Vec<Vec<u32>> = (1..=7).map(|lanes| vec![1500; crate::speculation::PeriodTable::row_entries(lanes) as usize]).collect();
+        let mixed = wide.with_shape_policy(
+            crate::speculation::ShapePolicy::Mixed,
+            crate::speculation::ShapeEstimate::new(16, crate::speculation::PeriodTable::from_rows(&rows).unwrap()).unwrap(),
+        );
+        let options = load_options(Some(mixed), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES)
+            .expect("options");
+        assert_eq!((options.shape_policy, options.shape_period_ratios, options.shape_mixed_period_ratios), (2, [1500; 4], [1500; 12]));
     }
 
     #[test]
@@ -1989,8 +2007,11 @@ mod tests {
         // four period ratios, six uint32.
         // GitHub #714: then the pool's device retained slots, a uint32,
         // padded to the pointer's alignment.
-        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 144);
+        // GitHub #715: then the cost table's twelve mixed entries, uint32,
+        // in that padding and on, padded to the pointer's alignment.
+        assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 192);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, retained_device_slots), 136);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_mixed_period_ratios), 140);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_policy), 112);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_estimate_rounds), 116);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_period_ratios), 120);
