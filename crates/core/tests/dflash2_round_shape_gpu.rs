@@ -23,8 +23,9 @@
 //! mirror of every lane's ask, written from the spec's rule (enter after a
 //! base round that drafted all 7 and had all 7 taken, stay while an extended
 //! round takes 6, a base round its budget cut short changes nothing), feeds
-//! it each round's extent and accept, and holds every round's shape
-//! ([`LaneVerifyRun::extended`]) to what the mirror predicts. Where the text
+//! it each round's extent and accept, and holds every lane's shape
+//! ([`LaneVerifyRun::extended`], #713: each lane's own, which under `all` and
+//! `aggregate` are the round's one) to what the mirror predicts. Where the text
 //! must not decide, the round's token budget does: an extended round under a
 //! budget of 4 tokens takes at most 3 drafts and sends its lane back. Each
 //! part also asserts that the cases it is about happened, so a text that
@@ -158,28 +159,34 @@ fn round(
     let lanes = vec![VerifyLane { remaining_tokens: budget, ..VerifyLane::greedy(&[]) }; seqs.len()];
     let runs: Vec<LaneVerifyRun> = decode_program_verify_runs(model, pool, seqs, &lanes, WINDOW).unwrap_or_else(|e| panic!("{what}: {e}"));
     set(ROUND_SHAPE, None);
-    let extended = runs[0].extended;
+    // #713: each lane reports its own shape; a round under `all` or
+    // `aggregate` is never mixed, so they are the round's one.
+    let extended = runs.iter().all(|run| run.extended);
     if runs.iter().any(|run| run.extended != extended) {
-        failures.push(format!("{what}: one round, lanes of two shapes"));
+        failures.push(format!("{what}: a mixed round under a policy that never mixes"));
     }
     println!(
-        "dflash2_round_shape_gpu {what}: {} lanes asking {asks:?}, {} (expected {}), accepts {:?}",
+        "dflash2_round_shape_gpu {what}: {} lanes asking {asks:?}, {:?} (expected {}), accepts {:?}",
         asks.len(),
-        if extended { "extended" } else { "base" },
+        runs.iter().map(|run| if run.extended { "extended" } else { "base" }).collect::<Vec<_>>(),
         if want { "extended" } else { "base" },
         runs.iter().map(|run| run.tokens.len() - 1).collect::<Vec<_>>()
     );
-    if extended != want {
-        failures.push(format!("{what}: lanes asking {asks:?} ran {} where the rule gives {}", shape(extended), shape(want)));
-    }
-    let window = if extended { WINDOW } else { BASE_WINDOW };
-    let expected_extent = if budget == 0 { window } else { window.min(budget - 1) };
     for (lane, run) in runs.iter().enumerate() {
+        if run.extended != want {
+            failures.push(format!(
+                "{what}: lane {lane} of lanes asking {asks:?} ran {} where the rule gives {}",
+                shape(run.extended),
+                shape(want)
+            ));
+        }
+        let window = if run.extended { WINDOW } else { BASE_WINDOW };
+        let expected_extent = if budget == 0 { window } else { window.min(budget - 1) };
         if run.extent != expected_extent {
-            failures.push(format!("{what}: lane {lane} drafted {} at its round's shape, not {expected_extent}", run.extent));
+            failures.push(format!("{what}: lane {lane} drafted {} at its shape, not {expected_extent}", run.extent));
         }
         let accepted = run.tokens.len() as u32 - 1;
-        asks[lane] = asks_after(rule, asks[lane], extended, run.extent, accepted);
+        asks[lane] = asks_after(rule, asks[lane], run.extended, run.extent, accepted);
     }
     extended
 }
@@ -218,15 +225,17 @@ fn forced_round(
     let recording_refs: Vec<&[i32]> = recordings.iter().map(Vec::as_slice).collect();
     let draft_refs: Vec<&[i32]> = drafts.iter().map(Vec::as_slice).collect();
     let lanes = vec![VerifyLane::greedy(&[]); seqs.len()];
-    let forcing = TeacherForcing { shape_window: None, drafts: Some(&draft_refs) };
+    let forcing = TeacherForcing { shape_window: None, drafts: Some(&draft_refs), lane_shapes: None };
     let runs = decode_program_verify_forced_with(model, pool, seqs, &lanes, WINDOW, &recording_refs, forcing)
         .unwrap_or_else(|e| panic!("{what}: {e}"));
-    let extended = runs[0].extended;
+    // #713: each lane reports its own shape, the round's one under `all` and
+    // `aggregate`, which never mix.
+    let extended = runs.iter().all(|run| run.extended);
     if runs.iter().any(|run| run.extended != extended) {
-        failures.push(format!("{what}: one round, lanes of two shapes"));
+        failures.push(format!("{what}: a mixed round under a policy that never mixes"));
     }
-    let window = if extended { WINDOW } else { BASE_WINDOW };
     for (lane, (run, &agree)) in runs.iter().zip(agree).enumerate() {
+        let window = if run.extended { WINDOW } else { BASE_WINDOW };
         let accepted = run.tokens.len() as u32 - 1;
         if (run.extent, accepted) != (window, agree.min(window)) {
             failures.push(format!(
