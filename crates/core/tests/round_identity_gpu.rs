@@ -254,6 +254,8 @@
 //! each after a capture again, so that each cell's period on the GPU clock
 //! stands beside the base rounds of every column count, one leg of the
 //! table's measurement on the load (the NVFP4 body's or the trellis body's).
+//! #721: `IGNIS_ROUND_IDENTITY_TIMING_TABLE=reverse` rides the same cells in
+//! the reverse order, so that legs alternating the two orders are mirrored.
 //!
 //! # Narrow runs
 //!
@@ -1649,15 +1651,22 @@ fn ride_timed(model: &Model, pool: &SeqPool, load: &Load, script: &Script, round
 /// after its line here: an entry is its cell's period over the base round's at
 /// its lane count, and a mix of `w` extended lanes stands beside the base round
 /// of `w` lanes more, its columns. Nothing is compared.
-fn time_cost_table(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, label: &str) {
-    for width in 1..=load.lanes {
-        let cells = 0..=ignis_core::PeriodTable::row_entries(width);
-        for extended in cells {
-            let shapes: Vec<bool> = (0..width).map(|lane| lane >= width - extended).collect();
-            capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
-            println!("round_identity_gpu {label}: the cost table's cell of {width} lanes, {extended} of them extended");
-            ride_timed(model, pool, load, script, rounds, &shapes, label);
-        }
+/// #721: `reverse` rides the same cells in the reverse order, the widest
+/// lane count first and each row from its most extended lanes to its base
+/// round, so that legs alternating the two orders mirror what drifts over a
+/// leg.
+fn time_cost_table(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, reverse: bool, label: &str) {
+    let mut cells: Vec<(u32, u32)> = (1..=load.lanes)
+        .flat_map(|width| (0..=ignis_core::PeriodTable::row_entries(width)).map(move |extended| (width, extended)))
+        .collect();
+    if reverse {
+        cells.reverse();
+    }
+    for (width, extended) in cells {
+        let shapes: Vec<bool> = (0..width).map(|lane| lane >= width - extended).collect();
+        capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
+        println!("round_identity_gpu {label}: the cost table's cell of {width} lanes, {extended} of them extended");
+        ride_timed(model, pool, load, script, rounds, &shapes, label);
     }
 }
 
@@ -1907,11 +1916,11 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         let timed = arm.switches.contains(&("IGNIS_ROUND_TIMING", "1")) && arm.switches.contains(&(MIXED_ROUNDS, "1"));
         let rounds = std::env::var("IGNIS_ROUND_IDENTITY_TIMING_ROUNDS").ok().and_then(|value| value.parse::<u32>().ok());
         if let (true, true, Some(rounds)) = (timed, load.mixes(), rounds) {
-            // #720: or every cell of the cost table, where asked.
-            if std::env::var("IGNIS_ROUND_IDENTITY_TIMING_TABLE").is_ok_and(|value| value == "1") {
-                time_cost_table(model, pool, load, script, rounds, label);
-            } else {
-                time_mixed_rounds(model, pool, load, script, rounds, label);
+            // #720: or every cell of the cost table, where asked (#721: in either order).
+            match std::env::var("IGNIS_ROUND_IDENTITY_TIMING_TABLE").as_deref() {
+                Ok("1") => time_cost_table(model, pool, load, script, rounds, false, label),
+                Ok("reverse") => time_cost_table(model, pool, load, script, rounds, true, label),
+                _ => time_mixed_rounds(model, pool, load, script, rounds, label),
             }
         }
     }

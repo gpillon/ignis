@@ -490,9 +490,12 @@ rounds at the base shape, then `n` at each count of extended lanes 64 columns
 hold (the last lanes extended, all of them the uniform extended round), each
 after a capture again, so that each cell prints a line here and then its own
 `verify`, `verify extended` or `verify mixed` lines. An entry is its cell's
-period over the base round's at its lane count, and each mix stands beside the
-base round of its columns. One run is one leg of the table's measurement on
-its load, the NVFP4 artifact's or the trellis artifact's:
+period over the base round's at its lane count, read within one run, and each
+mix stands beside the base round of its columns. One run is one leg of the
+table's measurement on its load, the NVFP4 artifact's or the trellis
+artifact's; `IGNIS_ROUND_IDENTITY_TIMING_TABLE=reverse` rides the same cells in
+the reverse order, the widest lane count first, so that legs run forward,
+reverse, reverse and forward are mirrored:
 
 ```sh
 make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=trellis-24gb-w15-rule IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 IGNIS_ROUND_IDENTITY_TIMING_TABLE=1 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
