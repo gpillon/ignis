@@ -92,9 +92,8 @@
 //! beside `n` at the base shape, one of the twelve mixes
 //! ([`ignis_core::lane_lines::MIXES`]), and is held to the base round's
 //! class as the extended round is, with the same method, margins and
-//! windows. On the same load (no new load: the NVFP4 cell's, [`Cell::mixed`];
-//! a trellis body's, which runs them from #720, waits on the owner's reading of
-//! its first run), speculation off writes the text of seven
+//! windows. On the same load (no new load: each cell's, [`Cell::mixed`]; on
+//! the trellis body bit for bit, below), speculation off writes the text of seven
 //! prompts of its own ([`MIXED_PROMPTS`]), one a lane, its rows over a uniform
 //! cell's window ([`MAX_TOKENS`]) and its text on past it
 //! ([`MIXED_TEXT_TOKENS`]), and the decode graphs are captured again under
@@ -119,6 +118,25 @@
 //! class at each lane count (over its mixes) and over the kind's; the control,
 //! one index off, over the kind's; and the near tie over the kind's, read, as
 //! the extended rows' is, over the uniform cells' base rows of the kind.
+//!
+//! On the trellis body (#720) a lane's rows follow its round's columns, not its
+//! lane count: the trellis projection routes by the call's token count, and on
+//! the RTX 5090 a lane's rows are the same bits in every round of 24 to 56
+//! columns, of either kind, where a graph round of 64 gives its own (its
+//! drafter's drafts, and so the lane's rounds, move on two prompts). So the
+//! base leg at the lane count is no reference there (a mix of 2 lanes is a
+//! round of 24 columns, that leg's 16), and the owner decided on 2026-11-23
+//! that each mixed row is held to the row of a uniform round of its own shape
+//! at its round's columns, bit for bit, as it is ([`MixedRows::Uniform`], ADR
+//! 0106): in each kind, uniform legs at one width on the mixed prompts' texts,
+//! every lane riding until each holds a uniform cell's rows, so that no round
+//! narrows, as no mixed round does ([`fixed_leg`]): for the mixes of 24 to 56
+//! columns 7 base lanes (56 columns) and 3 extended (48: the extended shape has
+//! no round of 24, 40 or 56), for the three of 64 8 base lanes and 4 extended;
+//! then every mix as above, each lane riding at its mix to [`MAX_TOKENS`] rows,
+//! every one of them its prompt's row in the uniform leg of its shape. The
+//! uniform rounds are held to the class by the uniform cells above; no mixed
+//! row is read against a base row there.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a **skip**; under the profile the same
@@ -171,7 +189,9 @@ use logit_drift::{row_drift, within, RowDrift};
 // mixes at 2 to 7 lanes on the seven prompts of their own, each lane held over
 // the uniform cells' window, forced rounds over 12,096 mixed rows (224 a lane)
 // and graph rounds over 11,887 (217 to 223 a lane), each against the base rows
-// at the same lane count.
+// at the same lane count. #720: on the trellis cell, its run of 2026-11-23,
+// 12,096 forced and 12,096 graph mixed rows (224 a lane), each of them its
+// uniform leg's bit for bit, so none is read by these bounds.
 
 /// The extended row against the base row after the same tokens: no logit
 /// further than this, in BF16 ulps at the base row's largest magnitude.
@@ -300,16 +320,28 @@ struct Cell {
     name: &'static str,
     artifact: &'static str,
     exceptions: ExceptionWeights,
-    /// #717: whether the mixed rounds' class is held on it too. A trellis
-    /// body runs them from #720, its cell's class there waiting on the owner.
-    mixed: bool,
+    /// #717: how the mixed rounds' class is held on it (#720: the trellis
+    /// body's too).
+    mixed: MixedRows,
+}
+
+/// #720: how a cell's mixed rows are held (ADR 0106).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MixedRows {
+    /// #717: each mixed row against the base row at the same text index and
+    /// lane count, by the class's bounds, as the extended rows are.
+    Class,
+    /// #720: each mixed row bit for bit the row of a uniform round of its
+    /// lane's shape at its round's columns
+    /// ([`hold_the_mixed_rows_bit_for_bit`]).
+    Uniform,
 }
 
 /// The NVFP4 body the RTX 5090 profile serves, under FP8 exception weights.
-const NVFP4: Cell = Cell { name: "nvfp4", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer", exceptions: ExceptionWeights::Fp8, mixed: true };
+const NVFP4: Cell = Cell { name: "nvfp4", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_nvfp4full-v2.ninfer", exceptions: ExceptionWeights::Fp8, mixed: MixedRows::Class };
 /// #695: the trellis body the 16 GB and 24 GB profiles load (the `sc30`
 /// artifact), which holds no BF16 exception tensor: `bf16` is its own.
-const TRELLIS: Cell = Cell { name: "trellis", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer", exceptions: ExceptionWeights::Bf16, mixed: false };
+const TRELLIS: Cell = Cell { name: "trellis", artifact: "F:/ai/q38/ninfer-models/qwen3_8_27b_trellis_sc30-v2.ninfer", exceptions: ExceptionWeights::Bf16, mixed: MixedRows::Uniform };
 
 /// The load: the widest DFlash2 window, at the served lanes, prefill chunk and
 /// context. The context is the envelope the rounds' attention splits by, so it
@@ -670,6 +702,45 @@ fn mixed_leg(
     (rows, rounds)
 }
 
+/// #720: the rows a uniform leg at one width gives each lane of `group`, by
+/// text index, at most `held[l]` to lane `l`: every round of `kind` at
+/// `shape`, from the prompt on, every lane riding until each holds its rows or
+/// a lane's text holds no whole round, so that no round narrows, as no mixed
+/// leg's does. A lane held to no row rides only to fill out the width.
+#[allow(clippy::too_many_arguments)]
+fn fixed_leg(
+    model: &Model,
+    pool: &SeqPool,
+    prompts: &[Vec<i32>],
+    texts: &[Vec<i32>],
+    group: &[usize],
+    shape: Shape,
+    kind: Kind,
+    held: &[usize],
+    what: &str,
+) -> Vec<Vec<Vec<u16>>> {
+    let greedy = SamplingParams::greedy();
+    let mut seqs: Vec<Seq<'_>> = Vec::new();
+    for &p in group {
+        let mut seq = pool.alloc(MIXED_SEQ_CONTEXT).unwrap_or_else(|e| panic!("{what}: alloc: {e}"));
+        prefill_program_permitted(model, pool, &mut seq, &prompts[p], 0, greedy, &[texts[p][0]], None)
+            .unwrap_or_else(|e| panic!("{what}: prefill: {e}"));
+        seqs.push(seq);
+    }
+    let mut rows: Vec<Vec<Vec<u16>>> = vec![Vec::new(); group.len()];
+    let mut at: Vec<usize> = vec![0; group.len()];
+    let lane_texts: Vec<&[i32]> = group.iter().map(|&p| texts[p].as_slice()).collect();
+    while (0..group.len()).any(|l| rows[l].len() < held[l]) && (0..group.len()).all(|l| at[l] + shape.columns() < lane_texts[l].len()) {
+        let round_rows = forced_round(model, pool, &mut seqs, &lane_texts, &at, shape, kind, what);
+        for (l, lane_rows) in round_rows.into_iter().enumerate() {
+            at[l] += lane_rows.len();
+            let room = held[l].saturating_sub(rows[l].len());
+            rows[l].extend(lane_rows.into_iter().take(room));
+        }
+    }
+    rows
+}
+
 /// The `p`-th quantile of `values` (nearest rank), 0 where there is none.
 fn quantile(values: &[f32], p: f64) -> f32 {
     let mut sorted = values.to_vec();
@@ -831,7 +902,8 @@ fn an_extended_rounds_rows_are_the_base_rounds_class() {
 
 /// #695: the same on the trellis body, at the same lanes, chunk and context
 /// (the 16 GB profile's context and chunk; 8 lanes, the 24 GB profile's, so
-/// that the extended shape runs its 4).
+/// that the extended shape runs its 4; #720: and its mixed rounds, every mix at
+/// those 8 lanes, bit for bit).
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 fn on_the_trellis_body_an_extended_rounds_rows_are_the_base_rounds_class() {
@@ -894,7 +966,7 @@ fn hold_the_class(cell: &Cell) {
         )
         .unwrap_or_else(|e| panic!("model load: {e}"));
         // #717: a mixed leg's sequences hold its longer texts.
-        let context = if cell.mixed { MIXED_SEQ_CONTEXT } else { SEQ_CONTEXT };
+        let context = MIXED_SEQ_CONTEXT;
         let pool = SeqPool::create_with_speculation(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
@@ -963,9 +1035,7 @@ fn hold_the_class(cell: &Cell) {
         }
 
         // #717: the mixed rounds' class, on the same load.
-        if cell.mixed {
-            hold_the_mixed_class(&model, &pool, &frontend, base_widest, &mut failures);
-        }
+        hold_the_mixed_class(&model, &pool, &frontend, base_widest, cell.mixed, &mut failures);
     }
     artifact.release_arena(&mut device).unwrap_or_else(|e| panic!("release: {e}"));
     assert!(failures.is_empty(), "{}: {} excesses, the first of them:\n{}", cell.name, failures.len(),failures.iter().take(24).cloned().collect::<Vec<_>>().join("\n"));
@@ -1129,8 +1199,10 @@ fn hold_lane(
 /// riding at its mix until each lane holds the rows its base leg gave it; each
 /// lane's mixed rows held to its base rows, the class at each lane count and
 /// over the kind's, in both kinds of round, the near tie read over the uniform
-/// cells' base rows of the kind, `base_widest` (ADR 0106).
-fn hold_the_mixed_class(model: &Model, pool: &SeqPool, frontend: &FrontendSet, base_widest: [f32; 2], failures: &mut Vec<String>) {
+/// cells' base rows of the kind, `base_widest` (ADR 0106). #720: on a cell
+/// whose mixed rows are held as [`MixedRows::Uniform`], after the capture,
+/// [`hold_the_mixed_rows_bit_for_bit`] in place of the legs at each lane count.
+fn hold_the_mixed_class(model: &Model, pool: &SeqPool, frontend: &FrontendSet, base_widest: [f32; 2], hold: MixedRows, failures: &mut Vec<String>) {
     let began = std::time::Instant::now();
     let mut prompts: Vec<Vec<i32>> = Vec::new();
     let mut texts: Vec<Vec<i32>> = Vec::new();
@@ -1174,6 +1246,15 @@ fn hold_the_mixed_class(model: &Model, pool: &SeqPool, frontend: &FrontendSet, b
     }
     let most = MIXES.iter().map(|&(w, n)| (w + n) as usize).max().expect("twelve mixes");
     assert!(prompts.len() >= most, "{} prompts for a mix of {most} lanes", prompts.len());
+    if hold == MixedRows::Uniform {
+        drop(rows_off);
+        hold_the_mixed_rows_bit_for_bit(model, pool, &prompts, &texts, failures);
+        println!(
+            "extended_round_class_gpu: the mixed rounds' rows took {:.0} s, {texts_took:.0} s of it speculation off's texts",
+            began.elapsed().as_secs_f64()
+        );
+        return;
+    }
     for (k, kind) in [Kind::Forced, Kind::Graph].into_iter().enumerate() {
         let mut kind_class = Class::default();
         for lanes in 2..=most {
@@ -1216,4 +1297,110 @@ fn hold_the_mixed_class(model: &Model, pool: &SeqPool, frontend: &FrontendSet, b
         "extended_round_class_gpu: the mixed rounds' class took {:.0} s, {texts_took:.0} s of it speculation off's texts",
         began.elapsed().as_secs_f64()
     );
+}
+
+/// #720: the trellis cell's mixed rows, each bit for bit the row of a uniform
+/// round of its lane's shape at its round's columns (ADR 0106). A mix's round
+/// is `16w + 8n` columns, 24 to 64; on the RTX 5090 a lane's rows are the same
+/// bits in every round of 24 to 56 columns and its own in one of 64, so one
+/// uniform round of each shape stands for each: below the widest mixes'
+/// columns the widest round of the shape under them (7 base lanes, 56 columns;
+/// 3 extended, 48), at them the uniform round of as many (8 base lanes, 4
+/// extended). In each kind and for each, the uniform legs of both shapes on
+/// every prompt its mixes' lanes of that shape take ([`fixed_leg`]: a leg from
+/// each such prompt not yet held, `width` prompts on, ending by the last prompt
+/// where it can and past it on the first again), then each of its mixes, its
+/// lanes and its extended group as [`hold_the_mixed_class`]'s, every lane
+/// riding at the mix to [`MAX_TOKENS`] rows and each of them its prompt's row
+/// in the uniform leg of its shape; each excess a line in `failures`.
+fn hold_the_mixed_rows_bit_for_bit(model: &Model, pool: &SeqPool, prompts: &[Vec<i32>], texts: &[Vec<i32>], failures: &mut Vec<String>) {
+    let columns = |w: u32, n: u32| w as usize * Shape::Extended.columns() + n as usize * Shape::Base.columns();
+    let widest = MIXES.iter().map(|&(w, n)| columns(w, n)).max().expect("twelve mixes");
+    // The lanes of the uniform round of `shape` that stands for a mix's round,
+    // at the widest mixes' columns or below them.
+    let standing = |shape: Shape, at_widest: bool| (if at_widest { widest } else { widest - 1 }) / shape.columns();
+    for kind in [Kind::Forced, Kind::Graph] {
+        let (mut lanes_held, mut rows_held, mut identical) = (0usize, 0usize, 0usize);
+        for at_widest in [false, true] {
+            let mixes: Vec<(u32, u32)> = MIXES.iter().copied().filter(|&(w, n)| (columns(w, n) == widest) == at_widest).collect();
+            // Each shape's uniform rows of every prompt a lane of that shape
+            // takes in these mixes, by its stats index and prompt.
+            let mut uniform: [Vec<Vec<Vec<u16>>>; 2] = [vec![Vec::new(); prompts.len()], vec![Vec::new(); prompts.len()]];
+            for shape in [Shape::Base, Shape::Extended] {
+                let width = standing(shape, at_widest);
+                let mut taken: Vec<usize> =
+                    mixes.iter().flat_map(|&(w, n)| (0..(w + n) as usize).filter(move |&l| shape_of(l >= n as usize) == shape)).collect();
+                taken.sort_unstable();
+                taken.dedup();
+                let mut legs: Vec<Vec<usize>> = Vec::new();
+                for &p in &taken {
+                    if !legs.iter().any(|leg| leg.contains(&p)) {
+                        let start = p.min(prompts.len().saturating_sub(width));
+                        legs.push((start..start + width).map(|q| q % prompts.len()).collect());
+                    }
+                }
+                for group in legs {
+                    // Each prompt's rows once, where a mix takes them.
+                    let held: Vec<usize> = group
+                        .iter()
+                        .enumerate()
+                        .map(|(l, &p)| if taken.contains(&p) && !group[..l].contains(&p) && uniform[shape.stats_index()][p].is_empty() { MAX_TOKENS } else { 0 })
+                        .collect();
+                    let what = format!("{kind:?} uniform rounds at the {shape:?} shape, {width} lanes ({} columns), mixed prompts {group:?}", width * shape.columns());
+                    let rows = fixed_leg(model, pool, prompts, texts, &group, shape, kind, &held, &what);
+                    for (l, lane_rows) in rows.into_iter().enumerate() {
+                        if held[l] > 0 {
+                            uniform[shape.stats_index()][group[l]] = lane_rows;
+                        }
+                    }
+                }
+            }
+            for &(w, n) in &mixes {
+                let lanes = (w + n) as usize;
+                let group: Vec<usize> = (0..lanes).collect();
+                let extended: Vec<bool> = (0..lanes).map(|l| l >= n as usize).collect();
+                let what = format!("{kind:?} rounds at the mix {w}+{n}, {} columns, mixed prompts {group:?}", columns(w, n));
+                let (mixed, rounds) = mixed_leg(model, pool, prompts, texts, &group, &extended, &vec![MAX_TOKENS; lanes], kind, &what);
+                let mut mix_identical = 0;
+                for (l, &p) in group.iter().enumerate() {
+                    let shape = shape_of(extended[l]);
+                    let width = standing(shape, at_widest);
+                    let lane = format!("{what}, lane {l} (prompt {p}, {shape:?})");
+                    let reference = &uniform[shape.stats_index()][p];
+                    // Every lane at a uniform cell's rows, against as many:
+                    // a short one means a text ran out first.
+                    if mixed[l].len() != MAX_TOKENS || reference.len() != MAX_TOKENS {
+                        failures.push(format!(
+                            "{lane}: {} rows at the mix and {} in the uniform leg at {width} lanes, where each holds {MAX_TOKENS}",
+                            mixed[l].len(),
+                            reference.len()
+                        ));
+                        continue;
+                    }
+                    let same = mixed[l].iter().zip(reference).filter(|(row, uniform_row)| row == uniform_row).count();
+                    if let Some(i) = (0..MAX_TOKENS).find(|&i| mixed[l][i] != reference[i]) {
+                        failures.push(format!(
+                            "{lane}: {same} of its {MAX_TOKENS} rows are the uniform round's at the {shape:?} shape and {} columns ({width} lanes) bit for bit; the first that is not, row {i}, sits {:.1} ulps from it",
+                            width * shape.columns(),
+                            row_drift(&reference[i], &mixed[l][i]).ulps
+                        ));
+                    }
+                    mix_identical += same;
+                    rows_held += MAX_TOKENS;
+                    lanes_held += 1;
+                }
+                identical += mix_identical;
+                println!(
+                    "extended_round_class_gpu {what}: {rounds} rounds at the mix; {mix_identical} of its {} rows bit for bit the uniform rounds' of their lanes' shapes, the base at {} columns and the extended at {}",
+                    lanes * MAX_TOKENS,
+                    standing(Shape::Base, at_widest) * Shape::Base.columns(),
+                    standing(Shape::Extended, at_widest) * Shape::Extended.columns()
+                );
+            }
+        }
+        println!(
+            "extended_round_class_gpu {kind:?} mixed rounds, 2 to {} lanes: {identical} of {rows_held} rows, over {lanes_held} lanes, bit for bit the uniform rounds' of their lanes' shapes at their rounds' columns",
+            MIXES.iter().map(|&(w, n)| w + n).max().expect("twelve mixes")
+        );
+    }
 }
