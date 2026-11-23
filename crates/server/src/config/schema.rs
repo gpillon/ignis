@@ -714,8 +714,9 @@ config_group! {
         /// more columns cost every lane, within 64 columns, so a round may
         /// mix both shapes (only at 15 drafts, on either artifact: any other
         /// load runs `aggregate`, as its load log says). A lane alone
-        /// runs at the shape it asks under each. Every profile gives
-        /// `aggregate`. A speed setting only.
+        /// runs at the shape it asks under each. The `rtx5090` profile gives
+        /// `mixed` (from 0.11.0), measured on that card; every other profile
+        /// gives `aggregate`. A speed setting only.
         shape_policy: ShapePolicyKind = ignis_core::ShapePolicy::Aggregate, Validator::OneOf(&ignis_core::ShapePolicy::NAMES),
             QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
         /// Under `aggregate` and `mixed`, the verify rounds of its own, the most recent,

@@ -2067,7 +2067,9 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
 }
 
 /// GitHub #715 (spec #711): `mixed` is a third shape policy, taken by flag,
-/// env and file, and every built-in profile gives `aggregate`; at 7 drafts it
+/// env and file, which the `rtx5090` profile gives (GitHub #722, the owner's
+/// decision after its served gate) and every other built-in profile gives
+/// `aggregate`; at 7 drafts it
 /// is accepted and changes nothing. The cost table is taken in both forms: its
 /// seven rows (`/` between rows on a flag or in the env, a list of seven lists
 /// in a file), and the four ratios of the form before it, read as its uniform
@@ -2075,7 +2077,7 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
 /// of the wrong length, a ratio outside 1..=2 or one that is not a number is
 /// refused, naming the flag and the value.
 #[test]
-fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gives_aggregate() {
+fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_only_the_rtx5090_profile_gives_mixed() {
     use ignis_core::{PeriodTable, PeriodTableSetting, ShapePolicy};
     let policy = |config: &Config| config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().period_table_setting()));
     let wide = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"];
@@ -2091,7 +2093,8 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
     assert!(profiles.contains_key("rtx5090"), "{:?}", profiles.keys());
     for name in profiles.keys() {
         let config = config(&["--profile", name]).for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(config.settings().spec.shape_policy, ShapePolicy::Aggregate, "the `{name}` profile");
+        let given = if name == "rtx5090" { ShapePolicy::Mixed } else { ShapePolicy::Aggregate };
+        assert_eq!(config.settings().spec.shape_policy, given, "the `{name}` profile");
     }
     // The table's seven rows, by flag and by env.
     let rows = "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5";
@@ -2132,7 +2135,7 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
     let files = MemFiles::with(&[("c.yaml", "spec:\n  qwen38:\n    backend: dflash2\n    draft_tokens: 15\n    shape_period_ratios: [1.1, 1.2, 1.3, 1.4]\n")]);
     let read = with_files(&["--config", "c.yaml"], no_env, &files).expect("the four-value form in a file");
     let read = read.for_family(ModelFamily::Qwen38_27b).unwrap();
-    assert_eq!(policy(&read), Some((ShapePolicy::Aggregate, want)));
+    assert_eq!(policy(&read), Some((ShapePolicy::Mixed, want)), "the 27B's, under the `rtx5090` profile");
     // Refusals.
     for raw in [
         "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24",
@@ -2146,6 +2149,33 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
         let err = refused(&with(&["--spec-shape-period-ratios", raw]));
         assert!(err.contains("--spec-shape-period-ratios") && err.contains(raw), "{raw}: {err}");
     }
+}
+
+/// GitHub #722 (spec #711): the `rtx5090` profile's `mixed` is a default, not
+/// a value the operator named, so a start under it that names another drafter
+/// or window starts as it did before: the 27B's MTP head and `--spec-backend
+/// off` refuse nothing, a window of 7 runs `aggregate` (no round shape reads
+/// the policy), and `--spec-shape-policy aggregate` takes the uniform rounds
+/// back at 15 drafts.
+#[test]
+fn under_the_rtx5090_profile_a_start_naming_another_drafter_or_window_starts_as_before() {
+    use ignis_core::ShapePolicy;
+    let under = |more: &[&'static str]| -> Result<Config, ConfigError> {
+        let mut all = vec!["--profile", "rtx5090"];
+        all.extend_from_slice(more);
+        config(&all).for_family(ModelFamily::Qwen38_27b)
+    };
+    let runs = |config: &Config| config.speculation.map(|s| (s.backend(), s.draft_tokens(), s.shape_policy_runs()));
+    let given = under(&[]).expect("the profile alone");
+    assert_eq!(runs(&given), Some((SpeculativeBackend::Dflash2, 15, ShapePolicy::Mixed)));
+    let mtp = under(&["--spec-backend", "mtp", "--qwen38-vision-enabled", "false"]).expect("the 27B's MTP head");
+    assert_eq!(runs(&mtp), Some((SpeculativeBackend::Mtp, QWEN38_MTP_DEFAULT_DRAFT_TOKENS, ShapePolicy::Aggregate)));
+    assert!(under(&["--spec-backend", "off"]).expect("speculation off").speculation.is_none());
+    let seven = under(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7"]).expect("a window of 7");
+    assert_eq!(runs(&seven), Some((SpeculativeBackend::Dflash2, 7, ShapePolicy::Aggregate)));
+    assert!(!seven.speculation.unwrap().has_extended_shape());
+    let uniform = under(&["--spec-backend", "dflash2", "--spec-draft-tokens", "15", "--spec-shape-policy", "aggregate"]).expect("named");
+    assert_eq!(runs(&uniform), Some((SpeculativeBackend::Dflash2, 15, ShapePolicy::Aggregate)));
 }
 
 /// GitHub #720 (spec #711): the cost table's default is `auto`, the loaded
@@ -4748,7 +4778,8 @@ fn auto_picks_rtx_24gb_on_an_rtx_3090_and_on_a_24gb_blackwell_card() {
 /// GitHub #480: `rtx-24gb` gives the 27B the RTX 5090 profile's 27B values at
 /// the context measured for the 24 GB class, 1,048,576 tokens (YaRN at 4
 /// under `auto` rope scaling): headroom 1200M, a 2,048-token chunk, DFlash2
-/// at 7 (the 5090's 15 since GitHub #696 is that card's measurement alone),
+/// at 7 under `aggregate` (the 5090's 15 since GitHub #696 and its `mixed`
+/// since GitHub #722 are that card's measurements alone),
 /// vision on in host RAM at the default envelope, the default lanes and
 /// head, every one a value the load adapts. Flash-Next resolves under it with
 /// nothing of its own.
@@ -4771,12 +4802,14 @@ fn the_rtx_24gb_profile_serves_the_27b_with_the_5090s_values_at_the_measured_con
     assert_eq!(s27.adaptable(), crate::adaptation::Adaptable::ALL, "every value the profile's or a default, so every one adapts");
 
     // The 5090 profile's 27B values, the context, (GitHub #508) the device
-    // retained slots and (GitHub #696) the draft window apart: the 5090
-    // drafts 15, this class 7.
+    // retained slots, (GitHub #696) the draft window and (GitHub #722) the
+    // shape policy apart: the 5090 drafts 15 under `mixed`, this class 7
+    // under `aggregate`.
     let rtx5090 = config(&["--profile", "rtx5090"]);
     let mut want = rtx5090.for_family(ModelFamily::Qwen38_27b).unwrap().settings().clone();
-    assert_eq!(want.spec.draft_tokens, Some(15));
+    assert_eq!((want.spec.draft_tokens, want.spec.shape_policy), (Some(15), ignis_core::ShapePolicy::Mixed));
     want.spec.draft_tokens = Some(7);
+    want.spec.shape_policy = ignis_core::ShapePolicy::Aggregate;
     want.model.max_context = 1_048_576;
     want.reuse.retained_device = Some(profile::RTX_24GB_RETAINED_DEVICE_SLOTS);
     // GitHub #489: and the solo width pinned to the chunk.

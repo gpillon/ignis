@@ -61,9 +61,7 @@ the RTX 5090; the RTX PRO 6000 has yet to confirm them
 
 From 0.11.0 the `rtx5090` profile's 27B drafts up to 15 tokens a round, each
 verify round at 8 columns a lane or, while the text is predictable, at 16; a
-round may also mix the two, a predictable request at 16 columns beside others
-at 8, under `--spec-backend dflash2 --spec-draft-tokens 15
---spec-shape-policy mixed`
+round may mix the two, a predictable request at 16 columns beside others at 8
 ([past seven drafts](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
 Against the same server at 7 drafts, one lane writing a greedy JSON answer
 went from 529 to 800 tok/s (+51%, 13.4 tokens a round against 7.9), a
@@ -79,6 +77,11 @@ a JSON answer beside a conversation, committed 812.8 tok/s together against
 exception weights and the context pinned at 262,144, on the RTX 5090; the RTX
 PRO 6000 has yet to confirm them, and its profile keeps 7
 ([the gate](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
+The mixed round, against the same 15 drafts with every round at one shape:
+a JSON answer beside three conversations committed 14.5% more tokens a second
+together (the JSON answer 35.6% more, the conversations 5.4% fewer), beside one
+conversation 8.2% more, both requests faster
+([the mixed rounds' gate](../../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)).
 
 Prefill and decode share one model stream and take turns. The scheduler hands
 the engine one prefill chunk, then runs a decode round for the lanes already

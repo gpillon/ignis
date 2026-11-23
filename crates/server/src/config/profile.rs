@@ -190,6 +190,16 @@ pub const NONE_PROFILE: &str = "none";
 /// the context and the KV pages held, and the first token of a cold 16K prompt
 /// came 8 ms (0.7%) later at the edge of the legs' spread, which the owner
 /// took as noise (finding 2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090).
+/// Its rounds take their shapes under `mixed` (spec #711, GitHub #722), so a
+/// round may carry lanes of both shapes: served on this card against the
+/// build of #684 under `aggregate` (2026-11-23), a JSON answer beside three
+/// conversations committed 14.5% more tokens a second together, no
+/// conversation more than 7.9% slower. The gate missed its 2% line by the
+/// letter (a sampled conversation -2.05%, code -2.45%, a cold 16K prompt's
+/// first token 7 ms later), and the owner made `mixed` the default anyway:
+/// one lane forms no mix, and seeded, a request alone wrote the same text in
+/// the same rounds under both builds (finding
+/// 2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090).
 /// Flash-Next's leg holds its decode
 /// lanes at their own default (3), in its own section since the 27B takes the
 /// field too and keeps its 8 (GitHub #336), and raises `model.max_context` to
@@ -359,7 +369,7 @@ const BUILT_IN: &str = r#"{
         },
         "vision": { "residency": "host", "qwen38": { "enabled": true } },
         "spec": {
-            "qwen38": { "backend": "dflash2", "draft_tokens": 15 },
+            "qwen38": { "backend": "dflash2", "draft_tokens": 15, "shape_policy": "mixed" },
             "qwen38flashnext": { "decode_lanes": 3 }
         }
     },
@@ -664,12 +674,18 @@ mod tests {
         let draft = field("spec", "draft_tokens").unwrap();
         assert_eq!(rtx5090.get(draft, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "15");
         assert!(rtx5090.get(draft, Some(ModelFamily::FlashNext)).is_none() && rtx5090.get(draft, None).is_none());
+        // GitHub #722: after spec #711's served gate on this card the owner
+        // made `mixed` its default, so the 27B's rounds take their shapes
+        // under it here.
+        let policy = field("spec", "shape_policy").unwrap();
+        assert_eq!(rtx5090.get(policy, Some(ModelFamily::Qwen38_27b)).unwrap().raw, "mixed");
+        assert!(rtx5090.get(policy, Some(ModelFamily::FlashNext)).is_none() && rtx5090.get(policy, None).is_none());
         {
             use super::super::source::{resolve_settings, Fit, Sources};
             let sources = Sources { profile: rtx5090.clone(), ..Sources::default() };
             let spec = resolve_settings(&sources, Some(ModelFamily::Qwen38_27b), Fit::Start).unwrap().settings.spec;
             let backend = Some(super::super::SpecChoice::Backend(ignis_core::SpeculativeBackend::Dflash2));
-            assert_eq!((spec.backend, spec.draft_tokens), (backend, Some(15)));
+            assert_eq!((spec.backend, spec.draft_tokens, spec.shape_policy), (backend, Some(15), ignis_core::ShapePolicy::Mixed));
         }
 
         // GitHub #336: both models take the lanes, so the profile scopes

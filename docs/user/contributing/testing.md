@@ -314,7 +314,8 @@ the other. They are no configuration fields: `GET /v1/config` and
 - `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) forces, at each verify
   round of a DFlash2 load of the 27B past 7 draft tokens, the round's shape
   over the shape rule. Unset: the shape rule and the shape policy
-  (`--spec-shape-policy`, `aggregate` by default) give each round its shape.
+  (`--spec-shape-policy`, `aggregate` by default, `mixed` under `rtx5090`)
+  give each round its shape.
   `base`: every
   round at the base shape, 8 columns a lane, the round of a load at 7 drafts
   token for token. `extended`: every round of 1 to 4 lanes at the extended
@@ -342,8 +343,8 @@ the other. They are no configuration fields: `GET /v1/config` and
   unset, the shape policy decides: `mixed` captures them, `aggregate` and
   `all` none. The VRAM plan reads it too, at the plan and the load, and plans
   those graphs as its `mixed_graphs` line, so set it before the start for a
-  load to hold them inside its plan. Under `--spec-shape-policy mixed` the
-  grant mixes served rounds (`0` turns that off: the load runs `aggregate`);
+  load to hold them inside its plan. Under `mixed` (`--spec-shape-policy`,
+  the `rtx5090` profile's) the grant mixes served rounds (`0` turns that off: the load runs `aggregate`);
   the round identity test forces a round's mix through the step ABI's test
   seam (`forced_lane_shapes`), and such a round replays the mix's graph where
   one was captured, runs eagerly where no capture asked for the mixed graphs,

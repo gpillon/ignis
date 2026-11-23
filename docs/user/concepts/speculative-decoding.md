@@ -182,8 +182,8 @@ and such a load holds two **round shapes**, on one set of buffers:
   up to 4 lanes, so that a round never carries more than the 64 columns of 8
   lanes of 8.
 
-A verify round takes one shape for all its lanes, chosen before it launches
-from what each lane's own earlier rounds did, the **shape rule**:
+Before a verify round launches, each lane asks for a shape from what its own
+earlier rounds did, the **shape rule**:
 
 - a request starts at the base shape;
 - after a base round that drafted all 7 and had all 7 taken
@@ -199,7 +199,8 @@ lanes at the base shape, under every policy. `aggregate` and `all` give a
 round one shape for all its lanes, at the base shape from 5 lanes on; at 2 to 4
 lanes they differ in who pays the wider round:
 
-- `aggregate`, the default, runs the round extended when the drafts its asking
+- `aggregate`, the default on every profile but `rtx5090`, runs the round
+  extended when the drafts its asking
   requests are expected to take past position 7 exceed what the wider round
   costs every request in it: the extended round's period over the base
   round's at that lane count (`--spec-shape-period-ratios`, 1.29 at two
@@ -238,8 +239,25 @@ lanes they differ in who pays the wider round:
   other load runs `mixed` as `aggregate`, and its load log says so
   (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a
   grammar is granted as any other: the grammar's check cuts its run at its
-  first miss at the shape it was granted, in a mixed round too. Every profile gives `aggregate`;
-  `mixed` is opt-in until its served gate passes. The grant stops at the last
+  first miss at the shape it was granted, in a mixed round too. From 0.11.0
+  the `rtx5090` profile gives `mixed`, and every other profile `aggregate`.
+  Served on the RTX 5090 at 15 drafts against the build before mixed rounds
+  under `aggregate` (FP8 exception weights, the context pinned at 262,144), a
+  greedy JSON answer beside three conversations at temperature 0.6 committed
+  14.5% more tokens a second together, the JSON answer 35.6% more and the
+  conversations 5.4% fewer (the slowest 7.9%); beside one conversation 8.2%
+  more, both requests faster, since the mixed round (24 columns) is shorter
+  than the extended round `aggregate` runs there (32); a moderately
+  predictable answer (a long JSON array) beside a conversation 4.6% more; two
+  JSON answers beside two conversations 7.5% more; a `response_format`
+  JSON-schema answer beside three conversations 13.3% more, its neighbours
+  faster too. A request alone, seeded, wrote the same text in the same rounds
+  under both builds, each round about 0.1% longer; unseeded, a sampled
+  conversation read 2.05% slower over 40 requests and code 2.45% over 20, past
+  the run's 2% line, readings the seeded requests put down to the texts'
+  sampling, not the rounds
+  ([finding](../../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)).
+  The grant stops at the last
   mix whose graphs the load holds, and a round at a lane count where it holds
   none takes the uniform shape `aggregate` gives it; a load whose pool holds
   no mix at all (two lanes without a retained device slot,
@@ -334,7 +352,9 @@ one, up to the draft window.
   A window a profile gives beside its own DFlash2 (`rtx5090`'s 15 from
   0.11.0, every other built-in profile's 7 but `rtx-12gb`'s, which is the
   head's own) is DFlash2's: `--spec-backend mtp` over it takes the head's own
-  default.
+  default. So is the shape policy a profile gives beside its own DFlash2
+  (`rtx5090`'s `mixed`, from 0.11.0): the head's load does not take it, and
+  its effective configuration names the default.
 - **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
   1, the head committed 3.9 tokens a round at 7 draft tokens on both artifacts
   (one is the anchor): its first draft was taken 74% of the time, its seventh

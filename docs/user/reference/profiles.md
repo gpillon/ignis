@@ -83,6 +83,7 @@ A profile follows the card's memory, not its generation, and what a card loads f
 | [`spec.backend`](configuration.md#specbackend) | Qwen3.8-27B | `dflash2` |
 | [`spec.decode_lanes`](configuration.md#specdecode_lanes) | Qwen3.8-Flash-Next | `3` |
 | [`spec.draft_tokens`](configuration.md#specdraft_tokens) | Qwen3.8-27B | `15` |
+| [`spec.shape_policy`](configuration.md#specshape_policy) | Qwen3.8-27B | `mixed` |
 | [`vision.enabled`](configuration.md#visionenabled) | Qwen3.8-27B | `true` |
 | [`vision.residency`](configuration.md#visionresidency) | every model | `host` |
 | [`vram.headroom_bytes`](configuration.md#vramheadroom_bytes) | Qwen3.8-27B | `1200M` |

@@ -1224,7 +1224,8 @@ measurement.
 How a **verify round** of a DFlash2 load past 7 drafts takes its **round
 shape** from what the **shape rule** has its lanes ask (#690;
 `spec.shape_policy`). `all`: extended only when every lane asks, so no lane
-pays for another. `aggregate`, the default: at one lane the lane's ask; at
+pays for another. `aggregate`, the default (the `rtx5090` profile's is `mixed`,
+#722): at one lane the lane's ask; at
 2..4 lanes extended when the drafts the asking lanes are expected to take past
 position 7 exceed (the extended round's period over the base round's at that
 lane count, `spec.shape_period_ratios`, less one) times the tokens every lane
@@ -1251,7 +1252,9 @@ there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
 other (#716); the grant stops at the last mix the load holds a graph of, and a
 round at a lane count where it holds none takes the uniform shape `aggregate`
 gives it; a load that holds no mix runs `aggregate`, as its startup line says.
-Every profile defaults to `aggregate`.
+Every profile defaults to `aggregate` but `rtx5090`, whose 27B section gives
+`mixed` (#722). A profile's policy beside its own DFlash2 is that drafter's,
+as its window is: the 27B's MTP head named over it carries the default.
 
 **Grant**:
 What the **shape policy** `mixed` gives a verify round's lanes (#715): each

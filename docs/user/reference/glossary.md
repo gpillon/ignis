@@ -224,8 +224,9 @@ streams, and takes a persistent loop back. See
 **Mixed round.** From 0.11.0, a verify round of the 27B at 15 drafts whose
 requests run at both round shapes: one to three at the *extended shape*, 16
 columns each, beside one to six at the *base shape*, 8 columns each, 64 columns
-at most. Only `--spec-backend dflash2 --spec-draft-tokens 15
---spec-shape-policy mixed` grants one, request by request, and
+at most. Only the shape policy `mixed` grants one (the `rtx5090` profile's;
+elsewhere `--spec-backend dflash2 --spec-draft-tokens 15
+--spec-shape-policy mixed`), request by request, and
 only at a mix whose graphs the load holds. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
@@ -316,14 +317,16 @@ probability to the drafter's, so the text keeps the model's distribution. See
 
 **Shape policy.** From 0.11.0, on a DFlash2 load past 7 drafts, how a verify
 round's lanes take their shapes from what its requests ask
-(`--spec-shape-policy`): `aggregate`, the default, a round of 1 to 4 lanes
+(`--spec-shape-policy`): `aggregate`, the default on every profile but
+`rtx5090`, a round of 1 to 4 lanes
 extended when the drafts the asking requests are expected to take past position
 7 exceed what the wider round costs every request in it, from each request's own
 recent rounds; `all`, extended only when every request asks, so no request pays
 for another; `mixed`, each asking request of 2 to 7 granted the extended shape on
 its own when its expected gain beats what its columns cost every request, so a
 round may mix both shapes (at 15 drafts, on either artifact; elsewhere it runs
-`aggregate`). A request alone runs at the shape it asks under each. See
+`aggregate`), the `rtx5090` profile's default. A request alone runs at the shape
+it asks under each. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Shape rule.** From 0.11.0, on a DFlash2 load past 7 drafts, what each request

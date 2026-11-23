@@ -71,9 +71,10 @@ base round's numerical class at its test's configuration (8 lanes, a
 262,144-token context), not at each profile's own; its speed is unmeasured
 off the RTX 5090, so no other profile's default moves. At 15 drafts a load
 of either artifact may also run
-[mixed rounds](speculative-decoding.md#past-seven-drafts-two-round-shapes),
-off on every profile: each profile below says how to turn them on and what
-their graphs cost at its lanes.
+[mixed rounds](speculative-decoding.md#past-seven-drafts-two-round-shapes):
+from 0.11.0 `rtx5090` runs them, measured on that card ([below](#rtx5090)),
+and every other profile keeps them off and says below how to turn them on and
+what their graphs cost at its lanes.
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
 with the finding for each choice linked below; `rtx-16gb` and `rtx-12gb` are
@@ -89,7 +90,7 @@ The default: a 32 GB RTX 5090.
 |---|---|---|
 | Context (`model.max_context`) | 917,504 | 589,824 |
 | Vision | on, tower and pool in host RAM (`vision.residency: host`) | off; from 0.11.0, with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in host RAM ([Flash-Next](../configuration/vision.md#flash-next)) |
-| Speculation | DFlash2, 15 draft tokens (from 0.11.0; 7 before) | off |
+| Speculation | DFlash2, 15 draft tokens (from 0.11.0; 7 before), mixed rounds (`spec.shape_policy: mixed`, from 0.11.0) | off |
 | Decode lanes | 8 (the default) | 3 |
 | Prefill chunk | 2,048 | 8,192 |
 | VRAM headroom | 1,200 MiB | 1,536 MiB (the default) |
@@ -126,15 +127,36 @@ Why each:
   the run resolves. At eight lanes both shapes are 64 columns, so the plan is
   528 bytes over a 7-draft load's, within one KV page
   ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
-  From 0.11.0 a load that asks for mixed rounds (`--spec-backend dflash2
-  --spec-draft-tokens 15 --spec-shape-policy mixed`, the shape options refused
-  without a named `--spec-backend`; every profile gives `aggregate`, which asks
-  for none) holds the graphs of all twelve mixes at these
-  eight lanes, with or without a device retained slot: 66 MiB, at most 118 KV
-  pages (7,552 tokens) of the pool
-  ([the VRAM plan](vram-plan.md#what-the-plan-counts)).
   `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
   to measure a window past 7, so `rtxpro6000` keeps 7.
+- **Mixed rounds**, from 0.11.0 (`spec.shape_policy: mixed`; 0.10.0 has none).
+  A round's requests take their shapes one by one, so a predictable request
+  drafts 15 beside others at 7
+  ([past seven drafts](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+  Served on this card against `aggregate`, the same 15 drafts, with the
+  context pinned at 262,144: a greedy JSON answer beside three conversations
+  at temperature 0.6 committed 14.5% more tokens a second together, the JSON
+  answer 35.6% more and the conversations 5.4% fewer (the slowest of the three
+  7.9%); beside one conversation 8.2% more, both faster; two JSON answers
+  beside two conversations 7.5% more; a `response_format` JSON-schema answer
+  beside three conversations 13.3% more, the conversations faster too.
+  Alone, a request writes the same text in the same rounds as under
+  `aggregate` (a seeded sampled request's too), each round about 0.1% longer;
+  plain decode and the context did not move, and a cold 16K prompt's first
+  token came 7 ms (0.6%) later. Unseeded, a sampled conversation read 2.05%
+  slower over 40 requests and code 2.45% over 20, past the run's 2% line; the
+  seeded requests put those readings down to the texts' sampling, not the
+  rounds, and the profile takes `mixed` with them.
+  The load holds the graphs of all twelve mixes at these eight lanes, with or
+  without a device retained slot: 66 MiB, at most 118 KV pages (7,552 tokens)
+  of the pool, which is all it gives up of the pool
+  ([the VRAM plan](vram-plan.md#what-the-plan-counts)), so the 917,504 tokens
+  need 66 MiB more free at start than the 28,483 MiB above to hold unadapted
+  ([finding](../../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)).
+  `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy aggregate`
+  gives the uniform rounds back (the shape options are refused without a named
+  `--spec-backend`), and a start that names `--spec-backend mtp`, `off` or a
+  window other than 15 runs no mixed round and plans no graph for one.
 - **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
   for each image and maps the embedding pool in pinned host RAM, so a vision
   load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
@@ -209,7 +231,7 @@ Why each:
   ([n-gram cache](../configuration/ngram-cache.md)).
 - **No pinned hot set.** The profile leaves `vram.pinned_expert_bytes` at its
   default, 0.
-- **Mixed rounds off**, as on every profile. From 0.11.0
+- **Mixed rounds off**, as on every profile but `rtx5090`. From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on for the 27B; its eight lanes hold all twelve mixes, the
   plan's line for their graphs 66 MiB, as on `rtx5090`. Neither the window
@@ -256,7 +278,7 @@ Why each:
   shape; whether it is faster on a 16 GB card is not measured, so the
   default stays 7. Off compute capability 12.0 the extended round attends on
   the vendored chunked route.
-- **Mixed rounds off**, as on every profile (`aggregate`). From 0.11.0
+- **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`). From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
@@ -423,7 +445,7 @@ Why each:
   whether it is faster on a 24 GB card is not measured, so the default stays
   7, and off compute capability 12.0 the extended round attends on the
   vendored chunked route.
-- **Mixed rounds off**, as on every profile (`aggregate`). From 0.11.0
+- **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`). From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
