@@ -237,7 +237,8 @@ lanes they differ in who pays the wider round:
   run only at 15 drafts, on either artifact (the trellis artifact the 16 GB and
   24 GB profiles load too, [Built-in profiles](profiles.md#rtx-24gb)): any
   other load runs `mixed` as `aggregate`, and its load log says so
-  (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a
+  (`shape_policy=aggregate shape_policy_given=mixed`, or
+  `shape_policy_profile=mixed` where the profile gave it). A request held to a
   grammar is granted as any other: the grammar's check cuts its run at its
   first miss at the shape it was granted, in a mixed round too. From 0.11.0
   the `rtx5090` profile gives `mixed` to the NVFP4 artifact, the one served
