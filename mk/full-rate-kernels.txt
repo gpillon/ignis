@@ -64,6 +64,12 @@ cuda     w8_rowsplit_gemm_simt_kernel     kernel/vendor/src/ops/linear/w8/w8_row
 # host-mapped memory and its accept handed back there, CUDA cores.
 cuda     copy_then_ticket                 kernel/src/deferred_verify.cu # #676: the staged copies, then the ticket the host waits on
 
+# The 27B's mixed round under its graph build on every card (spec #711, #718; the trellis body's
+# on 8.x since #720): the target argmax and the zeroing its graph holds as kernel nodes, CUDA cores.
+cuda     tiled_atomic_kernel              kernel/src/tiled_argmax.cu    # #718: the target argmax's tiles, the vendored tiled route restated
+cuda     zero_kernel                      kernel/src/tiled_argmax.cu    # #718: each slice's winners zeroed before its tiles
+cuda     zero_bytes_kernel                kernel/src/device_zero.cu     # #718: a BF16 KV cache's attention workspace zeroed
+
 # The kernels of the prompt prefill that predate the rule and stay as they are
 # (#488, parked): each leaves the list when #488 converts it.
 exempt   nvfp4_a16_mma_kernel                       # #488: the DFlash2 drafter's prompt prefill, BF16 MMA
