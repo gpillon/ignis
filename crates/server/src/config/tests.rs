@@ -2423,20 +2423,27 @@ fn the_27bs_mtp_setting_round_trips_and_its_scope_names_both_models() {
         }
     }
     // Under a profile whose DFlash2 window is not the head's default, the
-    // document writes the window that runs, not the profile's.
+    // document writes the window that runs, not the profile's. GitHub #722:
+    // and a profile whose DFlash2 runs `mixed` (the `rtx5090` profile's) gives
+    // the head no shape policy, so the load and its document carry the
+    // default, at the head's window and at 0.
     let profiles = "profiles:
   drafts:
     spec:
-      qwen38: { backend: dflash2, draft_tokens: 5 }
+      qwen38: { backend: dflash2, draft_tokens: 15, shape_policy: mixed }
 ";
     let files = MemFiles::with(&[("p.yaml", profiles)]);
-    let flags = ["--config", "p.yaml", "--profile", "drafts", "--qwen38-vision-enabled", "false", "--spec-backend", "mtp"];
-    let started = with_files(&flags, no_env, &files).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
-    assert_eq!(started.speculation, Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS)));
-    let document = file::effective_document(&started);
-    let files = MemFiles::with(&[("c.yaml", &Format::Yaml.write(&document))]);
-    let read = with_files(&["--config", "c.yaml"], no_env, &files).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
-    assert_eq!(read.speculation, started.speculation, "{document}");
+    for (window, runs) in [(&[][..], Some(mtp(QWEN38_MTP_DEFAULT_DRAFT_TOKENS))), (&["--spec-draft-tokens", "0"], None)] {
+        let mut flags = vec!["--config", "p.yaml", "--profile", "drafts", "--qwen38-vision-enabled", "false", "--spec-backend", "mtp"];
+        flags.extend_from_slice(window);
+        let started = with_files(&flags, no_env, &files).unwrap().for_family(ModelFamily::Qwen38_27b).unwrap();
+        assert_eq!(started.speculation, runs, "{window:?}");
+        let document = file::effective_document(&started);
+        let files = MemFiles::with(&[("c.yaml", &Format::Yaml.write(&document))]);
+        let read = with_files(&["--config", "c.yaml"], no_env, &files).and_then(|read| read.for_family(ModelFamily::Qwen38_27b));
+        let read = read.unwrap_or_else(|e| panic!("{window:?}: {e}\n{document}"));
+        assert_eq!((read.speculation, read.speculation_off), (started.speculation, started.speculation_off), "{window:?} {document}");
+    }
     let backend = schema::field("spec", "backend").unwrap();
     assert!(!backend.applies.refused_by(ModelFamily::Qwen38_27b) && !backend.applies.refused_by(ModelFamily::FlashNext));
     let text = backend.description_line();

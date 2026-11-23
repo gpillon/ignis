@@ -1782,7 +1782,7 @@ fn derive_speculation(
     // chose MTP too; the window a profile gives beside its own DFlash2 (every
     // built-in profile's 7) is that drafter's, not the head's.
     let the_27bs_mtp = the_27bs_mtp(family, Some(backend));
-    let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_window_given(resolution));
+    let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_takes(resolution, "draft_tokens"));
     let tokens = match window {
         Some(tokens) => tokens,
         None if the_27bs_mtp => QWEN38_MTP_DEFAULT_DRAFT_TOKENS,
@@ -1851,19 +1851,23 @@ fn derive_speculation(
     })?;
     // GitHub #690: the shape policy, its estimate window and its period
     // ratios, each in its field's range; every load without an extended shape
-    // never reads them.
+    // never reads them. GitHub #722: the policy a profile gives beside its own
+    // DFlash2 (`rtx5090`'s `mixed`) is that drafter's, as its window is: the
+    // 27B's MTP load named over it carries the default.
     let estimate = ignis_core::ShapeEstimate::new(s.shape_estimate_rounds, s.shape_period_ratios).map_err(ConfigError)?;
-    let speculation = speculation.with_shape_policy(s.shape_policy, estimate);
+    let policy = if !the_27bs_mtp || mtp_takes(resolution, "shape_policy") { s.shape_policy } else { ignis_core::ShapePolicy::default() };
+    let speculation = speculation.with_shape_policy(policy, estimate);
     Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
 }
 
-/// Whether the 27B's MTP load takes the window `resolution` resolved
-/// (GitHub #623): one the operator named, or a profile's when the profile
-/// chose the backend too. A profile's window beside a backend the operator
-/// named is the profile's own drafter's.
-fn mtp_window_given(resolution: &Resolution) -> bool {
+/// Whether the 27B's MTP load takes the value `resolution` resolved for
+/// `spec.<name>`, the window (GitHub #623) or the shape policy (GitHub #722):
+/// one the operator named, or a profile's when the profile chose the backend
+/// too. A profile's value beside a backend the operator named is the
+/// profile's own drafter's, and the load takes the head's default.
+fn mtp_takes(resolution: &Resolution, name: &str) -> bool {
     let source = |name: &str| resolution.origin("spec", name).map(|origin| origin.source);
-    match source("draft_tokens") {
+    match source(name) {
         Some(source::Source::Profile) => source("backend") == Some(source::Source::Profile),
         Some(given) => given.explicit(),
         None => false,
