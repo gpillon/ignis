@@ -505,8 +505,8 @@ pub struct ProgramStats {
     /// of mix `m`'s verify graph and of its drafter append graph, as the
     /// latest [`capture_decode_graphs`] made them: one root and no memset
     /// node each under the mixed graph's build (`IGNIS_MIXED_GRAPH_BUILD`
-    /// unset or `1`) on a load whose KV cache is hq-e8-2b; 0 for a mix with
-    /// no graph.
+    /// unset or `1`), on every KV cache format (GitHub #711: a BF16 cache's
+    /// attention workspace zeroed by a kernel); 0 for a mix with no graph.
     pub mixed_verify_graph_roots: [u32; ffi::IGNIS_ROUND_MIXES],
     pub mixed_verify_graph_memset_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
     pub mixed_append_graph_roots: [u32; ffi::IGNIS_ROUND_MIXES],

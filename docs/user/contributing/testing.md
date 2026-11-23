@@ -367,12 +367,14 @@ the other. They are no configuration fields: `GET /v1/config` and
   (`ignis_kernel_tiled_argmax_test`), where the vendored op's memset node
   waited behind the output head; and its extended group runs on a branch at
   the card's greatest stream priority, the graphs instantiated with their
-  nodes' priorities. Under `0` the round runs on the vendored argmax and
-  its extended group on the round's stream, as before. The tokens are the
-  same either way (the round identity test below, arm `mixed-graph-build-off`),
-  and so are the graphs' node counts; the program's stats report each mix's
-  graphs' root nodes and memset nodes (one root and none under the build, on
-  the hq-e8-2b KV cache). The eager mixed rounds follow the latest capture's
+  nodes' priorities; on a BF16 KV cache its attention workspace is zeroed by
+  a kernel of ignis's own too (`ignis_kernel_device_zero_test`). Under `0`
+  the round runs on the vendored argmax and its extended group on the
+  round's stream, as before. The tokens are the same either way (the round
+  identity test below, arm `mixed-graph-build-off`), and so are the graphs'
+  node counts; the program's stats report each mix's graphs' root nodes and
+  memset nodes (one root and none under the build; the round identity test
+  holds them on the hq-e8-2b KV cache, which zeroes no workspace). The eager mixed rounds follow the latest capture's
   reading; before a load's first capture they take the build's first op and
   argmax, the extended group on the round's stream. Any other value refuses
   the load, naming the variable.

@@ -632,8 +632,9 @@ struct ignis_program_stats {
   /* GitHub #718 (spec #711): entry m the root nodes and the memset nodes of
    * mix m's verify graph and of its drafter append graph, as the latest
    * capture made them: one root and no memset node each under the mixed
-   * graph's build (IGNIS_MIXED_GRAPH_BUILD unset or `1`), on a load whose KV
-   * cache is hq-e8-2b; 0 for a mix with no graph. */
+   * graph's build (IGNIS_MIXED_GRAPH_BUILD unset or `1`), on every KV cache
+   * format (GitHub #711: a BF16 cache's attention workspace zeroed by a
+   * kernel); 0 for a mix with no graph. */
   uint32_t mixed_verify_graph_roots[IGNIS_ROUND_MIXES];
   uint32_t mixed_verify_graph_memset_nodes[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_roots[IGNIS_ROUND_MIXES];
