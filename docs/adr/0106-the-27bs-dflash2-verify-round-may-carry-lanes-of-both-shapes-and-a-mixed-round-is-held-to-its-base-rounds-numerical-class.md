@@ -283,5 +283,5 @@ In ADR 0030, the plan's sixteenth line, `mixed_graphs`. In ADR 0017, the shape c
 - The cost tables are the RTX 5090's at about 3.5-5K tokens of context. The ratio grows with context, so on a longer
   conversation the wider round costs every lane somewhat more than its entry says, and `aggregate` and the grant take it
   a little more readily than it pays there; on another card both tables are unmeasured, the trellis body's indicative
-  for the 16 GB and 24 GB cards until a run on one (its measurement loaded the model at 262,144 tokens of context, where
-  the `rtx-24gb` profile serves 1,048,576).
+  for the 16 GB and 24 GB cards (its measurement loaded the model at 262,144 tokens of context, where the `rtx-24gb`
+  profile serves 1,048,576).
