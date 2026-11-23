@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 amends: [ADR-0017, ADR-0030, ADR-0104]
 ---
 
@@ -47,9 +47,14 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   unchanged and never run a mixed round. Granting every ask in the caller's order, as the prototype did, bought nothing
   on a moderately predictable answer beside a conversation (+0.6%, inside the spread, the conversation 5.0% slower): the
   grant has to refuse such a lane.
-- **Its default.** `aggregate` on every profile. The `rtx5090` profile's becomes `mixed` only once the served gate
-  passes: a JSON answer beside three conversations at four lanes at least 10% faster together than the build of #684, no
-  conversation lane more than 15% below it. The trellis bodies keep `aggregate` until a run on a 16 GB or 24 GB card;
+- **Its default.** `mixed` on the `rtx5090` profile, `aggregate` on every other. The served gate (#722) asked a JSON
+  answer beside three conversations at four lanes at least 10% faster together than the build of #684, no conversation
+  lane more than 15% below it, and no one-lane or free-text cell more than 2% below: on the RTX 5090 it read +14.48%,
+  the slowest conversation lane -7.9%, and missed the 2% line by the letter on two sampled one-lane cells (-2.05% and
+  -2.45%) and a cold first token 7 ms later. The owner made `mixed` the `rtx5090` profile's default on 2026-11-23 all
+  the same: one lane forms no mix, and seeded, a request alone wrote the same text in the same rounds under both
+  builds. A policy a profile gives beside its own DFlash2 is that drafter's, as its window is: the 27B's MTP head named
+  over it carries the default. The trellis bodies keep `aggregate` until a run on a 16 GB or 24 GB card;
   given `mixed`, a trellis body at 15 drafts runs it. A load given `mixed` that holds no mix runs `aggregate`, and its
   startup line names both: a load of DFlash2 at 8 to 14 drafts, one whose pool's lanes and GDN slots hold no mix (which
   a WARN at load names, with the lanes and the slots), and one whose plan asked for none under `IGNIS_MIXED_ROUNDS=0`; a
@@ -106,8 +111,8 @@ the control one index off over a kind's lane counts together. Every one of the t
 its last lanes extended so that the round's rows are not the caller's order, its lanes on seven prompts of their own.
 The owner decided on 2026-11-22 (#717), after a first reading failed on one lane, that the mixed rows are held exactly
 as ADR 0104 holds the extended round: legs long enough for each lane to reach the uniform cells' row counts, every
-round at its mix; the near tie read the way ADR 0104 reads it; the margins unchanged. How the test does so is proposed
-here, for the owner to confirm with this ADR:
+round at its mix; the near tie read the way ADR 0104 reads it; the margins unchanged. How the test does so, the owner
+confirmed with this ADR on 2026-11-23 (#722):
 
 - **A lane is held over a uniform cell's window.** A mixed lane holds the rows after its text's first 224 tokens, as a
   uniform cell's lane does, against the base rows a leg of base rounds at its lane count gives over the same window, at
@@ -172,8 +177,8 @@ lanes (24 to 56 columns) give each prompt's rows the same bits and the leg of 2 
 mix's 24 columns against a base leg of 16. The graph rounds' moved picks are six text positions at exact ties, gaps
 of 0 or 1 ulp, counted once for each mix that holds the lane, positions the uniform rounds move too; the argmax is not
 in it, the rows the same under `IGNIS_MIXED_GRAPH_BUILD=0` (12,096 and 11,808 of them, the moved picks 49 and 30 both
-ways). So a base leg at the lane count is no reference on that body. The test holds the decision so, proposed here for
-the owner to confirm:
+ways). So a base leg at the lane count is no reference on that body. The test holds the decision so, as the owner
+confirmed with this ADR on 2026-11-23 (#722):
 
 - **Uniform legs at one width stand for a mix's round.** On the RTX 5090 a lane's rows are the same bits in every
   round of 24 to 56 columns, of either kind (forced, the base legs of 3 to 7 lanes and every mix of those columns; on
