@@ -101,7 +101,9 @@ function Lock-Gpu([string]$Command, [int]$WaitSeconds = 0, [int]$ProcessId = $PI
         pid = $me.pid; name = $me.name; started = $me.started; worktree = $GpuLockRepo
         command = $Command; since = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     }
-    $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    # The wait is timed on a Stopwatch: the wall clock moves in ticks, and a
+    # wait timed on it could end before $WaitSeconds have passed (#728).
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $told = $false
     while ($true) {
         $state = @{}
@@ -115,7 +117,7 @@ function Lock-Gpu([string]$Command, [int]$WaitSeconds = 0, [int]$ProcessId = $PI
             }
         }
         if ($state.mine) { return $state.mine }
-        $left = ($deadline - [DateTime]::UtcNow).TotalSeconds
+        $left = $WaitSeconds - $clock.Elapsed.TotalSeconds
         if ($left -le 0) { throw "GPU lock: the card is held ($path) by $(Format-GpuLockHolder $state.held)" }
         if (-not $told) {
             Write-Host "GPU lock: waiting up to ${WaitSeconds}s for the card, held ($path) by $(Format-GpuLockHolder $state.held)"
