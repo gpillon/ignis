@@ -227,12 +227,12 @@ pub const QWEN27B_EXTENDED_SHAPE_STATE_BYTES: [u64; 4] = [2_101_248, 8_392_704, 
 /// `mixed_graphs` line (`mixed_graphs`, 0 on a load that captures none): the
 /// driver keeps their pages for the context's life once they are gone, as it
 /// keeps the round shapes' state. Read from the same WDDM counter on the RTX
-/// 5090 (driver 610.88) on 2026-11-22 at `vram_reload_gpu`'s shape, the
+/// 5090 (driver 610.88) on 2026-11-23 at `vram_reload_gpu`'s shape, the
 /// twelve mixes of eight lanes: the teardown of a 15-draft load that captured
-/// them with the mixed graph build left 69,206,016 B over the same load
-/// without them, the NVFP4 body's line: a reload adds back what the graphs
-/// left. Its plan charges the line again, so the add-back stays within what
-/// the plan charges again.
+/// them with the mixed graph build left 69,210,112 B over the same load
+/// without them, where the NVFP4 body's line is 69,206,016 B: a reload adds
+/// back 4,096 B less than the graphs left, the safe side. Its plan charges
+/// the line again, so the add-back stays within what the plan charges again.
 pub fn qwen27b_state_after(extended: Option<ignis_core::RoundShape>, mixed_graphs: u64) -> u64 {
     let extended_bytes = extended.map_or(0, |shape| {
         let lanes = shape.lanes.clamp(1, QWEN27B_EXTENDED_SHAPE_STATE_BYTES.len() as u32);
