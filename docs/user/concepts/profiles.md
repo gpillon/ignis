@@ -329,6 +329,8 @@ Why each:
 - **One lane.** A second costs about 0.87 GB, which the context pays: more
   than five of its 16,384-token steps.
   `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
+- **No mixed rounds.** One lane holds no mix, and the MTP head refuses
+  `--spec-shape-policy` by name, as it refuses every shape option.
 - **131,072 tokens, adapting 16,384 at a time.** Every other profile adapts
   65,536 at a time. A 12 GB card's budget is derived from the memory free at
   the start, which the desktop sets, and the context is the largest of the

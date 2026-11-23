@@ -235,9 +235,9 @@ lanes they differ in who pays the wider round:
   run only at 15 drafts, on either artifact (the trellis artifact the 16 GB and
   24 GB profiles load too, [Built-in profiles](profiles.md#rtx-24gb)): any
   other load runs `mixed` as `aggregate`, and its load log says so
-  (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a grammar is granted as any
-  other: the grammar's check cuts its run at its first miss at the shape it
-  was granted, in a mixed round too. Every profile gives `aggregate`;
+  (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a
+  grammar is granted as any other: the grammar's check cuts its run at its
+  first miss at the shape it was granted, in a mixed round too. Every profile gives `aggregate`;
   `mixed` is opt-in until its served gate passes. The grant stops at the last
   mix whose graphs the load holds, and a round at a lane count where it holds
   none takes the uniform shape `aggregate` gives it; a load whose pool holds
@@ -248,20 +248,16 @@ lanes they differ in who pays the wider round:
 The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
 the round's period with 1, 2, ... of them extended over the base round's) are
 each artifact's own (`auto`) unless you name a table (four ratios alone take
-the artifact's mixed entries beside them). The trellis artifact's keeps the
-NVFP4 artifact's uniform entries beside derived mixed ones, provisional until
-a run on it
-([the configuration reference](../configuration/context-and-speculation.md)).
-The NVFP4 artifact's are
-the RTX 5090's: the uniform entries measured with the extended round's cost
-levers on, at about 3.5-5K tokens of context, 1.128, 1.29, 1.363 and 1.344 at
-1 to 4 lanes; of the mixed entries 1+1, 1+3, 2+2 and 1+5 measured (1.155,
-1.138, 1.222, 1.093) and the other eight derived from its base rounds of the
-same columns (the three of 64 columns, where no base round was measured, one
-8-column step past 56), all pending a measurement of this build. The ratio grows with
-context, and at 3 and 4 lanes the card's power limit lowers the extended
-round's clock, so 3 lanes reads above 4. On other cards they are unmeasured,
-and the window is provisional. A request held to a
+the artifact's mixed entries beside them). The NVFP4 artifact's
+are the RTX 5090's, measured in part (its uniform entries 1.128, 1.29, 1.363
+and 1.344 at 1 to 4 lanes, at about 3.5-5K tokens of context: the ratio grows
+with context); the trellis artifact's keeps those uniform entries beside mixed
+ones derived from the NVFP4 artifact's; both are provisional until a
+measurement of this build
+([the configuration reference](../configuration/context-and-speculation.md),
+[ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)).
+On other cards they are unmeasured, and the window is provisional. A request
+held to a
 grammar (`response_format`, a held tool's
 calls) asks as any other does: its rounds take the shape the rule and the
 policy give them, the grammar's check cuts each run at its first miss at that
@@ -270,11 +266,14 @@ ones the check kept. Text the drafter predicts far ahead (a JSON answer, a
 long tool call's arguments) goes extended and stays there; free text rarely
 takes all 7, so it stays at the base shape and decodes as at 7 drafts (a
 greedy answer can differ at a near-tie where the shape changes, below). A
-request evicted and restored keeps what it asked; its recent rounds for
-`aggregate` start again. `/metrics` counts the rounds at each shape
+request evicted and restored keeps what it asked; its recent rounds, which
+`aggregate` and `mixed` read, start again, and so does the count of rounds it
+asked and was refused, which breaks a tie in the grant. `/metrics` counts the
+rounds at each shape, each request's rounds counted
 (`ignis_speculative_shape_rounds_total`: `base`, `extended`, and `mixed` for
-the lanes of a round that ran at both, each counted once, at one of the three), the rounds of two requests or more
-some but not all of which asked the extended shape, at whichever shape they
+each request of a round that ran at both, counted once, at one of the three),
+the rounds of two requests or more some but not all of which asked the
+extended shape, at whichever shape they
 ran (`ignis_speculative_shape_split_rounds_total`, counted on each request's
 rounds as the others are), and, per position up to the window, the drafts
 proposed and taken.
