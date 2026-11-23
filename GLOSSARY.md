@@ -1196,12 +1196,15 @@ lane does (#716): the host cut reads its run, and the repair after it the
 scores it kept, at its own group's columns. The **shape policy** `mixed` grants one
 (#715); a test forces a round's mix (`forced_lane_shapes`), from the mix's
 graphs where a capture made them and eagerly where no capture asked for them.
-A load that asks (`mixed`, or `IGNIS_MIXED_ROUNDS=1`) captures every mix its lanes and its pool's GDN slots
+A load that asks (`mixed`, or `IGNIS_MIXED_ROUNDS=1`) captures every mix its
+lanes and its pool's GDN slots
 hold (a mix takes `2w + n` slots, the lanes' and the device retained slots':
 all twelve at 8 lanes), a line of the VRAM plan (`mixed_graphs`, #714); a mix
 whose capture failed is never granted, and a round forced at it runs at the
-uniform shape `aggregate` would choose, counted, never eagerly. Its rows, of either group, are held to its
-base round's numerical class, as an extended round's are (#717, ADR 0106).
+uniform shape `aggregate` would choose, counted, never eagerly. Its rows, of
+either group, are held to its base round's numerical class on the NVFP4 body,
+as an extended round's are (#717, ADR 0106), and on the trellis body bit for
+bit to the uniform rounds' rows at the same columns (#720).
 
 **Shape rule**:
 What a lane of a DFlash2 load past 7 drafts asks of its next **verify round**,
@@ -1245,7 +1248,8 @@ estimate, whenever the columns allow; never past 64 columns, so a round may be
 a **mixed round**. The **cost table** (`spec.shape_period_ratios`) holds each
 round's period over the base round's by lane count (1..7) and extended lanes;
 `aggregate` reads its uniform entries; its default, `auto`, is the loaded body's
-own (#720: the NVFP4 body's or the trellis body's, `PeriodTableSetting::of_body`). `mixed`
+own (#720: the NVFP4 body's or the trellis body's,
+`PeriodTableSetting::of_body`). `mixed`
 runs at 15 drafts alone, on either body (#720; any other load runs
 `aggregate`) and asks for the mixed graphs
 there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
