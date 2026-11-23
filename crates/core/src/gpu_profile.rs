@@ -42,7 +42,7 @@ fn marker_path() -> PathBuf {
 const PREFLIGHT_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// How often a process under the profile restamps the marker at most:
-/// [`active`] is asked on every kernel return code, so not every call.
+/// [`active_naming`] is asked on every kernel return code, so not every call.
 const REFRESH_EVERY: Duration = Duration::from_secs(60);
 
 /// Restamps an existing marker at `now`, unless this process did so less
@@ -127,11 +127,13 @@ fn active_impl(var: Option<String>, preflight_passed: bool, condition: Option<&s
 /// the profile, and with `reason` before the refusal when the switch is on
 /// but no recent preflight pass is (GitHub #605).
 pub fn skip_or_fail(reason: &str) -> bool {
-    skip_or_fail_impl(reason, active_naming(Some(reason)))
+    skip_or_fail_impl(reason, active_naming)
 }
 
-fn skip_or_fail_impl(reason: &str, profile_active: bool) -> bool {
-    if profile_active {
+// The `_impl`s take `ask`, which answers whether the profile is active given
+// the condition met: `active_naming` in the code, a recorder in the tests.
+fn skip_or_fail_impl(reason: &str, ask: impl FnOnce(Option<&str>) -> bool) -> bool {
+    if ask(Some(reason)) {
         panic!(
             "{reason} -- GPU profile active (IGNIS_GPU_PROFILE=1): a busy \
              GPU, a missing fixture, or a kernel error is a hard failure, \
@@ -148,38 +150,37 @@ fn skip_or_fail_impl(reason: &str, profile_active: bool) -> bool {
 /// A kernel return code under ADR 0006 / the GPU profile: `false` (no skip)
 /// when `rc == 0`; otherwise [`skip_or_fail`].
 pub fn check_rc(rc: i32, what: &str) -> bool {
-    check_rc_impl(rc, what, active_naming(rc_condition(rc, what).as_deref()))
+    check_rc_impl(rc, what, active_naming)
 }
 
-/// The condition a nonzero `rc` meets, `None` for `rc == 0`.
-fn rc_condition(rc: i32, what: &str) -> Option<String> {
-    (rc != 0).then(|| format!("{what} returned {rc} (GPU busy/unavailable)"))
-}
-
-fn check_rc_impl(rc: i32, what: &str, profile_active: bool) -> bool {
-    match rc_condition(rc, what) {
-        Some(reason) => skip_or_fail_impl(&reason, profile_active),
-        None => false,
+fn check_rc_impl(rc: i32, what: &str, ask: impl FnOnce(Option<&str>) -> bool) -> bool {
+    if rc == 0 {
+        ask(None);
+        return false;
     }
+    skip_or_fail_impl(&format!("{what} returned {rc} (GPU busy/unavailable)"), ask)
 }
 
 /// A [`ComputeError`] under ADR 0006 / the GPU profile: `false` (no skip)
 /// for a non-kernel error (e.g. [`ComputeError::Stopped`], a soft stop, not
 /// a fault); otherwise the wrapped kernel rc via [`check_rc`].
 pub fn check_compute_err(e: &ComputeError, what: &str) -> bool {
-    let condition = match e {
-        ComputeError::Kernel(rc) => rc_condition(*rc, what),
-        ComputeError::Stopped => None,
-    };
-    check_compute_err_impl(e, what, active_naming(condition.as_deref()))
+    check_compute_err_impl(e, what, active_naming)
 }
 
-fn check_compute_err_impl(e: &ComputeError, what: &str, profile_active: bool) -> bool {
+fn check_compute_err_impl(
+    e: &ComputeError,
+    what: &str,
+    ask: impl FnOnce(Option<&str>) -> bool,
+) -> bool {
     match e {
-        ComputeError::Kernel(rc) => check_rc_impl(*rc, what, profile_active),
+        ComputeError::Kernel(rc) => check_rc_impl(*rc, what, ask),
         // Matched by name, not by `_`: a variant added later must be a
         // deliberate decision here, not silently treated as "not a fault".
-        ComputeError::Stopped => false,
+        ComputeError::Stopped => {
+            ask(None);
+            false
+        }
     }
 }
 
@@ -283,35 +284,69 @@ mod tests {
 
     #[test]
     fn check_rc_ok_never_skips_or_fails() {
-        assert!(!check_rc_impl(0, "thing", false));
-        assert!(!check_rc_impl(0, "thing", true));
+        assert!(!check_rc_impl(0, "thing", |_| false));
+        assert!(!check_rc_impl(0, "thing", |_| true));
     }
 
     #[test]
     fn check_rc_skips_when_profile_inactive() {
-        assert!(check_rc_impl(-1, "thing", false));
+        assert!(check_rc_impl(-1, "thing", |_| false));
     }
 
     #[test]
     #[should_panic(expected = "thing returned -1")]
     fn check_rc_fails_when_profile_active() {
-        check_rc_impl(-1, "thing", true);
+        check_rc_impl(-1, "thing", |_| true);
     }
 
     #[test]
     fn check_compute_err_stopped_is_never_a_skip_or_failure() {
-        assert!(!check_compute_err_impl(&ComputeError::Stopped, "thing", false));
-        assert!(!check_compute_err_impl(&ComputeError::Stopped, "thing", true));
+        assert!(!check_compute_err_impl(&ComputeError::Stopped, "thing", |_| false));
+        assert!(!check_compute_err_impl(&ComputeError::Stopped, "thing", |_| true));
     }
 
     #[test]
     fn check_compute_err_kernel_skips_when_profile_inactive() {
-        assert!(check_compute_err_impl(&ComputeError::Kernel(-1), "thing", false));
+        assert!(check_compute_err_impl(&ComputeError::Kernel(-1), "thing", |_| false));
     }
 
     #[test]
     #[should_panic(expected = "thing returned -1")]
     fn check_compute_err_kernel_fails_when_profile_active() {
-        check_compute_err_impl(&ComputeError::Kernel(-1), "thing", true);
+        check_compute_err_impl(&ComputeError::Kernel(-1), "thing", |_| true);
+    }
+
+    /// What `check` asked the profile with, the profile off: `None` if it
+    /// never asked, `Some(None)` if it asked naming no condition.
+    fn asked_by(
+        check: impl FnOnce(&mut dyn FnMut(Option<&str>) -> bool) -> bool,
+    ) -> Option<Option<String>> {
+        let mut asked = None;
+        check(&mut |condition| {
+            asked = Some(condition.map(str::to_string));
+            false
+        });
+        asked
+    }
+
+    #[test]
+    fn each_check_asks_the_profile_naming_the_condition_it_met() {
+        // A refusal for a stale marker names the condition it is handed, so
+        // a check that met one must hand it over (GitHub #605).
+        let failed = Some(Some("thing returned -1 (GPU busy/unavailable)".to_string()));
+        assert_eq!(
+            asked_by(|ask| skip_or_fail_impl("the artifact is missing", ask)),
+            Some(Some("the artifact is missing".to_string()))
+        );
+        assert_eq!(asked_by(|ask| check_rc_impl(-1, "thing", ask)), failed);
+        assert_eq!(
+            asked_by(|ask| check_compute_err_impl(&ComputeError::Kernel(-1), "thing", ask)),
+            failed
+        );
+        assert_eq!(asked_by(|ask| check_rc_impl(0, "thing", ask)), Some(None));
+        assert_eq!(
+            asked_by(|ask| check_compute_err_impl(&ComputeError::Stopped, "thing", ask)),
+            Some(None)
+        );
     }
 }

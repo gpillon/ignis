@@ -110,7 +110,7 @@ fn intervals(log_sink: &MemorySink) -> Vec<serde_json::Value> {
 /// model thread routes a request's `Done` to its stream before it sends the
 /// same event, and the counters of the step that finished it, to the
 /// telemetry task, so a test that has seen its stream end can still be
-/// ahead of those lines: on a loaded host, `nudge` alone yields before
+/// ahead of those lines: on a loaded host, a few yields can end before
 /// they are even sent.
 async fn until_logged(log_sink: &MemorySink, logged: impl Fn(&[serde_json::Value]) -> bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -121,7 +121,12 @@ async fn until_logged(log_sink: &MemorySink, logged: impl Fn(&[serde_json::Value
 
 /// The request's `ignis.request.done` line is in the log.
 fn done_logged(events: &[serde_json::Value]) -> bool {
-    events.iter().any(|e| e["event_name"] == "ignis.request.done")
+    has_event(events, "ignis.request.done")
+}
+
+/// A line named `name` is in the log.
+fn has_event(events: &[serde_json::Value], name: &str) -> bool {
+    events.iter().any(|e| e["event_name"] == name)
 }
 
 #[tokio::test]
@@ -354,7 +359,7 @@ async fn concurrent_submits_do_not_deadlock() {
         handle.await.expect("concurrent submits must not deadlock");
     }
     until_logged(&log_sink, |events| {
-        events.iter().any(|e| e["event_name"] == "ignis.scheduler.interval")
+        has_event(events, "ignis.scheduler.interval")
     })
     .await;
     assert!(
@@ -384,7 +389,7 @@ async fn reading_the_log_while_the_telemetry_consumer_is_still_draining_does_not
         .await
         .expect("the request completes");
     until_logged(&log_sink, |events| {
-        done_logged(events) && events.iter().any(|e| e["event_name"] == "ignis.scheduler.interval")
+        done_logged(events) && has_event(events, "ignis.scheduler.interval")
     })
     .await;
     let names = event_names(&log_sink);
@@ -415,7 +420,7 @@ async fn a_chunked_prefill_reports_its_phase_summary_through_the_real_engine() {
         .await
         .expect("the request completes");
     until_logged(&log_sink, |events| {
-        events.iter().any(|e| e["event_name"] == "ignis.request.admitted")
+        has_event(events, "ignis.request.admitted")
     })
     .await;
 
@@ -450,7 +455,7 @@ async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
         .await
         .expect("the request completes");
     until_logged(&log_sink, |events| {
-        events.iter().any(|e| e["event_name"] == "ignis.request.admitted")
+        has_event(events, "ignis.request.admitted")
     })
     .await;
 
