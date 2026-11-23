@@ -224,7 +224,8 @@ streams, and takes a persistent loop back. See
 **Mixed round.** From 0.11.0, a verify round of the 27B at 15 drafts whose
 requests run at both round shapes: one to three at the *extended shape*, 16
 columns each, beside one to six at the *base shape*, 8 columns each, 64 columns
-at most. Only `--spec-shape-policy mixed` grants one, request by request, and
+at most. Only `--spec-backend dflash2 --spec-draft-tokens 15
+--spec-shape-policy mixed` grants one, request by request, and
 only at a mix whose graphs the load holds. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 

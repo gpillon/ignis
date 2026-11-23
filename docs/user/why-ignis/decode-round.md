@@ -62,7 +62,8 @@ the RTX 5090; the RTX PRO 6000 has yet to confirm them
 From 0.11.0 the `rtx5090` profile's 27B drafts up to 15 tokens a round, each
 verify round at 8 columns a lane or, while the text is predictable, at 16; a
 round may also mix the two, a predictable request at 16 columns beside others
-at 8, under `--spec-shape-policy mixed`
+at 8, under `--spec-backend dflash2 --spec-draft-tokens 15
+--spec-shape-policy mixed`
 ([past seven drafts](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
 Against the same server at 7 drafts, one lane writing a greedy JSON answer
 went from 529 to 800 tok/s (+51%, 13.4 tokens a round against 7.9), a
