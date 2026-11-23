@@ -459,11 +459,12 @@ fn round_shapes_without_graphs(stats: &step::ProgramStats) -> Vec<(u32, &'static
 
 /// GitHub #714 (spec #711): the mixes whose graphs a capture that asked for
 /// them could not make, each as `w+n` (`w` extended lanes beside `n` base
-/// lanes), in the leaf's order. A round at such a mix runs at the uniform
-/// round shape `aggregate` would choose (the same tokens a round of that
-/// shape commits, without the mix's gain, never a refusal), which the load
-/// says in a structured event rather than leave to a silent fallback; the
-/// program's stats count those rounds.
+/// lanes), in the leaf's order. The grant never takes such a mix, stopping
+/// short of it at the last mix the load holds (GitHub #711), and a round
+/// forced at one runs at the uniform round shape `aggregate` would choose
+/// (the same tokens a round of that shape commits, never a refusal), which
+/// the load says in a structured event rather than leave to a silent
+/// fallback; the program's stats count those rounds.
 fn mixes_without_graphs(stats: &step::ProgramStats) -> Vec<String> {
     if !stats.mixed_graphs_asked {
         return Vec::new();
@@ -895,7 +896,7 @@ impl StepLeaf for CudaLeaf {
                 name: "ignis.runtime.mixed_graph_capture_incomplete",
                 mixes = ?mixes,
                 error = %step::last_decode_graph_error(),
-                "mixed graph capture: rounds at these mixes run at the uniform round shape aggregate chooses"
+                "mixed graph capture: the grant stops short of these mixes, at the last mix the load holds"
             );
         }
         if !capture_complete(capture.ready_count(), self.config.slot_count) {

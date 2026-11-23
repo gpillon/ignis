@@ -719,9 +719,9 @@ bool read_mixed_graph_build(ignis_model *model) {
 // the mixes of a load whose shape policy is `mixed`, and none under `aggregate` or `all`. Every
 // mixed graph of an earlier capture goes first, so a capture under `0` gives their memory back.
 // A mix whose capture fails has no graph -- its verify graph is
-// released where its append graph fails, so a mix is both or neither -- its rounds run at the
-// uniform choice (kernel/src/step.cu), its bit is in `mixed_failed_mask` and the capture's error
-// names it, and no capture is refused for it. Each captured mix's bytes are the device's free
+// released where its append graph fails, so a mix is both or neither -- the grant never takes it
+// and a round forced at it runs at the uniform choice (kernel/src/step.cu), its bit is in
+// `mixed_failed_mask` and the capture's error names it, and no capture is refused for it. Each captured mix's bytes are the device's free
 // memory before its capture less after. False (error set) on a value other than `0` or `1`, and
 // where CUDA cannot make the branch a mixed round runs its base group on.
 bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {

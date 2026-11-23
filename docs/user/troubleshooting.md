@@ -395,18 +395,18 @@ server with the card quiet, or with more `--vram-headroom-bytes`.
 
 ### WARN `ignis.runtime.mixed_graph_capture_incomplete`
 
-"mixed graph capture: rounds at these mixes run at the uniform round shape
-aggregate chooses", with the `mixes` (each `w+n`, `w` extended lanes beside `n`
+"mixed graph capture: the grant stops short of these mixes, at the last mix
+the load holds", with the `mixes` (each `w+n`, `w` extended lanes beside `n`
 base lanes) and the capture's `error`. From 0.11.0 a DFlash2 load of the 27B at
 15 draft tokens that asks for mixed rounds (rounds whose lanes take both
 [round shapes](concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes))
 captures the graphs of every mix its lanes hold, inside its
-[VRAM plan](concepts/vram-plan.md#what-the-plan-counts). A round at a mix whose
-graphs could not be captured still serves: it runs every lane at the one shape
-the shape policy `aggregate` would give them, the same tokens a round of that
-shape commits without the mix's gain, never refused and never eager; the
-shape policy `mixed` grants no round at such a mix, its grant stopping at the
-last mix the load holds. The load goes on. As for the verify graphs, restart
+[VRAM plan](concepts/vram-plan.md#what-the-plan-counts). A load with a mix
+whose graphs could not be captured still serves: the shape policy `mixed`
+grants no round at such a mix, its grant stopping at the last mix the load
+holds, and a round at a lane count where it holds none runs every lane at the
+one shape `aggregate` would give them, the same tokens without the mix's gain,
+never refused and never eager. The load goes on. As for the verify graphs, restart
 the server with the card quiet, or with more `--vram-headroom-bytes`.
 
 ### WARN `ignis.runtime.mixed_rounds_hold_no_mix`
