@@ -379,5 +379,8 @@ power limit and clock are its own), the route and the three levers, which are on
 
 - The RTX PRO 6000 run named above, before its profile's default moves.
 - #597: a drafted greedy decode against a plain one on the 27B, which the extended round does not widen.
-- The spec's out-of-scope studies, each its own `idea` issue: mixed lane shapes in one round (the only way to an
-  extended shape past 4 lanes), a rule that reads the same round's drafts, shapes below 8 columns for smaller cards.
+- The spec's out-of-scope studies: mixed lane shapes in one round (the only way to an extended shape past 4 lanes),
+  no `idea` issue but spec [#711](https://github.com/gpillon/ignis/issues/711), built and served
+  ([the mixed rounds' gate](2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)); a rule that reads the same
+  round's drafts ([#697](https://github.com/gpillon/ignis/issues/697)); shapes below 8 columns for smaller cards
+  ([#698](https://github.com/gpillon/ignis/issues/698)).
