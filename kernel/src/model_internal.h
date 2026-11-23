@@ -1123,6 +1123,27 @@ void ignis_each_group(ignis_model &model, const ignis::round_layout::Layout &lay
   call(layout.groups[1], model.mixed_branch.stream);
 }
 
+// GitHub #713, #718 (spec #711): mix `mix`'s graphs destroyed and the counts its capture recorded
+// zeroed, its bytes beside them where `bytes` says: a mix is both graphs or neither, at a capture
+// again, at a capture that failed (which keeps the bytes it read) and when the model goes.
+inline void ignis_release_mixed_graphs(ignis_model &model, std::uint32_t mix, bool bytes) {
+  for (cudaGraphExec_t *exec : {&model.mixed_verify_exec[mix], &model.mixed_append_exec[mix]}) {
+    if (*exec != nullptr) {
+      cudaGraphExecDestroy(*exec);
+      *exec = nullptr;
+    }
+  }
+  model.mixed_verify_nodes[mix] = 0;
+  model.mixed_append_nodes[mix] = 0;
+  model.mixed_verify_roots[mix] = 0;
+  model.mixed_verify_memsets[mix] = 0;
+  model.mixed_append_roots[mix] = 0;
+  model.mixed_append_memsets[mix] = 0;
+  if (bytes) {
+    model.mixed_graph_bytes[mix] = 0;
+  }
+}
+
 // GitHub #713 (spec #711): why this load cannot run a mixed round of `layout` over a pool of
 // `slot_count` slots, or null where it can: a DFlash2 load of two round shapes, on either body
 // (GitHub #720); one of the twelve mixes, within the load's lanes and its extended shape's; each

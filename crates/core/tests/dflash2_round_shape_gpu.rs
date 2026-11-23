@@ -462,7 +462,7 @@ fn blob_asks(blob: &[u8]) -> u32 {
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and_a_lanes_ask_is_its_sequences() {
+fn a_two_shape_loads_rounds_take_the_shapes_their_lanes_ask_or_are_granted_and_a_lanes_ask_is_its_sequences() {
     let path = Path::new(NVFP4);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {NVFP4}")) {
         return;

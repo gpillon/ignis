@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use ignis_core::image::ImageSize;
 use ignis_core::ngram_cache::CacheLocation;
 use ignis_core::ngram_table::HotBudget;
-use ignis_core::{DraftRule, ExceptionWeightsSetting, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, ShapeEstimate, ShapePolicy, SpeculativeBackend, VisionResidency};
+use ignis_core::{DraftRule, ExceptionWeightsSetting, KvFormat, KvPoolSize, PrefillAttention, PrefillLinear, ProposalHeadSetting, RopeSetting, ShapePolicy, SpeculativeBackend, VisionResidency};
 use serde_json::Value;
 
 use super::{ApiKey, ApiKeySetting, Expose, SoloWidth, SpecChoice};
@@ -949,7 +949,7 @@ impl PeriodRatios {
         row.split([',', ';'])
             .map(|ratio| {
                 Decimal::thousandths(ratio.trim())
-                    .filter(|milli| ShapeEstimate::PERIOD_RATIO_MILLI_RANGE.contains(milli))
+                    .filter(|milli| ignis_core::PeriodTable::RATIO_MILLI_RANGE.contains(milli))
                     .ok_or_else(|| format!("expects ratios from 1 to 2, got `{raw}`"))
             })
             .collect()

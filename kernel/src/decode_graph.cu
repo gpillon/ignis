@@ -726,19 +726,7 @@ bool read_mixed_graph_build(ignis_model *model) {
 // where CUDA cannot make the branch a mixed round runs its base group on.
 bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
   for (std::uint32_t i = 0; i < ignis::round_layout::kMixes; ++i) {
-    for (cudaGraphExec_t *exec : {&model->mixed_verify_exec[i], &model->mixed_append_exec[i]}) {
-      if (*exec != nullptr) {
-        cudaGraphExecDestroy(*exec);
-        *exec = nullptr;
-      }
-    }
-    model->mixed_verify_nodes[i] = 0;
-    model->mixed_append_nodes[i] = 0;
-    model->mixed_graph_bytes[i] = 0;
-    model->mixed_verify_roots[i] = 0;
-    model->mixed_verify_memsets[i] = 0;
-    model->mixed_append_roots[i] = 0;
-    model->mixed_append_memsets[i] = 0;
+    ignis_release_mixed_graphs(*model, i, true);
   }
   model->mixed_failed_mask = 0;
   model->mixed_capture_asked = false;
@@ -769,18 +757,7 @@ bool capture_mixed_graphs(ignis_model *model, ignis_seq_pool *pool) {
         ignis::round_layout::layout_of(mix[0], model->extended_shape->window, mix[1], base->window);
     const std::string name = "the mixed round " + std::to_string(mix[0]) + "+" + std::to_string(mix[1]);
     const auto failed = [&](const std::string &why) {
-      for (cudaGraphExec_t *exec : {&model->mixed_verify_exec[at], &model->mixed_append_exec[at]}) {
-        if (*exec != nullptr) {
-          cudaGraphExecDestroy(*exec);
-          *exec = nullptr;
-        }
-      }
-      model->mixed_verify_nodes[at] = 0;
-      model->mixed_append_nodes[at] = 0;
-      model->mixed_verify_roots[at] = 0;
-      model->mixed_verify_memsets[at] = 0;
-      model->mixed_append_roots[at] = 0;
-      model->mixed_append_memsets[at] = 0;
+      ignis_release_mixed_graphs(*model, at, false);
       model->mixed_failed_mask |= 1u << at;
       set_error("ignis_decode_graph_capture: " + name + ": " + why);
     };

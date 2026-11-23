@@ -3385,13 +3385,8 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     // GitHub #681: the gating's branch, idle once the stream is (every round joins it).
     model->gdn_gating_branch.destroy();
     // GitHub #713: the mixed rounds' graphs, and their branch, idle as the gating's is.
-    for (auto *execs : {&model->mixed_verify_exec, &model->mixed_append_exec}) {
-      for (cudaGraphExec_t &exec : *execs) {
-        if (exec != nullptr) {
-          cudaGraphExecDestroy(exec);
-          exec = nullptr;
-        }
-      }
+    for (std::uint32_t m = 0; m < ignis::round_layout::kMixes; ++m) {
+      ignis_release_mixed_graphs(*model, m, true);
     }
     model->mixed_branch.destroy();
     // GitHub #718: and the extended group's branch beside it.

@@ -623,11 +623,6 @@ impl ShapeEstimate {
     /// once in 17 rounds -- under 2% of its rate at two lanes -- and a lane
     /// whose text turns predictable waits at most 16 rounds.
     pub const DEFAULT_ROUNDS: u32 = 16;
-    /// The default table's uniform entries, at 1 to 4 lanes
-    /// ([`PeriodTable::NVFP4`]).
-    pub const DEFAULT_PERIOD_RATIOS_MILLI: [u32; EXTENDED_SHAPE_MAX_LANES as usize] = PeriodTable::NVFP4.uniform();
-    /// The narrowest and widest ratio taken ([`PeriodTable::RATIO_MILLI_RANGE`]).
-    pub const PERIOD_RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = PeriodTable::RATIO_MILLI_RANGE;
 
     /// `rounds` in `1..=`[`SHAPE_ESTIMATE_MAX_ROUNDS`], the refusal naming
     /// its range; the table is checked where it is made ([`PeriodTable`],
@@ -1063,12 +1058,12 @@ mod tests {
                 .map(|ratio| ratio.trim().parse().unwrap_or_else(|e| panic!("{name}: {e}")))
                 .collect()
         };
-        assert_eq!(ratios("kDefaultPeriodRatios"), ShapeEstimate::DEFAULT_PERIOD_RATIOS_MILLI);
+        assert_eq!(ratios("kDefaultPeriodRatios"), PeriodTable::NVFP4.uniform());
         // GitHub #715: and the cost table's mixed entries, in the mixes' order.
         assert_eq!(ratios("kDefaultMixedPeriodRatios"), PeriodTable::NVFP4.mixed());
         assert_eq!(
             number("kPeriodRatioMinMilli")..=number("kPeriodRatioMaxMilli"),
-            ShapeEstimate::PERIOD_RATIO_MILLI_RANGE
+            PeriodTable::RATIO_MILLI_RANGE
         );
     }
 
