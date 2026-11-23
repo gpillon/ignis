@@ -148,21 +148,30 @@ fn skip_or_fail_impl(reason: &str, profile_active: bool) -> bool {
 /// A kernel return code under ADR 0006 / the GPU profile: `false` (no skip)
 /// when `rc == 0`; otherwise [`skip_or_fail`].
 pub fn check_rc(rc: i32, what: &str) -> bool {
-    check_rc_impl(rc, what, active())
+    check_rc_impl(rc, what, active_naming(rc_condition(rc, what).as_deref()))
+}
+
+/// The condition a nonzero `rc` meets, `None` for `rc == 0`.
+fn rc_condition(rc: i32, what: &str) -> Option<String> {
+    (rc != 0).then(|| format!("{what} returned {rc} (GPU busy/unavailable)"))
 }
 
 fn check_rc_impl(rc: i32, what: &str, profile_active: bool) -> bool {
-    if rc == 0 {
-        return false;
+    match rc_condition(rc, what) {
+        Some(reason) => skip_or_fail_impl(&reason, profile_active),
+        None => false,
     }
-    skip_or_fail_impl(&format!("{what} returned {rc} (GPU busy/unavailable)"), profile_active)
 }
 
 /// A [`ComputeError`] under ADR 0006 / the GPU profile: `false` (no skip)
 /// for a non-kernel error (e.g. [`ComputeError::Stopped`], a soft stop, not
 /// a fault); otherwise the wrapped kernel rc via [`check_rc`].
 pub fn check_compute_err(e: &ComputeError, what: &str) -> bool {
-    check_compute_err_impl(e, what, active())
+    let condition = match e {
+        ComputeError::Kernel(rc) => rc_condition(*rc, what),
+        ComputeError::Stopped => None,
+    };
+    check_compute_err_impl(e, what, active_naming(condition.as_deref()))
 }
 
 fn check_compute_err_impl(e: &ComputeError, what: &str, profile_active: bool) -> bool {
