@@ -1882,10 +1882,16 @@ impl Metrics {
             // GitHub #689: the rounds by round shape. The base shape is a load
             // of one shape's only one (an MTP or a Flash-Next load, DFlash2 at
             // 7 drafts or fewer), whose extended series stays at 0. GitHub
-            // #719: a mixed round counts once as mixed, at neither shape; the
-            // series stays at 0 where no load runs one.
+            // #719: each lane of a mixed round counts once as mixed, at neither
+            // shape, as each lane's rounds count at the others; the series stays
+            // at 0 where no load runs one.
             let name = "ignis_speculative_shape_rounds_total";
-            declare(&mut out, name, "counter", "Verify rounds run, by round shape: base, extended or mixed.");
+            declare(
+                &mut out,
+                name,
+                "counter",
+                "Verify rounds run, counted on each lane's rounds, by round shape: base, extended or mixed (a lane of a round of both shapes).",
+            );
             let extended = read(&self.spec_extended_rounds);
             let mixed = read(&self.spec_mixed_rounds);
             let _ = writeln!(out, "{name}{{shape=\"base\"}} {}", rounds.saturating_sub(extended).saturating_sub(mixed));

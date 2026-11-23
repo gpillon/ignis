@@ -1,6 +1,6 @@
 ---
 status: proposed
-amends: [ADR-0030, ADR-0104]
+amends: [ADR-0017, ADR-0030, ADR-0104]
 ---
 
 # The 27B's DFlash2 verify round may carry lanes of both shapes, and a mixed round is held to its base round's numerical class
@@ -86,6 +86,15 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   [ADR 0030](0030-device-memory-reserved-at-load.md) as
   [ADR 0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)
   did for the fifteenth line, by a new ADR rather than an edit in place, which only the owner decides.
+- **The shape counts, a label of a family ADR 0017 has** (#719). `shape="mixed"` joins
+  `ignis_speculative_shape_rounds_total`'s label set beside `base` and `extended`, with no new family: like the other
+  shapes it counts each lane's rounds, a lane of a mixed round once as mixed and at neither of the others, so the three
+  series sum to `ignis_speculative_rounds_total` and a share of them is a share of lane-rounds. That is the unit user
+  story 27 asks for (how often rounds mix), taken over a literal reading of "the shape counts read each lane's own",
+  which would count a mixed round's lanes at their own shapes and no round as mixed; the per-position drafted and
+  accepted families keep counting each lane's own drafts, an extended lane's up to its window and a base lane's up to
+  its own. The series renders at 0 on a load that runs no mixed round, and the Monitor's *Speculation* card shows its
+  share beside the extended rounds'. This amends [ADR 0017](0017-prometheus-metrics.md) by a new ADR, as for ADR 0030.
 
 **A mixed round is held to its base round's numerical class as ADR 0104 holds the extended round: its method, its
 margins and its window.** Each group runs its own shape's routes on its slice and the ops that see only columns run once
