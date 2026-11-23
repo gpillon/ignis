@@ -75,60 +75,34 @@ impl PeriodTable {
     /// its columns.
     pub const RATIO_MILLI_RANGE: std::ops::RangeInclusive<u32> = 1000..=2000;
 
-    /// The NVFP4 body's table on the RTX 5090, the default of a load of that
-    /// body ([`PeriodTableSetting::of_body`]) until a measurement of the final
-    /// build replaces it (GitHub #721).
-    ///
-    /// The uniform entries, 1.128, 1.29, 1.363 and 1.344 at 1 to 4 lanes:
-    /// measured on the GPU clock (round timing), FP8 exception weights, the
-    /// `hq-e8-2b` cache, the default cost levers and route, at a matched
-    /// context of about 3.5-5K tokens (the ratio grows with context), pooled
-    /// over two orders; the card's 575 W limit lowers the extended round's
-    /// clock at 3 and 4 lanes, so 3 lanes reads above 4.
-    ///
-    /// The mixed entries: 1+1, 1+3, 2+2 and 1+5 are the RTX 5090's measured
-    /// periods of those mixes with their graph build, over the base round's at
-    /// their lane count (19,091 over 16,529 us; 24,467 and 26,275 over 21,505;
-    /// 29,039 over 26,574): 1.155, 1.138, 1.222 and 1.093. The other eight
-    /// were not measured: each is the RTX 5090's measured base round of the
-    /// mix's total columns over the base round at its lane count, since a
-    /// mixed round with its graph build was measured to cost what a base round
-    /// of its columns costs (3 to 7 lanes: about 19,200, 21,505, 24,668, 26,574
-    /// and 29,770 us); at 64 columns, where no base round of 8 lanes was
-    /// measured, one 8-column step past 56 at the step from 48 to 56 (32,966
-    /// us). All of them pending GitHub #721.
-    pub const NVFP4: Self = Self {
-        uniform: [1128, 1290, 1363, 1344],
-        // MIXES' order: 1+1, 1+2, 1+3, 1+4, 1+5, 1+6, 2+1, 2+2, 2+3, 2+4, 3+1, 3+2.
-        mixed: [1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336],
-    };
+    /// The NVFP4 body's table, the default of a load of that body
+    /// ([`PeriodTableSetting::of_body`]): its measurement on the RTX 5090
+    /// (`NVFP4_MEASURED`), held (`PeriodTable::held`).
+    pub const NVFP4: Self = NVFP4_MEASURED.held();
 
-    /// GitHub #720 (spec #711): the trellis body's table, the default of a
-    /// load of the 16 GB artifact the `rtx-16gb` and `rtx-24gb` profiles load
-    /// ([`PeriodTableSetting::of_body`]). Provisional until GitHub #721
-    /// measures it: no entry is measured on this body.
-    ///
-    /// Its uniform entries are [`Self::NVFP4`]'s, so that `aggregate` on this
-    /// body reads what it read before mixed rounds. Its mixed entries scale
-    /// the excess over 1 of [`Self::NVFP4`]'s by [`TRELLIS_MIXED_SCALE_MILLI`]
-    /// (what 8 more columns of a base round cost this body against the NVFP4
-    /// body's, ADR 0106), then each is held within its row: no higher than the
-    /// uniform entry at its lane count, a round of more columns, and no lower
-    /// than the mix of one fewer extended lane before it, so that no step of
-    /// the grant costs less than nothing.
-    pub const TRELLIS: Self = Self::trellis();
+    /// The trellis body's table, the default of a load of the 16 GB artifact
+    /// the `rtx-16gb` and `rtx-24gb` profiles load
+    /// ([`PeriodTableSetting::of_body`]): its measurement on the RTX 5090
+    /// (`TRELLIS_MEASURED`), held (`PeriodTable::held`).
+    pub const TRELLIS: Self = TRELLIS_MEASURED.held();
 
-    const fn trellis() -> Self {
-        let uniform = Self::NVFP4.uniform;
-        let mut mixed = [0; MIXES.len()];
+    /// The table with no step of a row costing less than nothing: every entry
+    /// at least 1, each mixed entry no higher than the uniform entry at its
+    /// lane count (a round of more columns) and no lower than the mix of one
+    /// fewer extended lane before it. The uniform entries, which `aggregate`
+    /// reads, are kept as they are.
+    const fn held(self) -> Self {
+        let mut mixed = self.mixed;
         let mut m = 0;
         while m < MIXES.len() {
             let (extended, base) = MIXES[m];
             let lanes = extended + base;
-            let excess = Self::NVFP4.mixed[m] - 1000;
-            let mut ratio = 1000 + (excess * TRELLIS_MIXED_SCALE_MILLI + 500) / 1000;
-            if lanes <= EXTENDED_SHAPE_MAX_LANES && ratio > uniform[lanes as usize - 1] {
-                ratio = uniform[lanes as usize - 1];
+            let mut ratio = mixed[m];
+            if ratio < *Self::RATIO_MILLI_RANGE.start() {
+                ratio = *Self::RATIO_MILLI_RANGE.start();
+            }
+            if lanes <= EXTENDED_SHAPE_MAX_LANES && ratio > self.uniform[lanes as usize - 1] {
+                ratio = self.uniform[lanes as usize - 1];
             }
             // MIXES holds every mix of one fewer extended lane before this one.
             let mut before = 0;
@@ -141,7 +115,7 @@ impl PeriodTable {
             mixed[m] = ratio;
             m += 1;
         }
-        Self { uniform, mixed }
+        Self { uniform: self.uniform, mixed }
     }
 
     /// The entries a row of `lanes` lanes holds: one for each count of
@@ -237,15 +211,37 @@ impl Default for PeriodTable {
     }
 }
 
-/// GitHub #720 (spec #711): what 8 more columns of a base round cost the
-/// trellis body against the NVFP4 body's, in thousandths: its base round at 2
-/// lanes over 1, 1.218 (17.62 over 14.47 ms at 8K tokens of context,
-/// `docs/findings/2026-10-24-27b-16gb-speed-estimate.md`), against the NVFP4
-/// body's 1.104 (16,468 over 14,915 us,
-/// `docs/findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md`):
-/// 0.218 over 0.104, taken as 2.09. [`PeriodTable::TRELLIS`]'s mixed entries
-/// scale by it until GitHub #721 measures them.
-pub const TRELLIS_MIXED_SCALE_MILLI: u32 = 2090;
+/// GitHub #721 (spec #711): the NVFP4 body's cost table as measured on the
+/// RTX 5090, every entry against measured base rounds of the same session:
+/// the round identity test's timing (`IGNIS_ROUND_IDENTITY_TIMING_TABLE`, the
+/// `nvfp4-dflash2-w15` load, FP8 exception weights, the `hq-e8-2b` cache, the
+/// default cost levers and route, the mixed graph build), each cell 600
+/// greedy rounds of its lanes forced to its shapes, at a context of the
+/// prompts' 64 tokens to 1,024 (the ratio grows with context: these are short
+/// context figures); eight legs, four in each order; each cell's period the
+/// median of its 256-round blocks' medians on the GPU clock, an entry that
+/// period over the base round's at its lane count.
+///
+/// The step from 56 columns to 64 costs nothing or less: the card's 575 W
+/// limit holds the 56-column rounds at a lower clock than the 64-column ones
+/// (about 2,715 against 2,790 MHz), so 3+1 reads above the uniform round of 4
+/// lanes, 3+2 below 2+3, 2+4 below 1+5 and 1+6 below the base round of 7
+/// lanes. [`PeriodTable::held`] holds those four.
+const NVFP4_MEASURED: PeriodTable = PeriodTable {
+    uniform: [1108, 1263, 1321, 1304],
+    // MIXES' order: 1+1, 1+2, 1+3, 1+4, 1+5, 1+6, 2+1, 2+2, 2+3, 2+4, 3+1, 3+2.
+    mixed: [1150, 1120, 1130, 1071, 1101, 978, 1256, 1201, 1177, 1082, 1323, 1161],
+};
+
+/// GitHub #721 (spec #711): the trellis body's cost table as measured on the
+/// RTX 5090, by [`NVFP4_MEASURED`]'s method on the `trellis-24gb-w15-rule`
+/// load (no exception tensor to hold), at a context of 64 tokens to 1,792,
+/// eight legs; indicative for the 16 GB and 24 GB cards until a run on one.
+/// No row falls, so [`PeriodTable::held`] keeps every entry.
+const TRELLIS_MEASURED: PeriodTable = PeriodTable {
+    uniform: [1362, 1388, 1611, 1572],
+    mixed: [1206, 1163, 1293, 1067, 1112, 1008, 1498, 1386, 1192, 1124, 1545, 1196],
+};
 
 /// GitHub #720 (spec #711): the cost table as `spec.shape_period_ratios`
 /// gives it, which a 27B load turns into the table it runs once its body is
@@ -443,8 +439,20 @@ mod tests {
         lane(true, 16, 128, 4, 4 * extra, refused)
     }
 
+    /// The table the grant's rows here are worked against, the tests' own,
+    /// so that each row's arithmetic holds whatever the defaults are: at 2
+    /// to 7 lanes 1.155 | 1.12, 1.285 | 1.138, 1.222, 1.384 | 1.077, 1.207,
+    /// 1.336 | 1.093, 1.241 | 1.107, the uniform entries 1.29, 1.363 and
+    /// 1.344 at 2 to 4. Its 3+1 entry above the uniform entry at 4 lanes,
+    /// a round of more columns, makes a step of the grant cheaper than the
+    /// round before it, as a table an operator names may.
+    const TABLE: PeriodTable = PeriodTable {
+        uniform: [1128, 1290, 1363, 1344],
+        mixed: [1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336],
+    };
+
     fn shapes(policy: ShapePolicy, lanes: &[GrantLane]) -> Vec<bool> {
-        lane_shapes(policy, &PeriodTable::NVFP4, lanes, &MIXES)
+        lane_shapes(policy, &TABLE, lanes, &MIXES)
     }
 
     /// The mixes a pool of `lanes` lanes and `retained` device retained slots
@@ -455,7 +463,10 @@ mod tests {
     }
 
     /// The default table's rows: at 1 to 7 lanes, an entry for each count of
-    /// extended lanes 64 columns hold.
+    /// extended lanes 64 columns hold. GitHub #721: the NVFP4 body's measured
+    /// entries, four of them held: 3+1 at the uniform 1.304 (measured 1.323),
+    /// 3+2 at 2+3's 1.177 (1.161), 2+4 at 1+5's 1.101 (1.082) and 1+6 at 1
+    /// (0.978).
     #[test]
     fn the_cost_table_holds_a_ratio_for_each_lane_count_and_extended_lanes_64_columns_hold() {
         let rows = PeriodTable::NVFP4.rows();
@@ -463,13 +474,13 @@ mod tests {
         assert_eq!(
             rows,
             [
-                vec![1128],
-                vec![1155, 1290],
-                vec![1120, 1285, 1363],
-                vec![1138, 1222, 1384, 1344],
-                vec![1077, 1207, 1336],
-                vec![1093, 1241],
-                vec![1107],
+                vec![1108],
+                vec![1150, 1263],
+                vec![1120, 1256, 1321],
+                vec![1130, 1201, 1304, 1304],
+                vec![1071, 1177, 1177],
+                vec![1101, 1101],
+                vec![1000],
             ]
         );
         assert_eq!(PeriodTable::from_rows(&rows), Ok(PeriodTable::NVFP4), "the rows read back");
@@ -498,26 +509,18 @@ mod tests {
         assert!(refusal.contains("2 lanes") && refusal.contains("2.1"), "{refusal}");
     }
 
-    /// GitHub #720: until GitHub #721 measures it, the trellis body's table
-    /// keeps the NVFP4 body's uniform entries, so that `aggregate` there reads
-    /// what it read before mixed rounds, and its mixed entries (the NVFP4
-    /// body's excess over 1 at 2.09 times) never pass the uniform entry at
-    /// their lane count nor fall as extended lanes rise: no step of the grant
+    /// GitHub #721: each body's default table costs a row no less as its
+    /// extended lanes rise, the uniform round last at 1 to 4 lanes, every
+    /// entry in the field's range: under either default no step of the grant
     /// is free.
     #[test]
-    fn the_trellis_tables_uniform_entries_are_the_nvfp4_bodys_and_no_step_of_a_row_falls() {
-        let table = PeriodTable::TRELLIS;
-        assert_eq!(table.uniform(), [1128, 1290, 1363, 1344]);
-        assert!(table.check().is_ok());
-        for (lanes, row) in (1..=MIXED_MAX_LANES).zip(table.rows()) {
-            assert!(row.windows(2).all(|step| step[0] <= step[1]), "{lanes} lanes: {row:?}");
+    fn no_default_row_falls_as_its_extended_lanes_rise() {
+        for (body, table) in [("NVFP4", PeriodTable::NVFP4), ("trellis", PeriodTable::TRELLIS)] {
+            assert!(table.check().is_ok(), "{body}");
+            for (lanes, row) in (1..=MIXED_MAX_LANES).zip(table.rows()) {
+                assert!(row.windows(2).all(|step| step[0] <= step[1]), "{body}, {lanes} lanes: {row:?}");
+            }
         }
-        // Worked: 1+4 scales 0.077 to 0.161; 3+2 0.336 to 0.702; 1+1's 1.324
-        // and 2+1's 1.596 are held to the uniform 1.29 and 1.363, and 2+2's
-        // 1.464 and 3+1's 1.803 to the uniform 1.344.
-        assert_eq!((table.ratio(5, 1), table.ratio(5, 3)), (1161, 1702));
-        assert_eq!((table.ratio(2, 1), table.ratio(3, 2)), (1290, 1363));
-        assert_eq!((table.ratio(4, 2), table.ratio(4, 3)), (1344, 1344));
     }
 
     /// The grant's order: the highest expected extra tokens first, so that at
@@ -594,8 +597,10 @@ mod tests {
         assert_eq!(shapes(ShapePolicy::Mixed, &vec![gains(); 2]), [true; 2]);
     }
 
-    /// A step to a round that costs less than the current one (3+1 at 1.384
-    /// to the uniform 1.344) is granted, even to a lane that gains nothing.
+    /// A step to a round that costs less than the current one is granted,
+    /// even to a lane that gains nothing: under the tests' table, 3+1 at 1.384
+    /// to the uniform 1.344, as a table an operator names may hold; no
+    /// default does ([`PeriodTable::held`]).
     #[test]
     fn a_step_to_a_cheaper_round_is_granted() {
         let lanes = [asking(8, 0), asking(8, 0), asking(8, 0), asking(0, 0)];
@@ -612,14 +617,14 @@ mod tests {
         assert_eq!(partial, [(1, 1), (1, 2), (1, 3), (2, 1)]);
         let four = [asking(5, 0), conversation(), asking(6, 0), conversation()];
         assert_eq!(shapes(ShapePolicy::Mixed, &four), [true, false, true, false], "every mix held: 2+2");
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &four, &partial), [false, false, true, false], "1+3");
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &four, &partial), [false, false, true, false], "1+3");
         let gains = vec![asking(8, 0); 4];
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &gains, &partial), [true, false, false, false]);
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &gains, &partial), [true, false, false, false]);
         // A capture that failed 1+2 leaves 1+1 at 2 lanes and no mix at 3.
         let failed: Vec<(u32, u32)> = MIXES.into_iter().filter(|&mix| mix != (1, 2)).collect();
         let three = [asking(8, 0), asking(8, 0), conversation()];
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &three[..2], &failed), [true, true]);
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &three, &failed), [true; 3], "aggregate's");
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &three[..2], &failed), [true, true]);
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &three, &failed), [true; 3], "aggregate's");
     }
 
     /// A round at a lane count where the load holds no mix (its first step's
@@ -630,16 +635,16 @@ mod tests {
     fn a_round_where_the_load_holds_no_mix_takes_aggregates_choice() {
         assert_eq!(held(2, 0), []);
         let pair = [asking(6, 0), conversation()];
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &pair, &[]), [true, true], "6 > 0.29 * 10");
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &pair, &[]), [true, true], "6 > 0.29 * 10");
         let pair = [asking(2, 0), conversation()];
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &pair, &[]), [false, false], "2 does not");
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &pair, &[]), [false, false], "2 does not");
         // 4 lanes and no retained slot hold 1+1 and 1+2: a round of 4 holds none.
         assert_eq!(held(4, 0), [(1, 1), (1, 2)]);
         let four = [asking(6, 0), conversation(), conversation(), conversation()];
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &four, &held(4, 0)), [true; 4], "6 > 0.344 * 14");
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &four, &held(4, 0)), [true; 4], "6 > 0.344 * 14");
         // 5 lanes and more: past the extended shape's lanes, `aggregate`'s base round.
         let five = vec![asking(8, 0); 5];
-        assert_eq!(lane_shapes(ShapePolicy::Mixed, &PeriodTable::NVFP4, &five, &held(5, 0)), [false; 5]);
+        assert_eq!(lane_shapes(ShapePolicy::Mixed, &TABLE, &five, &held(5, 0)), [false; 5]);
     }
 
     /// One lane runs at the shape it asks under `mixed` and `aggregate`, and

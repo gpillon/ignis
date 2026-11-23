@@ -1991,7 +1991,7 @@ fn the_shape_rules_thresholds_ride_the_speculation_and_a_stay_past_the_window_is
 }
 
 /// GitHub #690: the shape policy rides the speculation, `aggregate` over each
-/// lane's last 16 rounds at the period ratios 1.128, 1.29, 1.363 and 1.344
+/// lane's last 16 rounds at the loaded body's cost table (`auto`, GitHub #720)
 /// unless named, by flag, env or file (the ratios a list of four there), each
 /// a visible, patchable reload of the 27B's; the effective configuration
 /// writes them in the 27B's section, from which a start reads them back. A

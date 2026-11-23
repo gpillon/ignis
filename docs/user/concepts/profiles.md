@@ -260,7 +260,8 @@ Why each:
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
-  table, provisional until a run on one of these cards
+  table, measured on the RTX 5090 and indicative here until a run on one of
+  these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   Their graphs cost nothing here: a mix of `w` extended lanes beside `n` base
   lanes takes `2w + n` of the pool's slots, so two lanes with no device
@@ -426,7 +427,8 @@ Why each:
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
-  table, provisional until a run on one of these cards
+  table, measured on the RTX 5090 and indicative here until a run on one of
+  these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   These eight lanes hold all twelve mixes, with or without the two device
   retained slots: the plan's line for their graphs is 70 MiB, at most 125 KV

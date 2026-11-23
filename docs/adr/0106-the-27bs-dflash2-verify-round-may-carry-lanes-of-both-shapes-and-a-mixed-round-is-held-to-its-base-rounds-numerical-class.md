@@ -62,18 +62,13 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   table, resolved at load where the body is known (`PeriodTableSetting::of_body`), as `model.exception_weights` and
   `model.rope_scaling` resolve theirs under ADR 0046's one declaration: a table named whole stands on either body, the
   four-value form's mixed entries are the loaded body's, and the four-value form at its earlier default reads as `auto`,
-  so a file an earlier build generated names no table. The NVFP4 body's: its uniform entries the RTX 5090's measured
-  1.128, 1.290, 1.363 and 1.344; four of its mixed entries, 1+1, 1+3, 2+2 and 1+5, those mixes' periods measured with
-  their graph build, and each of the other eight the measured base round of the mix's columns over the base round at its
-  lane count, a mixed round with its graph build having been measured to cost what a base round of its columns costs
-  (the three mixes of 64 columns, where no base round of 8 lanes was measured, one 8-column step past 56). The trellis
-  body's keeps the NVFP4 body's uniform entries, so that `aggregate` there reads what it read before mixed rounds; its
-  mixed entries scale the NVFP4 body's excess over 1 by 2.09, what the trellis body's base round's 8 more columns cost
-  at one and two lanes against the NVFP4 body's (1.218 over 1.104), each held no higher than the uniform entry at its
-  lane count and no lower than the mix of one fewer extended lane, so that no step of the grant is free. Both are
-  provisional until measured against measured rounds of the same columns, never read off a line between lane counts: the
-  base round's cost rises in steps with its columns (5 lanes 24,668 us and 7 lanes 29,770, where a line between lane
-  counts said 23.9 and 27.7 ms). The four-value form stays accepted as the uniform entries.
+  so a file an earlier build generated names no table. Both bodies' tables are measured on the RTX 5090 (#721, below):
+  every entry a round forced to its shapes over a base round at its lane count measured in the same session, never read
+  off a line between lane counts, since the base round's cost rises in steps with its columns and on this card not even
+  always upward (8 lanes ran faster than 7 on the NVFP4 body). Where a mixed entry measured below the entry before it in
+  its row, above its row's uniform entry or under 1, the default holds it at that bound (`PeriodTable::held`), so that
+  under a default no step of the grant is free; the uniform entries, which `aggregate` reads, stand as measured. The
+  four-value form stays accepted as the uniform entries.
 - **The mixed graphs, a sixteenth line of the VRAM plan** (#714). A mixed round replays a verify graph and a drafter
   append graph of its mix, both or neither, captured at load for every mix the load holds where mixed rounds are asked;
   the grant never takes a mix with no graph, and a round forced at one (the test seam) runs at the uniform shape
@@ -198,6 +193,36 @@ the twelve mixes, the cell's uniform section printing what its run of 2026-11-22
 splits the rounds of 24 to 56 columns fails it, and the uniform legs then follow the split; the extended shape has a
 round of a mix's own columns only beside an even count of base lanes.
 
+**The cost table, measured** (#721). On the RTX 5090 on 2026-11-23, through the round identity test's timing
+(`IGNIS_ROUND_IDENTITY_TIMING_TABLE`): at each lane count of 1 to 8, the base round and each count of extended lanes 64
+columns hold, each cell after a capture again, 600 greedy rounds of fresh lanes forced to its shapes (its last lanes
+extended), on the GPU clock with the round timing; the NVFP4 body on `nvfp4-dflash2-w15` (FP8 exception weights,
+hq-e8-2b, the mixed graph build, 64 to 1,024 tokens of context), the trellis body on `trellis-24gb-w15-rule` (64 to
+1,792); eight legs each, half riding the cells in the reverse order. Each cell's period is the median of its 256-round
+blocks' medians over the eight legs, sixteen of them: the machine is shared, and a stretch of tens of seconds now and
+then ran 5-14% slow at the same clock, which only ever slows a block, so one slow block or leg must not move a cell.
+An entry is its cell's period over the base round's at its lane count; dropping any one leg moves no entry by more
+than 0.006 on the NVFP4 body and 0.010 on the trellis body. Each row's entries at 1, 2, ... lanes extended, a held entry
+beside its measured value:
+
+| lanes | NVFP4 base round | NVFP4 entries | trellis base round | trellis entries |
+|---|---|---|---|---|
+| 1 | 15,296 us | 1.108 | 14,793 us | 1.362 |
+| 2 | 16,581 us | 1.15, 1.263 | 19,883 us | 1.206, 1.388 |
+| 3 | 18,955 us | 1.12, 1.256, 1.321 | 23,946 us | 1.163, 1.498, 1.611 |
+| 4 | 21,027 us | 1.13, 1.201, 1.304 (1.323), 1.304 | 27,840 us | 1.293, 1.386, 1.545, 1.572 |
+| 5 | 23,823 us | 1.071, 1.177, 1.177 (1.161) | 36,520 us | 1.067, 1.192, 1.196 |
+| 6 | 25,562 us | 1.101, 1.101 (1.082) | 39,073 us | 1.112, 1.124 |
+| 7 | 28,475 us | 1 (0.978) | 43,823 us | 1.008 |
+| 8 | 27,983 us | none | 44,631 us | none |
+
+A mixed round costs what a base round of its columns costs to within 3% on either body. On the NVFP4 body the step from
+56 columns to 64 costs nothing or less: its 56-column rounds ran at about 2,715 MHz under the card's 575 W limit and
+its 64-column ones at about 2,790, in either order, so 3+1 measured above the uniform round of 4 lanes, 3+2 below 2+3,
+2+4 below 1+5, 1+6 below the base round of 7 lanes and that round above the base round of 8; those four are held. The
+trellis body's rows do not fall. The NVFP4 body's uniform entries read 1.108, 1.263, 1.321 and 1.304 where #684's
+served timing read 1.128, 1.29, 1.363 and 1.344 at about 3.5-5K tokens of context: the ratio grows with context.
+
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class
 reaches the mixed round; "lanes of both shapes in one round" is built, the only way to an extended shape past 4 lanes.
 In ADR 0030, the plan's sixteenth line, `mixed_graphs`. In ADR 0017, the shape counts' `mixed` label.
@@ -238,3 +263,7 @@ In ADR 0030, the plan's sixteenth line, `mixed_graphs`. In ADR 0017, the shape c
 - The bounds are the RTX 5090's on the NVFP4 body under FP8 exception weights over hq-e8-2b. A trellis body runs mixed
   rounds from #720, held to the round identity test's tokens at 8 lanes and, on its class test's cell, bit for bit to
   the uniform rounds' rows, which follow a round's columns there.
+- The cost tables are the RTX 5090's at a short context. The ratio grows with context, so on a long conversation the
+  wider round costs every lane somewhat more than its entry says, and `aggregate` and the grant take it a little more
+  readily than it pays there; on another card both tables are unmeasured, the trellis body's indicative for the 16 GB
+  and 24 GB cards until a run on one.

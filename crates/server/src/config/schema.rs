@@ -734,11 +734,13 @@ config_group! {
         /// the form before the table, are the uniform entries, the rest the
         /// loaded artifact's. `auto`, the default, is the loaded artifact's own
         /// table, which the load's `ignis.model.loaded` line names: the NVFP4
-        /// artifact's measured on the RTX 5090 in part, the rest derived from
-        /// its measured base rounds; the trellis artifact's (the 16 GB and
-        /// 24 GB profiles') the NVFP4 artifact's uniform entries beside mixed
-        /// ones derived from the NVFP4 artifact's; both provisional until a
-        /// measurement of this build (ADR 0106). Unmeasured on other cards.
+        /// artifact's and the trellis artifact's (the 16 GB and 24 GB
+        /// profiles'), each measured on the RTX 5090 against base rounds
+        /// measured beside it, at a short context (up to 1,024 and 1,792
+        /// tokens: the ratio grows with context); where a mixed entry measured
+        /// below the entry before it in its row, above its row's uniform entry
+        /// or under 1, it is held at that bound (ADR 0106). Unmeasured on
+        /// other cards.
         /// The one-lane entry is not read: a lane alone runs at the shape it
         /// asks. A speed setting only.
         shape_period_ratios: PeriodRatios = ignis_core::PeriodTableSetting::Auto, NO_RULE, QWEN38_ONLY,

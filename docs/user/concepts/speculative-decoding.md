@@ -202,8 +202,9 @@ lanes they differ in who pays the wider round:
 - `aggregate`, the default, runs the round extended when the drafts its asking
   requests are expected to take past position 7 exceed what the wider round
   costs every request in it: the extended round's period over the base
-  round's at that lane count (`--spec-shape-period-ratios`, 1.29 at two
-  lanes), less one, times the tokens every request is expected to take a
+  round's at that lane count (`--spec-shape-period-ratios`, 1.263 at two
+  lanes on the NVFP4 artifact), less one, times the tokens every request is
+  expected to take a
   round. Each request's expectations come from its own last 16 verify rounds
   (`--spec-shape-estimate-rounds`); a request that asks with no extended round
   among them is granted one, so that its estimate has something to read. A
@@ -248,12 +249,16 @@ lanes they differ in who pays the wider round:
 The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
 the round's period with 1, 2, ... of them extended over the base round's) are
 each artifact's own (`auto`) unless you name a table (four ratios alone take
-the artifact's mixed entries beside them). The NVFP4 artifact's
-are the RTX 5090's, measured in part (its uniform entries 1.128, 1.29, 1.363
-and 1.344 at 1 to 4 lanes, at about 3.5-5K tokens of context: the ratio grows
-with context); the trellis artifact's keeps those uniform entries beside mixed
-ones derived from the NVFP4 artifact's; both are provisional until a
-measurement of this build
+the artifact's mixed entries beside them). Both artifacts' are the RTX
+5090's, every entry measured against base rounds measured beside it, at a
+short context (the ratio grows with context): the NVFP4 artifact's uniform
+entries 1.108, 1.263, 1.321 and 1.304 at 1 to 4 lanes, the trellis
+artifact's 1.362, 1.388, 1.611 and 1.572. A mixed round costs about what a
+base round of its columns costs, and on the NVFP4 artifact the step from 56
+columns to 64 costs nothing or less (its 56-column rounds run at a lower
+clock under the card's power limit), so where a mixed entry measured below
+the entry before it in its row, above its row's uniform entry or under 1, it
+is held at that bound
 ([the configuration reference](../configuration/context-and-speculation.md),
 [ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)).
 On other cards they are unmeasured, and the window is provisional. A request
