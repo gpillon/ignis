@@ -495,8 +495,9 @@ base round of its columns. One run is one leg of the table's measurement on
 its load, the NVFP4 artifact's or the trellis artifact's;
 `IGNIS_ROUND_IDENTITY_TIMING_TABLE=reverse` rides the same cells in the
 reverse order, the widest lane count first, so that legs run forward, reverse,
-reverse and forward are mirrored. The defaults took eight legs a load, each
-cell's period the median of its blocks' medians over all of them, since a busy
+reverse and forward are mirrored. The defaults took four legs a load at the
+served context below (`IGNIS_ROUND_IDENTITY_TIMING_CONTEXT=3584`), each cell's
+period the median of its blocks' medians over all of them, since a busy
 machine slows a block now and then and never speeds one
 ([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)):
 

@@ -1912,7 +1912,7 @@ pub(crate) fn decimal_text(thousandths: u32) -> String {
 }
 
 /// GitHub #690: the shape policy's cost table as its flag would spell it
-/// (GitHub #715: its seven rows, `1.108/1.15,1.263/...`).
+/// (GitHub #715: its seven rows, `1.128/1.159,1.29/...`).
 pub(crate) fn ratios_text(table: ignis_core::PeriodTable) -> String {
     table.rows().iter().map(|row| row.iter().map(|&milli| decimal_text(milli)).collect::<Vec<_>>().join(",")).collect::<Vec<_>>().join("/")
 }

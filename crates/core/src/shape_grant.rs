@@ -211,38 +211,49 @@ impl Default for PeriodTable {
     }
 }
 
-/// GitHub #721 (spec #711): the NVFP4 body's cost table as measured on the
-/// RTX 5090, every entry against measured base rounds of the same session:
-/// the round identity test's timing (`IGNIS_ROUND_IDENTITY_TIMING_TABLE`, the
-/// `nvfp4-dflash2-w15` load, FP8 exception weights, the `hq-e8-2b` cache, the
-/// default cost levers and route, the mixed graph build), each cell 600
-/// greedy rounds of its lanes forced to its shapes, at a context of up to
-/// 1,024 tokens from prompts of up to 64 (the ratio grows with context: these
-/// are short context figures); eight legs, four in each order; each cell's
-/// period the median of its 256-round blocks' medians on the GPU clock, an
-/// entry that period over the base round's at its lane count.
+/// GitHub #721 (spec #711): the NVFP4 body's cost table on the RTX 5090.
 ///
-/// The step from 56 columns to 64 costs nothing or less: the card's 575 W
-/// limit holds the 56-column rounds at a lower clock than the 64-column ones
-/// (about 2,715 against 2,790 MHz), so 3+1 reads above the uniform round of 4
-/// lanes, 3+2 below 2+3, 2+4 below 1+5 and 1+6 below the base round of 7
-/// lanes. [`PeriodTable::held`] holds those four.
+/// The uniform entries, 1.128, 1.29, 1.363 and 1.344 at 1 to 4 lanes: the
+/// served timing of GitHub #690 (GPU clock, FP8 exception weights, the
+/// `hq-e8-2b` cache, the default cost levers and route, a matched context of
+/// about 3.5-5K tokens, two orders pooled), which the measurement below read
+/// within 0.011 (1.125, 1.295, 1.352 and 1.342).
+///
+/// The mixed entries: measured against measured base rounds of the same
+/// session, through the round identity test's timing
+/// (`IGNIS_ROUND_IDENTITY_TIMING_TABLE`, the `nvfp4-dflash2-w15` load, FP8
+/// exception weights, the `hq-e8-2b` cache, the default cost levers and route,
+/// the mixed graph build) at a served context
+/// (`IGNIS_ROUND_IDENTITY_TIMING_CONTEXT=3584`: each lane prefilled to 3,584
+/// tokens and ridden 1,536 more, the model loaded at 262,144); each cell 600
+/// greedy rounds of its lanes forced to its shapes; four legs, two in each
+/// order; each cell's period the median of its 256-round blocks' medians on
+/// the GPU clock, an entry that period over the base round's at its lane
+/// count. The ratio grows with context: these are figures at about 3.5-5K
+/// tokens.
+///
+/// The step from 56 columns to 64 costs nothing or less: near the card's
+/// 575 W limit the 56-column rounds ran at a lower clock than the 64-column
+/// ones (about 2,775 against 2,815 MHz), so 3+1 reads above the uniform round
+/// of 4 lanes (1.345, where the uniform entry is 1.344 and this measurement
+/// read 1.342), 3+2 below 2+3, 2+4 below 1+5 and 1+6 at the base round of 7
+/// lanes (0.999). [`PeriodTable::held`] holds those four.
 const NVFP4_MEASURED: PeriodTable = PeriodTable {
-    uniform: [1108, 1263, 1321, 1304],
+    uniform: [1128, 1290, 1363, 1344],
     // MIXES' order: 1+1, 1+2, 1+3, 1+4, 1+5, 1+6, 2+1, 2+2, 2+3, 2+4, 3+1, 3+2.
-    mixed: [1150, 1120, 1130, 1071, 1101, 978, 1256, 1201, 1177, 1082, 1323, 1161],
+    mixed: [1159, 1112, 1132, 1083, 1109, 999, 1249, 1217, 1196, 1106, 1345, 1188],
 };
 
 /// GitHub #721 (spec #711): the trellis body's cost table as measured on the
-/// RTX 5090, by [`NVFP4_MEASURED`]'s method on the `trellis-24gb-w15-rule`
-/// load (no exception tensor to hold), at a context of up to 1,792 tokens,
-/// eight legs; indicative for the 16 GB and 24 GB cards until a run on one.
-/// No row falls as measured, so [`PeriodTable::held`] keeps every entry; its
-/// two smallest steps, 2+3 to 3+2 and the base round of 7 lanes to 1+6 (0.004
-/// and 0.008), are inside the 0.010 one leg moves an entry.
+/// RTX 5090, every entry, uniform ones included, by [`NVFP4_MEASURED`]'s
+/// method at its served context on the `trellis-24gb-w15-rule` load (no
+/// exception tensor to hold), four legs; indicative for the 16 GB and 24 GB
+/// cards until a run on one. No row falls (its smallest step, from the base
+/// round of 7 lanes to 1+6, is 0.036), so [`PeriodTable::held`] keeps every
+/// entry.
 const TRELLIS_MEASURED: PeriodTable = PeriodTable {
-    uniform: [1362, 1388, 1611, 1572],
-    mixed: [1206, 1163, 1293, 1067, 1112, 1008, 1498, 1386, 1192, 1124, 1545, 1196],
+    uniform: [1364, 1407, 1629, 1606],
+    mixed: [1214, 1162, 1291, 1082, 1117, 1036, 1502, 1391, 1204, 1154, 1550, 1243],
 };
 
 /// GitHub #720 (spec #711): the cost table as `spec.shape_period_ratios`
@@ -466,9 +477,9 @@ mod tests {
 
     /// The default table's rows: at 1 to 7 lanes, an entry for each count of
     /// extended lanes 64 columns hold. GitHub #721: the NVFP4 body's measured
-    /// entries, four of them held: 3+1 at the uniform 1.304 (measured 1.323),
-    /// 3+2 at 2+3's 1.177 (1.161), 2+4 at 1+5's 1.101 (1.082) and 1+6 at 1
-    /// (0.978).
+    /// mixed entries beside its served uniform ones, four of them held: 3+1 at
+    /// the uniform 1.344 (measured 1.345), 3+2 at 2+3's 1.196 (1.188), 2+4 at
+    /// 1+5's 1.109 (1.106) and 1+6 at 1 (0.999).
     #[test]
     fn the_cost_table_holds_a_ratio_for_each_lane_count_and_extended_lanes_64_columns_hold() {
         let rows = PeriodTable::NVFP4.rows();
@@ -476,12 +487,12 @@ mod tests {
         assert_eq!(
             rows,
             [
-                vec![1108],
-                vec![1150, 1263],
-                vec![1120, 1256, 1321],
-                vec![1130, 1201, 1304, 1304],
-                vec![1071, 1177, 1177],
-                vec![1101, 1101],
+                vec![1128],
+                vec![1159, 1290],
+                vec![1112, 1249, 1363],
+                vec![1132, 1217, 1344, 1344],
+                vec![1083, 1196, 1196],
+                vec![1109, 1109],
                 vec![1000],
             ]
         );

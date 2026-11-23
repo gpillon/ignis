@@ -48,10 +48,10 @@ inline bool has_extended_shape(int32_t backend, uint32_t draft_tokens) {
 inline constexpr std::uint32_t kDefaultEnterAccepted = 7;
 inline constexpr std::uint32_t kDefaultStayAccepted = 6;
 inline constexpr std::uint32_t kDefaultEstimateRounds = 16;
-inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1108, 1263, 1321, 1304};
+inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1128, 1290, 1363, 1344};
 // GitHub #715: the cost table's mixed entries, in kMixTable's order (crates/core/src/shape_grant.rs
 // `PeriodTable::NVFP4`, where the measurement and the four entries held are said).
-inline constexpr std::array<std::uint32_t, round_layout::kMixes> kDefaultMixedPeriodRatios = {1150, 1120, 1130, 1071, 1101, 1000, 1256, 1201, 1177, 1101, 1304, 1177};
+inline constexpr std::array<std::uint32_t, round_layout::kMixes> kDefaultMixedPeriodRatios = {1159, 1112, 1132, 1083, 1109, 1000, 1249, 1217, 1196, 1109, 1344, 1196};
 inline constexpr std::uint32_t kPeriodRatioMinMilli = 1000;
 inline constexpr std::uint32_t kPeriodRatioMaxMilli = 2000;
 
@@ -161,12 +161,13 @@ struct ShapePolicy {
   // rounds behind an estimate from before. Provisional.
   std::uint32_t estimate_rounds = kDefaultEstimateRounds;
   // The extended round's period over the base round's, in thousandths, at 1..4 lanes: measured on
-  // the RTX 5090 (1.108, 1.263, 1.321, 1.304; GPU clock, FP8 exception weights, the default cost
-  // levers and route, the round identity test's forced rounds at up to 1,024 tokens of context,
-  // eight legs in mirrored orders; crates/core/src/shape_grant.rs `NVFP4_MEASURED`). At 3 and 4
-  // lanes the extended round runs at the card's 575 W power limit, so 4 lanes measured below 3 in
-  // either order: not a slip. The ratio grows with context. The one-lane entry is not read: a lane
-  // alone runs at the shape it asks.
+  // the RTX 5090 (1.128, 1.29, 1.363, 1.344; GPU clock, FP8 exception weights, the default cost
+  // levers and route, a matched context, two orders pooled), and read within 0.011 by the round
+  // identity test's forced rounds from 3,584 tokens of context, 1,536 more ridden
+  // (crates/core/src/shape_grant.rs `NVFP4_MEASURED`). At 3 and 4 lanes the card's 575 W power
+  // limit lowers the extended round's clock, so 3 lanes measured above 4 in either order: not a
+  // slip. The ratio grows with context; these are its value at about 3.5-5K tokens. The one-lane
+  // entry is not read: a lane alone runs at the shape it asks.
   std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> period_ratios = kDefaultPeriodRatios;
   // GitHub #715: the cost table's mixed entries, the round of w extended lanes beside n base lanes
   // over the base round of w + n lanes, in thousandths, in kMixTable's order: read by `mixed` alone.
