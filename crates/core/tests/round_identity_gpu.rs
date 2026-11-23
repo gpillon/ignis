@@ -385,14 +385,10 @@ const ARMS: &[Arm] = &[
     // counted ([`capture_failure`]).
     Arm { name: CAPTURE_FAILURE_ARM, switches: &[(MIXED_ROUNDS, "1")], graphs: true },
 
-    // #715's arms, below this line.
-
     // #716's arms, below this line.
     // None: mixed rounds with lanes held to a grammar, the repair after each cut and a repair
     // refused after a mixed round the lane sat out are rides every arm's sessions take on the
     // loads of [`MIXED_LOADS`] ([`HELD_RIDES`]).
-
-    // #717's arms, below this line.
 
     // #718's arms, below this line.
     // The mixed graphs built without the mixed graph's build (two roots, the argmax zeroed by a
@@ -401,8 +397,6 @@ const ARMS: &[Arm] = &[
     // times both builds' mixes ([`time_mixed_rounds`]); held to the reference's eager rounds, which
     // take the build, and to the old graphs' form ([`mixed_graph_nodes`]).
     Arm { name: MIXED_GRAPH_BUILD_OFF_ARM, switches: &[(MIXED_ROUNDS, "1"), (MIXED_GRAPH_BUILD, "0"), ("IGNIS_ROUND_TIMING", "1")], graphs: true },
-
-    // #719's arms, below this line.
 
     // #720's arms, below this line.
     // None: the trellis body's 24 GB load rides the mixed rounds every arm's sessions take
