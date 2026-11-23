@@ -296,7 +296,11 @@ past 8 columns a lane the round takes other routes, and the extended round is
 held to the base round's numerical class, not to its bytes
 ([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)),
 and so is a mixed round (from 0.11.0), whose lanes take both shapes
-([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)).
+([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)):
+on the NVFP4 artifact its rows are held to the base round's, and on the
+trellis artifact, whose rows follow a round's columns rather than its
+requests, each of its rows is held, on the RTX 5090, bit for bit to the row a
+round of one shape gives that request.
 So a greedy answer can differ at a near-tie where a round of one shape runs in
 place of the other, as it can between speculation on and off.
 

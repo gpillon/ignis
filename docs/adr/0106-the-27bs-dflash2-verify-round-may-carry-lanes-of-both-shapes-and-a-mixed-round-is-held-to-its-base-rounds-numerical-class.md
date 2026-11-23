@@ -162,6 +162,42 @@ over its first 64: the short window's excess again, inside the bound over the wi
 to the test on this run: over the mixed cells' own base rows it would have been 18 and 20, which the mixed rows' 9.0 and
 10.0 pass too. The same run's uniform cells print what the first reading's did, line for line.
 
+**On the trellis body a mixed row is held, bit for bit, to the row of a uniform round of its lane's shape at its
+round's columns**, and the uniform rounds to the class by ADR 0104's cells, its margins unchanged (the owner's decision
+of 2026-11-23, #720). Read on the trellis cell of the same test (the `sc30` artifact, BF16 exception weights, the same
+8 lanes and context; 2026-11-22), the method above sat inside every bound of the row and the likelihood and past five
+relative clauses of the class: forced rounds at 2 lanes, the widest mixed row 23.5 ulps from speculation off's against
+the base leg's 14.3, past 1.5 times it; graph rounds, 4, 8 and 9 picks moved from the plain rows at 3, 4 and 5 lanes
+against the base legs' 0, 3 and 3, and 30 against 13 over the kind's lane counts. A diagnostic found no defect in the
+trellis mixed path. Every mixed row, 12,096 forced and 11,808 from the graph, is bit-identical to the same prompt's row
+in a uniform round of its own shape at the round's columns: on the trellis body a lane's rows follow its round's
+columns, not its lane count, the trellis projection routing by the call's token count. Forced, the base legs of 3 to 7
+lanes (24 to 56 columns) give each prompt's rows the same bits and the leg of 2 (16) others, so the test read the 1+1
+mix's 24 columns against a base leg of 16. The graph rounds' moved picks are six text positions at exact ties, gaps
+of 0 or 1 ulp, counted once for each mix that holds the lane, positions the uniform rounds move too; the argmax is not
+in it, the rows the same under `IGNIS_MIXED_GRAPH_BUILD=0` (12,096 and 11,808 of them, the moved picks 49 and 30 both
+ways). So a base leg at the lane count is no reference on that body. The test holds the decision so, proposed here for
+the owner to confirm:
+
+- **Uniform legs at one width stand for a mix's round.** On the RTX 5090 a lane's rows are the same bits in every
+  round of 24 to 56 columns, of either kind (forced, the base legs of 3 to 7 lanes and every mix of those columns; on
+  graph rounds the base round at 3 and at 7 lanes, every mix of those columns against the base round at 7 and the
+  extended at 3), and a graph round of 64 columns gives its own where the drafter's drafts move (two prompts' lanes
+  leave the 56-column round's at their rows 6 and 17, the three mixes of 64 columns bit-identical to the uniform rounds
+  of 64); the extended shape has no round of 24, 40 or 56 columns. So, in each kind, the uniform legs of each shape on
+  the mixed prompts' texts, every lane riding until each holds 224 rows so that no round narrows, as no mixed round
+  does: 7 base lanes (56 columns) and 3 extended (48) for the nine mixes of 24 to 56 columns, 8 base lanes (the eighth
+  on a prompt again) and 4 extended for the three of 64.
+- **Each mixed lane rides at its mix to 224 rows, every one its prompt's row in the uniform leg of its shape**, bit for
+  bit; a lane short of them fails. No trellis mixed row is read against a base row, so none of ADR 0104's margins is
+  read there; the NVFP4 cell holds its mixed rows as above.
+
+Measured on the RTX 5090 on 2026-11-23, every mixed row of the trellis cell is its uniform leg's, bit for bit: 12,096
+forced rows (each mix 28 rounds) and 12,096 from the graph (224 a lane, each mix 39 to 88 rounds) over the 54 lanes of
+the twelve mixes, the cell's uniform section printing what its run of 2026-11-22 did, line for line. A change that
+splits the rounds of 24 to 56 columns fails it, and the uniform legs then follow the split; the extended shape has a
+round of a mix's own columns only beside an even count of base lanes.
+
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class
 reaches the mixed round; "lanes of both shapes in one round" is built, the only way to an extended shape past 4 lanes.
 In ADR 0030, the plan's sixteenth line, `mixed_graphs`. In ADR 0017, the shape counts' `mixed` label.
@@ -195,9 +231,10 @@ In ADR 0030, the plan's sixteenth line, `mixed_graphs`. In ADR 0017, the shape c
   mixed round (`ignis_verify_readout_mixed_logits`, `dflash2_readout::mixed_verify_logits`) reads each lane's rows at
   its group's stride and refuses after any other round, as the readout of one shape refuses after a mixed one.
 - The mixed checks add no load: they ride the NVFP4 cell's load after its uniform ones, five to six minutes more (323 s
-  on 2026-11-22, 36 s of it speculation off's texts; the NVFP4 test 431 s, where the first reading's took 304 to 314). A
+  on 2026-11-22, 36 s of it speculation off's texts; the NVFP4 test 431 s, where the first reading's took 304 to 314),
+  and the trellis cell's, bit for bit, under three minutes (162 s on 2026-11-23, 32 s of it the texts; the trellis test
+  272 s, 120 s without them and 450 s with the method of the NVFP4 cell). A
   mixed prompt must run past the 1,408 tokens a leg may ride on, or the test fails before its legs.
 - The bounds are the RTX 5090's on the NVFP4 body under FP8 exception weights over hq-e8-2b. A trellis body runs mixed
-  rounds from #720, held to the round identity test's tokens at 8 lanes; its class test's mixed section, read once on
-  its cell (2026-11-22), sits inside every bound of the row and the likelihood and past five relative clauses of the
-  class, which waits on the owner's reading.
+  rounds from #720, held to the round identity test's tokens at 8 lanes and, on its class test's cell, bit for bit to
+  the uniform rounds' rows, which follow a round's columns there.

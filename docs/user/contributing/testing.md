@@ -523,9 +523,15 @@ graphs are captured again under `IGNIS_MIXED_ROUNDS=1`, and each of the twelve
 mixes is teacher-forced to the text at its 2 to 7 lanes, offered the text and
 from its graph, riding at its mix until each lane holds as many rows as a lane
 of the uniform cells, every mixed row held to the base row at the same text
-index and lane count by the same bounds. Each test loads once; the NVFP4 one
-takes about seven minutes, the trellis one about two and a half. The test's
-name runs one:
+index and lane count by the same bounds. From 0.11.0 the trellis test holds
+the same twelve mixes on its own load, each mixed row bit for bit the row of a
+uniform round of its lane's shape at its round's columns: on the trellis
+artifact a lane's rows follow its round's columns, not its lane count, so
+uniform legs at one width on the same texts stand for each mix's round, 7 base
+lanes and 3 extended for the mixes of 24 to 56 columns, 8 and 4 for the three
+of 64, and the uniform rounds stay held to the class by the uniform cells. Each
+test loads once; the NVFP4 one takes about seven minutes, the trellis one about
+four and a half. The test's name runs one:
 
 ```sh
 cargo test -p ignis-core --features cuda --test extended_round_class_gpu -- --ignored --nocapture --test-threads=1
