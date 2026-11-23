@@ -198,8 +198,9 @@ pub(crate) mod ffi {
         /// append graph for each mix the load captures when mixed rounds are
         /// asked, at one mix's measured bytes
         /// ([`crate::lane_lines::mixed_graphs`] mirrors it); a loaded model
-        /// reports the line it planned. 0 but on a DFlash2 load of the NVFP4
-        /// body at 15 drafts with `IGNIS_MIXED_ROUNDS=1`.
+        /// reports the line it planned. 0 but on a DFlash2 load of either body
+        /// at 15 drafts with mixed rounds asked: the shape policy `mixed` with
+        /// `IGNIS_MIXED_ROUNDS` unset, or the switch at `1`.
         pub mixed_graphs_bytes: u64,
     }
 

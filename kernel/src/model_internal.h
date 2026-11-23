@@ -1007,7 +1007,7 @@ struct ignis_model {
   ninfer::GdnReplayRecords mixed_base_records;
   std::uint32_t mixed_base_capacity = 0;
   // Each mix's verify graph and drafter append graph (`ignis::round_layout::kMixTable`'s order), as
-  // the latest capture made them under IGNIS_MIXED_ROUNDS=1, and their node counts
+  // the latest capture made them where it asked for them (`ignis::mixed_graphs::asked`), and their node counts
   // (`ignis_program_stats`); and the branch a mixed round's base group runs on beside its extended
   // group, made by the first mixed capture or round and destroyed with the model.
   std::array<cudaGraphExec_t, ignis::round_layout::kMixes> mixed_verify_exec{};

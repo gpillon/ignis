@@ -285,7 +285,7 @@ enum ignis_shape_policy {
    * asking lane granted the extended shape on its own when what it is
    * expected to gain beats what its 8 more columns cost every lane, within
    * 64 columns, so a round may be mixed (kernel/src/round_shape.h `grant`).
-   * On a DFlash2 load of the NVFP4 body at 15 drafts alone; any other load
+   * On a DFlash2 load of either body at 15 drafts alone; any other load
    * runs IGNIS_SHAPE_POLICY_AGGREGATE. */
   IGNIS_SHAPE_POLICY_MIXED = 2,
 };
@@ -721,9 +721,10 @@ struct ignis_model_reservations {
    * asked (kernel/src/mixed_graphs.h `planned`), at the bytes one mix's graphs
    * were measured to take. Not a buffer: the driver allocates the graphs at
    * capture, and a loaded model reports the line it planned, whatever its
-   * capture made. 0 on every load but a DFlash2 load of the NVFP4 body at 15
-   * drafts with mixed rounds asked (IGNIS_MIXED_ROUNDS=1, read at the plan and
-   * the load), and where no mix fits the lanes and the pool's GDN slots. */
+   * capture made. 0 on every load but a DFlash2 load of either body at 15
+   * drafts with mixed rounds asked (IGNIS_SHAPE_POLICY_MIXED with
+   * IGNIS_MIXED_ROUNDS unset, or the switch at `1`, read at the plan and the
+   * load), and where no mix fits the lanes and the pool's GDN slots. */
   uint64_t mixed_graphs_bytes;
 };
 

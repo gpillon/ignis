@@ -3365,8 +3365,8 @@ extern "C" int32_t ignis_program_decode(struct ignis_model *model,
     if (options != nullptr && options->size == sizeof(struct ignis_decode_options) &&
         (options->forced_drafts != nullptr || options->forced_shape_window != 0 ||
          options->forced_lane_shapes != nullptr)) {
-      set_error("ignis_program_decode: forced_drafts and forced_shape_window are the 27B verify round's; a "
-                "Flash-Next load has none");
+      set_error("ignis_program_decode: forced_drafts, forced_shape_window and forced_lane_shapes are the 27B "
+                "verify round's; a Flash-Next load has none");
       return -1;
     }
     // GitHub #590: so is a host cut -- Flash-Next keeps no scores a repair
