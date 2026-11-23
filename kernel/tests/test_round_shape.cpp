@@ -670,8 +670,10 @@ void check_the_grant() {
   // The table's lookup: the base round, a mix, the uniform entry.
   const ShapePolicy defaults{};
   check(period_ratio(defaults, 4, 0) == 1000 && period_ratio(defaults, 4, 2) == 1222 &&
-            period_ratio(defaults, 4, 4) == 1344 && period_ratio(defaults, 7, 1) == 1107,
-        "the cost table at 4 lanes: 1, 1.222 at 2+2, 1.344 at 4 extended; 1.107 at 1+6");
+            period_ratio(defaults, 4, 4) == 1344 && period_ratio(defaults, 7, 1) == 1107 &&
+            period_ratio(defaults, 7, 2) == ignis::round_shape::kPeriodRatioMaxMilli,
+        "the cost table at 4 lanes: 1, 1.222 at 2+2, 1.344 at 4 extended; 1.107 at 1+6; 2+5, past 64 columns, "
+        "the widest ratio, as the core's");
 }
 
 // One lane through rounds under the default rule and policy, the rule, the record and the round's

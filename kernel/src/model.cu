@@ -1037,7 +1037,7 @@ std::unique_ptr<IgnisVerifyRound> build_extended_shape(const ignis_topology &top
 // none otherwise, and no mixed round runs on the load. No device memory: a view of the backing.
 void bind_mixed_base_records(ignis_model &model, const ignis_topology &topology) {
   // The most rows the vendored records and their fold hold.
-  constexpr std::uint32_t kMaxRecordRows = 8;
+  constexpr std::uint32_t kMaxRecordRows = IGNIS_DECODE_MAX_BATCH;
   const IgnisVerifyRound &base = *model.base_shape;
   const IgnisVerifyRound &extended = *model.extended_shape;
   const std::uint32_t capacity = ignis::round_layout::mixed_base_record_capacity(

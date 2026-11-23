@@ -1,7 +1,9 @@
 //! `struct ignis_decode_options` and `struct ignis_prefill_options`
-//! (`kernel/include/ignis_step.h`) as plain `repr(C)` mirrors: no kernel is
+//! (`kernel/include/ignis_step.h`) as plain `repr(C)` mirrors, and (GitHub
+//! #711) `struct ignis_program_stats` with its round shapes': no kernel is
 //! needed to lay them out, so their layout pins run in the CPU suite (GitHub
-//! #340, #520) while [`crate::step`], which fills them, is `cuda`-only.
+//! #340, #520) while [`crate::step`], which fills and reads them, is
+//! `cuda`-only.
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
@@ -177,6 +179,102 @@ pub struct IgnisMediaEmbedding {
     _private: [u8; 0],
 }
 
+/// `IGNIS_ROUND_SHAPES_MAX` (`kernel/include/ignis_step.h`): the most
+/// round shapes a load builds (GitHub #686): GitHub #687, a DFlash2
+/// load's base and extended shapes.
+pub const IGNIS_ROUND_SHAPES_MAX: usize = 2;
+
+/// `IGNIS_ROUND_MIXES` (`kernel/include/ignis_step.h`, GitHub #713): the
+/// mixes a mixed verify round takes.
+pub const IGNIS_ROUND_MIXES: usize = 12;
+
+/// `IGNIS_MIXED_FALLBACK_REASONS` (GitHub #714): why a round at a mix
+/// with no graph ran at the uniform choice (`enum ignis_mixed_fallback`).
+pub const IGNIS_MIXED_FALLBACK_REASONS: usize = 2;
+
+/// 1:1 with `struct ignis_round_shape_stats` (GitHub #686): one round
+/// shape's verify round.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IgnisRoundShapeStats {
+    pub window: u32,
+    pub verify_graph_ready_mask: u32,
+    pub vram_bytes: u64,
+    pub verify_graph_nodes: [u32; 8],
+    pub verify_graph_copy_nodes: [u32; 8],
+    pub drafter_append_graph_ready_mask: u32,
+    /// GitHub #687.
+    pub lanes: u32,
+    pub verify_folds_in_flight: u64,
+    /// GitHub #687.
+    pub verify_rounds: u64,
+    pub eager_verify_rounds: u64,
+    /// GitHub #712.
+    pub drafter_append_graph_nodes: [u32; 8],
+}
+
+/// 1:1 with `struct ignis_program_stats`: the program's counters, read back
+/// by `step::program_stats`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IgnisProgramStats {
+    pub vram_bytes: u64,
+    pub last_step_micros: u64,
+    pub kernel_count: u64,
+    /// P3-05 (GitHub #102): `cudaGraphLaunch` calls the most recent
+    /// `ignis_program_decode` call made -- 1 if it replayed a decode
+    /// graph, 0 if it ran the eager per-lane loop.
+    pub graph_launches: u64,
+    /// P3-05 (GitHub #102): bit (w-1) set when a decode graph for exact
+    /// width w (1..the load's decode lanes, GitHub #336) is captured and
+    /// replayable.
+    pub decode_graph_ready_mask: u32,
+    /// P5-04 (GitHub #153): the same for the verify graphs at the load's
+    /// draft window; 0 on a load without one.
+    pub verify_graph_ready_mask: u32,
+    /// GitHub #572: entry w-1 the node count of the 27B's decode graph
+    /// and of its verify graph for exact width w; 0 for a width with no
+    /// graph and on Flash-Next.
+    pub decode_graph_nodes: [u32; 8],
+    pub verify_graph_nodes: [u32; 8],
+    /// GitHub #677: entry w-1 how many of the decode graph's nodes for
+    /// exact width w are copies.
+    pub decode_graph_copy_nodes: [u32; 8],
+    /// GitHub #676: the verify rounds of this load that returned with
+    /// their fold in flight.
+    pub verify_folds_in_flight: u64,
+    /// GitHub #676: bit (w-1) set when the DFlash2 drafter's append after
+    /// a verify round's commit is a captured graph at exact width w.
+    pub drafter_append_graph_ready_mask: u32,
+    /// GitHub #680: the same for the verify graphs.
+    pub verify_graph_copy_nodes: [u32; 8],
+    /// GitHub #681: the GDN gating's home, 0 chain, 1 branch.
+    pub gdn_gating: u32,
+    /// GitHub #686: the round shapes the load built, and each one's
+    /// verify round, the base shape first.
+    pub round_shapes: u32,
+    pub shapes: [IgnisRoundShapeStats; IGNIS_ROUND_SHAPES_MAX],
+    /// GitHub #713: each mix's verify and drafter append graph nodes.
+    pub mixed_verify_graph_nodes: [u32; IGNIS_ROUND_MIXES],
+    pub mixed_append_graph_nodes: [u32; IGNIS_ROUND_MIXES],
+    /// GitHub #714: whether the latest capture asked for the mixed
+    /// graphs, the mixes it could not capture, each mix's graphs' bytes
+    /// and the rounds at a mix with no graph run at the uniform choice,
+    /// by reason.
+    pub mixed_graphs_asked: u32,
+    pub mixed_graph_failed_mask: u32,
+    pub mixed_graph_bytes: [u64; IGNIS_ROUND_MIXES],
+    pub mixed_fallback_rounds: [u64; IGNIS_MIXED_FALLBACK_REASONS],
+    /// GitHub #718: each mix's verify and drafter append graph's root
+    /// nodes and memset nodes.
+    pub mixed_verify_graph_roots: [u32; IGNIS_ROUND_MIXES],
+    pub mixed_verify_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
+    pub mixed_append_graph_roots: [u32; IGNIS_ROUND_MIXES],
+    pub mixed_append_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
+    /// GitHub #719: the mixed rounds run at each mix.
+    pub mixed_rounds: [u64; IGNIS_ROUND_MIXES],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +301,27 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, out_shape_asks), 136);
         // GitHub #713: the forced lane shapes, last.
         assert_eq!(std::mem::offset_of!(IgnisDecodeOptions, forced_lane_shapes), 144);
+    }
+
+    /// GitHub #711: `ignis_program_stats` has no `size` field, so both sides
+    /// pin its layout and its round shapes': GitHub #712's append graph nodes
+    /// at each shape's tail, and the mixes' fields of GitHub #713, #714, #718
+    /// and #719 at the stats' tail. The leaf pins the same numbers
+    /// (kernel/include/ignis_step.h).
+    #[test]
+    fn the_program_stats_mirror_is_the_leaf_structs_layout() {
+        assert_eq!(std::mem::size_of::<IgnisRoundShapeStats>(), 144);
+        assert_eq!(std::mem::offset_of!(IgnisRoundShapeStats, verify_folds_in_flight), 88);
+        assert_eq!(std::mem::offset_of!(IgnisRoundShapeStats, drafter_append_graph_nodes), 112);
+        assert_eq!(std::mem::size_of::<IgnisProgramStats>(), 984);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, shapes), 192);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_verify_graph_nodes), 480);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_graphs_asked), 576);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_graph_bytes), 584);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_fallback_rounds), 680);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_verify_graph_roots), 696);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_append_graph_memset_nodes), 840);
+        assert_eq!(std::mem::offset_of!(IgnisProgramStats, mixed_rounds), 888);
     }
 
     /// GitHub #520: `keeps_draw` filled the tail padding after

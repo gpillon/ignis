@@ -109,99 +109,8 @@ pub(crate) mod ffi {
     pub const IGNIS_PREFILL_COMPUTE_POLICY_ENGINE_DEFAULT: i32 = 0;
     pub const IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY: i32 = 1;
 
-    /// `IGNIS_ROUND_SHAPES_MAX` (`kernel/include/ignis_step.h`): the most
-    /// round shapes a load builds (GitHub #686): GitHub #687, a DFlash2
-    /// load's base and extended shapes.
-    pub const IGNIS_ROUND_SHAPES_MAX: usize = 2;
-
-    /// `IGNIS_ROUND_MIXES` (`kernel/include/ignis_step.h`, GitHub #713): the
-    /// mixes a mixed verify round takes.
-    pub const IGNIS_ROUND_MIXES: usize = 12;
-
-    /// `IGNIS_MIXED_FALLBACK_REASONS` (GitHub #714): why a round at a mix
-    /// with no graph ran at the uniform choice (`enum ignis_mixed_fallback`).
-    pub const IGNIS_MIXED_FALLBACK_REASONS: usize = 2;
-
-    /// 1:1 with `struct ignis_round_shape_stats` (GitHub #686): one round
-    /// shape's verify round.
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct IgnisRoundShapeStats {
-        pub window: u32,
-        pub verify_graph_ready_mask: u32,
-        pub vram_bytes: u64,
-        pub verify_graph_nodes: [u32; 8],
-        pub verify_graph_copy_nodes: [u32; 8],
-        pub drafter_append_graph_ready_mask: u32,
-        /// GitHub #687.
-        pub lanes: u32,
-        pub verify_folds_in_flight: u64,
-        /// GitHub #687.
-        pub verify_rounds: u64,
-        pub eager_verify_rounds: u64,
-        /// GitHub #712.
-        pub drafter_append_graph_nodes: [u32; 8],
-    }
-
-    #[repr(C)]
-    #[derive(Debug, Clone, Copy, Default)]
-    pub struct IgnisProgramStats {
-        pub vram_bytes: u64,
-        pub last_step_micros: u64,
-        pub kernel_count: u64,
-        /// P3-05 (GitHub #102): `cudaGraphLaunch` calls the most recent
-        /// `ignis_program_decode` call made -- 1 if it replayed a decode
-        /// graph, 0 if it ran the eager per-lane loop.
-        pub graph_launches: u64,
-        /// P3-05 (GitHub #102): bit (w-1) set when a decode graph for exact
-        /// width w (1..the load's decode lanes, GitHub #336) is captured and
-        /// replayable.
-        pub decode_graph_ready_mask: u32,
-        /// P5-04 (GitHub #153): the same for the verify graphs at the load's
-        /// draft window; 0 on a load without one.
-        pub verify_graph_ready_mask: u32,
-        /// GitHub #572: entry w-1 the node count of the 27B's decode graph
-        /// and of its verify graph for exact width w; 0 for a width with no
-        /// graph and on Flash-Next.
-        pub decode_graph_nodes: [u32; 8],
-        pub verify_graph_nodes: [u32; 8],
-        /// GitHub #677: entry w-1 how many of the decode graph's nodes for
-        /// exact width w are copies.
-        pub decode_graph_copy_nodes: [u32; 8],
-        /// GitHub #676: the verify rounds of this load that returned with
-        /// their fold in flight.
-        pub verify_folds_in_flight: u64,
-        /// GitHub #676: bit (w-1) set when the DFlash2 drafter's append after
-        /// a verify round's commit is a captured graph at exact width w.
-        pub drafter_append_graph_ready_mask: u32,
-        /// GitHub #680: the same for the verify graphs.
-        pub verify_graph_copy_nodes: [u32; 8],
-        /// GitHub #681: the GDN gating's home, 0 chain, 1 branch.
-        pub gdn_gating: u32,
-        /// GitHub #686: the round shapes the load built, and each one's
-        /// verify round, the base shape first.
-        pub round_shapes: u32,
-        pub shapes: [IgnisRoundShapeStats; IGNIS_ROUND_SHAPES_MAX],
-        /// GitHub #713: each mix's verify and drafter append graph nodes.
-        pub mixed_verify_graph_nodes: [u32; IGNIS_ROUND_MIXES],
-        pub mixed_append_graph_nodes: [u32; IGNIS_ROUND_MIXES],
-        /// GitHub #714: whether the latest capture asked for the mixed
-        /// graphs, the mixes it could not capture, each mix's graphs' bytes
-        /// and the rounds at a mix with no graph run at the uniform choice,
-        /// by reason.
-        pub mixed_graphs_asked: u32,
-        pub mixed_graph_failed_mask: u32,
-        pub mixed_graph_bytes: [u64; IGNIS_ROUND_MIXES],
-        pub mixed_fallback_rounds: [u64; IGNIS_MIXED_FALLBACK_REASONS],
-        /// GitHub #718: each mix's verify and drafter append graph's root
-        /// nodes and memset nodes.
-        pub mixed_verify_graph_roots: [u32; IGNIS_ROUND_MIXES],
-        pub mixed_verify_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
-        pub mixed_append_graph_roots: [u32; IGNIS_ROUND_MIXES],
-        pub mixed_append_graph_memset_nodes: [u32; IGNIS_ROUND_MIXES],
-        /// GitHub #719: the mixed rounds run at each mix.
-        pub mixed_rounds: [u64; IGNIS_ROUND_MIXES],
-    }
+    // GitHub #711: the program's stats, laid out where the CPU suite pins them.
+    pub use crate::step_abi::{IgnisProgramStats, IGNIS_MIXED_FALLBACK_REASONS, IGNIS_ROUND_MIXES, IGNIS_ROUND_SHAPES_MAX};
 
     unsafe extern "C" {
         pub fn ignis_prefill(
@@ -571,13 +480,14 @@ pub struct ProgramStats {
     /// GitHub #713 (spec #711): entry `m` the node count of mix `m`'s verify
     /// graph and of its drafter append graph, the mixes in the order
     /// (1,1)..(1,6), (2,1)..(2,4), (3,1), (3,2) of `w` extended lanes beside `n`
-    /// base lanes, as the latest [`capture_decode_graphs`] made them under
-    /// `IGNIS_MIXED_ROUNDS=1` (GitHub #714: every mix the load holds); 0 for
-    /// a mix with no graph.
+    /// base lanes, as the latest [`capture_decode_graphs`] made them where it
+    /// asked for them (the shape policy `mixed`, or `IGNIS_MIXED_ROUNDS=1`;
+    /// GitHub #714: every mix the load holds); 0 for a mix with no graph.
     pub mixed_verify_graph_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
     pub mixed_append_graph_nodes: [u32; ffi::IGNIS_ROUND_MIXES],
     /// GitHub #714 (spec #711): whether the latest [`capture_decode_graphs`]
-    /// asked for the mixed graphs (`IGNIS_MIXED_ROUNDS=1`).
+    /// asked for the mixed graphs (the shape policy `mixed`, or
+    /// `IGNIS_MIXED_ROUNDS=1`).
     pub mixed_graphs_asked: bool,
     /// Bit `m` set for a mix whose graphs that capture tried and could not
     /// make: the mix has neither its verify nor its append graph.

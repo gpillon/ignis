@@ -193,8 +193,9 @@ impl PeriodTable {
     }
 
     /// The period of a round of `lanes` lanes with `extended` of them
-    /// extended over the base round's, in thousandths: 1000 for none.
-    /// `extended` within the row ([`Self::row_entries`]).
+    /// extended over the base round's, in thousandths: 1000 for none, and the
+    /// widest ratio for a round past the table's 64 columns, as the leaf's
+    /// twin reads it (`period_ratio`).
     pub fn ratio(&self, lanes: u32, extended: u32) -> u32 {
         if extended == 0 {
             return 1000;
@@ -202,7 +203,7 @@ impl PeriodTable {
         if extended == lanes {
             return self.uniform[lanes as usize - 1];
         }
-        self.mixed[mix_at(extended, lanes - extended)]
+        MIXES.iter().position(|&mix| mix == (extended, lanes - extended)).map_or(*Self::RATIO_MILLI_RANGE.end(), |at| self.mixed[at])
     }
 
     fn entry_mut(&mut self, lanes: u32, extended: u32) -> &mut u32 {
@@ -473,6 +474,7 @@ mod tests {
         );
         assert_eq!(PeriodTable::from_rows(&rows), Ok(PeriodTable::NVFP4), "the rows read back");
         assert_eq!(PeriodTable::NVFP4.ratio(4, 0), 1000, "no lane extended: the base round");
+        assert_eq!(PeriodTable::NVFP4.ratio(7, 2), 2000, "2+5, past 64 columns: the widest ratio, as the leaf's");
     }
 
     /// GitHub #720: `auto` is the loaded body's own table, the four-value

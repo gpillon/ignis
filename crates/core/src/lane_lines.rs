@@ -521,6 +521,44 @@ mod tests {
         assert_eq!(mixed_graphs(Some(fifteen), true, 8, 0, Body27b::Trellis).mixes.len(), 12, "either body holds the same mixes");
     }
 
+    /// GitHub #711: the mixes, the mixed round's window and the mixed graphs'
+    /// bytes are the leaf's twins (`kMixTable`, `kernel/src/round_layout.h`;
+    /// `kWindow` and the bytes, `kernel/src/mixed_graphs.h`), which this
+    /// reads as text and holds to these. No toolchain: a value changed, or
+    /// two mixes swapped, on one side alone goes red here.
+    #[test]
+    fn the_mixes_and_the_mixed_graphs_bytes_are_the_leafs() {
+        let header = |name: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernel/src").join(name);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        let numbers = |text: &str| -> Vec<u64> {
+            text.split(|c: char| !c.is_ascii_digit()).filter(|n| !n.is_empty()).map(|n| n.parse().unwrap()).collect()
+        };
+        let layout = header("round_layout.h");
+        let table = layout.split_once("kMixTable = {").expect("round_layout.h declares kMixTable").1;
+        let table = table.split_once("};").expect("kMixTable ends").0;
+        let mixes: Vec<(u32, u32)> = numbers(table).chunks(2).map(|mix| (mix[0] as u32, mix[1] as u32)).collect();
+        assert_eq!(mixes, MIXES, "kMixTable's mixes, in its order");
+        let graphs = header("mixed_graphs.h");
+        let constant = |name: &str| -> u64 {
+            let line = graphs
+                .lines()
+                .find(|line| line.starts_with("inline constexpr") && line.contains(&format!(" {name} = ")))
+                .unwrap_or_else(|| panic!("mixed_graphs.h declares no `{name} = ...;` line"));
+            match numbers(&line.split_once(" = ").expect("an initializer").1.replace("std::uint64_t", ""))[..] {
+                [value] => value,
+                [value, shift] => value << shift,
+                ref other => panic!("`{name}`: {other:?}"),
+            }
+        };
+        assert_eq!(constant("kWindow"), u64::from(MIXED_ROUND_WINDOW));
+        assert_eq!(constant("kBytesPerMix"), MIXED_GRAPH_BYTES);
+        assert_eq!(constant("kFirstMixBytes"), MIXED_GRAPHS_FIRST_BYTES);
+        assert_eq!(constant("kTrellisFirstMixBytes"), MIXED_GRAPHS_TRELLIS_FIRST_BYTES);
+        assert_eq!(constant("kPageBytes"), MIXED_GRAPHS_PAGE_BYTES);
+    }
+
     /// The sampler's workspace the leaf asks the vendored query for: one
     /// 82,176-byte layout at one column, 648,704 at eight, as the 8-lane
     /// sampling line and the verify round's accept (8 columns a lane) hold.

@@ -23,6 +23,7 @@
 #pragma once
 
 #include "ignis_model.h"
+#include "mixed_graphs.h"
 #include "process_environment.h"
 #include "round_layout.h"
 
@@ -297,9 +298,9 @@ struct GrantLane {
 
 // The most columns a verify round carries (8 lanes at the base shape), and a lane's at the base
 // shape and, at the mixed round's window of 15, at the extended one.
-inline constexpr std::uint32_t kRoundColumns = 64;
+inline constexpr std::uint32_t kRoundColumns = round_layout::kMaxColumns;
 inline constexpr std::uint32_t kBaseColumns = IGNIS_BASE_SHAPE_DRAFT_TOKENS + 1;
-inline constexpr std::uint32_t kMixedExtendedColumns = IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1;
+inline constexpr std::uint32_t kMixedExtendedColumns = mixed_graphs::kWindow + 1;
 inline constexpr std::uint32_t kMaxLanes = kRoundColumns / kBaseColumns;
 
 // Each lane's shape in a round of `count` lanes (1..kMaxLanes) under `policy`, `extended[i]` 1 where

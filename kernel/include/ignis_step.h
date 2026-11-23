@@ -605,16 +605,18 @@ struct ignis_program_stats {
   struct ignis_round_shape_stats shapes[IGNIS_ROUND_SHAPES_MAX];
   /* GitHub #713 (spec #711): entry m the node count of the verify graph and
    * of the drafter append graph of mix m (IGNIS_ROUND_MIXES' order) as the
-   * latest capture made them under IGNIS_MIXED_ROUNDS=1 (GitHub #714: every
+   * latest capture made them where it asked for them (IGNIS_SHAPE_POLICY_MIXED
+   * with IGNIS_MIXED_ROUNDS unset, or the switch at `1`; GitHub #714: every
    * mix the load holds, kernel/src/mixed_graphs.h `planned`); 0 for a mix with
-   * no graph, under the switch unset or `0`, and on every load but a DFlash2
-   * load of two round shapes. */
+   * no graph, where the capture asked for none, and on every load but a
+   * DFlash2 load of two round shapes. */
   uint32_t mixed_verify_graph_nodes[IGNIS_ROUND_MIXES];
   uint32_t mixed_append_graph_nodes[IGNIS_ROUND_MIXES];
   /* GitHub #714 (spec #711): whether the latest capture asked for the mixed
-   * graphs (IGNIS_MIXED_ROUNDS=1); bit m set for a mix whose graphs it tried
-   * and could not capture (a mix is its verify graph and, where the rounds
-   * defer, its append graph: a failure of either leaves the mix neither);
+   * graphs (`mixed`, or IGNIS_MIXED_ROUNDS=1); bit m set for a mix whose
+   * graphs it tried and could not capture (a mix is its verify graph and,
+   * where the rounds defer, its append graph: a failure of either leaves the
+   * mix neither);
    * entry m the device memory mix m's graphs took, the free memory before its
    * capture less after it (0 for a mix with no graph; a capture after another
    * in one process may read less, where the driver reuses what the earlier
@@ -642,6 +644,27 @@ struct ignis_program_stats {
    * shapes. */
   uint64_t mixed_rounds[IGNIS_ROUND_MIXES];
 };
+
+#ifdef __cplusplus
+/* GitHub #711: neither stats struct has a `size` field, so both sides pin
+ * their layouts (here, and crates/core/src/step_abi.rs's mirror test, on
+ * CPU): GitHub #712 appended each shape's append graph nodes, and GitHub
+ * #713, #714, #718 and #719 the mixes' fields after every earlier one. */
+static_assert(sizeof(struct ignis_round_shape_stats) == 144 &&
+                  offsetof(struct ignis_round_shape_stats, verify_folds_in_flight) == 88 &&
+                  offsetof(struct ignis_round_shape_stats, drafter_append_graph_nodes) == 112,
+              "ignis_round_shape_stats layout moved: the Rust mirror (step_abi.rs) must move with it");
+static_assert(sizeof(struct ignis_program_stats) == 984 &&
+                  offsetof(struct ignis_program_stats, shapes) == 192 &&
+                  offsetof(struct ignis_program_stats, mixed_verify_graph_nodes) == 480 &&
+                  offsetof(struct ignis_program_stats, mixed_graphs_asked) == 576 &&
+                  offsetof(struct ignis_program_stats, mixed_graph_bytes) == 584 &&
+                  offsetof(struct ignis_program_stats, mixed_fallback_rounds) == 680 &&
+                  offsetof(struct ignis_program_stats, mixed_verify_graph_roots) == 696 &&
+                  offsetof(struct ignis_program_stats, mixed_append_graph_memset_nodes) == 840 &&
+                  offsetof(struct ignis_program_stats, mixed_rounds) == 888,
+              "ignis_program_stats layout moved: the Rust mirror (step_abi.rs) must move with it");
+#endif
 
 /* Captures one CUDA graph per exact decode batch width 1..the load's decode
  * lanes (P3-05, GitHub #102, ADR 0019; GitHub #336: IGNIS_DECODE_MAX_BATCH
@@ -952,10 +975,11 @@ struct ignis_decode_options {
    * (w, n) they make, one of the twelve that fit 64 columns, its extended
    * lanes first in the round's rows (the caller's order within each group)
    * and every output written back at the caller's index: from its mix's
-   * graphs where IGNIS_MIXED_ROUNDS=1 captured them and the round is not
-   * forced on the device; GitHub #714: where the latest capture asked for the
-   * mixed graphs and made none of the mix (its capture failed), at the uniform
-   * round shape `aggregate` would choose for these lanes, counted by reason
+   * graphs where the latest capture made them (the shape policy `mixed`, or
+   * IGNIS_MIXED_ROUNDS=1) and the round is not forced on the device; GitHub
+   * #714: where the latest capture asked for the mixed graphs and made none
+   * of the mix (its capture failed), at the uniform round shape `aggregate`
+   * would choose for these lanes, counted by reason
    * (`ignis_program_stats::mixed_fallback_rounds`), never eagerly; where no
    * capture asked for them, eagerly, the reference a test holds the graphs
    * to. It rides a live or a
