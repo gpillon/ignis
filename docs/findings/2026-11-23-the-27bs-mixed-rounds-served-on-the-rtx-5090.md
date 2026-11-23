@@ -45,8 +45,8 @@ repository's GPU lock for its whole length, and before every leg the card held n
 process and less than 8 GiB in use, no compiler ran at a batch's start, and every build process seen during a batch
 was logged. The 27B NVFP4 artifact, `--model-exception-weights fp8`, hq-e8-2b KV, a context of 262,144 and rope none,
 an empty config file (no setting from a file: every origin a flag, the `rtx5090` profile or a default), host pools
-8 GiB and 2 GiB, the Playground off, idle unload off, `IGNIS_ROUND_TIMING=1`, no other `IGNIS_` variable, the server
-on its own ports.
+8 GiB and 2 GiB, the Playground off, idle unload off, the loop guard at its default (`rewind`) in both arms, as every
+leg's configuration in force shows, `IGNIS_ROUND_TIMING=1`, no other `IGNIS_` variable, the server on its own ports.
 
 The executables were frozen and their sha256 checked at every batch:
 
@@ -354,5 +354,7 @@ Inferred:
 ## Follow-ups
 
 - A regression line read from seeded pairs.
-- The first token's 7 ms under this build, and the process VRAM over its plan named above.
+- The process VRAM over its plan named above.
+- Not pursued, the owner's call on 2026-11-23, and no issue: whose the first token's 7 ms and the one-lane round's
+  0.1% are, the build's or the policy's.
 - The RTX PRO 6000 and the 16 GB and 24 GB cards, before their profiles' policies move.
