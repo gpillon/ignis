@@ -23,6 +23,7 @@
 #pragma once
 
 #include "ignis_model.h"
+#include "mixed_graphs.h"
 #include "process_environment.h"
 #include "round_layout.h"
 
@@ -297,9 +298,9 @@ struct GrantLane {
 
 // The most columns a verify round carries (8 lanes at the base shape), and a lane's at the base
 // shape and, at the mixed round's window of 15, at the extended one.
-inline constexpr std::uint32_t kRoundColumns = 64;
+inline constexpr std::uint32_t kRoundColumns = round_layout::kMaxColumns;
 inline constexpr std::uint32_t kBaseColumns = IGNIS_BASE_SHAPE_DRAFT_TOKENS + 1;
-inline constexpr std::uint32_t kMixedExtendedColumns = IGNIS_DFLASH2_MAX_DRAFT_TOKENS + 1;
+inline constexpr std::uint32_t kMixedExtendedColumns = mixed_graphs::kWindow + 1;
 inline constexpr std::uint32_t kMaxLanes = kRoundColumns / kBaseColumns;
 
 // Each lane's shape in a round of `count` lanes (1..kMaxLanes) under `policy`, `extended[i]` 1 where
@@ -317,11 +318,14 @@ inline constexpr std::uint32_t kMaxLanes = kRoundColumns / kBaseColumns;
 //
 //   each mean in thousandths of a token (as `policy_extends` takes them), each ratio the cost
 //   table's (`period_ratio`), signed: a step to a round that costs less is granted. A refused lane
-//   does not end the grant; only the columns do, so 8 lanes are always at the base shape.
+//   does not end the grant; only the columns do, so 8 lanes are always at the base shape, and a step
+//   to a mix outside `held` (bit m for kMixTable[m], the mixes the load holds a graph of), so the
+//   grant stops at the last mix the load holds. A round at a lane count where the load holds no mix
+//   (no 1+n) takes `aggregate`'s choice, as a round of a load that holds none.
 // The columns are the mixed round's window of 15 drafts: a load at another window runs `mixed` as
 // `aggregate` (resolved at load, kernel/src/model.cu).
 inline std::uint32_t grant(const ShapePolicy &policy, const GrantLane *lanes, std::uint64_t count,
-                           std::uint8_t *extended) {
+                           std::uint8_t *extended, std::uint32_t held) {
   std::fill_n(extended, count, std::uint8_t{0});
   if (count == 0 || count > kMaxLanes) {
     return 0;
@@ -333,7 +337,11 @@ inline std::uint32_t grant(const ShapePolicy &policy, const GrantLane *lanes, st
   if (count == 1) {
     return uniform(lanes[0].asks);
   }
-  if (policy.policy != Policy::kMixed) {
+  const auto holds = [held](std::uint32_t w, std::uint32_t n) {
+    const int mix = round_layout::mix_of(w, n);
+    return mix >= 0 && ((held >> mix) & 1u) != 0;
+  };
+  if (policy.policy != Policy::kMixed || !holds(1, static_cast<std::uint32_t>(count) - 1)) {
     std::array<std::uint8_t, kMaxLanes> asks{};
     std::array<LaneEstimate, kMaxLanes> estimates{};
     for (std::uint64_t i = 0; i < count; ++i) {
@@ -379,6 +387,9 @@ inline std::uint32_t grant(const ShapePolicy &policy, const GrantLane *lanes, st
   std::uint32_t granted = 0;
   for (std::uint32_t k = 0; k < asking; ++k) {
     if (kMixedExtendedColumns * (granted + 1) + kBaseColumns * (lanes32 - granted - 1) > kRoundColumns) {
+      break;
+    }
+    if (granted + 1 < lanes32 && !holds(granted + 1, lanes32 - granted - 1)) {
       break;
     }
     const std::uint32_t lane = order[k];

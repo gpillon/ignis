@@ -178,8 +178,8 @@ pub struct VramLines {
     /// The mixed rounds' graphs (GitHub #714, spec #711): a verify graph and
     /// a drafter append graph for each mix of extended and base lanes the
     /// load captures when mixed rounds are asked, at one mix's measured
-    /// bytes. 0 but on a DFlash2 load of the 27B's NVFP4 body at 15 drafts
-    /// with mixed rounds asked.
+    /// bytes. 0 but on a DFlash2 load of the 27B at 15 drafts, of either
+    /// body, with mixed rounds asked.
     pub mixed_graphs: u64,
     /// Every lane's mutable state in the sequence pool: GDN recurrent and
     /// conv state, penalty counts, the drafter's window.

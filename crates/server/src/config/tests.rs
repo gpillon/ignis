@@ -2000,15 +2000,15 @@ fn the_shape_rules_thresholds_ride_the_speculation_and_a_stay_past_the_window_is
 /// drafts.
 #[test]
 fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_period_ratios() {
-    use ignis_core::ShapePolicy;
+    use ignis_core::{PeriodTableSetting, ShapePolicy};
     let policy = |config: &Config| {
-        config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().rounds(), s.shape_estimate().period_ratios_milli()))
+        config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().rounds(), s.shape_estimate().period_table_setting()))
     };
     let wide = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"];
     let with = |more: &[&'static str]| -> Vec<&'static str> { wide.iter().chain(more).copied().collect() };
-    assert_eq!(policy(&config(&wide)), Some((ShapePolicy::Aggregate, 16, [1128, 1290, 1363, 1344])));
+    assert_eq!(policy(&config(&wide)), Some((ShapePolicy::Aggregate, 16, PeriodTableSetting::Auto)));
     let named = config(&with(&["--spec-shape-policy", "all", "--spec-shape-estimate-rounds", "8", "--spec-shape-period-ratios", "1,1.2,1.25,2"]));
-    assert_eq!(policy(&named), Some((ShapePolicy::All, 8, [1000, 1200, 1250, 2000])));
+    assert_eq!(policy(&named), Some((ShapePolicy::All, 8, PeriodTableSetting::Uniform([1000, 1200, 1250, 2000]))));
     let env = env_map(&[
         ("IGNIS_SPEC_BACKEND", "dflash2"),
         ("IGNIS_SPEC_DRAFT_TOKENS", "10"),
@@ -2016,7 +2016,7 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
         ("IGNIS_SPEC_SHAPE_ESTIMATE_ROUNDS", "64"),
         ("IGNIS_SPEC_SHAPE_PERIOD_RATIOS", "1.1;1.2;1.3;1.4"),
     ]);
-    assert_eq!(policy(&expect_config(resolve(&[], env).expect("resolve"))), Some((ShapePolicy::Aggregate, 64, [1100, 1200, 1300, 1400])));
+    assert_eq!(policy(&expect_config(resolve(&[], env).expect("resolve"))), Some((ShapePolicy::Aggregate, 64, PeriodTableSetting::Uniform([1100, 1200, 1300, 1400]))));
     for name in ["shape_policy", "shape_estimate_rounds", "shape_period_ratios"] {
         let meta = schema::field("spec", name).unwrap();
         assert!(meta.reload_required && meta.visible && meta.patchable, "spec.{name}: a visible, patchable reload");
@@ -2039,8 +2039,7 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
         let files = MemFiles::with(&[(name, &format.write(&document))]);
         let read = with_files(&["--config", name], no_env, &files).unwrap_or_else(|e| panic!("{name}: {e}"));
         let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(policy(&read), Some((ShapePolicy::All, 8, [1000, 1200, 1250, 2000])), "{name}");
-        assert!(read.speculation.unwrap().shape_estimate().period_table().uniform_only(), "{name}: read back as the four-value form");
+        assert_eq!(policy(&read), Some((ShapePolicy::All, 8, PeriodTableSetting::Uniform([1000, 1200, 1250, 2000]))), "{name}: read back as the four-value form");
     }
     // Outside the fields' ranges, and a table that is not four ratios.
     for (flag, raw) in [
@@ -2072,16 +2071,16 @@ fn the_shape_policy_rides_the_speculation_with_its_estimate_window_and_its_perio
 /// is accepted and changes nothing. The cost table is taken in both forms: its
 /// seven rows (`/` between rows on a flag or in the env, a list of seven lists
 /// in a file), and the four ratios of the form before it, read as its uniform
-/// entries beside the default mixed ones. A table of other rows, a row of the
-/// wrong length, a ratio outside 1..=2 or one that is not a number is refused,
-/// naming the flag and the value.
+/// entries beside the loaded body's mixed ones. A table of other rows, a row
+/// of the wrong length, a ratio outside 1..=2 or one that is not a number is
+/// refused, naming the flag and the value.
 #[test]
 fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gives_aggregate() {
-    use ignis_core::{PeriodTable, ShapePolicy};
-    let policy = |config: &Config| config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().period_table()));
+    use ignis_core::{PeriodTable, PeriodTableSetting, ShapePolicy};
+    let policy = |config: &Config| config.speculation.map(|s| (s.shape_policy(), s.shape_estimate().period_table_setting()));
     let wide = ["--spec-backend", "dflash2", "--spec-draft-tokens", "15"];
     let with = |more: &[&'static str]| -> Vec<&'static str> { wide.iter().chain(more).copied().collect() };
-    assert_eq!(policy(&config(&with(&["--spec-shape-policy", "mixed"]))), Some((ShapePolicy::Mixed, PeriodTable::NVFP4)));
+    assert_eq!(policy(&config(&with(&["--spec-shape-policy", "mixed"]))), Some((ShapePolicy::Mixed, PeriodTableSetting::Auto)));
     let env = env_map(&[("IGNIS_SPEC_BACKEND", "dflash2"), ("IGNIS_SPEC_DRAFT_TOKENS", "15"), ("IGNIS_SPEC_SHAPE_POLICY", "mixed")]);
     assert_eq!(policy(&expect_config(resolve(&[], env).expect("resolve"))).map(|(policy, _)| policy), Some(ShapePolicy::Mixed));
     let seven = config(&["--spec-backend", "dflash2", "--spec-draft-tokens", "7", "--spec-shape-policy", "mixed"]);
@@ -2096,7 +2095,7 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
     }
     // The table's seven rows, by flag and by env.
     let rows = "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5";
-    let mut want = PeriodTable::from_rows(&[
+    let mut want = PeriodTableSetting::Table(PeriodTable::from_rows(&[
         vec![1100],
         vec![1150, 1250],
         vec![1120, 1300, 1400],
@@ -2105,7 +2104,7 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
         vec![1090, 1240],
         vec![1500],
     ])
-    .unwrap();
+    .unwrap());
     assert_eq!(policy(&config(&with(&["--spec-shape-policy", "mixed", "--spec-shape-period-ratios", rows]))), Some((ShapePolicy::Mixed, want)));
     let env = env_map(&[
         ("IGNIS_SPEC_BACKEND", "dflash2"),
@@ -2127,9 +2126,8 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
         let read = read.for_family(ModelFamily::Qwen38_27b).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(policy(&read), Some((ShapePolicy::Mixed, want)), "{name}");
     }
-    // The four-value form: the uniform entries, the mixed ones their defaults, by flag and in a file.
-    want = PeriodTable::with_uniform([1100, 1200, 1300, 1400]).unwrap();
-    assert_eq!(want.mixed(), PeriodTable::NVFP4.mixed());
+    // The four-value form: the uniform entries, the mixed ones the loaded body's, by flag and in a file.
+    want = PeriodTableSetting::Uniform([1100, 1200, 1300, 1400]);
     assert_eq!(policy(&config(&with(&["--spec-shape-period-ratios", "1.1,1.2,1.3,1.4"]))), Some((ShapePolicy::Aggregate, want)));
     let files = MemFiles::with(&[("c.yaml", "spec:\n  qwen38:\n    backend: dflash2\n    draft_tokens: 15\n    shape_period_ratios: [1.1, 1.2, 1.3, 1.4]\n")]);
     let read = with_files(&["--config", "c.yaml"], no_env, &files).expect("the four-value form in a file");
@@ -2148,6 +2146,29 @@ fn the_mixed_policy_and_the_cost_tables_two_forms_are_taken_and_every_profile_gi
         let err = refused(&with(&["--spec-shape-period-ratios", raw]));
         assert!(err.contains("--spec-shape-period-ratios") && err.contains(raw), "{raw}: {err}");
     }
+}
+
+/// GitHub #720 (spec #711): the cost table's default is `auto`, the loaded
+/// artifact's own table, and the effective configuration writes it so; a file
+/// an earlier build's `config generate` wrote, the four-value form at its
+/// default, names no table either: the 27B's MTP head and `--spec-backend
+/// off` start from it, as from no file.
+#[test]
+fn the_cost_tables_default_is_auto_and_an_earlier_files_four_default_ratios_name_none() {
+    let earlier = "spec:\n  qwen38:\n    shape_period_ratios: [1.128, 1.29, 1.363, 1.344]\n";
+    let files = MemFiles::with(&[("c.yaml", earlier)]);
+    for backend in ["mtp", "off"] {
+        let read = with_files(&["--qwen38-vision-enabled", "false", "--config", "c.yaml", "--spec-backend", backend], no_env, &files)
+            .and_then(|config| config.for_family(ModelFamily::Qwen38_27b));
+        assert!(read.is_ok(), "`--spec-backend {backend}` beside an earlier file: {:?}", read.err());
+    }
+    let document = file::effective_document(&config(&["--profile", "none"]));
+    let section = &document["spec"][field::scope(ModelFamily::Qwen38_27b)];
+    assert_eq!(section["shape_period_ratios"], serde_json::json!("auto"), "{document}");
+    let files = MemFiles::with(&[("c.yaml", &Format::Yaml.write(&document))]);
+    let read = with_files(&["--config", "c.yaml", "--spec-backend", "mtp", "--qwen38-vision-enabled", "false"], no_env, &files)
+        .and_then(|config| config.for_family(ModelFamily::Qwen38_27b));
+    assert!(read.is_ok(), "the 27B's MTP head beside a generated file: {:?}", read.err());
 }
 
 #[test]

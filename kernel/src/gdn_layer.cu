@@ -674,6 +674,14 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
     const ignis::gdn_gating::Gating gating{h, w.a_b_projection, a_log, dt_bias, g, beta};
     std::optional<ignis::gdn_gating::Beside> beside;
     fork_gating(*model, gating, stream, beside);
+    // GitHub #339, #720: on the trellis body, the layer's input projection with the trellis op, the
+    // conv input into `conv_rows` (a record's flat `[C, columns]` rows) and z beside it.
+    const auto trellis_projection = [&](void *conv_rows) {
+      ignis::trellis_body::linear(*model, w.trellis.in_proj_qkv, h, conv_rows, static_cast<uint32_t>(conv_channels),
+                                  IGNIS_TRELLIS_STORE, stream);
+      ignis::trellis_body::linear(*model, w.trellis.in_proj_z, h, zbuf.data, static_cast<uint32_t>(value_width),
+                                  IGNIS_TRELLIS_STORE, stream);
+    };
 
     // GitHub #713: a mixed round projects its columns once, into the layer's conv records as one flat
     // [C, T] matrix from its first row -- both groups' records lay the layer's rows over the round's
@@ -705,10 +713,7 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
       if (model->is_trellis_body) {
         // GitHub #720: on the trellis body, its projection into the same rows, as the uniform
         // round's trellis arm below projects into its own.
-        ignis::trellis_body::linear(*model, w.trellis.in_proj_qkv, h, record_flat.data,
-                                    static_cast<uint32_t>(conv_channels), IGNIS_TRELLIS_STORE, stream);
-        ignis::trellis_body::linear(*model, w.trellis.in_proj_z, h, zbuf.data, static_cast<uint32_t>(value_width),
-                                    IGNIS_TRELLIS_STORE, stream);
+        trellis_projection(record_flat.data);
       } else {
         const ninfer::ops::LinearPolicy policy = ignis_policy_for(w.query_key_value_z.qtype, mode);
         const std::size_t projection_bytes = ninfer::ops::gdn_input_proj_workspace_capacity_bytes(
@@ -793,10 +798,7 @@ int32_t run_gdn_layer_record(ignis_model *model, ignis_seq_pool *pool, const Ign
       // `[C, W*B]` matrix of every lane's columns) and z beside it, then the
       // shared record kernel convolves each lane's valid columns from its
       // own conv taps, without touching them.
-      ignis::trellis_body::linear(*model, w.trellis.in_proj_qkv, h, records.conv.data,
-                                  static_cast<uint32_t>(conv_channels), IGNIS_TRELLIS_STORE, stream);
-      ignis::trellis_body::linear(*model, w.trellis.in_proj_z, h, zbuf.data, static_cast<uint32_t>(value_width),
-                                  IGNIS_TRELLIS_STORE, stream);
+      trellis_projection(records.conv.data);
       ninfer::ops::detail::gdn_projected_conv_record_launch(records.conv, conv_weight, conv_states, valid_columns,
                                                             lane_slots, query_rows, key_rows, value_rows, stream);
     } else {

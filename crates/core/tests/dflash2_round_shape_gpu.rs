@@ -287,7 +287,7 @@ fn forced_lane_shapes(
 fn mixed_graphs_captured(model: &Model, pool: &SeqPool, spec: Speculation, failures: &mut Vec<String>) {
     let stats = program_stats(model, pool).unwrap_or_else(|e| panic!("stats: {e}"));
     let asked = spec.shape_policy() == ShapePolicy::Mixed;
-    let held = ignis_core::lane_lines::mixed_graphs(Some(spec), asked, LANES, 0).mixes;
+    let held = ignis_core::lane_lines::mixed_graphs(Some(spec), asked, LANES, 0, ignis_artifact::Body27b::Nvfp4).mixes;
     let what = format!("`{}`", spec.shape_policy().as_str());
     println!(
         "dflash2_round_shape_gpu {what}: mixed graphs asked {}, verify nodes {:?}, append nodes {:?}",
@@ -462,7 +462,7 @@ fn blob_asks(blob: &[u8]) -> u32 {
 
 #[test]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
-fn a_two_shape_loads_rounds_take_the_shape_their_lanes_ask_one_shape_a_round_and_a_lanes_ask_is_its_sequences() {
+fn a_two_shape_loads_rounds_take_the_shapes_their_lanes_ask_or_are_granted_and_a_lanes_ask_is_its_sequences() {
     let path = Path::new(NVFP4);
     if !path.exists() && gpu_profile::skip_or_fail(&format!("artifact absent: {NVFP4}")) {
         return;

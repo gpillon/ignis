@@ -1037,7 +1037,7 @@ std::unique_ptr<IgnisVerifyRound> build_extended_shape(const ignis_topology &top
 // none otherwise, and no mixed round runs on the load. No device memory: a view of the backing.
 void bind_mixed_base_records(ignis_model &model, const ignis_topology &topology) {
   // The most rows the vendored records and their fold hold.
-  constexpr std::uint32_t kMaxRecordRows = 8;
+  constexpr std::uint32_t kMaxRecordRows = IGNIS_DECODE_MAX_BATCH;
   const IgnisVerifyRound &base = *model.base_shape;
   const IgnisVerifyRound &extended = *model.extended_shape;
   const std::uint32_t capacity = ignis::round_layout::mixed_base_record_capacity(
@@ -2620,7 +2620,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
   sizes.mixed_graph_mask = ignis::mixed_graphs::planned(
       options.mixed_rounds_asked, two_shapes, sizes.extended_window, lanes,
       static_cast<std::int64_t>(lanes) + options.retained_device_slots);
-  sizes.mixed_graphs = ignis::mixed_graphs::bytes_of(sizes.mixed_graph_mask);
+  sizes.mixed_graphs = ignis::mixed_graphs::bytes_of(sizes.mixed_graph_mask, model.is_trellis_body);
   return sizes;
 }
 
@@ -2650,7 +2650,7 @@ ignis_model_reservations reserved_of(const ignis_model &model) {
   out.trellis_dense_bytes = bytes(model.trellis_dense_buffer);
   out.tma_descriptor_bytes = model.tma_descriptors != nullptr ? model.tma_descriptors->bytes() : 0;
   // GitHub #714: the mixed graphs the load planned; the driver holds them, not a buffer of its own.
-  out.mixed_graphs_bytes = ignis::mixed_graphs::bytes_of(model.mixed_planned_mask);
+  out.mixed_graphs_bytes = ignis::mixed_graphs::bytes_of(model.mixed_planned_mask, model.is_trellis_body);
   // GitHub #687: a load's extended shape holds the base shape's buffers and
   // none of its own, so the base shape's are every byte of both.
   if (model.base_shape != nullptr) {
@@ -3385,13 +3385,8 @@ extern "C" void ignis_model_free(struct ignis_model *model) {
     // GitHub #681: the gating's branch, idle once the stream is (every round joins it).
     model->gdn_gating_branch.destroy();
     // GitHub #713: the mixed rounds' graphs, and their branch, idle as the gating's is.
-    for (auto *execs : {&model->mixed_verify_exec, &model->mixed_append_exec}) {
-      for (cudaGraphExec_t &exec : *execs) {
-        if (exec != nullptr) {
-          cudaGraphExecDestroy(exec);
-          exec = nullptr;
-        }
-      }
+    for (std::uint32_t m = 0; m < ignis::round_layout::kMixes; ++m) {
+      ignis_release_mixed_graphs(*model, m, true);
     }
     model->mixed_branch.destroy();
     // GitHub #718: and the extended group's branch beside it.

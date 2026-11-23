@@ -395,18 +395,34 @@ server with the card quiet, or with more `--vram-headroom-bytes`.
 
 ### WARN `ignis.runtime.mixed_graph_capture_incomplete`
 
-"mixed graph capture: rounds at these mixes run at the uniform round shape
-aggregate chooses", with the `mixes` (each `w+n`, `w` extended lanes beside `n`
+"mixed graph capture: the grant stops short of these mixes, at the last mix
+the load holds", with the `mixes` (each `w+n`, `w` extended lanes beside `n`
 base lanes) and the capture's `error`. From 0.11.0 a DFlash2 load of the 27B at
 15 draft tokens that asks for mixed rounds (rounds whose lanes take both
 [round shapes](concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes))
 captures the graphs of every mix its lanes hold, inside its
-[VRAM plan](concepts/vram-plan.md#what-the-plan-counts). A round at a mix whose
-graphs could not be captured still serves: it runs every lane at the one shape
-the shape policy `aggregate` would give them, the same tokens a round of that
-shape commits without the mix's gain, never refused and never eager. The load
-goes on. As for the verify graphs, restart the server with the card quiet, or
-with more `--vram-headroom-bytes`.
+[VRAM plan](concepts/vram-plan.md#what-the-plan-counts). A load with a mix
+whose graphs could not be captured still serves: the shape policy `mixed`
+grants no round at such a mix, its grant stopping at the last mix the load
+holds, and a round at a lane count where it holds none runs every lane at the
+one shape `aggregate` would give them, the same tokens without the mix's gain,
+never refused and never eager. The load goes on. As for the verify graphs, restart
+the server with the card quiet, or with more `--vram-headroom-bytes`.
+
+### WARN `ignis.runtime.mixed_rounds_hold_no_mix`
+
+"the shape policy mixed: this load holds no mix (...), so it runs aggregate",
+with the load's `lanes` and `gdn_slots`. From 0.11.0 a mixed round of `w`
+extended lanes beside `n` base lanes takes `w + n` of the load's lanes and
+`2w + n` of its pool's GDN slots (the lanes and the device retained slots), so
+a load given `--spec-backend dflash2 --spec-draft-tokens 15
+--spec-shape-policy mixed` whose pool holds
+no mix, two lanes without a device retained slot (`rtx-16gb`'s) or one lane,
+runs `aggregate`, and its load log's `speculation` says
+`shape_policy=aggregate shape_policy_given=mixed`. The load serves as
+`aggregate` serves. One device retained slot (`--reuse-retained-device 1`)
+gives two lanes the 1+1 mix
+([Built-in profiles](concepts/profiles.md#rtx-16gb)).
 
 ### `--spec-backend mtp` refuses the start
 

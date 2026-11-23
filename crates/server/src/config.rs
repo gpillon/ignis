@@ -1734,7 +1734,7 @@ fn derive_speculation(
         // GitHub #690: the shape policy's three.
         ("shape_policy", Some(s.shape_policy.as_str().to_owned())),
         ("shape_estimate_rounds", Some(s.shape_estimate_rounds.to_string())),
-        ("shape_period_ratios", Some(ratios_text(s.shape_period_ratios))),
+        ("shape_period_ratios", Some(setting_text(s.shape_period_ratios))),
     ]
     .map(|(name, value)| (name, value.filter(|_| named(name))));
     let backend = match s.backend {
@@ -1891,7 +1891,7 @@ fn refuse_dflash2s_settings_under_mtp(resolution: &Resolution, spelled: &impl Fn
         // GitHub #690: and the shape policy chooses each round's from them.
         ("shape_policy", named("shape_policy").then(|| s.shape_policy.as_str().to_owned()), "the shape policy"),
         ("shape_estimate_rounds", named("shape_estimate_rounds").then(|| s.shape_estimate_rounds.to_string()), "the shape policy"),
-        ("shape_period_ratios", named("shape_period_ratios").then(|| ratios_text(s.shape_period_ratios)), "the shape policy"),
+        ("shape_period_ratios", named("shape_period_ratios").then(|| setting_text(s.shape_period_ratios)), "the shape policy"),
     ];
     for (name, value, what) in refused {
         if let Some(value) = value {
@@ -1915,6 +1915,16 @@ pub(crate) fn decimal_text(thousandths: u32) -> String {
 /// (GitHub #715: its seven rows, `1.128/1.155,1.29/...`).
 pub(crate) fn ratios_text(table: ignis_core::PeriodTable) -> String {
     table.rows().iter().map(|row| row.iter().map(|&milli| decimal_text(milli)).collect::<Vec<_>>().join(",")).collect::<Vec<_>>().join("/")
+}
+
+/// GitHub #720: `spec.shape_period_ratios` as its flag would spell it:
+/// `auto`, the four-value form's four ratios, or the table's rows.
+pub(crate) fn setting_text(setting: ignis_core::PeriodTableSetting) -> String {
+    match setting {
+        ignis_core::PeriodTableSetting::Auto => "auto".to_owned(),
+        ignis_core::PeriodTableSetting::Uniform(uniform) => uniform.map(decimal_text).join(","),
+        ignis_core::PeriodTableSetting::Table(table) => ratios_text(table),
+    }
 }
 
 /// `--vision-enabled`, `--vision-max-tokens`,

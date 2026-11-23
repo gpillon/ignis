@@ -1199,8 +1199,8 @@ graphs where a capture made them and eagerly where no capture asked for them.
 A load that asks (`mixed`, or `IGNIS_MIXED_ROUNDS=1`) captures every mix its lanes and its pool's GDN slots
 hold (a mix takes `2w + n` slots, the lanes' and the device retained slots':
 all twelve at 8 lanes), a line of the VRAM plan (`mixed_graphs`, #714); a mix
-whose capture failed runs its rounds at the uniform shape `aggregate` would
-choose, counted, never eagerly. Its rows, of either group, are held to its
+whose capture failed is never granted, and a round forced at it runs at the
+uniform shape `aggregate` would choose, counted, never eagerly. Its rows, of either group, are held to its
 base round's numerical class, as an extended round's are (#717, ADR 0106).
 
 **Shape rule**:
@@ -1243,13 +1243,38 @@ less one) times the tokens every lane is expected to take, or, without an
 estimate, whenever the columns allow; never past 64 columns, so a round may be
 a **mixed round**. The **cost table** (`spec.shape_period_ratios`) holds each
 round's period over the base round's by lane count (1..7) and extended lanes;
-`aggregate` reads its uniform entries; its default is the loaded body's own
-(#720: the NVFP4 body's or the trellis body's, `PeriodTable::of_load`). `mixed`
+`aggregate` reads its uniform entries; its default, `auto`, is the loaded body's
+own (#720: the NVFP4 body's or the trellis body's, `PeriodTableSetting::of_body`). `mixed`
 runs at 15 drafts alone, on either body (#720; any other load runs
 `aggregate`) and asks for the mixed graphs
 there (`IGNIS_MIXED_ROUNDS` unset); a lane held to a grammar is granted as any
-other (#716), and a round whose mix the load holds no graph of runs the uniform
-shape `aggregate` gives it. Every profile defaults to `aggregate`.
+other (#716); the grant stops at the last mix the load holds a graph of, and a
+round at a lane count where it holds none takes the uniform shape `aggregate`
+gives it; a load that holds no mix runs `aggregate`, as its startup line says.
+Every profile defaults to `aggregate`.
+
+**Grant**:
+What the **shape policy** `mixed` gives a verify round's lanes (#715): each
+lane's **round shape**, from the lanes' asks, their recent rounds and the
+**cost table**, the asking lanes taken one by one as the **Shape policy** entry
+says. A pure function in the core (`shape_grant::lane_shapes`), whose twin the
+leaf runs each round (`round_shape::grant`); both read the **mixes** the load
+holds graphs of, and stop at the last of them.
+
+**Mix**:
+`(w, n)`: `w` lanes at the **extended shape** beside `n` at the **base shape**
+in a **mixed round**, one of the twelve whose `16w + 8n` columns fit 64
+(`lane_lines::MIXES`, the leaf's `kMixTable`, in one order); its `w` lanes are
+the round's **extended group** (group 0), its `n` the **base group** (group 1).
+A load holds a mix where its lanes hold `w + n` and its pool's GDN slots
+`2w + n` (#714).
+
+**Cost table**:
+`spec.shape_period_ratios` (#715): at 1..7 lanes, the period of a round with
+`w` of its lanes extended over the base round's at the same lane count, one
+entry for each `w` 64 columns hold; `aggregate` reads the uniform entries
+(`w` the lanes), the **grant** every one. Its default, `auto`, is the loaded
+body's own (`PeriodTableSetting::of_body`, #720).
 
 **Near-tie**:
 A split between the token a **decode round** picked and the one a **verify

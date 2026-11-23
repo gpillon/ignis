@@ -828,6 +828,11 @@ impl Load {
         self.vision.then(|| Vision::default().with_residency(VisionResidency::Host))
     }
 
+    /// #720: the load's body, whose cost table it runs.
+    fn body(&self) -> ignis_artifact::Body27b {
+        if self.artifact == NVFP4 { ignis_artifact::Body27b::Nvfp4 } else { ignis_artifact::Body27b::Trellis }
+    }
+
     /// The context the session's longest-lived lane needs: its prompt, then
     /// at each width and once more after the release its plain and
     /// constrained tokens and whole verify runs, the forced one's included.
@@ -1130,7 +1135,7 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
     }
     let measured: u64 = stats.mixed_graph_bytes.iter().sum();
     if asked && !held.is_empty() {
-        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0);
+        let planned = ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0, load.body());
         println!(
             "round_identity_gpu {label}: arm `{}`: the mixed graphs of {} mixes, verify nodes {verify:?}, append nodes {append:?}, \
              bytes {:?}: {measured} B measured, {} B planned; verify roots {:?}, memset nodes {:?}",
@@ -1149,7 +1154,7 @@ fn mixed_graph_nodes(model: &Model, pool: &SeqPool, load: &Load, arm: &Arm, labe
 /// (`ignis_core::lane_lines::mixed_graphs`), on either body (#720): none at
 /// the trellis body's 16 GB load's 2 lanes.
 fn mixes_held(load: &Load) -> Vec<(u32, u32)> {
-    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0).mixes
+    ignis_core::lane_lines::mixed_graphs(Some(load.speculation()), true, load.lanes, 0, load.body()).mixes
 }
 
 /// #712: a digest of a session's tokens, every lane's in order (FNV-1a over
@@ -1286,7 +1291,7 @@ fn ride(
         // #689, #690: the drafts each lane's round shape carries, from what
         // its lanes ask, their recent rounds and the shape the switch names.
         let riders_mirror: Vec<&shape_policy::Lane> = riding.iter().map(|&lane| &mirror[lane]).collect();
-        let policy_extends = shape_policy::extends(spec.shape_policy(), spec.shape_estimate(), &riders_mirror);
+        let policy_extends = shape_policy::extends(spec.shape_policy(), spec.shape_estimate(), load.body(), &riders_mirror);
         match round {
             Round::Verify | Round::Cut => {
                 let lanes: Vec<VerifyLane<'_>> =
@@ -1718,7 +1723,7 @@ fn capture_failure(model: &Model, pool: &SeqPool, load: &Load, script: &Script, 
     let counted = || stats().mixed_fallback_rounds;
     let before = counted();
     let mirrors: Vec<&shape_policy::Lane> = mirror.iter().collect();
-    let want = shape_policy::extends(ShapePolicy::Aggregate, spec.shape_estimate(), &mirrors);
+    let want = shape_policy::extends(ShapePolicy::Aggregate, spec.shape_estimate(), load.body(), &mirrors);
     assert!(want, "{label}: lanes that took a full base round ask the extended shape with no extended round behind them");
     let mut refs = riders(&mut seqs, &riding);
     let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, &[true, false, true])

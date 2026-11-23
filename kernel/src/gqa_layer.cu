@@ -5,6 +5,7 @@
 // KV append -> attention + sigmoid output gate -> output residual -> MLP tail.
 
 #include "attention_readout.h"
+#include "device_zero.h"
 #include "extended_attention.h"
 #include "hq_decode_attention.h"
 #include "ignis_attn_tap.h"
@@ -589,12 +590,17 @@ int32_t run_gqa_layer_batch(ignis_model *model, ignis_seq_pool *pool, uint32_t l
                             ninfer::DeviceSpan storage, ninfer::Tensor &out, cudaStream_t on) {
       // Graph-safe (ADR 0019): the predicate is the pool's KV format, fixed for
       // the life of the load (ADR 0022), so which nodes this body records does
-      // not depend on anything a replay can change.
+      // not depend on anything a replay can change. GitHub #711: a mixed round
+      // under the mixed graph's build zeroes it by a kernel of ours, so that its
+      // graphs hold no memset node on such a format either; every other round
+      // keeps the memset, and the uniform graphs their nodes.
       if (ignis_gqa_workspace_needs_zeroing(batch_cache.dtype)) {
-        const cudaError_t zeroed = cudaMemsetAsync(storage.data, 0, storage.bytes, on);
+        const bool by_kernel = mixed != nullptr && model->mixed_graph_build;
+        const cudaError_t zeroed = by_kernel ? ignis::device_zero::zero(storage.data, storage.bytes, on)
+                                             : cudaMemsetAsync(storage.data, 0, storage.bytes, on);
         if (zeroed != cudaSuccess) {
-          throw std::runtime_error(std::string("cudaMemsetAsync(attention workspace) failed: ") +
-                                   cudaGetErrorString(zeroed));
+          throw std::runtime_error(std::string(by_kernel ? "ignis::device_zero::zero" : "cudaMemsetAsync") +
+                                   "(attention workspace) failed: " + cudaGetErrorString(zeroed));
         }
       }
       ninfer::DeviceArena workspace(storage);

@@ -130,8 +130,8 @@ Why each:
   --spec-draft-tokens 15 --spec-shape-policy mixed`, the shape options refused
   without a named `--spec-backend`; every profile gives `aggregate`, which asks
   for none) holds the graphs of all twelve mixes at these
-  eight lanes, with or without a device retained slot: 64 MiB, at most 114 KV
-  pages (7,296 tokens) of the pool
+  eight lanes, with or without a device retained slot: 66 MiB, at most 118 KV
+  pages (7,552 tokens) of the pool
   ([the VRAM plan](vram-plan.md#what-the-plan-counts)).
   `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
   to measure a window past 7, so `rtxpro6000` keeps 7.
@@ -212,7 +212,7 @@ Why each:
 - **Mixed rounds off**, as on every profile. From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on for the 27B; its eight lanes hold all twelve mixes, the
-  plan's line for their graphs 64 MiB, as on `rtx5090`. Neither the window
+  plan's line for their graphs 66 MiB, as on `rtx5090`. Neither the window
   past 7 nor the mixed rounds are measured on this card.
 
 ### `rtx-16gb`
@@ -255,22 +255,20 @@ Why each:
   at its test's 8 lanes and 262,144-token context, not at this profile's
   shape; whether it is faster on a 16 GB card is not measured, so the
   default stays 7. Off compute capability 12.0 the extended round attends on
-  the vendored chunked route. From 0.11.0 `aggregate` there reads the trellis
-  artifact's own cost table, whose extended round costs more than the NVFP4
-  artifact's (1.85 times the base round at 2 lanes, against 1.29), unless you
-  name one.
+  the vendored chunked route.
 - **Mixed rounds off**, as on every profile (`aggregate`). From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
-  table, derived from the RTX 5090's and indicative for these cards until a
-  run on one ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+  table, provisional until a run on one of these cards
+  ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   Their graphs cost nothing here: a mix of `w` extended lanes beside `n` base
   lanes takes `2w + n` of the pool's slots, so two lanes with no device
-  retained slot hold no mix, and every round a mix would be granted runs at
-  the shape `aggregate` gives it. One device retained slot
+  retained slot hold no mix, and the load runs `aggregate`, which its load
+  log says (`ignis.runtime.mixed_rounds_hold_no_mix`). One device retained slot
   (`--reuse-retained-device 1`, a lane's state out of the KV pool) holds the
-  1+1 mix, its graphs 10 MiB (18 KV pages) more.
+  1+1 mix, its graphs planned at 16 MiB (29 KV pages) more; that shape is
+  planned, not yet run on a card.
 - **The 1,024-token chunk.** The prefill scratch is sized by the chunk, and
   2,048 would cost about 0.4 GB of KV pool. The solo width is pinned to it for
   the same reason: on an RTX 40 card in a 16 GiB budget less 1 GiB, `auto`
@@ -331,6 +329,8 @@ Why each:
 - **One lane.** A second costs about 0.87 GB, which the context pays: more
   than five of its 16,384-token steps.
   `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
+- **No mixed rounds.** One lane holds no mix, and the MTP head refuses
+  `--spec-shape-policy` by name, as it refuses every shape option.
 - **131,072 tokens, adapting 16,384 at a time.** Every other profile adapts
   65,536 at a time. A 12 GB card's budget is derived from the memory free at
   the start, which the desktop sets, and the context is the largest of the
@@ -421,21 +421,17 @@ Why each:
   at its test's 262,144-token context, not this profile's million;
   whether it is faster on a 24 GB card is not measured, so the default stays
   7, and off compute capability 12.0 the extended round attends on the
-  vendored chunked route. From 0.11.0 `aggregate` there reads the trellis
-  artifact's own cost table, whose extended round costs more than the NVFP4
-  artifact's (2 times the base round at 3 and 4 lanes, the table's widest,
-  against about 1.35), unless you name one.
+  vendored chunked route.
 - **Mixed rounds off**, as on every profile (`aggregate`). From 0.11.0
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
-  table, derived from the RTX 5090's and indicative for these cards until a
-  run on one ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+  table, provisional until a run on one of these cards
+  ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   These eight lanes hold all twelve mixes, with or without the two device
-  retained slots: the plan's line for their graphs is 64 MiB, at most 114 KV
-  pages (7,296 tokens) of the pool, and two captures took 68 and 70 MiB on
-  the RTX 5090 (this artifact's verify graphs are about 200 nodes larger than
-  the NVFP4 artifact's). Their rounds are held on the RTX 5090 to the
+  retained slots: the plan's line for their graphs is 70 MiB, at most 125 KV
+  pages (8,000 tokens) of the pool, the most two captures took on the RTX
+  5090. Their rounds are held on the RTX 5090 to the
   reference's tokens at these lanes; whether they are faster on a 24 GB card
   is not measured.
 - **A million tokens of context.** Measured as the 16 GB numbers were: the

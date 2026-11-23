@@ -21,7 +21,8 @@
 //! (`step::fail_mixed_capture`, the leaf's
 //! `ignis_decode_graph_fail_mixed_capture`). GitHub #716: so are the forced
 //! mixes, live and with a host cut (`step::decode_program_verify_mixed` and
-//! `decode_program_verify_mixed_cut`). The replays that call the seams
+//! `decode_program_verify_mixed_cut`), and GitHub #713: the decode options'
+//! `forced_lane_shapes`, which only they set. The replays that call the seams
 //! are examples (`crates/runtime/examples/`), outside every directory scanned.
 
 use std::path::{Path, PathBuf};
@@ -48,7 +49,7 @@ fn rust_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// The seams' names, as code would call them.
-const SEAMS: [&str; 14] = [
+const SEAMS: [&str; 15] = [
     "decode_program_verify_forced",
     "dflash2_readout",
     "forced_tokens",
@@ -63,6 +64,7 @@ const SEAMS: [&str; 14] = [
     "plain_round_logits",
     "fail_mixed_capture",
     "decode_program_verify_mixed",
+    "forced_lane_shapes",
 ];
 
 /// The core crate's files that define the seams, and its root, which

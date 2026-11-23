@@ -812,6 +812,14 @@ target_include_directories(ignis_kernel_tiled_argmax_test PRIVATE ${CMAKE_CURREN
 target_link_libraries(ignis_kernel_tiled_argmax_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_tiled_argmax_test COMMAND ignis_kernel_tiled_argmax_test)
 
+# GitHub #711 (spec #711): OURS -- a device range zeroed by a kernel (kernel/src/device_zero.h), the
+# attention workspace's zeroing in a mixed round's graphs: exactly its range at every alignment,
+# eagerly and from a graph of one kernel node and no memset node. No SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_device_zero_test test_device_zero.cu)
+target_include_directories(ignis_kernel_device_zero_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_device_zero_test PRIVATE ignis_kernel ignis_vendor)
+add_test(NAME ignis_kernel_device_zero_test COMMAND ignis_kernel_device_zero_test)
+
 # OURS: the same route timed against the vendored small-T GEMVs on one weight.
 # A timing is a finding, not a pass/fail, so a tool and NOT registered with
 # CTest.

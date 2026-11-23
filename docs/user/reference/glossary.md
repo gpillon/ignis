@@ -127,8 +127,9 @@ refused below 12 GiB. See
 [the VRAM plan](../concepts/vram-plan.md).
 
 **Extended shape.** From 0.11.0, the 27B's verify round at the window + 1 columns
-a lane (9 to 16), at up to 4 lanes: the second round shape of a DFlash2 load
-past 7 drafts, on the *base shape*'s buffers. See
+a lane (9 to 16), at up to 4 lanes in a round of one shape, and at 15 drafts up
+to 3 lanes beside lanes at the base shape in a *mixed round*: the second round
+shape of a DFlash2 load past 7 drafts, on the *base shape*'s buffers. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Family.** The architecture an artifact runs as (Qwen3.8-27B, Qwen3.8-Flash-Next,
@@ -219,6 +220,14 @@ protection and eviction order. See
 **Loop guard.** The task that scores a request's reasoning for repetition as it
 streams, and takes a persistent loop back. See
 [reasoning and the loop guard](../concepts/reasoning.md).
+
+**Mixed round.** From 0.11.0, a verify round of the 27B at 15 drafts whose
+requests run at both round shapes: one to three at the *extended shape*, 16
+columns each, beside one to six at the *base shape*, 8 columns each, 64 columns
+at most. Only `--spec-backend dflash2 --spec-draft-tokens 15
+--spec-shape-policy mixed` grants one, request by request, and
+only at a mix whose graphs the load holds. See
+[speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **MTP.** Multi-token prediction: a model's own draft head. The 27B's is in every
 27B artifact and drafts from 0.11.0, in place of DFlash2: the default under `rtx-12gb`
