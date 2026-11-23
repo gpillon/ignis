@@ -742,7 +742,8 @@ config_group! {
         /// grows with context), the NVFP4 artifact's uniform entries its
         /// served timing's; where a mixed entry measured below the entry
         /// before it in its row, above its row's uniform entry or under 1, it
-        /// is held at that bound (ADR 0106). Unmeasured on other cards.
+        /// is held at that bound (ADR 0106). Unmeasured on other cards, the
+        /// trellis artifact's indicative for the 16 GB and 24 GB cards.
         /// The one-lane entry is not read: a lane alone runs at the shape it
         /// asks. A speed setting only.
         shape_period_ratios: PeriodRatios = ignis_core::PeriodTableSetting::Auto, NO_RULE, QWEN38_ONLY,
