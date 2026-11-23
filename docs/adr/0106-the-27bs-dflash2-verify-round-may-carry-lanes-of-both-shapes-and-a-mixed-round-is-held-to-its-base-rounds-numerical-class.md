@@ -164,7 +164,7 @@ to the test on this run: over the mixed cells' own base rows it would have been 
 
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class
 reaches the mixed round; "lanes of both shapes in one round" is built, the only way to an extended shape past 4 lanes.
-In ADR 0030, the plan's sixteenth line, `mixed_graphs`.
+In ADR 0030, the plan's sixteenth line, `mixed_graphs`. In ADR 0017, the shape counts' `mixed` label.
 
 ## Considered options
 
