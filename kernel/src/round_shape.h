@@ -162,7 +162,7 @@ struct ShapePolicy {
   std::uint32_t estimate_rounds = kDefaultEstimateRounds;
   // The extended round's period over the base round's, in thousandths, at 1..4 lanes: measured on
   // the RTX 5090 (1.108, 1.263, 1.321, 1.304; GPU clock, FP8 exception weights, the default cost
-  // levers and route, the round identity test's forced rounds at 64 to 1,024 tokens of context,
+  // levers and route, the round identity test's forced rounds at up to 1,024 tokens of context,
   // eight legs in mirrored orders; crates/core/src/shape_grant.rs `NVFP4_MEASURED`). At 3 and 4
   // lanes the extended round runs at the card's 575 W power limit, so 4 lanes measured below 3 in
   // either order: not a slip. The ratio grows with context. The one-lane entry is not read: a lane

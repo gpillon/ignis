@@ -197,7 +197,7 @@ round of a mix's own columns only beside an even count of base lanes.
 (`IGNIS_ROUND_IDENTITY_TIMING_TABLE`): at each lane count of 1 to 8, the base round and each count of extended lanes 64
 columns hold, each cell after a capture again, 600 greedy rounds of fresh lanes forced to its shapes (its last lanes
 extended), on the GPU clock with the round timing; the NVFP4 body on `nvfp4-dflash2-w15` (FP8 exception weights,
-hq-e8-2b, the mixed graph build, 64 to 1,024 tokens of context), the trellis body on `trellis-24gb-w15-rule` (64 to
+hq-e8-2b, the mixed graph build, up to 1,024 tokens of context), the trellis body on `trellis-24gb-w15-rule` (up to
 1,792); eight legs each, half riding the cells in the reverse order. Each cell's period is the median of its 256-round
 blocks' medians over the eight legs, sixteen of them: the machine is shared, and a stretch of tens of seconds now and
 then ran 5-14% slow at the same clock, which only ever slows a block, so one slow block or leg must not move a cell.
@@ -220,7 +220,8 @@ A mixed round costs what a base round of its columns costs to within 3% on eithe
 56 columns to 64 costs nothing or less: its 56-column rounds ran at about 2,715 MHz under the card's 575 W limit and
 its 64-column ones at about 2,790, in either order, so 3+1 measured above the uniform round of 4 lanes, 3+2 below 2+3,
 2+4 below 1+5, 1+6 below the base round of 7 lanes and that round above the base round of 8; those four are held. The
-trellis body's rows do not fall. The NVFP4 body's uniform entries read 1.108, 1.263, 1.321 and 1.304 where #684's
+trellis body's rows do not fall as measured, though two of their steps, 2+3 to 3+2 and the base round of 7 lanes to
+1+6 (0.004 and 0.008), are inside what one leg moves an entry. The NVFP4 body's uniform entries read 1.108, 1.263, 1.321 and 1.304 where #684's
 served timing read 1.128, 1.29, 1.363 and 1.344 at about 3.5-5K tokens of context: the ratio grows with context.
 
 **What this amends.** In ADR 0104, a round's shape is each lane's, a round may carry both, and its numerical class

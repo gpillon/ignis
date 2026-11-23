@@ -216,11 +216,11 @@ impl Default for PeriodTable {
 /// the round identity test's timing (`IGNIS_ROUND_IDENTITY_TIMING_TABLE`, the
 /// `nvfp4-dflash2-w15` load, FP8 exception weights, the `hq-e8-2b` cache, the
 /// default cost levers and route, the mixed graph build), each cell 600
-/// greedy rounds of its lanes forced to its shapes, at a context of the
-/// prompts' 64 tokens to 1,024 (the ratio grows with context: these are short
-/// context figures); eight legs, four in each order; each cell's period the
-/// median of its 256-round blocks' medians on the GPU clock, an entry that
-/// period over the base round's at its lane count.
+/// greedy rounds of its lanes forced to its shapes, at a context of up to
+/// 1,024 tokens from prompts of up to 64 (the ratio grows with context: these
+/// are short context figures); eight legs, four in each order; each cell's
+/// period the median of its 256-round blocks' medians on the GPU clock, an
+/// entry that period over the base round's at its lane count.
 ///
 /// The step from 56 columns to 64 costs nothing or less: the card's 575 W
 /// limit holds the 56-column rounds at a lower clock than the 64-column ones
@@ -235,9 +235,11 @@ const NVFP4_MEASURED: PeriodTable = PeriodTable {
 
 /// GitHub #721 (spec #711): the trellis body's cost table as measured on the
 /// RTX 5090, by [`NVFP4_MEASURED`]'s method on the `trellis-24gb-w15-rule`
-/// load (no exception tensor to hold), at a context of 64 tokens to 1,792,
+/// load (no exception tensor to hold), at a context of up to 1,792 tokens,
 /// eight legs; indicative for the 16 GB and 24 GB cards until a run on one.
-/// No row falls, so [`PeriodTable::held`] keeps every entry.
+/// No row falls as measured, so [`PeriodTable::held`] keeps every entry; its
+/// two smallest steps, 2+3 to 3+2 and the base round of 7 lanes to 1+6 (0.004
+/// and 0.008), are inside the 0.010 one leg moves an entry.
 const TRELLIS_MEASURED: PeriodTable = PeriodTable {
     uniform: [1362, 1388, 1611, 1572],
     mixed: [1206, 1163, 1293, 1067, 1112, 1008, 1498, 1386, 1192, 1124, 1545, 1196],
