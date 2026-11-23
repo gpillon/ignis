@@ -67,7 +67,7 @@ Flash-Next). The lines include:
 - from 0.11.0, on a 27B DFlash2 load of either artifact at 15 drafts that
   asks for mixed rounds (rounds whose lanes take both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes);
-  `--spec-shape-policy mixed` asks, or the measurement switch
+  `--spec-shape-policy mixed` asks, which the `rtx5090` profile gives, or the measurement switch
   `IGNIS_MIXED_ROUNDS=1`, [Testing](../contributing/testing.md)), the **mixed rounds' graphs**
   (`mixed_graphs`): a verify graph and a drafter graph for each mix of extended
   and base lanes the load's lanes and its pool hold (a mix of `w` extended

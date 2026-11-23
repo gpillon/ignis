@@ -1,4 +1,4 @@
-# The 27B's mixed rounds served on the RTX 5090 after spec #711: a JSON answer beside three conversations 14.5% faster together, every multi-lane cell faster or inside its spread, one lane the same text in the same rounds, and a sampled conversation cell 2.05% below past the gate's 2% line, so the `rtx5090` profile keeps `aggregate`
+# The 27B's mixed rounds served on the RTX 5090 after spec #711: a JSON answer beside three conversations 14.5% faster together, every multi-lane cell faster or inside its spread, one lane the same text in the same rounds, and a sampled conversation cell 2.05% below past the gate's 2% line, a miss by the letter after which the owner made `mixed` the `rtx5090` profile's default
 
 - Kind: experiment
 - Status: current
@@ -16,7 +16,7 @@
   [ADR 0104](../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md),
   [the 27B's draft window of 15 served](2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)
 - Superseded by: none
-- Summary: RTX 5090, 27B NVFP4, 15 drafts, served vs aggregate: mixed +14.5% on a JSON answer beside three conversations (worst lane -7.9%), one lane the same text and rounds, but a conversation cell read -2.05%: rtx5090 keeps aggregate.
+- Summary: RTX 5090, 27B NVFP4, 15 drafts, served vs aggregate: mixed +14.5% on a JSON answer beside three conversations (worst lane -7.9%), one lane the same text and rounds; a conversation cell -2.05%, yet the owner made mixed rtx5090's default.
 
 ## Question
 
@@ -78,7 +78,7 @@ Eighteen batches, 08:24 to 11:05, about 150 minutes under the lock, each under 1
 server stop read the wrong process, fixed), a BF16 KV smoke, the threshold cell twice, the pairs, four lanes, the
 regression line (seven batches) and its repeat, speculation off, the first token by depth, and the profile's own
 load. No build ran during any batch, and every timed request's largest gap between two streamed tokens was under
-125 ms. The raw legs, client records and summaries are in `.scratch/711-722/` of the build's worktree.
+125 ms. The raw legs, client records and summaries are kept locally, not in the repository.
 
 ### The threshold cell: a JSON answer beside three conversations, four lanes
 
@@ -315,9 +315,12 @@ Inferred:
 
 ## Implications
 
-- By #722's rule a miss leaves the default where it was: every profile, `rtx5090` included, keeps `aggregate`, and
-  the owner decides. `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed` gives a load the gains
-  above ([speculative decoding](../user/concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
+- By #722's rule a miss left the default to the owner, who made `mixed` the `rtx5090` profile's default after the
+  miss by the letter (2026-11-23, #722): one lane forms no mix, and the seeded pairs wrote the same text in the same
+  rounds under both builds, so the one-lane readings are the build's cost or the texts' sampling, not the policy's.
+  Every other profile keeps `aggregate`, and under `rtx5090`
+  `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy aggregate` gives the uniform rounds back
+  ([speculative decoding](../user/concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
 - A gate that holds one-lane sampled cells to a 2% line needs seeded pairs, or many more requests than 20 an arm: at
   20 to 40, main against main moves past 2%.
 - A load under `mixed` gives up 117 KV pages (about 7,500 tokens) of the `rtx5090` pool for the mixed graphs, which
@@ -350,7 +353,6 @@ Inferred:
 
 ## Follow-ups
 
-- The owner's decision on the `rtx5090` default (`spec.shape_policy: mixed` in its 27B section).
 - A regression line read from seeded pairs.
 - The first token's 7 ms under this build, and the process VRAM over its plan named above.
 - The RTX PRO 6000 and the 16 GB and 24 GB cards, before their profiles' policies move.

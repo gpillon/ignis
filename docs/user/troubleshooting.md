@@ -415,8 +415,8 @@ the server with the card quiet, or with more `--vram-headroom-bytes`.
 with the load's `lanes` and `gdn_slots`. From 0.11.0 a mixed round of `w`
 extended lanes beside `n` base lanes takes `w + n` of the load's lanes and
 `2w + n` of its pool's GDN slots (the lanes and the device retained slots), so
-a load given `--spec-backend dflash2 --spec-draft-tokens 15
---spec-shape-policy mixed` whose pool holds
+a load under `mixed` (the `rtx5090` profile's, or `--spec-backend dflash2
+--spec-draft-tokens 15 --spec-shape-policy mixed` named) whose pool holds
 no mix, two lanes without a device retained slot (`rtx-16gb`'s) or one lane,
 runs `aggregate`, and its load log's `speculation` says
 `shape_policy=aggregate shape_policy_given=mixed`. The load serves as

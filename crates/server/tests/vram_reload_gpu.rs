@@ -36,7 +36,8 @@
 //!
 //! GitHub #714 (spec #711): then the same two-shape load with its mixed
 //! rounds' graphs asked ([`MIXED_ROUNDS`]`=1`: the twelve mixes at the default
-//! 8 lanes), and its reload, held as the two-shape ones are; and, on Windows,
+//! 8 lanes, under the shape policy `aggregate` every load here names,
+//! [`options`]), and its reload, held as the two-shape ones are; and, on Windows,
 //! while each two-shape load is in, what the process holds past its plan: the
 //! mixed load no more past its plan than the two-shape load without them,
 //! within [`UNDER_SLACK_BYTES`], so the graphs are a line of the plan and do
@@ -65,9 +66,12 @@ const SEVEN_DRAFT_TOKENS: u32 = 7;
 
 /// The defaults at a context that fits beside the desktop, with idle unload
 /// off (ADR 0049): the reload is the test's. The pool takes the rest of the
-/// budget at any context. `draft_tokens` names the DFlash2 window.
+/// budget at any context. `draft_tokens` names the DFlash2 window, and the
+/// shape policy is named `aggregate`, since the `rtx5090` profile's became
+/// `mixed` (GitHub #722): the two-shape load captures no mixed graph unless
+/// [`MIXED_ROUNDS`] asks.
 fn options(draft_tokens: u32) -> ignis_server::config::Config {
-    let mut args: Vec<String> = ["--model-max-context", "16384", "--model-idle-unload", "0", "--spec-backend", "dflash2", "--spec-draft-tokens"]
+    let mut args: Vec<String> = ["--model-max-context", "16384", "--model-idle-unload", "0", "--spec-backend", "dflash2", "--spec-shape-policy", "aggregate", "--spec-draft-tokens"]
         .map(String::from)
         .to_vec();
     args.push(draft_tokens.to_string());
