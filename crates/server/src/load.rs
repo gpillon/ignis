@@ -1171,7 +1171,7 @@ mod tests {
             speculation_text(the_27b, LoadSpeculation::Runs(Some(wide)), NVFP4, false),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=7 shape_stay_accepted=6 shape_policy=aggregate shape_estimate_rounds=16 \
-             shape_period_ratios=1.128/1.155,1.29/1.12,1.285,1.363/1.138,1.222,1.384,1.344/1.077,1.207,1.336/1.093,1.241/1.107"
+             shape_period_ratios=1.128/1.159,1.29/1.112,1.249,1.363/1.132,1.217,1.344,1.344/1.083,1.196,1.196/1.109,1.109/1"
         );
         let all = wide
             .with_shape_rule(ShapeRule::new(5, 12).unwrap())
@@ -1181,7 +1181,7 @@ mod tests {
             speculation_text(the_27b, LoadSpeculation::Runs(Some(all)), NVFP4, false),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=5 shape_stay_accepted=12 shape_policy=all shape_estimate_rounds=8 \
-             shape_period_ratios=1/1.155,1.2/1.12,1.285,1.25/1.138,1.222,1.384,2/1.077,1.207,1.336/1.093,1.241/1.107"
+             shape_period_ratios=1/1.159,1.2/1.112,1.249,1.25/1.132,1.217,1.344,2/1.083,1.196,1.196/1.109,1.109/1"
         );
         let line_holding = |draft_tokens: u32, holds_a_mix: bool| {
             let mixed = Speculation::new(SpeculativeBackend::Dflash2, draft_tokens)
@@ -1194,7 +1194,7 @@ mod tests {
             format!(
                 "dflash2 draft_tokens={draft_tokens} draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
                  shape_enter_accepted=7 shape_stay_accepted=6 shape_policy={policy} shape_estimate_rounds=16 \
-                 shape_period_ratios=1.1/1.155,1.2/1.12,1.285,1.3/1.138,1.222,1.384,1.4/1.077,1.207,1.336/1.093,1.241/1.107"
+                 shape_period_ratios=1.1/1.159,1.2/1.112,1.249,1.3/1.132,1.217,1.344,1.4/1.083,1.196,1.196/1.109,1.109/1"
             )
         };
         assert_eq!(line(15), shapes(15, "mixed"), "15 drafts run `mixed`, on either body (#720)");
@@ -1231,8 +1231,8 @@ mod tests {
             let line = speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(config.speculation), Some(body), true);
             line.split_once("shape_period_ratios=").map(|(_, table)| table.to_owned()).unwrap_or_else(|| panic!("{line}"))
         };
-        let trellis = "1.128/1.29,1.29/1.251,1.363,1.363/1.288,1.344,1.344,1.344/1.161,1.433,1.702/1.194,1.504/1.224";
-        let nvfp4 = "1.128/1.155,1.29/1.12,1.285,1.363/1.138,1.222,1.384,1.344/1.077,1.207,1.336/1.093,1.241/1.107";
+        let trellis = "1.364/1.214,1.407/1.162,1.502,1.629/1.291,1.391,1.55,1.606/1.082,1.204,1.243/1.117,1.154/1.036";
+        let nvfp4 = "1.128/1.159,1.29/1.112,1.249,1.363/1.132,1.217,1.344,1.344/1.083,1.196,1.196/1.109,1.109/1";
         assert_eq!(ratios(&[], None, Body27b::Trellis), trellis, "the trellis body's default");
         assert_eq!(ratios(&[], None, Body27b::Nvfp4), nvfp4, "the NVFP4 body's default");
         let named = "1.1/1.15,1.25/1.12,1.3,1.4/1.13,1.22,1.38,1.34/1.07,1.2,1.33/1.09,1.24/1.5";
@@ -1248,8 +1248,8 @@ mod tests {
         }
         // The four-value form: its uniform entries beside the body's mixed ones.
         let four = ["--spec-shape-period-ratios", "1.1,1.2,1.3,1.4"];
-        assert_eq!(ratios(&four, None, Body27b::Trellis), "1.1/1.29,1.2/1.251,1.363,1.3/1.288,1.344,1.344,1.4/1.161,1.433,1.702/1.194,1.504/1.224");
-        assert_eq!(ratios(&four, None, Body27b::Nvfp4), "1.1/1.155,1.2/1.12,1.285,1.3/1.138,1.222,1.384,1.4/1.077,1.207,1.336/1.093,1.241/1.107");
+        assert_eq!(ratios(&four, None, Body27b::Trellis), "1.1/1.214,1.2/1.162,1.502,1.3/1.291,1.391,1.55,1.4/1.082,1.204,1.243/1.117,1.154/1.036");
+        assert_eq!(ratios(&four, None, Body27b::Nvfp4), "1.1/1.159,1.2/1.112,1.249,1.3/1.132,1.217,1.344,1.4/1.083,1.196,1.196/1.109,1.109/1");
         let earlier = "spec:
   qwen38:
     shape_period_ratios: [1.128, 1.29, 1.363, 1.344]

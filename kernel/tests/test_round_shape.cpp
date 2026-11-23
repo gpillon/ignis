@@ -248,10 +248,22 @@ void check_the_thresholds() {
   }
 }
 
-// The policies, `all` and `aggregate` at the defaults of the rest of the policy.
+// GitHub #721: the cost table the rows here are worked against, the tests' own (the core's tests
+// hold the same, crates/core/src/shape_grant.rs `TABLE`), so that each row's arithmetic holds
+// whatever the defaults are: the uniform entries 1.128, 1.29, 1.363 and 1.344 at 1 to 4 lanes, and
+// the mixed entries in kMixTable's order, 1+1 1.155 ... 3+2 1.336, its 3+1 above the uniform entry
+// at 4 lanes.
+constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kTestPeriodRatios = {1128, 1290, 1363, 1344};
+constexpr std::array<std::uint32_t, ignis::round_layout::kMixes> kTestMixedPeriodRatios = {
+    1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336};
+
+// The policies, `all` and `aggregate`, over the tests' cost table and the defaults of the rest of
+// the policy.
 ShapePolicy policy_of(Policy policy) {
   ShapePolicy shape_policy{};
   shape_policy.policy = policy;
+  shape_policy.period_ratios = kTestPeriodRatios;
+  shape_policy.mixed_period_ratios = kTestMixedPeriodRatios;
   return shape_policy;
 }
 
@@ -538,10 +550,10 @@ void check_the_policy_options() {
         "a ratio of 0 is that lane count's default, the others as given");
   // GitHub #715: the cost table's mixed entries, 0 each's default, refused by their own name.
   check(got.mixed_period_ratios == ignis::round_shape::kDefaultMixedPeriodRatios,
-        "the mixed entries at their defaults: 1+1 1.155 ... 3+2 1.336");
+        "the mixed entries at their defaults: 1+1 1.159 ... 3+2 1.196");
   mixed[7] = 1500;
   check(ignis::round_shape::policy_of(IGNIS_SHAPE_POLICY_MIXED, 0, some.data(), mixed.data(), got) == nullptr &&
-            got.policy == Policy::kMixed && got.mixed_period_ratios[7] == 1500 && got.mixed_period_ratios[0] == 1155,
+            got.policy == Policy::kMixed && got.mixed_period_ratios[7] == 1500 && got.mixed_period_ratios[0] == 1159,
         "`mixed` with the 2+2 entry given, the others their defaults");
   for (const std::uint32_t wrong : {999u, 2001u}) {
     mixed[11] = wrong;
@@ -669,10 +681,10 @@ void check_the_grant() {
   }
   // The table's lookup: the base round, a mix, the uniform entry.
   const ShapePolicy defaults{};
-  check(period_ratio(defaults, 4, 0) == 1000 && period_ratio(defaults, 4, 2) == 1222 &&
-            period_ratio(defaults, 4, 4) == 1344 && period_ratio(defaults, 7, 1) == 1107 &&
+  check(period_ratio(defaults, 4, 0) == 1000 && period_ratio(defaults, 4, 2) == 1217 &&
+            period_ratio(defaults, 4, 4) == 1344 && period_ratio(defaults, 7, 1) == 1000 &&
             period_ratio(defaults, 7, 2) == ignis::round_shape::kPeriodRatioMaxMilli,
-        "the cost table at 4 lanes: 1, 1.222 at 2+2, 1.344 at 4 extended; 1.107 at 1+6; 2+5, past 64 columns, "
+        "the cost table at 4 lanes: 1, 1.217 at 2+2, 1.344 at 4 extended; 1 at 1+6; 2+5, past 64 columns, "
         "the widest ratio, as the core's");
 }
 

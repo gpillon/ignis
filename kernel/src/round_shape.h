@@ -50,8 +50,8 @@ inline constexpr std::uint32_t kDefaultStayAccepted = 6;
 inline constexpr std::uint32_t kDefaultEstimateRounds = 16;
 inline constexpr std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> kDefaultPeriodRatios = {1128, 1290, 1363, 1344};
 // GitHub #715: the cost table's mixed entries, in kMixTable's order (crates/core/src/shape_grant.rs
-// `PeriodTable::NVFP4`, where each is said to be measured or derived).
-inline constexpr std::array<std::uint32_t, round_layout::kMixes> kDefaultMixedPeriodRatios = {1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336};
+// `PeriodTable::NVFP4`, where the measurement and the four entries held are said).
+inline constexpr std::array<std::uint32_t, round_layout::kMixes> kDefaultMixedPeriodRatios = {1159, 1112, 1132, 1083, 1109, 1000, 1249, 1217, 1196, 1109, 1344, 1196};
 inline constexpr std::uint32_t kPeriodRatioMinMilli = 1000;
 inline constexpr std::uint32_t kPeriodRatioMaxMilli = 2000;
 
@@ -162,9 +162,11 @@ struct ShapePolicy {
   std::uint32_t estimate_rounds = kDefaultEstimateRounds;
   // The extended round's period over the base round's, in thousandths, at 1..4 lanes: measured on
   // the RTX 5090 (1.128, 1.29, 1.363, 1.344; GPU clock, FP8 exception weights, the default cost
-  // levers and route, a matched context, two orders pooled). At 3 and 4 lanes the card's 575 W
-  // power limit lowers the extended round's clock, so 3 lanes measured above 4 in either order: not
-  // a slip. The ratio grows with context; these are its value at about 3.5-5K tokens. The one-lane
+  // levers and route, a matched context, two orders pooled), and read within 0.011 by the round
+  // identity test's forced rounds from 3,584 tokens of context, 1,536 more ridden
+  // (crates/core/src/shape_grant.rs `NVFP4_MEASURED`). At 3 and 4 lanes the card's 575 W power
+  // limit lowers the extended round's clock, so 3 lanes measured above 4 in either order: not a
+  // slip. The ratio grows with context; these are its value at about 3.5-5K tokens. The one-lane
   // entry is not read: a lane alone runs at the shape it asks.
   std::array<std::uint32_t, IGNIS_EXTENDED_SHAPE_MAX_LANES> period_ratios = kDefaultPeriodRatios;
   // GitHub #715: the cost table's mixed entries, the round of w extended lanes beside n base lanes

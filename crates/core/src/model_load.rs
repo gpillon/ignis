@@ -1906,13 +1906,13 @@ mod tests {
         // GitHub #690: and the shape policy, `aggregate` at its defaults unless named.
         assert_eq!((options.shape_policy, options.shape_estimate_rounds, options.shape_period_ratios), (0, 16, [1128, 1290, 1363, 1344]));
         // GitHub #715: and the cost table's mixed entries, the defaults unless named.
-        assert_eq!(options.shape_mixed_period_ratios, [1155, 1120, 1138, 1077, 1093, 1107, 1285, 1222, 1207, 1241, 1384, 1336]);
+        assert_eq!(options.shape_mixed_period_ratios, [1159, 1112, 1132, 1083, 1109, 1000, 1249, 1217, 1196, 1109, 1344, 1196]);
         // GitHub #720: on the trellis body, that body's own table.
         let trellis = load_options(Some(wide), None, RopeScaling::NONE, 0, PrefillAttention::Fp8, PrefillLinear::default(), LANES, Body27b::Trellis)
             .expect("options");
         assert_eq!(
             (trellis.shape_period_ratios, trellis.shape_mixed_period_ratios),
-            ([1128, 1290, 1363, 1344], [1290, 1251, 1288, 1161, 1194, 1224, 1363, 1344, 1433, 1504, 1344, 1702])
+            ([1364, 1407, 1629, 1606], [1214, 1162, 1291, 1082, 1117, 1036, 1502, 1391, 1204, 1154, 1550, 1243])
         );
         let all = wide.with_shape_policy(
             crate::speculation::ShapePolicy::All,

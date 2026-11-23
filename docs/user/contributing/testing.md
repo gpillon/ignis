@@ -492,11 +492,24 @@ after a capture again, so that each cell prints a line here and then its own
 `verify`, `verify extended` or `verify mixed` lines. An entry is its cell's
 period over the base round's at its lane count, and each mix stands beside the
 base round of its columns. One run is one leg of the table's measurement on
-its load, the NVFP4 artifact's or the trellis artifact's:
+its load, the NVFP4 artifact's or the trellis artifact's;
+`IGNIS_ROUND_IDENTITY_TIMING_TABLE=reverse` rides the same cells in the
+reverse order, the widest lane count first, so that legs run forward, reverse,
+reverse and forward are mirrored. The defaults took four legs a load at the
+served context below (`IGNIS_ROUND_IDENTITY_TIMING_CONTEXT=3584`), each cell's
+period the median of its blocks' medians over all of them, since a busy
+machine slows a block now and then and never speeds one
+([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)):
 
 ```sh
 make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=trellis-24gb-w15-rule IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 IGNIS_ROUND_IDENTITY_TIMING_TABLE=1 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
 ```
+
+Beside them, `IGNIS_ROUND_IDENTITY_TIMING_CONTEXT=<tokens>` prefills each
+timed lane to that many tokens, its prompt behind a long text of the guide's,
+and rides it 1,536 more, the load taking the served gate's 262,144-token
+context; the sessions keep their own. `IGNIS_ROUND_IDENTITY_TIMING_CELLS=uniform`
+rides only the base and uniform extended cells at 1 to 4 lanes.
 
 `IGNIS_ROUND_IDENTITY_ARMS` names the arms the same way. Unset, each of the
 three is everything. The second test runs the 15-draft loads the loads filter

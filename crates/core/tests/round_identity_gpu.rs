@@ -254,6 +254,8 @@
 //! each after a capture again, so that each cell's period on the GPU clock
 //! stands beside the base rounds of every column count, one leg of the
 //! table's measurement on the load (the NVFP4 body's or the trellis body's).
+//! #721: `IGNIS_ROUND_IDENTITY_TIMING_TABLE=reverse` rides the same cells in
+//! the reverse order, so that legs alternating the two orders are mirrored.
 //!
 //! # Narrow runs
 //!
@@ -478,6 +480,20 @@ const MIXED_GRAPH_BUILD: &str = "IGNIS_MIXED_GRAPH_BUILD";
 const MIXED_GRAPH_BUILD_OFF_ARM: &str = "mixed-graph-build-off";
 const TIMED_MIXES: [&[bool]; 3] =
     [&[true, false, false, false], &[true, true, false, false], &[true, false, false, false, false, false]];
+
+/// #721 (opt-in): `IGNIS_ROUND_IDENTITY_TIMING_CONTEXT=<tokens>` beside the
+/// cost table's timing prefills each timed lane to that many tokens, its
+/// prompt behind [`TIMING_TEXT`]'s, and rides it [`TIMING_RIDE_TOKENS`] more,
+/// and the load takes the served gate's context, [`TIMING_MAX_CONTEXT`], from
+/// which its attention's envelope, and so its route, is chosen; the sessions
+/// keep their own context. Unset: none.
+fn timing_context() -> Option<u32> {
+    let raw = std::env::var("IGNIS_ROUND_IDENTITY_TIMING_CONTEXT").ok()?;
+    Some(raw.parse().unwrap_or_else(|e| panic!("IGNIS_ROUND_IDENTITY_TIMING_CONTEXT={raw}: {e}")))
+}
+const TIMING_MAX_CONTEXT: u32 = 262_144;
+const TIMING_RIDE_TOKENS: u32 = 1_536;
+const TIMING_TEXT: &str = include_str!("../../../docs/user/concepts/speculative-decoding.md");
 
 /// #687: the switch that names a two-shape load's round shape, read at each
 /// verify round; the base shape's drafts a lane, and the most lanes a round
@@ -947,6 +963,9 @@ fn set_round_shape(named: Option<&str>) {
 struct Script {
     prompts: Vec<Vec<i32>>,
     permitted: Vec<i32>,
+    /// #721: a long text's tokens, the prefix of each timed lane under
+    /// [`timing_context`]; empty without it.
+    long: Vec<i32>,
 }
 
 fn script(reader: &Reader) -> Script {
@@ -974,7 +993,8 @@ fn script(reader: &Reader) -> Script {
             ref ids => panic!("the digit {digit} is {} tokens", ids.len()),
         })
         .collect();
-    Script { prompts, permitted }
+    let long = if timing_context().is_some() { encode(TIMING_TEXT) } else { Vec::new() };
+    Script { prompts, permitted, long }
 }
 
 /// Axis-major `[3, n]` positions of a prompt whose first four tokens rotate
@@ -1079,7 +1099,8 @@ fn uniform_graph_nodes(model: &Model, pool: &SeqPool, arm: &Arm, label: &str) {
     let Some(main) = MAIN_GRAPH_NODES.iter().find(|nodes| nodes.label == label) else {
         return;
     };
-    if major != 12 {
+    // #721: main's nodes are its graphs' at the session's context, not at the timing's.
+    if major != 12 || timing_context().is_some() {
         return;
     }
     assert_eq!(stats.shapes().len(), main.shapes.len(), "{label}: the round shapes main captures");
@@ -1604,16 +1625,32 @@ fn ride_timed(model: &Model, pool: &SeqPool, load: &Load, script: &Script, round
     let mut tokens = vec![0u64; width];
     let mut first: Option<Committed> = None;
     while ridden < rounds {
+        // #721: under `IGNIS_ROUND_IDENTITY_TIMING_CONTEXT`, each lane's prompt
+        // behind a long text, to that many tokens, and as many more to ride.
+        let (prompts, context) = match timing_context() {
+            Some(tokens) => {
+                let prompts: Vec<Vec<i32>> = (0..width)
+                    .map(|lane| {
+                        let own = &script.prompts[lane];
+                        let before = (tokens as usize).checked_sub(own.len()).filter(|&n| n <= script.long.len());
+                        let before = before.unwrap_or_else(|| panic!("{label}: a timing context of {tokens} tokens past the text's {}", script.long.len()));
+                        script.long[..before].iter().chain(own).copied().collect()
+                    })
+                    .collect();
+                (prompts, tokens + TIMING_RIDE_TOKENS)
+            }
+            None => (script.prompts[..width].to_vec(), load.context()),
+        };
         let mut riders: Vec<Seq<'_>> = (0..width)
             .map(|lane| {
-                let mut seq = pool.alloc(load.context()).unwrap_or_else(|e| panic!("{label}: timing alloc: {e}"));
-                prefill(model, pool, &mut seq, &script.prompts[lane], greedy(lane), false, label);
+                let mut seq = pool.alloc(context).unwrap_or_else(|e| panic!("{label}: timing alloc: {e}"));
+                prefill(model, pool, &mut seq, &prompts[lane], greedy(lane), false, label);
                 seq
             })
             .collect();
         let mut text: Committed = vec![Vec::new(); width];
-        let mut used = (0..width).map(|lane| script.prompts[lane].len()).max().unwrap_or(0) as u32;
-        while ridden < rounds && used + 2 * (load.window + 1) <= load.context() {
+        let mut used = prompts.iter().map(Vec::len).max().unwrap_or(0) as u32;
+        while ridden < rounds && used + 2 * (load.window + 1) <= context {
             let mut refs: Vec<&mut Seq<'_>> = riders.iter_mut().collect();
             let runs = decode_program_verify_mixed(model, pool, &mut refs, &lanes, load.window, extended)
                 .unwrap_or_else(|e| panic!("{label}: timing at {extended:?}: {e}"));
@@ -1649,15 +1686,26 @@ fn ride_timed(model: &Model, pool: &SeqPool, load: &Load, script: &Script, round
 /// after its line here: an entry is its cell's period over the base round's at
 /// its lane count, and a mix of `w` extended lanes stands beside the base round
 /// of `w` lanes more, its columns. Nothing is compared.
-fn time_cost_table(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, label: &str) {
-    for width in 1..=load.lanes {
-        let cells = 0..=ignis_core::PeriodTable::row_entries(width);
-        for extended in cells {
-            let shapes: Vec<bool> = (0..width).map(|lane| lane >= width - extended).collect();
-            capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
-            println!("round_identity_gpu {label}: the cost table's cell of {width} lanes, {extended} of them extended");
-            ride_timed(model, pool, load, script, rounds, &shapes, label);
-        }
+/// #721: `reverse` rides the same cells in the reverse order, the widest
+/// lane count first and each row from its most extended lanes to its base
+/// round, so that legs alternating the two orders mirror what drifts over a
+/// leg.
+fn time_cost_table(model: &Model, pool: &SeqPool, load: &Load, script: &Script, rounds: u32, reverse: bool, label: &str) {
+    // #721: `IGNIS_ROUND_IDENTITY_TIMING_CELLS=uniform`, the base and uniform extended rounds alone at 1 to
+    // [`EXTENDED_LANES`] lanes.
+    let uniform = std::env::var("IGNIS_ROUND_IDENTITY_TIMING_CELLS").is_ok_and(|value| value == "uniform");
+    let mut cells: Vec<(u32, u32)> = (1..=load.lanes)
+        .flat_map(|width| (0..=ignis_core::PeriodTable::row_entries(width)).map(move |extended| (width, extended)))
+        .filter(|&(width, extended)| !uniform || (width <= EXTENDED_LANES as u32 && (extended == 0 || extended == width)))
+        .collect();
+    if reverse {
+        cells.reverse();
+    }
+    for (width, extended) in cells {
+        let shapes: Vec<bool> = (0..width).map(|lane| lane >= width - extended).collect();
+        capture_decode_graphs(model, pool).unwrap_or_else(|e| panic!("{label}: timing capture: {e}"));
+        println!("round_identity_gpu {label}: the cost table's cell of {width} lanes, {extended} of them extended");
+        ride_timed(model, pool, load, script, rounds, &shapes, label);
     }
 }
 
@@ -1907,11 +1955,11 @@ fn run(model: &Model, pool: &SeqPool, load: &Load, script: &Script, arm: &Arm, l
         let timed = arm.switches.contains(&("IGNIS_ROUND_TIMING", "1")) && arm.switches.contains(&(MIXED_ROUNDS, "1"));
         let rounds = std::env::var("IGNIS_ROUND_IDENTITY_TIMING_ROUNDS").ok().and_then(|value| value.parse::<u32>().ok());
         if let (true, true, Some(rounds)) = (timed, load.mixes(), rounds) {
-            // #720: or every cell of the cost table, where asked.
-            if std::env::var("IGNIS_ROUND_IDENTITY_TIMING_TABLE").is_ok_and(|value| value == "1") {
-                time_cost_table(model, pool, load, script, rounds, label);
-            } else {
-                time_mixed_rounds(model, pool, load, script, rounds, label);
+            // #720: or every cell of the cost table, where asked (#721: in either order).
+            match std::env::var("IGNIS_ROUND_IDENTITY_TIMING_TABLE").as_deref() {
+                Ok("1") => time_cost_table(model, pool, load, script, rounds, false, label),
+                Ok("reverse") => time_cost_table(model, pool, load, script, rounds, true, label),
+                _ => time_mixed_rounds(model, pool, load, script, rounds, label),
             }
         }
     }
@@ -1989,13 +2037,19 @@ fn with_load<T>(
     };
     let converted = artifact.stats().fp8_device_bytes;
     assert_eq!(converted > 0, exceptions.is_fp8(), "{label}: {converted} bytes of exception tensors held in FP8");
+    // #721: under `IGNIS_ROUND_IDENTITY_TIMING_CONTEXT` the model loads at the
+    // served gate's context and the pool holds every lane at the timing's.
+    let (model_context, lane_tokens) = match timing_context() {
+        Some(tokens) => (TIMING_MAX_CONTEXT, load.context().max(tokens + TIMING_RIDE_TOKENS)),
+        None => (load.context(), load.context()),
+    };
     let returned = {
         let model = load_qwen38_27b_with_decode_lanes(
             reader,
             &artifact,
             &handles,
             CHUNK,
-            load.context(),
+            model_context,
             KvFormat::HqE8_2b,
             Some(spec),
             load.vision(),
@@ -2009,8 +2063,8 @@ fn with_load<T>(
             &ModelConfig::qwen38_27b(),
             &SeqPoolBudget {
                 kv_format: KvFormat::HqE8_2b,
-                kv_page_group_count: load.context().div_ceil(64) * load.lanes,
-                max_context_tokens: load.context(),
+                kv_page_group_count: lane_tokens.div_ceil(64) * load.lanes,
+                max_context_tokens: model_context,
                 slot_count: load.lanes,
                 retained_slot_count: 0,
                 retained_host_slot_count: 0,
