@@ -129,8 +129,9 @@ Two batches, 3 windows a leg, 12 windows an arm (A in the first batch).
   mixed round holds 24, so both lanes gain. On the GPU clock N's two-lane mixed rounds took 19,723 and 19,742 us, M's
   two-lane uniform extended rounds 21,605 and 21,625 us.
 - Every answer was well formed in both arms: JSON 6 of 6 and 12 of 12, json_schema 6 of 6 valid (200 items), the
-  strict tool calls' arguments parsed in 6 of 6 under N and M, with the host cut and its repair running inside mixed
-  rounds (25.3% of that pair's lane-rounds mixed). A's strict-tools pair parsed 5 of 6.
+  strict tool calls' arguments parsed in 6 of 6 under N and M, 25.3% of that pair's lane-rounds mixed under N; no
+  structured repair was counted in any of these legs (`ignis_structured_repairs_total` 0), and the grammar's cuts of
+  a round's run are not counted served. A's strict-tools pair parsed 5 of 6.
 - At four lanes beside the json_schema answer `aggregate` ran every lane extended in 78.7% of its lane-rounds; the
   mixed round keeps the conversations at 8 columns, so they too are faster.
 
@@ -188,10 +189,10 @@ the extended share from `/metrics`.
 in all four legs), 83.60 against 83.58 tok/s (-0.02%, CI +-0.03%, control +0.02%); the conversation at temperature
 0.6, 3 a leg, +0.03%.
 
-**The first token** (a cold prompt of 16,676 tokens, one token, 3 a leg after the warm-up in the seven speculative
-batches of the regression line and the depth batch's 16K cell: 16 legs an arm): N later by 7.3 ms (+0.62%), leg-level
-95% CI +-4.8 ms; the server's own `duration_ms` over the seven batches +4.6 ms (CI +-3.1). The depth batch alone (4 a
-depth a leg, M N N M):
+**The first token** (a cold prompt of 16,676 tokens, one token, 3 a leg after the warm-up in the eight speculative
+batches of the regression line and its repeat, and the depth batch's 16K cell: 18 legs an arm): N later by 7.1 ms
+(+0.60%), leg-level 95% CI +-4.9 ms; the server's own `duration_ms` over the eight batches +3.7 ms (CI +-3.0). The
+depth batch alone (4 a depth a leg, M N N M):
 
 | depth | M (legs) | N (legs) | change | 95% CI |
 |---|---|---|---|---|
@@ -204,12 +205,13 @@ With speculation off the cold 16K prompt read +1.33% (2 an arm).
 ### Context and pages
 
 Every speculative load held 262,144 tokens of context. Each load planned its KV pool from the budget its start read
-(29,162 to 29,192 MB, from the free memory at its start: 3,145 to 3,152 MiB in use on the desktop before each load).
-Against M's pool at the same budget (a line fitted through M's eight loads), every N load's pool was 69.20 to 69.48 MB
-smaller, 117.3 to 117.8 pages of 589,833 bytes: the plan's `mixed_graphs` line, 69,206,016 bytes (117.3 pages), within
-a page. Every A load's pool was M's within 0.5 MB (0.8 page). Read by the WDDM per-process counter after the load, the
-process held 0.7 to 2.7 MB more than its plan under M, 5.1 to 6.8 MB under A and 7.1 to 8.8 MB under N, out of the
-headroom.
+(29,126 to 29,192 MB, from the free memory at its start: 3,147 to 3,211 MiB in use on the desktop before each load).
+Against M's pool at the same budget (a line fitted through M's 26 speculative loads, each within 0.9 page of it), every
+one of N's 26 speculative loads held a pool 68.8 to 69.5 MB smaller, 116.7 to 117.8 pages of 589,833 bytes: the
+plan's `mixed_graphs` line, 69,206,016 bytes (117.3 pages), within a page. A's four loads held M's pool within 0.4
+page. With speculation off both executables planned the same pages at the same budget (18,155 against 18,152 and
+18,156). Read by the WDDM per-process counter after the load, the process held 0.7 to 2.7 MB more than its plan under
+M, 5.1 to 6.8 MB under A and 7.1 to 9.0 MB under N, out of the headroom.
 
 ### A BF16 KV cache under `mixed`
 
@@ -288,10 +290,10 @@ Observed:
 - **The regression line misses by the letter of its 2% line**: the conversation at temperature 0.6 reads -2.05% over
   40 requests an arm (-0.26% and -3.79% in its two batches) and code at the model card's sampling -2.45% over 20; the
   other one-lane cells sit within 1.5% of the build of #684, the greedy ones within 0.14%. A cold 16K prompt's first
-  token comes 7.3 ms (0.62%) later, outside its CI (+-4.8 ms), at 4K and 64K within 0.12%.
+  token comes 7.1 ms (0.60%) later, outside its CI (+-4.9 ms), at 4K and 64K within 0.12%.
 - The same request, seeded, writes the same text in the same rounds under both builds, sampled or greedy, at a rate
   within 0.02 to 0.14%: one lane runs the same rounds, each about 0.1% longer under this build.
-- Plain decode and the served context are equal; the KV pages are lower by the planned mixed graphs alone (117.3 to
+- Plain decode and the served context are equal; the KV pages are lower by the planned mixed graphs alone (116.7 to
   117.8 pages against the line's 117.3); this build under `aggregate` plans and decodes as the build of #684 (its
   shares within 1.8 points, its pool within a page).
 - A BF16 KV cache loads under `mixed`, runs mixed rounds and writes valid answers, and the `rtx5090` profile's own
@@ -321,7 +323,8 @@ Inferred:
 - A load under `mixed` gives up 117 KV pages (about 7,500 tokens) of the `rtx5090` pool for the mixed graphs, which
   the profile's 917,504 tokens hold with 66 MiB more free at start.
 - The process holds a few MB its plan does not count, more under this build than under #684's (A 5-7 MB, N 7-9 MB,
-  M 1-3 MB, N on BF16 KV 9.9 MB): out of the headroom.
+  M 1-3 MB, N on BF16 KV 9.9 MB): out of the headroom. This build's first-token delay and its 0.1% longer one-lane
+  round ship with it under either policy, if they are the build's.
 
 ## Limits and unknowns
 
@@ -335,6 +338,11 @@ Inferred:
   correctness is the round identity and numerical-class tests' (ADR 0106).
 - Multi-lane greedy texts vary between starts of one configuration, so the windows compare texts that differ between
   legs.
+- Nine of the ten unseeded sampled one-lane readings fell below the build of #684, in tokens a round as well, a
+  pattern independent sampling noise gives about one time in a hundred; the seeded pairs, which wrote the same texts
+  in the same rounds, are the evidence the one-lane rounds are the same, and the pattern is not explained.
+- The first token's delay and the one-lane round's 0.1% were not timed under this build with `aggregate`, so whose
+  they are (the build's or the policy's) is inferred.
 - The cost table is a figure at about 3.5-5K tokens of context, and the ratio grows with context (ADR 0106).
 - The served `/metrics` count lane-rounds by shape, not rounds by mix: the shares of mixes (1+3 against 2+2 at four
   lanes) were not read served.
