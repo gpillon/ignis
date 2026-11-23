@@ -81,12 +81,20 @@ fn preflight_passed(path: &Path, now: SystemTime) -> bool {
 /// profile each call also keeps the marker fresh for the test binaries that
 /// follow (GitHub #517).
 pub fn active() -> bool {
+    active_naming(None)
+}
+
+/// [`active`], asked by a caller that has met `condition`, a skip outside
+/// the profile: a refusal for want of a preflight pass names it first,
+/// where the refusal alone would hide it (GitHub #605).
+fn active_naming(condition: Option<&str>) -> bool {
     static ACTIVE: OnceLock<bool> = OnceLock::new();
     static LAST_REFRESH: AtomicU64 = AtomicU64::new(0);
     let on = *ACTIVE.get_or_init(|| {
         active_impl(
             env::var("IGNIS_GPU_PROFILE").ok(),
             preflight_passed(&marker_path(), SystemTime::now()),
+            condition,
         )
     });
     if on {
@@ -95,13 +103,14 @@ pub fn active() -> bool {
     on
 }
 
-fn active_impl(var: Option<String>, preflight_passed: bool) -> bool {
+fn active_impl(var: Option<String>, preflight_passed: bool, condition: Option<&str>) -> bool {
     if !matches!(var.as_deref(), Some("1")) {
         return false;
     }
     if !preflight_passed {
+        let met = condition.map_or(String::new(), |reason| format!("{reason} -- "));
         panic!(
-            "IGNIS_GPU_PROFILE=1, but no preflight pass is on record (no recent \
+            "{met}IGNIS_GPU_PROFILE=1, but no preflight pass is on record (no recent \
              marker at the path scripts/gpu-preflight.ps1 writes). The profile \
              must not run un-preflighted while the reference engine may hold the \
              GPU (ADR 0006): run `scripts/gpu-profile.ps1`, which preflights, \
@@ -115,9 +124,10 @@ fn active_impl(var: Option<String>, preflight_passed: bool) -> bool {
 /// it: a busy/absent GPU, a missing fixture, or (via [`check_rc`] /
 /// [`check_compute_err`]) a kernel error. Returns `true` when the caller
 /// should skip (the message is already printed); panics with `reason` under
-/// the profile.
+/// the profile, and with `reason` before the refusal when the switch is on
+/// but no recent preflight pass is (GitHub #605).
 pub fn skip_or_fail(reason: &str) -> bool {
-    skip_or_fail_impl(reason, active())
+    skip_or_fail_impl(reason, active_naming(Some(reason)))
 }
 
 fn skip_or_fail_impl(reason: &str, profile_active: bool) -> bool {
@@ -180,21 +190,29 @@ mod tests {
     #[test]
     fn active_impl_stays_off_without_the_switch_however_the_preflight_went() {
         for preflight_passed in [false, true] {
-            assert!(!active_impl(None, preflight_passed));
-            assert!(!active_impl(Some("0".to_string()), preflight_passed));
-            assert!(!active_impl(Some("true".to_string()), preflight_passed));
+            assert!(!active_impl(None, preflight_passed, None));
+            assert!(!active_impl(Some("0".to_string()), preflight_passed, None));
+            assert!(!active_impl(Some("true".to_string()), preflight_passed, None));
         }
     }
 
     #[test]
     fn active_impl_is_on_when_the_switch_and_a_preflight_pass_agree() {
-        assert!(active_impl(Some("1".to_string()), true));
+        assert!(active_impl(Some("1".to_string()), true, None));
     }
 
     #[test]
     #[should_panic(expected = "no preflight pass is on record")]
     fn active_impl_refuses_the_switch_without_a_preflight_pass() {
-        active_impl(Some("1".to_string()), false);
+        active_impl(Some("1".to_string()), false, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "the artifact is missing -- IGNIS_GPU_PROFILE=1, but no preflight pass is on record")]
+    fn active_impl_names_the_condition_met_before_refusing_the_switch() {
+        // A skip condition met once the marker had aged out was reported as
+        // the stale marker alone, the condition never printed (GitHub #605).
+        active_impl(Some("1".to_string()), false, Some("the artifact is missing"));
     }
 
     #[test]
