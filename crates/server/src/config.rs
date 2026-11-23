@@ -1855,9 +1855,22 @@ fn derive_speculation(
     // DFlash2 (`rtx5090`'s `mixed`) is that drafter's, as its window is: the
     // 27B's MTP load named over it carries the default.
     let estimate = ignis_core::ShapeEstimate::new(s.shape_estimate_rounds, s.shape_period_ratios).map_err(ConfigError)?;
-    let policy = if !the_27bs_mtp || mtp_takes(resolution, "shape_policy") { s.shape_policy } else { ignis_core::ShapePolicy::default() };
-    let speculation = speculation.with_shape_policy(policy, estimate);
+    let speculation = speculation.with_shape_policy(shape_policy_carried(resolution, family), estimate);
     Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
+}
+
+/// GitHub #722: the shape policy a load of `resolution` for `family` carries:
+/// the one resolved, but the default on the 27B's MTP load where that load
+/// does not take it ([`mtp_takes`]). The one rule both the load's speculation
+/// ([`derive_speculation`]) and the effective document
+/// ([`file::effective_document`]) read.
+fn shape_policy_carried(resolution: &Resolution, family: Option<ModelFamily>) -> ignis_core::ShapePolicy {
+    let s = &resolution.settings.spec;
+    if the_27bs_mtp(family, s.backend.and_then(SpecChoice::backend)) && !mtp_takes(resolution, "shape_policy") {
+        ignis_core::ShapePolicy::default()
+    } else {
+        s.shape_policy
+    }
 }
 
 /// Whether the 27B's MTP load takes the value `resolution` resolved for

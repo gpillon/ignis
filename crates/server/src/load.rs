@@ -672,6 +672,8 @@ fn cuda_scheduler_for(
     let shape = load_shape(config, vision_item_bound).with_second_tail_cut(config.basis.family(), second_tail_cut);
     // GitHub #720: the 27B's body, whose cost table its load runs.
     let mut body = None;
+    // GitHub #711: the 27B's shape policy as its config gives it, and where from.
+    let given = ShapePolicyGiven::of(config);
     // GitHub #302: a Flash-Next artifact runs its own program and leaf.
     let loaded = match family {
         ModelFamily::FlashNext => crate::runtime::flash_next_load(
@@ -691,11 +693,13 @@ fn cuda_scheduler_for(
                 log_exception_weights(config, &shape, read);
                 body = Some(read);
             }
+            // GitHub #711 (ADR 0106): the shape policy a profile gives is the NVFP4 body's.
+            let speculation = body.map_or(shape.speculation, |body| speculation_on(shape.speculation, given, body));
             crate::runtime::qwen27b_load(
                 artifact,
                 model.into(),
                 eos,
-                shape.with_family_decode_share(ModelFamily::Qwen38_27b),
+                EngineShape { speculation, ..shape.with_family_decode_share(ModelFamily::Qwen38_27b) },
                 thinking_close,
                 &config.kv_disk_location,
             )
@@ -708,15 +712,16 @@ fn cuda_scheduler_for(
     // The 27B's context, lanes and head are the ones its plan kept, and so
     // its rope table: what the scheduler admits and `GET /v1/models` says.
     let (scheduler, reserved, shape, adapted) = loaded?;
-    // GitHub #711: a load given `mixed` whose pool holds no mix runs `aggregate`, which it says, and why.
+    // GitHub #711: a load the operator gave `mixed` whose pool holds no mix runs `aggregate`, which it says, and why.
     if let Some((lanes, gdn_slots)) =
-        pool_without_a_mix(shape.speculation.filter(|_| family == ModelFamily::Qwen38_27b), shape.decode_lanes_for(family), shape.retained_device_slots)
+        pool_without_a_mix(shape.speculation.filter(|_| family == ModelFamily::Qwen38_27b), given, shape.decode_lanes_for(family), shape.retained_device_slots)
     {
         tracing::warn!(
             name: "ignis.runtime.mixed_rounds_hold_no_mix",
             lanes,
             gdn_slots,
-            "the shape policy mixed: this load holds no mix (w extended lanes beside n base lanes take w + n lanes and 2w + n GDN slots,              the lanes' and the device retained slots'; 1+1 two lanes and three slots), so it runs aggregate"
+            "the shape policy mixed: this load holds no mix (w extended lanes beside n base lanes take w + n lanes and 2w + n GDN slots, \
+             the lanes' and the device retained slots'; 1+1 two lanes and three slots), so it runs aggregate"
         );
     }
     // GitHub #489: the solo width as configured and as the load resolved it.
@@ -738,7 +743,7 @@ fn cuda_scheduler_for(
         // GitHub #336: the 27B's are a load setting too.
         decode_lanes = shape.decode_lanes_for(family),
         kv_format = shape.kv_format.as_str(),
-        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation), body, reserved.lines.mixed_graphs > 0),
+        speculation = %speculation_text(family, LoadSpeculation::of(config, family, shape.speculation), given, body, reserved.lines.mixed_graphs > 0),
         vision = %shape.vision.map_or_else(
             || "off".to_owned(),
             |v| format!("max_tokens={} item_max_tokens={}", v.max_tokens(), v.item_max_tokens())
@@ -790,7 +795,9 @@ impl LoadSpeculation {
 /// GitHub #690: a load of two round shapes then names the shape rule's
 /// thresholds and the shape policy with its window and its period ratios,
 /// which no other load reads. GitHub #715: the policy is the one the load
-/// runs, with the one it was given beside it where they differ. GitHub #720:
+/// runs, with the one it was given beside it where they differ, GitHub #711:
+/// the one its config gives (`given`), named as a profile's or the
+/// operator's ([`ShapePolicyGiven::field`]). GitHub #720:
 /// the table is the one the load runs on its `body`
 /// ([`ignis_core::PeriodTableSetting::of_body`]), the setting where the body
 /// was not read. GitHub #711: `mixed` runs only where the load holds a mix
@@ -801,6 +808,7 @@ impl LoadSpeculation {
 fn speculation_text(
     family: ModelFamily,
     speculation: LoadSpeculation,
+    given: ShapePolicyGiven,
     body: Option<ignis_artifact::Body27b>,
     holds_a_mix: bool,
 ) -> String {
@@ -829,12 +837,12 @@ fn speculation_text(
             }
             let (rule, estimate) = (s.shape_rule(), s.shape_estimate());
             // GitHub #715: the policy the load runs, and the one it was given where they differ
-            // (`mixed` on a load that runs no mixed round runs `aggregate`).
+            // (`mixed` on a load that runs no mixed round runs `aggregate`), GitHub #711: by whom.
             let runs = match s.shape_policy_runs() {
                 ignis_core::ShapePolicy::Mixed if !holds_a_mix => ignis_core::ShapePolicy::Aggregate,
                 runs => runs,
             };
-            let given = if runs == s.shape_policy() { String::new() } else { format!(" shape_policy_given={}", s.shape_policy().as_str()) };
+            let given = if runs == given.policy { String::new() } else { format!(" {}={}", given.field(), given.policy.as_str()) };
             format!(
                 "{line} shape_enter_accepted={} shape_stay_accepted={} shape_policy={}{given} shape_estimate_rounds={} shape_period_ratios={}",
                 rule.enter_accepted(),
@@ -850,14 +858,60 @@ fn speculation_text(
     )
 }
 
-/// GitHub #711 (spec #711): a 27B load of `speculation` that runs `mixed`
-/// ([`ignis_core::Speculation::shape_policy_runs`]) over a pool of `lanes`
-/// lanes and `retained_device_slots` device retained slots that holds no mix
-/// (`ignis_core::lane_lines::mixed_graphs`): its lanes and GDN slots, which its
-/// load names; `None` for any other load.
+/// GitHub #711 (ADR 0106): the shape policy a 27B load's config gives, and
+/// where it came from: a profile (`rtx5090`'s `mixed`) or the operator (a
+/// flag, the environment, a file or a patch).
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn pool_without_a_mix(speculation: Option<ignis_core::Speculation>, lanes: u32, retained_device_slots: u32) -> Option<(u32, u32)> {
-    let mixed = speculation.filter(|s| s.shape_policy_runs() == ignis_core::ShapePolicy::Mixed)?;
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ShapePolicyGiven {
+    policy: ignis_core::ShapePolicy,
+    source: crate::config::source::Source,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl ShapePolicyGiven {
+    /// The shape policy `config`'s speculation carries, and its source.
+    fn of(config: &crate::config::Config) -> Self {
+        let origin = config.basis.resolution().origin("spec", "shape_policy");
+        Self {
+            policy: config.speculation.map_or_else(ignis_core::ShapePolicy::default, |s| s.shape_policy()),
+            source: origin.map_or(crate::config::source::Source::Default, |origin| origin.source),
+        }
+    }
+
+    /// The field a load's line names it in beside the policy the load runs
+    /// where they differ: `shape_policy_profile` for a profile's,
+    /// `shape_policy_given` for the operator's.
+    fn field(self) -> &'static str {
+        if self.source == crate::config::source::Source::Profile { "shape_policy_profile" } else { "shape_policy_given" }
+    }
+}
+
+/// GitHub #711 (ADR 0106): the speculation a 27B load of `body` runs of
+/// `speculation`, whose shape policy is `given`'s: the policy a profile gives
+/// (`rtx5090`'s `mixed`) is the NVFP4 body's, measured and served there, so a
+/// trellis body runs `aggregate` under it, its plan asking for no mixed graph,
+/// and `mixed` where the operator names it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn speculation_on(speculation: Option<ignis_core::Speculation>, given: ShapePolicyGiven, body: ignis_artifact::Body27b) -> Option<ignis_core::Speculation> {
+    speculation.map(|s| match s.shape_policy() {
+        ignis_core::ShapePolicy::Mixed if body == ignis_artifact::Body27b::Trellis && given.source == crate::config::source::Source::Profile => {
+            s.with_shape_policy(ignis_core::ShapePolicy::Aggregate, s.shape_estimate())
+        }
+        _ => s,
+    })
+}
+
+/// GitHub #711 (spec #711): a 27B load of `speculation` that runs `mixed`
+/// ([`ignis_core::Speculation::shape_policy_runs`]) the operator gave
+/// (`given`) over a pool of `lanes` lanes and `retained_device_slots` device
+/// retained slots that holds no mix (`ignis_core::lane_lines::mixed_graphs`):
+/// its lanes and GDN slots, which its load names; `None` for any other load,
+/// a profile's `mixed` among them, which its line names beside the
+/// `aggregate` it runs.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn pool_without_a_mix(speculation: Option<ignis_core::Speculation>, given: ShapePolicyGiven, lanes: u32, retained_device_slots: u32) -> Option<(u32, u32)> {
+    let mixed = speculation.filter(|s| given.source != crate::config::source::Source::Profile && s.shape_policy_runs() == ignis_core::ShapePolicy::Mixed)?;
     let held = ignis_core::lane_lines::mixed_graphs(Some(mixed), true, lanes, retained_device_slots, ignis_artifact::Body27b::Nvfp4);
     held.mixes.is_empty().then_some((lanes, lanes + retained_device_slots))
 }
@@ -869,6 +923,12 @@ mod tests {
 
     /// GitHub #720: the body a 27B load log of these tests names its cost table on.
     const NVFP4: Option<ignis_artifact::Body27b> = Some(ignis_artifact::Body27b::Nvfp4);
+
+    /// GitHub #711: the shape policy `speculation` carries, as the operator named it.
+    fn named(speculation: Option<ignis_core::Speculation>) -> ShapePolicyGiven {
+        let policy = speculation.map_or_else(ignis_core::ShapePolicy::default, |s| s.shape_policy());
+        ShapePolicyGiven { policy, source: crate::config::source::Source::Flag }
+    }
 
     /// A request on `engine`'s model: its id.
     async fn submitted(engine: &crate::engine::Engine) -> ignis_core::RequestId {
@@ -1143,15 +1203,15 @@ mod tests {
         let the_27b = ModelFamily::Qwen38_27b;
         let spec = Speculation::new(SpeculativeBackend::Dflash2, 7).unwrap();
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec)), NVFP4, true),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(spec)), named(Some(spec)), NVFP4, true),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let sampled = spec.with_draft_rule(DraftRule::Sampled, DrafterSampling { temperature_factor_milli: 1000, top_p_milli: 875 });
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled)), NVFP4, true),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(sampled)), named(Some(sampled)), NVFP4, true),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=sampled drafter_temperature_factor=1 drafter_top_p=0.875"
         );
-        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None), NVFP4, false), "off");
+        assert_eq!(speculation_text(the_27b, LoadSpeculation::Runs(None), named(None), NVFP4, false), "off");
     }
 
     /// GitHub #690 (spec #684, user story 25): a load of two round shapes
@@ -1168,7 +1228,7 @@ mod tests {
         let table = |uniform| PeriodTableSetting::uniform(uniform).unwrap();
         let wide = Speculation::new(SpeculativeBackend::Dflash2, 15).unwrap();
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide)), NVFP4, false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(wide)), named(Some(wide)), NVFP4, false),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=7 shape_stay_accepted=6 shape_policy=aggregate shape_estimate_rounds=16 \
              shape_period_ratios=1.128/1.159,1.29/1.112,1.249,1.363/1.132,1.217,1.344,1.344/1.083,1.196,1.196/1.109,1.109/1"
@@ -1178,7 +1238,7 @@ mod tests {
             .unwrap()
             .with_shape_policy(ShapePolicy::All, ShapeEstimate::new(8, table([1000, 1200, 1250, 2000])).unwrap());
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(all)), NVFP4, false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(all)), named(Some(all)), NVFP4, false),
             "dflash2 draft_tokens=15 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95 \
              shape_enter_accepted=5 shape_stay_accepted=12 shape_policy=all shape_estimate_rounds=8 \
              shape_period_ratios=1/1.159,1.2/1.112,1.249,1.25/1.132,1.217,1.344,2/1.083,1.196,1.196/1.109,1.109/1"
@@ -1187,7 +1247,7 @@ mod tests {
             let mixed = Speculation::new(SpeculativeBackend::Dflash2, draft_tokens)
                 .unwrap()
                 .with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::new(16, table([1100, 1200, 1300, 1400])).unwrap());
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(mixed)), NVFP4, holds_a_mix)
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(mixed)), named(Some(mixed)), NVFP4, holds_a_mix)
         };
         let line = |draft_tokens: u32| line_holding(draft_tokens, draft_tokens == 15);
         let shapes = |draft_tokens: u32, policy: &str| {
@@ -1205,7 +1265,7 @@ mod tests {
             .unwrap()
             .with_shape_policy(ShapePolicy::Mixed, ShapeEstimate::new(8, table([1000, 1200, 1250, 2000])).unwrap());
         assert_eq!(
-            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven)), NVFP4, false),
+            speculation_text(the_27b, LoadSpeculation::Runs(Some(seven)), named(Some(seven)), NVFP4, false),
             "dflash2 draft_tokens=7 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
     }
@@ -1228,7 +1288,7 @@ mod tests {
             }
             let crate::config::ConfigOutcome::Config(config) = crate::config::resolve_with(&args, |_| None, &files).unwrap() else { unreachable!() };
             let config = config.for_family(ModelFamily::Qwen38_27b).unwrap();
-            let line = speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(config.speculation), Some(body), true);
+            let line = speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(config.speculation), ShapePolicyGiven::of(&config), Some(body), true);
             line.split_once("shape_period_ratios=").map(|(_, table)| table.to_owned()).unwrap_or_else(|| panic!("{line}"))
         };
         let trellis = "1.364/1.214,1.407/1.162,1.502,1.629/1.291,1.391,1.55,1.606/1.082,1.204,1.243/1.117,1.154/1.036";
@@ -1257,7 +1317,43 @@ mod tests {
         assert_eq!(ratios(&[], Some(earlier), Body27b::Trellis), trellis, "an earlier build's file names no table");
     }
 
-    /// GitHub #711: a load given `mixed` whose pool holds no mix (a mix of
+    /// A 27B config resolved from `args` beside a config file `file` (empty: none).
+    fn the_27b(args: &[&str], file: &str) -> crate::config::Config {
+        let mut args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        let files = crate::config::file::testing::MemFiles::with(&[("c.yaml", file)]);
+        if !file.is_empty() {
+            args.extend(["--config".to_owned(), "c.yaml".to_owned()]);
+        }
+        let crate::config::ConfigOutcome::Config(config) = crate::config::resolve_with(&args, |_| None, &files).unwrap() else { unreachable!() };
+        config.for_family(ModelFamily::Qwen38_27b).unwrap()
+    }
+
+    /// GitHub #711 (ADR 0106): the shape policy a profile gives is the NVFP4
+    /// body's, measured and served on the RTX 5090: under `rtx5090` a trellis
+    /// body runs `aggregate` and plans no mixed graph, the NVFP4 body `mixed`
+    /// with its twelve; `mixed` the operator names, by flag or in a file, a
+    /// trellis body runs, its graphs planned.
+    #[test]
+    fn a_trellis_body_runs_a_profiles_mixed_as_aggregate_and_a_named_mixed_as_mixed() {
+        use ignis_artifact::Body27b;
+        use ignis_core::ShapePolicy;
+        let on = |args: &[&str], file: &str, body| {
+            let config = the_27b(args, file);
+            let runs = speculation_on(config.speculation, ShapePolicyGiven::of(&config), body);
+            let asked = ignis_core::lane_lines::mixed_rounds_asked(None, runs);
+            let planned = ignis_core::lane_lines::mixed_graphs(runs, asked, 8, 2, body);
+            (runs.map(|s| s.shape_policy_runs()), planned.mixes.len())
+        };
+        let profile = ["--profile", "rtx5090"];
+        assert_eq!(on(&profile, "", Body27b::Trellis), (Some(ShapePolicy::Aggregate), 0), "the profile's, on a trellis body");
+        assert_eq!(on(&profile, "", Body27b::Nvfp4), (Some(ShapePolicy::Mixed), 12), "the profile's, on the NVFP4 body");
+        let named = ["--profile", "rtx5090", "--spec-backend", "dflash2", "--spec-draft-tokens", "15", "--spec-shape-policy", "mixed"];
+        assert_eq!(on(&named, "", Body27b::Trellis), (Some(ShapePolicy::Mixed), 12), "named by flag");
+        let file = "spec:\n  qwen38:\n    backend: dflash2\n    draft_tokens: 15\n    shape_policy: mixed\n";
+        assert_eq!(on(&profile, file, Body27b::Trellis), (Some(ShapePolicy::Mixed), 12), "named in a file");
+    }
+
+    /// GitHub #711: a load the operator gave `mixed` whose pool holds no mix (a mix of
     /// `w` extended lanes beside `n` base lanes takes `w + n` lanes and `2w +
     /// n` GDN slots) is named with its lanes and GDN slots, so its load can say
     /// why it runs `aggregate`; one that holds a mix, one given another policy
@@ -1268,13 +1364,47 @@ mod tests {
         let at = |draft_tokens: u32, policy| {
             Some(Speculation::new(SpeculativeBackend::Dflash2, draft_tokens).unwrap().with_shape_policy(policy, ShapeEstimate::default()))
         };
-        assert_eq!(pool_without_a_mix(at(15, ShapePolicy::Mixed), 2, 0), Some((2, 2)), "`rtx-16gb`'s two lanes");
-        assert_eq!(pool_without_a_mix(at(15, ShapePolicy::Mixed), 1, 2), Some((1, 3)), "one lane");
-        assert_eq!(pool_without_a_mix(at(15, ShapePolicy::Mixed), 2, 1), None, "1+1 in three slots");
-        assert_eq!(pool_without_a_mix(at(15, ShapePolicy::Mixed), 8, 0), None, "the twelve");
-        assert_eq!(pool_without_a_mix(at(15, ShapePolicy::Aggregate), 2, 0), None, "`aggregate`");
-        assert_eq!(pool_without_a_mix(at(10, ShapePolicy::Mixed), 2, 0), None, "10 drafts");
-        assert_eq!(pool_without_a_mix(None, 2, 0), None, "no speculation");
+        let pool = |speculation, lanes, retained| pool_without_a_mix(speculation, named(speculation), lanes, retained);
+        assert_eq!(pool(at(15, ShapePolicy::Mixed), 2, 0), Some((2, 2)), "`rtx-16gb`'s two lanes");
+        assert_eq!(pool(at(15, ShapePolicy::Mixed), 1, 2), Some((1, 3)), "one lane");
+        assert_eq!(pool(at(15, ShapePolicy::Mixed), 2, 1), None, "1+1 in three slots");
+        assert_eq!(pool(at(15, ShapePolicy::Mixed), 8, 0), None, "the twelve");
+        assert_eq!(pool(at(15, ShapePolicy::Aggregate), 2, 0), None, "`aggregate`");
+        assert_eq!(pool(at(10, ShapePolicy::Mixed), 2, 0), None, "10 drafts");
+        assert_eq!(pool(None, 2, 0), None, "no speculation");
+    }
+
+    /// GitHub #711: the no-mix WARN is the operator's `mixed`. Under the
+    /// `rtx5090` profile's own, a load that holds no mix (one lane, two
+    /// without a retained slot, a trellis body, a window of 10 named) runs
+    /// `aggregate` without it, and its line names the profile's policy beside
+    /// the one it runs (`shape_policy_profile`); a load the operator gave
+    /// `mixed` warns at those lanes, and its line names the policy given.
+    #[test]
+    fn a_profiles_mixed_that_holds_no_mix_runs_aggregate_without_a_warn_and_its_line_says_whose_it_was() {
+        use ignis_artifact::Body27b;
+        let load = |args: &[&str], body, lanes, retained| {
+            let config = the_27b(args, "");
+            let given = ShapePolicyGiven::of(&config);
+            let runs = speculation_on(config.speculation, given, body);
+            let asked = ignis_core::lane_lines::mixed_rounds_asked(None, runs);
+            let holds_a_mix = !ignis_core::lane_lines::mixed_graphs(runs, asked, lanes, retained, body).mixes.is_empty();
+            let line = speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(runs), given, Some(body), holds_a_mix);
+            let policy: Vec<&str> = line.split(' ').filter(|field| field.starts_with("shape_policy")).collect();
+            (pool_without_a_mix(runs, given, lanes, retained), policy.join(" "))
+        };
+        let profile = ["--profile", "rtx5090"];
+        let named = ["--profile", "rtx5090", "--spec-backend", "dflash2", "--spec-draft-tokens", "15", "--spec-shape-policy", "mixed"];
+        let (by_profile, by_name) = ("shape_policy=aggregate shape_policy_profile=mixed", "shape_policy=aggregate shape_policy_given=mixed");
+        assert_eq!(load(&profile, Body27b::Nvfp4, 8, 0), (None, "shape_policy=mixed".to_owned()), "the profile's, the twelve held");
+        for (lanes, retained) in [(1, 2), (2, 0)] {
+            assert_eq!(load(&profile, Body27b::Nvfp4, lanes, retained), (None, by_profile.to_owned()), "the profile's at {lanes} lanes");
+            let warned = Some((lanes, lanes + retained));
+            assert_eq!(load(&named, Body27b::Nvfp4, lanes, retained), (warned, by_name.to_owned()), "named, at {lanes} lanes");
+        }
+        assert_eq!(load(&profile, Body27b::Trellis, 8, 0), (None, by_profile.to_owned()), "the profile's on a trellis body");
+        let ten = ["--profile", "rtx5090", "--spec-backend", "dflash2", "--spec-draft-tokens", "10"];
+        assert_eq!(load(&ten, Body27b::Nvfp4, 8, 0), (None, by_profile.to_owned()), "a window of 10 named");
     }
 
     /// GitHub #623: the 27B's MTP load names its drafter and its window, and
@@ -1284,10 +1414,10 @@ mod tests {
     fn the_load_log_names_the_27bs_mtp_drafter_and_its_window() {
         use ignis_core::{DraftRule, DrafterSampling, Speculation, SpeculativeBackend};
         let mtp = Speculation::new(SpeculativeBackend::Mtp, 5).unwrap().with_draft_rule(DraftRule::Fixed, DrafterSampling::default());
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp)), NVFP4, false), "mtp draft_tokens=5");
-        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero, NVFP4, false), "off (mtp draft_tokens=0)");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(Some(mtp)), named(Some(mtp)), NVFP4, false), "mtp draft_tokens=5");
+        assert_eq!(speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::MtpWindowZero, named(None), NVFP4, false), "off (mtp draft_tokens=0)");
         assert_eq!(
-            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp)), None, false),
+            speculation_text(ModelFamily::FlashNext, LoadSpeculation::Runs(Some(mtp)), named(Some(mtp)), None, false),
             "mtp draft_tokens=5 draft_head=full draft_rule=fixed drafter_temperature_factor=0.9 drafter_top_p=0.95"
         );
         let config = |flags: &[&str]| {

@@ -237,10 +237,14 @@ lanes they differ in who pays the wider round:
   run only at 15 drafts, on either artifact (the trellis artifact the 16 GB and
   24 GB profiles load too, [Built-in profiles](profiles.md#rtx-24gb)): any
   other load runs `mixed` as `aggregate`, and its load log says so
-  (`shape_policy=aggregate shape_policy_given=mixed`). A request held to a
+  (`shape_policy=aggregate shape_policy_given=mixed`, or
+  `shape_policy_profile=mixed` where the profile gave it). A request held to a
   grammar is granted as any other: the grammar's check cuts its run at its
   first miss at the shape it was granted, in a mixed round too. From 0.11.0
-  the `rtx5090` profile gives `mixed`, and every other profile `aggregate`.
+  the `rtx5090` profile gives `mixed` to the NVFP4 artifact, the one served
+  below, and every other profile `aggregate`; a trellis artifact runs
+  `aggregate` under `rtx5090` too unless you name `mixed`, and its load log
+  says so (`shape_policy=aggregate shape_policy_profile=mixed`).
   Served on the RTX 5090 at 15 drafts against the build before mixed rounds
   under `aggregate` (FP8 exception weights, the context pinned at 262,144), a
   greedy JSON answer beside three conversations at temperature 0.6 committed
@@ -262,7 +266,7 @@ lanes they differ in who pays the wider round:
   none takes the uniform shape `aggregate` gives it; a load whose pool holds
   no mix at all (two lanes without a retained device slot,
   [the configuration reference](../configuration/context-and-speculation.md))
-  runs `aggregate`, and its load log says so and why.
+  runs `aggregate`, and its load log says so, and why where you named `mixed`.
 
 The ratios (`--spec-shape-period-ratios`, the **cost table**: at 1 to 7 lanes,
 the round's period with 1, 2, ... of them extended over the base round's) are

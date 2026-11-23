@@ -442,7 +442,8 @@ pub fn effective_document(config: &Config) -> Value {
         // back as the operator's. The document writes the window that runs,
         // the one the load's speculation was derived with. GitHub #722: and
         // the shape policy the load carries, the default where the profile's
-        // was its DFlash2's ([`super::mtp_takes`]), at any window, 0 too.
+        // was its DFlash2's ([`super::shape_policy_carried`]), at any window,
+        // 0 too.
         let spec = &resolution.settings.spec;
         let the_27bs_mtp = super::the_27bs_mtp(Some(family), spec.backend.and_then(super::SpecChoice::backend));
         if the_27bs_mtp && spec.draft_tokens.is_some() {
@@ -453,9 +454,10 @@ pub fn effective_document(config: &Config) -> Value {
                 written.insert("draft_tokens".to_owned(), Value::from(runs.draft_tokens()));
             }
         }
-        if the_27bs_mtp && !super::mtp_takes(&resolution, "shape_policy") {
+        let carried = super::shape_policy_carried(&resolution, Some(family));
+        if carried != spec.shape_policy {
             if let Some(written) = scoped.get_mut("spec").and_then(Value::as_object_mut) {
-                written.insert("shape_policy".to_owned(), Value::from(ignis_core::ShapePolicy::default().as_str()));
+                written.insert("shape_policy".to_owned(), Value::from(carried.as_str()));
             }
         }
         for meta in all_fields().filter(|meta| meta.takes_scope(family)) {

@@ -14,7 +14,7 @@ constexpr std::size_t kWord = sizeof(uint4);
 
 // The bytes before the first 16-byte boundary one a thread, then 16 bytes a thread a step, then the
 // bytes past the last whole word one a thread, each over the grid's threads.
-__global__ void zero_kernel(unsigned char *data, std::size_t bytes) {
+__global__ void zero_bytes_kernel(unsigned char *data, std::size_t bytes) {
   const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   const std::size_t first = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t misaligned = reinterpret_cast<std::uintptr_t>(data) % kWord;
@@ -40,7 +40,7 @@ cudaError_t zero(void *data, std::size_t bytes, cudaStream_t stream) {
   }
   const std::size_t steps = bytes / kWord + 1;
   const auto blocks = static_cast<unsigned>(std::min((steps + kThreads - 1) / kThreads, kMaxBlocks));
-  zero_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<unsigned char *>(data), bytes);
+  zero_bytes_kernel<<<blocks, kThreads, 0, stream>>>(static_cast<unsigned char *>(data), bytes);
   return cudaGetLastError();
 }
 

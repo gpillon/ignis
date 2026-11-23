@@ -224,8 +224,8 @@ streams, and takes a persistent loop back. See
 **Mixed round.** From 0.11.0, a verify round of the 27B at 15 drafts whose
 requests run at both round shapes: one to three at the *extended shape*, 16
 columns each, beside one to six at the *base shape*, 8 columns each, 64 columns
-at most. Only the shape policy `mixed` grants one (the `rtx5090` profile's;
-elsewhere `--spec-backend dflash2 --spec-draft-tokens 15
+at most. Only the shape policy `mixed` grants one (the `rtx5090` profile's on
+the NVFP4 artifact; elsewhere `--spec-backend dflash2 --spec-draft-tokens 15
 --spec-shape-policy mixed`), request by request, and
 only at a mix whose graphs the load holds. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
@@ -325,7 +325,8 @@ recent rounds; `all`, extended only when every request asks, so no request pays
 for another; `mixed`, each asking request of 2 to 7 granted the extended shape on
 its own when its expected gain beats what its columns cost every request, so a
 round may mix both shapes (at 15 drafts, on either artifact; elsewhere it runs
-`aggregate`), the `rtx5090` profile's default. A request alone runs at the shape
+`aggregate`), the `rtx5090` profile's default on the NVFP4 artifact. A request
+alone runs at the shape
 it asks under each. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 

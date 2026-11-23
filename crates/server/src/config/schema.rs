@@ -715,8 +715,9 @@ config_group! {
         /// mix both shapes (only at 15 drafts, on either artifact: any other
         /// load runs `aggregate`, as its load log says). A lane alone
         /// runs at the shape it asks under each. The `rtx5090` profile gives
-        /// `mixed` (from 0.11.0), measured on that card; every other profile
-        /// gives `aggregate`. A speed setting only.
+        /// `mixed` to the NVFP4 artifact, measured on that card (a trellis
+        /// artifact runs `aggregate` under it unless `mixed` is named); every
+        /// other profile gives `aggregate`. A speed setting only.
         shape_policy: ShapePolicyKind = ignis_core::ShapePolicy::Aggregate, Validator::OneOf(&ignis_core::ShapePolicy::NAMES),
             QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
         /// Under `aggregate` and `mixed`, the verify rounds of its own, the most recent,
@@ -741,7 +742,8 @@ config_group! {
         /// grows with context), the NVFP4 artifact's uniform entries its
         /// served timing's; where a mixed entry measured below the entry
         /// before it in its row, above its row's uniform entry or under 1, it
-        /// is held at that bound (ADR 0106). Unmeasured on other cards.
+        /// is held at that bound (ADR 0106). Unmeasured on other cards, the
+        /// trellis artifact's indicative for the 16 GB and 24 GB cards.
         /// The one-lane entry is not read: a lane alone runs at the shape it
         /// asks. A speed setting only.
         shape_period_ratios: PeriodRatios = ignis_core::PeriodTableSetting::Auto, NO_RULE, QWEN38_ONLY,

@@ -314,7 +314,8 @@ the other. They are no configuration fields: `GET /v1/config` and
 - `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) forces, at each verify
   round of a DFlash2 load of the 27B past 7 draft tokens, the round's shape
   over the shape rule. Unset: the shape rule and the shape policy
-  (`--spec-shape-policy`, `aggregate` by default, `mixed` under `rtx5090`)
+  (`--spec-shape-policy`, `aggregate` by default, `mixed` under `rtx5090` on
+  the NVFP4 artifact)
   give each round its shape.
   `base`: every
   round at the base shape, 8 columns a lane, the round of a load at 7 drafts

@@ -248,7 +248,7 @@ const NVFP4_MEASURED: PeriodTable = PeriodTable {
 /// RTX 5090, every entry, uniform ones included, by [`NVFP4_MEASURED`]'s
 /// method at its served context on the `trellis-24gb-w15-rule` load (no
 /// exception tensor to hold), four legs; indicative for the 16 GB and 24 GB
-/// cards until a run on one. No row falls (its smallest step, from the base
+/// cards. No row falls (its smallest step, from the base
 /// round of 7 lanes to 1+6, is 0.036), so [`PeriodTable::held`] keeps every
 /// entry.
 const TRELLIS_MEASURED: PeriodTable = PeriodTable {
