@@ -16,14 +16,6 @@ use ignis_logging::MemorySink;
 use ignis_server::engine::{collect_tokens, Engine};
 use ignis_server::telemetry::FixedClock;
 
-// The telemetry consumer runs as a separate async task off the model thread
-// (GitHub #69) — `nudge()` gives it a few scheduling turns to drain
-// whatever is already sitting in the facts channel before a test inspects
-// the captured events.
-#[path = "support/mod.rs"]
-mod support;
-use support::nudge;
-
 /// A test engine: the concrete scheduler over a deterministic mock, on a
 /// fixed clock (keeps the request events deterministic — ADR 0006).
 fn engine() -> Engine {
@@ -240,7 +232,19 @@ async fn the_interval_counters_track_inflight_requests() {
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    // The counters of the step that finished the request: nothing running
+    // after the request ran. The consumer publishes the snapshot on `Done`,
+    // before that step's tick logs its line, so an earlier read can find the
+    // two apart.
+    until_logged(&log_sink, |events| {
+        let running: Vec<u64> = events
+            .iter()
+            .filter(|e| e["event_name"] == "ignis.scheduler.interval")
+            .map(|e| e["attributes"]["running"].as_u64().unwrap_or(0))
+            .collect();
+        running.iter().any(|&r| r >= 1) && running.last() == Some(&0)
+    })
+    .await;
 
     let intervals = intervals(&log_sink);
     let saw_running = intervals
@@ -349,7 +353,10 @@ async fn concurrent_submits_do_not_deadlock() {
     for handle in handles {
         handle.await.expect("concurrent submits must not deadlock");
     }
-    nudge().await;
+    until_logged(&log_sink, |events| {
+        events.iter().any(|e| e["event_name"] == "ignis.scheduler.interval")
+    })
+    .await;
     assert!(
         !intervals(&log_sink).is_empty(),
         "the shared sink captured an interval event"
@@ -376,7 +383,10 @@ async fn reading_the_log_while_the_telemetry_consumer_is_still_draining_does_not
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    until_logged(&log_sink, |events| {
+        done_logged(events) && events.iter().any(|e| e["event_name"] == "ignis.scheduler.interval")
+    })
+    .await;
     let names = event_names(&log_sink);
     assert!(names.iter().any(|e| e.starts_with("ignis.request.")), "{names:?}");
     assert!(names.iter().any(|e| e == "ignis.scheduler.interval"), "{names:?}");
@@ -404,7 +414,10 @@ async fn a_chunked_prefill_reports_its_phase_summary_through_the_real_engine() {
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    until_logged(&log_sink, |events| {
+        events.iter().any(|e| e["event_name"] == "ignis.request.admitted")
+    })
+    .await;
 
     let admitted = events(&log_sink)
         .into_iter()
@@ -436,7 +449,10 @@ async fn the_admitted_line_counts_the_chunks_run_at_the_solo_width() {
     collect_tokens(&mut rx, Duration::from_secs(5))
         .await
         .expect("the request completes");
-    nudge().await;
+    until_logged(&log_sink, |events| {
+        events.iter().any(|e| e["event_name"] == "ignis.request.admitted")
+    })
+    .await;
 
     let admitted = events(&log_sink)
         .into_iter()
@@ -461,7 +477,14 @@ async fn a_request_that_ends_on_its_first_token_reports_its_prefill_on_the_done_
         collect_tokens(&mut rx, Duration::from_secs(5))
             .await
             .expect("the request completes");
-        nudge().await;
+        // Any `admitted` line the request logged comes before its done line,
+        // so waiting for the done line settles the absence asserted below.
+        until_logged(&log_sink, |events| {
+            events
+                .iter()
+                .any(|e| e["event_name"] == "ignis.request.done" && e["attributes"]["request_id"] == id)
+        })
+        .await;
 
         let events = events(&log_sink);
         assert!(
