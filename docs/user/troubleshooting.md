@@ -415,14 +415,18 @@ the server with the card quiet, or with more `--vram-headroom-bytes`.
 with the load's `lanes` and `gdn_slots`. From 0.11.0 a mixed round of `w`
 extended lanes beside `n` base lanes takes `w + n` of the load's lanes and
 `2w + n` of its pool's GDN slots (the lanes and the device retained slots), so
-a load under `mixed` (the `rtx5090` profile's, or `--spec-backend dflash2
---spec-draft-tokens 15 --spec-shape-policy mixed` named) whose pool holds
+a load you gave `mixed` (`--spec-backend dflash2 --spec-draft-tokens 15
+--spec-shape-policy mixed`, or the same in a config file) whose pool holds
 no mix, two lanes without a device retained slot (`rtx-16gb`'s) or one lane,
 runs `aggregate`, and its load log's `speculation` says
 `shape_policy=aggregate shape_policy_given=mixed`. The load serves as
 `aggregate` serves. One device retained slot (`--reuse-retained-device 1`)
 gives two lanes the 1+1 mix
-([Built-in profiles](concepts/profiles.md#rtx-16gb)).
+([Built-in profiles](concepts/profiles.md#rtx-16gb)). The `rtx5090`
+profile's own `mixed` gives no WARN: a load of it that holds no mix (one or
+two lanes named, lanes its adaptation lowered, a window of 8 to 14 named,
+a trellis artifact) runs `aggregate`, and its load log says
+`shape_policy=aggregate shape_policy_profile=mixed`.
 
 ### `--spec-backend mtp` refuses the start
 

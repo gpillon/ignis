@@ -47,20 +47,25 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   unchanged and never run a mixed round. Granting every ask in the caller's order, as the prototype did, bought nothing
   on a moderately predictable answer beside a conversation (+0.6%, inside the spread, the conversation 5.0% slower): the
   grant has to refuse such a lane.
-- **Its default.** `mixed` on the `rtx5090` profile, `aggregate` on every other. The served gate (#722) asked a JSON
+- **Its default.** `mixed` on the `rtx5090` profile for the NVFP4 body, `aggregate` on every other profile. The served
+  gate (#722,
+  [finding](../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)) asked a JSON
   answer beside three conversations at four lanes at least 10% faster together than the build of #684, no conversation
   lane more than 15% below it, and no one-lane or free-text cell more than 2% below: on the RTX 5090 it read +14.48%,
   the slowest conversation lane -7.9%, and missed the 2% line by the letter on two sampled one-lane cells (-2.05% and
   -2.45%) and a cold first token 7 ms later. The owner made `mixed` the `rtx5090` profile's default on 2026-11-23 all
   the same: one lane forms no mix, and seeded, a request alone wrote the same text in the same rounds under both
   builds. A policy a profile gives beside its own DFlash2 is that drafter's, as its window is: the 27B's MTP head named
-  over it carries the default. The trellis bodies keep `aggregate` until a run on a 16 GB or 24 GB card;
-  given `mixed`, a trellis body at 15 drafts runs it. A load given `mixed` that holds no mix runs `aggregate`, and its
-  startup line names both: a load of DFlash2 at 8 to 14 drafts, one whose pool's lanes and GDN slots hold no mix (which
-  a WARN at load names, with the lanes and the slots), and one whose plan asked for none under `IGNIS_MIXED_ROUNDS=0`; a
-  load whose latest capture ran under that switch takes `aggregate`'s choice too. At 7 drafts or fewer `mixed` is taken
-  and changes nothing, the load holding one shape; the 27B's MTP head refuses it by name, as it refuses every shape
-  policy (#690).
+  over it carries the default. It is the NVFP4 body's too, the one the gate served: the trellis bodies keep
+  `aggregate`, under `rtx5090` as under their own profiles, and a trellis body at 15 drafts runs `mixed` where the
+  operator names it (a flag, the environment, a file or a patch); a run on a 16 GB or 24 GB card would be a new
+  decision. A load given `mixed` that holds no mix runs `aggregate`, and its startup line names both, the policy it was
+  given as the operator's (`shape_policy_given`) or a profile's (`shape_policy_profile`): a load of DFlash2 at 8 to 14
+  drafts, a trellis body under the profile's, one whose pool's lanes and GDN slots hold no mix (which a WARN at load
+  names, with the lanes and the slots, where the operator named `mixed`), and one whose plan asked for none under
+  `IGNIS_MIXED_ROUNDS=0`; a load whose latest capture ran under that switch takes `aggregate`'s choice too. At 7 drafts
+  or fewer `mixed` is taken and changes nothing, the load holding one shape; the 27B's MTP head refuses it by name, as
+  it refuses every shape policy (#690).
 - **The cost table.** `spec.shape_period_ratios` becomes a table by lane count (1 to 7) and extended lanes, each entry
   the period of the round with that many lanes extended over the base round at the same lane count; `aggregate` reads
   its uniform entries at 1 to 4 lanes and `mixed` reads every entry. Its default, `auto`, is the loaded body's own

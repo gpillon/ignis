@@ -72,8 +72,9 @@ base round's numerical class at its test's configuration (8 lanes, a
 off the RTX 5090, so no other profile's default moves. At 15 drafts a load
 of either artifact may also run
 [mixed rounds](speculative-decoding.md#past-seven-drafts-two-round-shapes):
-from 0.11.0 `rtx5090` runs them, measured on that card ([below](#rtx5090)),
-and every other profile keeps them off and says below how to turn them on and
+from 0.11.0 `rtx5090` runs them on the NVFP4 artifact, measured on that card
+([below](#rtx5090)), and a trellis artifact under it only where `mixed` is
+named; every other profile keeps them off and says below how to turn them on and
 what their graphs cost at its lanes.
 
 `rtx5090` and `rtxpro6000` carry numbers measured on the card they name,
@@ -156,7 +157,12 @@ Why each:
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy aggregate`
   gives the uniform rounds back (the shape options are refused without a named
   `--spec-backend`), and a start that names `--spec-backend mtp`, `off` or a
-  window other than 15 runs no mixed round and plans no graph for one.
+  window other than 15 runs no mixed round and plans no graph for one. The
+  profile's `mixed` is the NVFP4 artifact's, the one served above: a trellis
+  artifact loaded under `rtx5090` runs `aggregate` and plans no mixed graph
+  (its load log says `shape_policy=aggregate shape_policy_profile=mixed`), and
+  `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
+  turns them on there.
 - **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
   for each image and maps the embedding pool in pinned host RAM, so a vision
   load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).

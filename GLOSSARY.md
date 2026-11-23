@@ -1254,7 +1254,9 @@ round at a lane count where it holds none takes the uniform shape `aggregate`
 gives it; a load that holds no mix runs `aggregate`, as its startup line says.
 Every profile defaults to `aggregate` but `rtx5090`, whose 27B section gives
 `mixed` (#722). A profile's policy beside its own DFlash2 is that drafter's,
-as its window is: the 27B's MTP head named over it carries the default.
+as its window is: the 27B's MTP head named over it carries the default. It is
+the NVFP4 body's too: a trellis body runs `aggregate` under it, and `mixed`
+where the operator names it (#711, ADR 0106).
 
 **Grant**:
 What the **shape policy** `mixed` gives a verify round's lanes (#715): each
