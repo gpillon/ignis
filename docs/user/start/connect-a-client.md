@@ -158,7 +158,7 @@ lists every servable model.
 
 ### ignis's tools in the harness
 
-From 0.11.0 a coding agent's harness can also add ignis as an MCP server, one
+A coding agent's harness can also add ignis as an MCP server, one
 entry at `http://127.0.0.1:8000/v1/mcp` with the same key. The agent then sees
 the connector's server tools, the models the server can switch to or fetch
 among them. [The connector](../guides/connector.md) has each harness's entry:

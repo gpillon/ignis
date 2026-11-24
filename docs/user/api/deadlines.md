@@ -29,8 +29,8 @@ an answer a limit cut, so every client already reads them; the header, on a
 whole answer, and the log say it was the deadline. A browser on another origin
 can read the header: the server exposes it, with `ignis-model-status` and
 `Retry-After` (`Access-Control-Expose-Headers`). A tool call the deadline cut
-mid-way comes back as one the cap cuts does (from 0.11.0; 0.10.0 drops it
-whole): its name and the arguments written so far, last, with `length` (an
+mid-way comes back as one the cap cuts does: its name and the arguments
+written so far, last, with `length` (an
 `incomplete` `function_call` item on `/v1/responses`;
 [Chat completions](chat-completions.md)). Under `error` no call is sent. A
 decision has no partial answer, and an image cut

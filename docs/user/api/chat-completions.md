@@ -96,8 +96,8 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   way out). With thinking on the reasoning spends the same `max_tokens`: a
   block that never closes ends `length` with no call, which the thinking
   budget's answer reserve prevents.
-- `parallel_tool_calls: false` gives at most one tool call per turn (from
-  0.11.0; earlier versions refuse it with a 400). The turn ends at the close
+- `parallel_tool_calls: false` gives at most one tool call per turn.
+  The turn ends at the close
   of its first call, with `finish_reason: "tool_calls"`: nothing the model
   generates after that close reaches you or counts in `usage`, streamed or
   not. A call the model writes inside its reasoning is not a call and ends
@@ -109,8 +109,8 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   call; with a tool that is not held, a turn whose only block does not parse
   has none. `true` or absent serves every call the model writes, as before.
   It holds on every model, Flash-Next included.
-- **A tool call the cap cuts comes back as the model wrote it** (from 0.11.0;
-  0.10.0 drops it whole), as OpenAI's API returns one: a call `max_tokens`
+- **A tool call the cap cuts comes back as the model wrote it**, as OpenAI's
+  API returns one: a call `max_tokens`
   stops before it closes is the last entry of `tool_calls`, after the calls
   that closed, with its name and the arguments written so far, and the answer
   ends `finish_reason: "length"`. The arguments are the start of the JSON the
@@ -128,7 +128,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `ignis_tool_calls_total`.
 - `response_format: {"type": "json_object"}` holds the answer to a valid JSON
   object, and `{"type": "json_schema", "json_schema": {...}}` to your schema,
-  streamed or not (from 0.11.0, on the 27B; 0.10.0 refuses both): each
+  streamed or not (on the 27B): each
   sampled token is checked and a miss repaired. Under `strict: true` OpenAI's
   strict subset is held exactly and a schema outside it is refused by name;
   without it the rest is inert. `{"type": "text"}` is a free answer, and
@@ -138,7 +138,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   before its answer starts is released from the schema, and
   `tool_choice: "required"` or a named function still forces the call
   ([Tools beside structured output](structured-output.md#tools-beside-structured-output)).
-- `ignis_describe_schema` is an **Ignis extension** (from 0.11.0): with
+- `ignis_describe_schema` is an **Ignis extension**: with
   `json_schema`, the server describes the schema to the model in a block after
   the conversation, where the assistant's turn opens, and `false` leaves the
   prompt as you sent it, for a client whose own prompt already describes the
@@ -147,7 +147,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   nothing either way
   ([the schema, described to the model](structured-output.md#the-schema-described-to-the-model)).
 - Non-streaming returns `choices[].message.content` plus `usage`, and
-  `message.refusal`, always `null` (from 0.11.0); streaming
+  `message.refusal`, always `null`; streaming
   emits `chat.completion.chunk` SSE frames (token deltas, a final
   `finish_reason` chunk, then `[DONE]`). The first token is sent alone as
   soon as the prompt's prefill ends, before any decode round, and each
@@ -160,7 +160,7 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   `metadata`, `user`, ...) and refused
   with a 400 `unsupported_value` naming it in `param` otherwise. The full
   table is in the API reference at `/v1/docs/`; a field outside it is ignored.
-- `strict: true` on a function tool (from 0.11.0, on the 27B) holds its calls
+- `strict: true` on a function tool (on the 27B) holds its calls
   to the tool's `parameters` as the model writes them: every call to it names
   a declared tool and carries arguments valid under its schema, in the order
   of its `properties`, and a strict schema outside OpenAI's strict subset is

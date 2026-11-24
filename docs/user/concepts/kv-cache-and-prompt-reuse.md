@@ -132,7 +132,7 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
 - **Time to first token.** A request that resumes skips prefilling the part it
   matched. At the 27B's cold rate of about 11,300 tokens per second on a 46K
   prompt, reading such a prompt cold takes roughly 4.1 seconds (arithmetic from
-  the README's figure, measured on 0.10.0: from 0.11.0 the prefill changes have a cold prompt of 16K to 64K tokens read about 14-18% sooner on the RTX 5090, [measured](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)); the resumed part costs a copy instead. A
+  the README's figure, measured on 0.10.0: 0.11.0's prefill changes have a cold prompt of 16K to 64K tokens read about 14-18% sooner on the RTX 5090, [measured](../../findings/2026-11-18-the-27bs-cold-prefill-served-on-the-rtx-5090-after-spec-646.md)); the resumed part costs a copy instead. A
   device-to-device clone of 148 MiB of state measured 0.25 ms, and a full-context
   snapshot and restore round trip through host RAM about 90 ms, both far below
   the prefill they replace
@@ -151,11 +151,11 @@ beyond the best match above it (for KV-disk, 8,192 on Flash-Next and
   percent on a 70K prompt
   ([the finding](../../findings/2026-09-18-prompt-reuse-tax-on-short-ttft.md)).
   The bet is that a later request skips more than that. On Flash-Next, and
-  from 0.11.0 on the 27B on every card, the opener's page floor has no cut of
-  its own: the capture at the opener hands over the whole pages below it. The
-  0.10.0 release still cuts the 27B there on an RTX 50 or RTX PRO card;
+  on the 27B on every card, the opener's page floor has no cut of
+  its own: the capture at the opener hands over the whole pages below it.
+  Earlier releases cut the 27B there on an RTX 50 or RTX PRO card;
   measured, that cut cost 45 to 55 ms per request (its traversal and a copy of
-  the state into a host retained slot), so from 0.11.0 it is gone. What that
+  the state into a host retained slot), so it is gone. What that
   gives up is the image at the opener's page floor, which only a prompt
   parting from this one in the last 63 tokens before its opener would have
   resumed from: that request now

@@ -107,7 +107,7 @@ built-in profile for the card's memory (`--profile auto`,
 fetch the default one, `qwen3.8-27b`, into `./models` beside where you ran it.
 On a terminal it asks first (`[y/N]`), naming the size, the source and the
 destination; the 27B is 18.1 GiB, on a 16 GB card its 16 GB entry, 12.5
-GiB, and on a 12 GB card, from 0.11.0, its 12 GB entry, 11.9 GiB. Every file is checked against its pinned size and SHA-256 before use.
+GiB, and on a 12 GB card, its 12 GB entry, 11.9 GiB. Every file is checked against its pinned size and SHA-256 before use.
 
 - **Keep the model elsewhere**: `--download-path D:\models` (or
   `/srv/models`) fetches there and looks there on the next start.

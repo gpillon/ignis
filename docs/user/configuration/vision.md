@@ -7,8 +7,8 @@ sidebar:
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on for the 27B under the `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles, off for Flash-Next under every one (from 0.11.0, `--vision-enabled` turns it on for both and `--qwen38flashnext-vision-enabled` for Flash-Next alone; `--vision-enabled false` turns it off for both; a switch carries the vision of the model it replaces, [Flash-Next](#flash-next)) | Load the vision tower and reserve its workspace. Flash-Next's tower is its vision companion's, beside the artifact ([Flash-Next](#flash-next), from 0.11.0). Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
-| `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`4096` under the `rtx-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the request log reports both sizes, `media.vision_tokens` (admitted) and `media.natural_vision_tokens` ([telemetry](../guides/telemetry.md)). From 0.11.0, several images whose total is past the cap, or past the 256 MiB media byte budget, are not refused: the oldest are dropped, a block of images holding half the cap at a time, and the model reads `[image omitted: past this request's vision budget]` where each was, so a harness that resends an agent's whole image history every turn keeps its session and its prefix reuse ([ADR 0102](../../adr/0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md)); the request log counts them, `media.dropped_items` ([telemetry](../guides/telemetry.md)). 0.10.0 refuses such a request with `media_budget_exceeded`. |
+| `--vision-enabled` | `IGNIS_VISION_ENABLED` | off; on for the 27B under the `rtx5090`, `rtxpro6000`, `rtx-16gb` and `rtx-24gb` profiles, off for Flash-Next under every one (`--vision-enabled` turns it on for both and `--qwen38flashnext-vision-enabled` for Flash-Next alone; `--vision-enabled false` turns it off for both; a switch carries the vision of the model it replaces, [Flash-Next](#flash-next)) | Load the vision tower and reserve its workspace. Flash-Next's tower is its vision companion's, beside the artifact ([Flash-Next](#flash-next)). Without it every `image_url` part is refused with `vision_disabled`, whatever the artifact holds. |
+| `--vision-max-tokens <n>` | `IGNIS_VISION_MAX_TOKENS` | `32768` with `--vision-enabled` (`4096` under the `rtx-16gb` profile) | Merged vision tokens per request, 1..1,048,576. An image whose natural size is past the cap is downscaled to fit (aspect ratio kept, one token = 32 x 32 pixels), not refused, unless its aspect ratio is too extreme for the cap (a side cannot go below 32 pixels); the request log reports both sizes, `media.vision_tokens` (admitted) and `media.natural_vision_tokens` ([telemetry](../guides/telemetry.md)). Several images whose total is past the cap, or past the 256 MiB media byte budget, are not refused: the oldest are dropped, a block of images holding half the cap at a time, and the model reads `[image omitted: past this request's vision budget]` where each was, so a harness that resends an agent's whole image history every turn keeps its session and its prefix reuse ([ADR 0102](../../adr/0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md)); the request log counts them, `media.dropped_items` ([telemetry](../guides/telemetry.md)). |
 | `--vision-embedding-pool-mib <n>` | `IGNIS_VISION_EMBEDDING_POOL_MIB` | one envelope-wide embedding | Encoded images kept for reuse across requests, 1..65536, counted where `--vision-residency` puts the pool ([below](#where-the-vision-tower-and-the-embedding-pool-live)). |
 | `--vision-residency <host\|device>` | `IGNIS_VISION_RESIDENCY` | `host`; `device` under `rtxpro6000` | Needs `--vision-enabled`. Where the vision tower's weights and the embedding pool live: `device` in VRAM, `host` in pinned host RAM, the weights copied to the GPU for each image ([below](#where-the-vision-tower-and-the-embedding-pool-live)). Read at load: a change takes effect at the next one. |
 | `--media-cache-mib <n>` | `IGNIS_MEDIA_CACHE_MIB` | `1024` with `--vision-enabled` | Prepared images kept for reuse; `0` disables, max 65536. |
@@ -18,7 +18,7 @@ sidebar:
 
 The 27B's vision combines with either of its drafters
 ([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)):
-DFlash2, which every built-in profile but `rtx-12gb` loads, and, from 0.11.0, its own MTP head
+DFlash2, which every built-in profile but `rtx-12gb` loads, and its own MTP head
 (`--spec-backend mtp`, and `rtx-12gb`'s default), under either vision residency and with nothing else to
 set. The text after an image is drafted as text is, and a greedy answer is the
 same with speculation on or off, up to near-ties. Where the next token is an
@@ -32,9 +32,8 @@ eight lanes. Flash-Next's MTP head drafts after images too
 
 ## Flash-Next
 
-From 0.11.0, Flash-Next takes images as the 27B does, through the same
-requests, limits and media cache (0.10.0 refuses `--vision-enabled` on
-Flash-Next, and its image parts with `vision_disabled`). Its vision tower is
+Flash-Next takes images as the 27B does, through the same
+requests, limits and media cache. Its vision tower is
 not in its 72 GB container: it ships in a
 **vision companion** beside it, `qwen3_8_flash_next_vision-v2.ninfer` (482 MB),
 which `ignis-server model download qwen3.8-flash-next` fetches with the model.
@@ -43,14 +42,14 @@ Flash-Next's 2,560 columns. Vision stays off on a Flash-Next start unless you
 turn it on: every built-in profile turns it on for the 27B alone, so a
 Flash-Next start holds nothing for it until `--vision-enabled` (or `make
 MODEL=flash-next VISION=1`). A switch is not a start: it carries the vision of
-the model it replaces (from 0.11.0), so a 27B serving images on its profile's
+the model it replaces, so a 27B serving images on its profile's
 vision switches to Flash-Next with vision on, at Flash-Next's own vision
 settings, unless vision is named off for Flash-Next itself
 (`--qwen38flashnext-vision-enabled false`, its env var or its section of the
 config file), which wins ([Model switching](../api/model-switching.md)).
 The profile's residency is both models': `host` under `rtx5090`,
 `device` under `rtxpro6000`. Every vision and media field also has a form for
-one model alone (from 0.11.0), which needs that model's vision on:
+one model alone, which needs that model's vision on:
 `--qwen38flashnext-vision-enabled --qwen38flashnext-vision-residency device`,
 or `vision: { qwen38flashnext: { enabled: true, residency: device } }` in a
 config file. Named for a model whose vision is off, such a form is refused,

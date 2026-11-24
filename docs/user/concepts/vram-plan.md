@@ -50,13 +50,13 @@ Flash-Next). The lines include:
   int8`, the default on an RTX 30 or RTX 40 card), the **dense prefill buffer** (`trellis_dense`): the largest matrix
   decoded to INT8, 89 MB, which every matrix of a prefill chunk is decoded into
   in turn, so it costs the KV pool about that much and no more;
-- from 0.11.0, on Windows, on the 27B's NVFP4 entries on an RTX 50 or RTX PRO
+- on Windows, on the 27B's NVFP4 entries on an RTX 50 or RTX PRO
   card, the **TMA descriptor slots** (`tma_descriptors`): 512 bytes for each of a prompt
   chunk's matrix products (247 on the 27B) at every chunk width from 1,024
   tokens up to the wider of `--model-prefill-chunk` and the solo width, in
   steps of 256: 0.6 MB at a 2,048-token chunk, 3.7 MB at 8,192. They keep each
   product's tensor maps on the device instead of allocating and copying them
-  before every product, as 0.10.0 does, so the first request after a load
+  before every product, so the first request after a load
   allocates nothing a later one does not
   ([ADR 0101](../../adr/0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)).
   0 on Linux, which passes the maps by value, on every
@@ -64,7 +64,7 @@ Flash-Next). The lines include:
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
   for the linear-attention layers);
 - the **decode and drafter graphs**' staging buffers;
-- from 0.11.0, on a 27B DFlash2 load of either artifact at 15 drafts that
+- on a 27B DFlash2 load of either artifact at 15 drafts that
   asks for mixed rounds (rounds whose lanes take both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes);
   `--spec-shape-policy mixed` asks, which the `rtx5090` profile gives on the NVFP4 artifact, or the measurement switch
@@ -92,7 +92,7 @@ Flash-Next). The lines include:
   the compressed KV format, the residual window of every lane and slot;
 - the **media embedding** pool for images (0 under `--vision-residency host`,
   which keeps it in pinned host RAM);
-- the **CUDA context**, from 0.11.0 measured on the card when the first load
+- the **CUDA context**, measured on the card when the first load
   creates it ([Every byte planned at load](../why-ignis/every-byte-planned.md#how-it-works));
 - the **KV pool**, which takes whatever is left on the 27B, or is reserved first
   on a Flash-Next that streams its experts.
@@ -112,7 +112,7 @@ a start will use before it runs.
 On the RTX 5090 profile the 27B's 917,504-token context fits with vision and
 DFlash2 on, and 950,272 is refused by 59 MB
 ([finding](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md)),
-when the card has enough free at start. From 0.11.0 the 27B holds its exception
+when the card has enough free at start. The 27B holds its exception
 tensors in FP8 on the RTX 50 and RTX PRO cards
 ([`model.exception_weights`](../reference/configuration.md#modelexception_weights)), and its plan at
 917,504 tokens needs 534.3 MB less than with BF16: under the profile's
@@ -126,8 +126,8 @@ guessed.
 ### What the 27B's drafter holds
 
 The same 27B load under its two drafters and with no speculation, read off the
-three plans on the RTX 5090 (from 0.11.0, where the 27B takes its MTP head;
-vision on, as every profile turns it on;
+three plans on the RTX 5090
+(vision on, as every profile turns it on;
 [finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)):
 
 | | NVFP4, `rtx5090`, 8 lanes | 16 GB artifact, `rtx-16gb`, 2 lanes, 13 GiB budget |

@@ -79,8 +79,8 @@ FP8 kernels and Flash-Next's decode clusters and staged kernel compile for that
 entry alone, and so do three vendored kernels that declare more than 48 KiB of
 static shared memory per block (the W8 linear's small-T and split-K routes, the
 i8 decode attention), on no route the 27B's trellis artifact takes. A launch
-of one on another card fails with CUDA's "no kernel image is available". From
-0.11.0 ignis's attention route of the 27B's decode and verify rounds over
+of one on another card fails with CUDA's "no kernel image is available".
+ignis's attention route of the 27B's decode and verify rounds over
 `hq-e8-2b` compiles for that entry alone too, and a load on another card keeps
 the vendored route ([Context and speculation](../configuration/context-and-speculation.md)).
 Every architecture added costs another device compile of nearly every
@@ -125,7 +125,7 @@ On a card below compute capability 12.0 the server picks what the card runs:
 - the 27B NVFP4 artifact, the image model and Flash-Next's staged decode
   (`IGNIS_FN_MOE_STAGED=1`) are refused before the load, by name
   ([Troubleshooting](../troubleshooting.md#starting)). The 27B loads from its
-  trellis artifact (`--model-id qwen3.8-27b-16g`, or from 0.11.0
+  trellis artifact (`--model-id qwen3.8-27b-16g`, or
   `qwen3.8-27b-12g` on a 12 GB card).
 
 On every card the 27B's 48 linear-attention (GDN) layers prefill on ignis's

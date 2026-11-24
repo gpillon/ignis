@@ -7,7 +7,7 @@ sidebar:
 
 Every setting is one **field** in a **group** — `server`, `model`, `vram`,
 `reuse`, `switch`, `spec`, `vision`, `media`, `image`, `speech`, `download`, `ngram`, `kv_disk`,
-`connector` (from 0.11.0, [the connector](../guides/connector.md#the-settings)) — and has the same name on every surface
+`connector` ([the connector](../guides/connector.md#the-settings)) — and has the same name on every surface
 ([ADR 0046](../../adr/0046-one-declaration-per-config-field.md)):
 
 | Surface | Spelling | Example |
@@ -53,8 +53,7 @@ ignis-server config patch --model-max-context 131072   # change the file in plac
 names a bundle of hardware-shaped defaults, below the file and above the
 built-in defaults. Five are built in, and the default, `--profile auto`,
 picks one by the card's total memory as NVML reports it: under 14 GiB
-(a 12 GB card) `rtx-12gb` (from 0.11.0; 0.10.0 has four, and reads such a
-card as the 16 GB class), from 14 GiB up to 20 GiB
+(a 12 GB card) `rtx-12gb`, from 14 GiB up to 20 GiB
 (a 16 GB card) `rtx-16gb`, from 20 GiB up
 to 28 GiB (an RTX 3090 or RTX 4090)
 `rtx-24gb`, 28 to 40 GiB (a 5090) `rtx5090`, 88 to 104 GiB
@@ -76,7 +75,7 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   turns it off. The 27B prefills 2,048 tokens a chunk (`--model-prefill-chunk`):
   with vision on that costs no VRAM, and long prompts prefill ~2% faster
   ([finding](../../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
-  From 0.11.0 it drafts up to 15 tokens a round with DFlash2 (7 before):
+  It drafts up to 15 tokens a round with DFlash2:
   structured output 25 to 64% faster than at 7, free text within 2% of it
   ([Profiles and defaults](../concepts/profiles.md#rtx5090)).
   Flash-Next prefills 8,192, as `make` always started it: each of its chunks
@@ -90,8 +89,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([Flash-Next speculation (MTP)](flash-next-mtp.md)) and `--ngram-hot-bytes auto`: the
   whole n-gram table in RAM when the host plan leaves room for it
   ([Flash-Next n-gram startup cache](ngram-cache.md)). Everything else is as on the
-  5090, except that the 27B's VRAM headroom stays at its default and, from
-  0.11.0, it drafts 7 tokens a round where the 5090 drafts 15: no window past
+  5090, except that the 27B's VRAM headroom stays at its default and
+  it drafts 7 tokens a round where the 5090 drafts 15: no window past
   7 is measured on this card yet. `--profile
   auto` picks it on this card; `--profile rtxpro6000` names it.
 - `rtx-16gb` is the 16 GB class (RTX 5060 Ti 16 GB, 5070 Ti, 5080, and the
@@ -105,7 +104,7 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   pinned to it).
   It names no model: a start with no artifact takes the catalog's 16 GB entry
   of the default id.
-- `rtx-12gb`, from 0.11.0, is the 12 GB class (RTX 5070, the 12 GB RTX 4070
+- `rtx-12gb` is the 12 GB class (RTX 5070, the 12 GB RTX 4070
   family, RTX 3060 12 GB, RTX 3080 Ti): measured on the 5090 held to a 12 GiB
   budget, not on a 12 GB card. The 27B at 131,072 tokens of context, which
   adapt 16,384 at a time (`--model-adapt-context-step`) to what the card's
@@ -118,8 +117,8 @@ the profile it resolved to. A build without CUDA has no card, so `auto` there is
   ([Profiles and defaults](../concepts/profiles.md#rtx-12gb)).
 - `rtx-24gb` is the 24 GB class (RTX 3090, RTX 4090): the 5090 profile's
   values for the 27B but its draft window (VRAM headroom 1200M, a 2,048-token
-  prefill chunk, DFlash2 at 7 draft tokens where `rtx5090` drafts 15 from
-  0.11.0, vision on with the tower and pool in host RAM,
+  prefill chunk, DFlash2 at 7 draft tokens where `rtx5090` drafts 15,
+  vision on with the tower and pool in host RAM,
   the default lanes and drafter's head) at 1,048,576 tokens of context (YaRN
   at 4 under `auto` rope scaling), the 27B's whole compressed-KV attention
   envelope, measured on the 5090 held to a 24 GiB budget
@@ -213,7 +212,7 @@ is: its key, kind, default, rule, the model families that take it, and whether
 a change is live, needs a reload, or can only be made at start — the same
 declarations as `ignis-server help --fields --format json`, minus the fields
 `GET /v1/config` hides; `?group=` and `?names=` (a comma list of
-`<group>.<field>` keys) ask for some of them, from 0.11.0. `GET /v1/config/origins` says where each value in force
+`<group>.<field>` keys) ask for some of them. `GET /v1/config/origins` says where each value in force
 comes from, for the shared value and for each model family: the default, the
 profile, the card, the file, an env var, a flag or a live change, whether it
 was set for that family itself, and the flag, env var, file key or profile

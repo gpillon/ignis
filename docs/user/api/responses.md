@@ -26,8 +26,8 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   thinking extensions. A conversation renders the same prompt tokens as the
   same conversation through chat completions, so prompt reuse hits across
   both endpoints.
-- **`parallel_tool_calls: false` gives at most one call per response**, from
-  0.11.0 (earlier versions accept it and change nothing): the response ends
+- **`parallel_tool_calls: false` gives at most one call per response**:
+  the response ends
   at the close of its first call and completes with that one
   `function_call` item, over HTTP and over the WebSocket mode, which is what
   an agent CLI that sends `false` on every request asks for. Nothing
@@ -46,15 +46,15 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   the like are accepted and change nothing; `include: ["reasoning.encrypted_content"]` adds the
   reasoning as the model saw it ([Chat completions](chat-completions.md)). ignis stores no response, so `previous_response_id` on
   HTTP is a `400 previous_response_not_found`.
-- **`text.format` holds the answer**, from 0.11.0: `json_object` to a valid
+- **`text.format` holds the answer**: `json_object` to a valid
   JSON object, `json_schema` (`name`, `schema`, `strict`, `description` flat
   beside the `type`) to your schema, over HTTP and over the WebSocket mode,
   with chat completions' guarantees, refusals (`param: text.format`) and
   limits, and the schema described to the model unless
   `ignis_describe_schema` is `false`
   ([Structured output](structured-output.md)).
-- **`strict: true` on a function tool holds its calls**, from 0.11.0, on the
-  27B (earlier versions accept it and change nothing): `strict` sits flat
+- **`strict: true` on a function tool holds its calls**, on the
+  27B: `strict` sits flat
   beside the tool's `name`, and every call to such a strict tool names a
   tool the request declares and carries `arguments` valid under its
   `parameters`, in the order you sent its `properties` in, over HTTP and over
@@ -67,9 +67,9 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
   `tools[1].function.parameters` for a tool in the chat shape; the WebSocket
   mode answers the same refusal as an `error` event. On Flash-Next `strict`
   is accepted and inert (GitHub #581), and echoed `false`.
-- **A function tool sent without `strict` is normalized and held**, from
-  0.11.0, on the 27B, as OpenAI's Responses API does by default (earlier
-  versions serve it free): its `parameters` are put in strict form, every
+- **A function tool sent without `strict` is normalized and held**,
+  on the 27B, as OpenAI's Responses API does by default:
+  its `parameters` are put in strict form, every
   object closed, so a call names no parameter they do not declare, and an
   optional parameter, one `required` does not list, may be left out and
   stays out of `arguments`, which are valid under the schema you sent, its
@@ -93,7 +93,7 @@ completions (GitHub #282): the wire Codex CLI, the OpenAI SDKs'
 - A length stop ends `incomplete` (`max_output_tokens`), an engine error
   `failed`; `usage` carries `input_tokens_details.cached_tokens` and
   `output_tokens_details.reasoning_tokens`. A tool call the cap cuts before it
-  closes (from 0.11.0; 0.10.0 drops it) is the response's last
+  closes is the response's last
   `function_call` item, `status: "incomplete"`, with its name and the
   arguments written so far, a JSON prefix that does not parse; every call
   that closed stays `completed`. Streamed, it carries a closed call's four

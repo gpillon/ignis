@@ -12,7 +12,7 @@ That makes the Playground an agent loop you can watch: a turn streams a reply,
 runs the calls it made, sends the results back, and goes on until a reply
 calls nothing, up to **Tool rounds** replies. A call to a tool the model was
 not given is shown under **Unknown tools** with its arguments, and not run.
-On the 27B, from 0.11.0, the calls are held to their tools' parameters when
+On the 27B, the calls are held to their tools' parameters when
 the chat talks over the Responses socket, which sends its tools without
 `strict` ([A tool sent without `strict`](../api/structured-output.md#a-tool-sent-without-strict));
 over chat completions they come as the model writes them, unless the
@@ -34,7 +34,7 @@ the **agent reader**: its system prompt, its task, its reasoning, the tools it
 called, its answer and its own figures. The session log gets a row per agent
 request, tagged `agent <name>`.
 
-From 0.11.0 an agent whose reply reaches its token limit ends as **Cut**, beside
+An agent whose reply reaches its token limit ends as **Cut**, beside
 Done, Failed and Stopped, and the reader shows **Cut at the token limit**. It
 runs none of that reply's tool calls. The model that launched it receives
 *The agent was cut by its token limit before it finished.* and, if the agent

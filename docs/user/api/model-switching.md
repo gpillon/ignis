@@ -20,13 +20,13 @@ running on the old model get `--switch-drain-timeout` (30 s) to finish; one
 still running then ends with an `engine_error`. The new model loads on the
 flags the server started with, except the ones it cannot take, which are left
 off for it and named in the log (the 27B's `--spec-backend dflash2` on
-Flash-Next; Flash-Next's own knobs on the 27B). From 0.11.0 `--spec-backend mtp`
+Flash-Next; Flash-Next's own knobs on the 27B). `--spec-backend mtp`
 is both models' and crosses the switch: the 27B loads its own MTP head, at its
 own default window when none is named, beside the vision the switch carries
 ([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)).
 
-**Vision crosses the switch** (from 0.11.0; 0.10.0 drops vision on a switch
-to Flash-Next). A switch carries the vision of the model it replaces: when
+**Vision crosses the switch**.
+A switch carries the vision of the model it replaces: when
 the model serving takes images, whether `--vision-enabled`, its own flag or a
 built-in profile turned vision on (every profile turns it on for the 27B
 alone), the model switched to loads with vision on too, with its own vision

@@ -48,7 +48,7 @@ tok/s at one lane and the 1,065 tok/s across eight
 On 200 recorded agent turns replayed with the sampling an agent uses (T=1.0,
 top_p 0.95, top_k 20) it commits 3.46 tokens a round under the fixed draft
 ([DFlash2 sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md))
-and 3.83 under the sampled draft, the default from 0.11.0
+and 3.83 under the sampled draft, the default
 ([The sampled draft served](../../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md)).
 The gap is the predictability of the text and the sampling, not a regression.
 Expect the first figure on code written from a clear instruction and the second
@@ -82,8 +82,8 @@ what ignis does:
 - **FP8 for the exception tensors.** It frees 0.53 GB and adds 3% to cold prefill
   with KLD unchanged, but two decision fixtures moved, so it stayed opt-in
   ([the finding](../../findings/2026-10-21-the-bf16-exception-tensors-in-fp8.md)).
-  Measured again, those two reads proved a coin in both encodings, and from
-  0.11.0 FP8 is the default on the RTX 50 and RTX PRO cards, admitted by the
+  Measured again, those two reads proved a coin in both encodings, and
+  FP8 is the default on the RTX 50 and RTX PRO cards, admitted by the
   KLD gate ([`model.exception_weights`](../reference/configuration.md#modelexception_weights);
   [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 

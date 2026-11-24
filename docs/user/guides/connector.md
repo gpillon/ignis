@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-From 0.11.0, ignis serves an MCP server of its own at `/v1/mcp`, on the port
+ignis serves an MCP server of its own at `/v1/mcp`, on the port
 and behind the key the rest of `/v1` has. A coding agent's harness adds it as
 one MCP server entry, and the model in the harness sees ignis's **server
 tools**: what the server can do beyond chat, as tools it can call. With ignis
@@ -336,7 +336,7 @@ serve the image model in a commercial product
 ### Changing the server: `change_config`, `download_model`, `cancel_download`
 
 These three are listed only when the server was started with
-`connector.allow_changes` on (from 0.11.0; [the settings](#the-settings)).
+`connector.allow_changes` on ([the settings](#the-settings)).
 Off, the default, they are not in `tools/list` and a call to one is an
 unknown-tool error. The connector's `instructions` name them only then.
 
@@ -394,7 +394,7 @@ bytes would pass through the model, and a server reading paths works only on
 the machine the harness runs on. So ignis serves a **skill** too, `ignis`: a
 `SKILL.md` and Node scripts that run in the harness's own shell, beside the
 files, and call ignis's existing routes. ignis touches no file, so it works the
-same with ignis local, on the LAN or behind a tunnel. From 0.11.0 the skill
+same with ignis local, on the LAN or behind a tunnel. The skill
 holds three scripts:
 
 | Script | What it does |

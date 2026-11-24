@@ -18,8 +18,8 @@ already seen.
 Images arrive inline as data URIs, or as URLs the server fetches, prepares and
 caches. One merged vision token covers 32x32 pixels, so a 4096x4096 image is
 16,384 tokens. An image past `vision.max_tokens` is downscaled, not refused,
-unless a side would fall below 32 px. From 0.11.0, images that pass it only
-together are not refused either (0.10.0 refuses them): the oldest are dropped,
+unless a side would fall below 32 px. Images that pass it only
+together are not refused either: the oldest are dropped,
 a block of half the budget at a time, and the model reads a line of text where
 each was, so an agent whose history grows by an image a turn keeps working and
 keeps resuming from the turn before between two drops
@@ -77,10 +77,10 @@ about one new image takes the same time as before.
 - **Logs**: the line a request with images ends with, `ignis.request.done`
   or `ignis.request.cancelled`, reports `media.vision_tokens`,
   `media.natural_vision_tokens`, `media.encode_seconds` and
-  `media.cache_hits`, whatever the primitive, and from 0.11.0
+  `media.cache_hits`, whatever the primitive, and
   `media.dropped_items` for the images dropped past the budget; a decide
   question the engine never ran logs none. A request refused for its images
-  leaves `ignis.media.refused` from 0.11.0 ([telemetry](../guides/telemetry.md)).
+  leaves `ignis.media.refused` ([telemetry](../guides/telemetry.md)).
 - **Playground**: image input in the [chat](../playground/chat.md), and the
   [Decide tab](../playground/decide.md) with an image as the state.
 

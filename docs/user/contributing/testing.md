@@ -29,7 +29,7 @@ and nothing is published until both legs are green
 A machine-local smoke test whose fixture is absent skips, and a skip counts as
 green — except for compute work: a test on the forward pass that skips on a
 busy GPU or a kernel error proves nothing, so those tests live in the GPU
-profile instead. On CI every machine-local test skips, so from 0.11.0 they run
+profile instead. On CI every machine-local test skips, so they run
 for real once per release, on the owner's machine before the tag
 (`make test-machine-local`, [Cutting a release](releases.md)); their targets
 are listed in `mk/machine-local-tests.txt`, and `cargo test` fails on a test
@@ -56,16 +56,16 @@ print `SKIP:` and return, for a quick local check
 make gpu-status     # VRAM in use, every process that may hold the card, the GPU lock's holder
 make gpu-profile    # preflight, the kernel leaf's op tests, the ignored Rust GPU tests
 make kernel-test    # the kernel leaf's CTest op tests alone
-make gpu-run CMD='…'  # from 0.11.0: any other GPU command, under the GPU lock
+make gpu-run CMD='…'  # any other GPU command, under the GPU lock
 ```
 
 `make gpu-profile` runs `scripts/gpu-profile.ps1` on Windows and
-`scripts/gpu-profile.sh` on Linux ([make](make.md) lists their switches; from
-0.11.0 `-Test a_test,b_test` / `--test a_test --test b_test` runs only those
+`scripts/gpu-profile.sh` on Linux ([make](make.md) lists their switches;
+`-Test a_test,b_test` / `--test a_test --test b_test` runs only those
 tests).
 
 The card fits one run at a time, in any worktree: check `make gpu-status`
-before every GPU run. From 0.11.0 a GPU lock names who holds the card: a
+before every GPU run. A GPU lock names who holds the card: a
 server started through make holds it, and the profile, `make kernel-test` and
 `make gpu-run` wait for it ([make](make.md)).
 
@@ -85,10 +85,10 @@ the other. They are no configuration fields: `GET /v1/config` and
   attention band beside it, and its VRAM plan is sized for that route. The
   sm_86 gate's quality leg ([Releases](releases.md)) names `ours` beside the
   other two routes, as its limits were measured.
-- `IGNIS_SECOND_TAIL_CUT=1` (from 0.11.0) gives the 27B on an RTX 50 or RTX
+- `IGNIS_SECOND_TAIL_CUT=1` gives the 27B on an RTX 50 or RTX
   PRO card, or with no card read, its second tail cut back at each model load:
   a reusable prompt is cut at the generation opener's page floor too, where
-  its imaged prefix is published, as 0.10.0 cuts it there
+  its imaged prefix is published
   ([ADR 0100](../../adr/0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md)),
   the comparison a time-to-first-token measurement needs. Unset, the 27B cuts a
   reusable prompt once, at the opener, on every card. The 27B on an RTX 30 or
@@ -96,7 +96,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   value refuses the load, naming the variable. The load logs what it runs
   under `ignis.model.loaded` (`second_tail_cut`: `true` only where it cuts a
   second time).
-- `IGNIS_HQ_DECODE_ATTENTION=ours|vendored` (from 0.11.0) picks the attention
+- `IGNIS_HQ_DECODE_ATTENTION=ours|vendored` picks the attention
   route of the 27B's decode and verify rounds over `hq-e8-2b` at each model
   load: ignis's warp-specialized route, or the vendored kernel's route it
   replaced ([ADR 0031](../../adr/0031-vendored-kernel-bottleneck-exemption.md),
@@ -111,7 +111,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   width's decode graph and verify graph (`decode_nodes`, `verify_nodes`),
   which the two routes share, as they share every byte they write and the
   VRAM plan.
-- `IGNIS_MTP_HEAD_LINEAR=ours|vendored` (from 0.11.0) picks, at each MTP load
+- `IGNIS_MTP_HEAD_LINEAR=ours|vendored` picks, at each MTP load
   of the 27B, the route of the head's five W8 matrices: ignis's own, the one
   an RTX 30 or RTX 40 card runs (the vendored SIMT kernel up to 8 tokens, the
   integer MMA above, `kernel/src/w8_imma.h`), or the vendored `ops::linear`
@@ -125,7 +125,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   the route under `ignis.runtime.decode_routes` (`mtp_head_linear`: `ours`,
   `vendored`, or `none` without the head), and the VRAM plan is the same on
   both.
-- `IGNIS_TMA_DESCRIPTOR_CACHE=0|1` (from 0.11.0) picks, at each model load on
+- `IGNIS_TMA_DESCRIPTOR_CACHE=0|1` picks, at each model load on
   Windows, how the 27B's NVFP4 prompt products get their tensor maps: from the
   device slots the load keeps (`1`, or unset), or by upstream's allocation,
   copy and free before every product (`0`), the comparison a measurement of
@@ -136,7 +136,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   way (`ignis_kernel_tma_descriptor_cache_test`). Linux passes the maps by
   value and has no slots whatever the variable says. Any other value refuses
   the load, naming the variable.
-- `IGNIS_PREFILL_SWIGLU=split|fused|quant` (from 0.11.0) picks, at each load
+- `IGNIS_PREFILL_SWIGLU=split|fused|quant` picks, at each load
   of the 27B's NVFP4 artifact, how its prefill's MLP multiplies by the gate
   and up matrix and applies SwiGLU. `quant`, or unset: in one kernel at every
   chunk width from 1,024 tokens in whole 256-token tiles, whose epilogue
@@ -145,8 +145,8 @@ the other. They are no configuration fields: `GET /v1/config` and
   down product does not run on the NVFP4 W4A4 route (its weight held as an
   exception tensor in FP8, say) the same kernel writes that matrix instead.
   `fused`: the same kernel writing the BF16 matrix in every layer, which the
-  down product then quantizes itself. `split`: the vendored route 0.10.0
-  runs, the product written out in full and a SiLU-mul pass reading it back,
+  down product then quantizes itself. `split`: the vendored route of earlier
+  releases, the product written out in full and a SiLU-mul pass reading it back,
   and at exactly 1,024 tokens the vendored fused kernel. `quant` and `fused`
   write the split route's bytes at every width: the BF16 output, the down
   product's codes and scales, and the residual after it
@@ -158,7 +158,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   runs no W4A4 TMA product, as for `w4a4_activation_layout` below: the trellis
   artifacts, a prefill chunk below 1,024 tokens), and the VRAM plan is the
   same on all three.
-- `IGNIS_W4A4_ACTIVATION_LAYOUT=ktile|token` (from 0.11.0) picks, at each
+- `IGNIS_W4A4_ACTIVATION_LAYOUT=ktile|token` picks, at each
   model load, the layout the 27B's NVFP4 prompt products read their
   activations in on an RTX 50 or RTX PRO card: K tile by K tile (`ktile`, or
   unset), which they read in whole 128-byte lines, or token by token
@@ -174,7 +174,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   `ktile`, `token`, or `none` where its prefill runs no such product: the
   trellis artifacts, Flash-Next, an RTX 30 or RTX 40 card, a prefill chunk
   below 1,024 tokens). Any other value refuses the load, naming the variable.
-- `IGNIS_ROUND_TIMING=1` (from 0.11.0) picks no route: it times each decode
+- `IGNIS_ROUND_TIMING=1` picks no route: it times each decode
   and verify round of the 27B that replays its graph, on the GPU's clock and
   with no tracer, by an event recorded on the stream just before the round's
   graph and one just after it. Every 256 rounds of a kind, the server's
@@ -192,7 +192,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   tracer's. It is read at each capture of the decode graphs, once per load;
   unset, or `0`, nothing is timed and the rounds pay nothing. Any other value
   refuses the load, naming the variable. Flash-Next's rounds are never timed.
-- `IGNIS_DEFER_VERIFY=0|1` (from 0.11.0) picks, at each capture of the decode
+- `IGNIS_DEFER_VERIFY=0|1` picks, at each capture of the decode
   graphs, how a verify round of the 27B with DFlash2 waits on the host. `1`, or
   unset: one kernel copies the round's inputs from page-locked host memory the
   GPU maps, another hands its accept back there behind a ticket the server
@@ -208,7 +208,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   every round before the load's first capture return as earlier releases do.
   The VRAM plan is the same on both. Any other value refuses the load, naming
   the variable.
-- `IGNIS_DECODE_GRAPH_COPIES=1` (from 0.11.0) gives the 27B the decode and
+- `IGNIS_DECODE_GRAPH_COPIES=1` gives the 27B the decode and
   verify rounds of earlier releases, the comparison a measurement of the two
   needs. Unset, an RTX 50 or RTX PRO card runs them copy-free: each layer adds
   its output into its input in place, and each GDN layer of a decode round
@@ -226,7 +226,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   at each capture of the decode graphs, once per load; any other value
   refuses the load, naming the variable. `ignis.runtime.decode_graph_capture`'s
   `decode_nodes` and `verify_nodes` show which round each width captured.
-- `IGNIS_EXTENDED_ATTENTION=ours|vendored` (from 0.11.0) picks, at each
+- `IGNIS_EXTENDED_ATTENTION=ours|vendored` picks, at each
   capture of the decode graphs, the attention route of the extended round (a
   DFlash2 load of the 27B past 7 draft tokens, `IGNIS_ROUND_SHAPE` below). Its
   9 to 16 columns a lane run in chunks of 8 columns (of 6 over `bf16` KV),
@@ -241,7 +241,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   vendored ones whatever the variable says. A load at 7 drafts or fewer, an
   MTP load and Flash-Next never read it; any other value refuses the load,
   naming the variable.
-- `IGNIS_FP8_GEMV_PAIRED=0` (from 0.11.0) gives the 27B's grouped q, k, gate
+- `IGNIS_FP8_GEMV_PAIRED=0` gives the 27B's grouped q, k, gate
   and v exception projection under `fp8` exception weights its one-row GEMV
   back, one output row a warp, the comparison a speed measurement of the
   paired GEMV needs. Unset, or `1`, a call of 1 to 8 tokens runs the paired
@@ -251,7 +251,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   `bf16` load runs neither. It is read at each call, so a decode graph keeps
   the form its capture read; any other value refuses the load, naming the
   variable.
-- `IGNIS_FP8_W8A8_TILE16=0` (from 0.11.0) gives the 27B's exception products
+- `IGNIS_FP8_W8A8_TILE16=0` gives the 27B's exception products
   under `fp8` exception weights their 128-token tile back for a call of 9 to
   16 tokens, the comparison a speed measurement of the 16-token tile needs.
   Unset on a card of compute capability 12, where the tile was measured, or
@@ -267,7 +267,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   stays, as `0` keeps it everywhere; `1` there is the measurement off the
   RTX 5090. It is read at each call, so a graph keeps the tile its capture
   read; any other value refuses the load, naming the variable.
-- `IGNIS_DFLASH2_APPEND_KV_ONLY=0` (from 0.11.0) gives the 27B's DFlash2
+- `IGNIS_DFLASH2_APPEND_KV_ONLY=0` gives the 27B's DFlash2
   drafter its whole q, k and v product back in the append after a verify
   round, the comparison a speed measurement of the append needs. Unset on a
   card of compute capability 12, where the lever was measured, or `1` on any
@@ -282,7 +282,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   the measurement off the RTX 5090. It is read at each call, so a graph
   keeps the product its capture read; any other value refuses the load,
   naming the variable.
-- `IGNIS_DFLASH2_SMALL_T_FILL=0` (from 0.11.0) gives the 27B's DFlash2
+- `IGNIS_DFLASH2_SMALL_T_FILL=0` gives the 27B's DFlash2
   drafter's conv projections and q, k and v product their vendored launch
   back for a call of 5 to 16 columns, 8 or 16 warps a block, the comparison a
   speed measurement of the launch needs. Unset on a card of compute
@@ -297,7 +297,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   measurement off the RTX 5090. It is read at each call, so a graph keeps
   the launch its capture read; any other value refuses the load, naming the
   variable.
-- `IGNIS_GDN_GATING=chain|branch` (from 0.11.0) picks, at each capture of
+- `IGNIS_GDN_GATING=chain|branch` picks, at each capture of
   the decode graphs, where each GDN layer of the 27B computes its gating (the
   a and b products of the layer's normed input and the decay and update gates
   from them) in the decode and verify rounds. `chain` is the round of earlier
@@ -311,7 +311,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   counts. An RTX 30 or RTX 40 card keeps `chain` whatever the variable says,
   and Flash-Next's rounds are its own. Any other value refuses the load,
   naming the variable.
-- `IGNIS_ROUND_SHAPE=base|extended` (from 0.11.0) forces, at each verify
+- `IGNIS_ROUND_SHAPE=base|extended` forces, at each verify
   round of a DFlash2 load of the 27B past 7 draft tokens, the round's shape
   over the shape rule. Unset: the shape rule and the shape policy
   (`--spec-shape-policy`, `aggregate` by default, `mixed` under `rtx5090` on
@@ -333,7 +333,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   `ignis.runtime.verify_graph_capture_incomplete` names a shape's widths whose
   verify graph, or drafter's append graph (`graph`), could not be captured,
   whose rounds run that part eagerly.
-- `IGNIS_MIXED_ROUNDS=0|1` (from 0.11.0) picks, at each capture of the decode
+- `IGNIS_MIXED_ROUNDS=0|1` picks, at each capture of the decode
   graphs of a DFlash2 load of the 27B at 15 draft tokens on either
   artifact, whether the mixed rounds (rounds whose lanes take both round
   shapes) have their verify and drafter-append graphs: `1` captures them for
@@ -358,7 +358,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   another window, a pool whose lanes and slots hold no mix (`rtx-16gb`'s 2
   lanes with no device retained slot), an MTP load and Flash-Next capture
   none. Any other value refuses the load, naming the variable.
-- `IGNIS_MIXED_GRAPH_BUILD=0` (from 0.11.0) gives the 27B's mixed rounds,
+- `IGNIS_MIXED_GRAPH_BUILD=0` gives the 27B's mixed rounds,
   at each capture of the decode graphs of a DFlash2 load past 7 draft tokens,
   their graphs as `IGNIS_MIXED_ROUNDS` first captured them, the comparison a
   speed measurement of the mixed graph's build needs. Unset, or `1`, a mixed
@@ -390,7 +390,7 @@ a constrained round, a verify round whose runs the host cuts short, a
 teacher-forced verify round and a snapshot and restore of each lane right
 after a verify round, on the NVFP4 artifact with DFlash2, with its MTP head and with vision, and on
 the 16 GB and 12 GB classes' trellis artifacts, each under the exception
-weights it has. From 0.11.0 it also loads DFlash2 at 15 and 10 draft tokens
+weights it has. It also loads DFlash2 at 15 and 10 draft tokens
 and vision at 15, under `IGNIS_ROUND_SHAPE=extended`, so every arm holds the
 extended round at 1 to 4 lanes and the base round past them; DFlash2 at 15
 under the shape rule and the default shape policy `aggregate`
@@ -406,7 +406,7 @@ and on both trellis loads at 15; and a third holds a prefill whose last
 chunk is 9 to 16 tokens to the same logits, bit for bit, under
 `IGNIS_FP8_W8A8_TILE16=0` as unset. Each arm is held to the graphs' replay
 with every switch unset; a change behind a switch
-of its own adds that switch as an arm, as the file says. From 0.11.0 the
+of its own adds that switch as an arm, as the file says. The
 reference's verify and drafter-append graphs, each round shape's at each
 width, are also held to main's node counts on the NVFP4 artifact with DFlash2
 at 7 and 15 draft tokens and with its MTP head, under both exception weights,
@@ -415,17 +415,15 @@ prints them and a digest of the reference's tokens, so that two builds' runs
 of one load say whether they capture the same graphs and commit the same
 text. The whole run
 materializes nineteen loads in turn for the first test and eight for the
-second, so a narrow one is the usual run, from 0.11.0 through the GPU profile's
-single-test mode, under the GPU lock (`--test <name>` on Linux; 0.10.0 runs it as
-`cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored
---nocapture`):
+second, so a narrow one is the usual run, through the GPU profile's
+single-test mode, under the GPU lock (`--test <name>` on Linux):
 
 ```sh
 IGNIS_ROUND_IDENTITY_LOADS=nvfp4-dflash2 IGNIS_ROUND_IDENTITY_WEIGHTS=bf16 \
   make gpu-profile GPU_PROFILE_ARGS='-Test every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'
 ```
 
-From 0.11.0 the sessions of DFlash2 at 15 draft tokens under
+The sessions of DFlash2 at 15 draft tokens under
 `IGNIS_ROUND_SHAPE=extended` (`nvfp4-dflash2-w15`) end with three rounds of two
 lanes at a forced mix of one extended lane beside one base lane, live,
 teacher-forced and live again, each lane at its own shape's window: every arm
@@ -538,7 +536,7 @@ graphs are captured again under `IGNIS_MIXED_ROUNDS=1`, and each of the twelve
 mixes is teacher-forced to the text at its 2 to 7 lanes, offered the text and
 from its graph, riding at its mix until each lane holds as many rows as a lane
 of the uniform cells, every mixed row held to the base row at the same text
-index and lane count by the same bounds. From 0.11.0 the trellis test holds
+index and lane count by the same bounds. The trellis test holds
 the same twelve mixes on its own load, each mixed row bit for bit the row of a
 uniform round of its lane's shape at its round's columns: on the trellis
 artifact a lane's rows follow its round's columns, not its lane count, so
@@ -597,7 +595,7 @@ make web-build      # the TypeScript check and the production build
 
 ## The connector's skill
 
-From 0.11.0 the [connector's skill](../guides/connector.md#the-skill), the
+The [connector's skill](../guides/connector.md#the-skill), the
 Node scripts in `connector/ignis`, has `node --test` tests in `connector/`.
 They need Node alone, no `npm install`; a change to a script needs them green:
 

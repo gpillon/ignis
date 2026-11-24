@@ -16,7 +16,7 @@ same id on all three:
 |---|---|---|---|
 | 32 GB or larger | `qwen3.8-27b-abliterated` | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB |
 | 16 GB | `qwen3.8-27b-abliterated-16g` | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB |
-| 12 GB, from 0.11.0 | `qwen3.8-27b-abliterated-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | 11.9 GiB |
+| 12 GB | `qwen3.8-27b-abliterated-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | 11.9 GiB |
 
 ```
 ignis-server model download qwen3.8-27b-abliterated   # the artifact this card loads
@@ -29,7 +29,7 @@ client can tell it from the 27B. On a 16 GB card the same commands fetch and
 start `qwen3.8-27b-abliterated-16g`, which answers to `qwen3.8-27b-abliterated`
 there, as `qwen3.8-27b-16g` answers to `qwen3.8-27b`
 ([ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md)).
-From 0.11.0, on a 12 GB card, an RTX 50, RTX 40 or RTX 30 card alike, they
+On a 12 GB card, an RTX 50, RTX 40 or RTX 30 card alike, they
 fetch and start `qwen3.8-27b-abliterated-12g`, which answers to it there, as
 `qwen3.8-27b-12g` answers to `qwen3.8-27b`; the 16 GB build is refused there by
 name before anything is fetched. Where both builds fit, on a 16 or 24 GB
@@ -95,7 +95,7 @@ detail:
 
 ## The 12 GB artifact
 
-From 0.11.0. The 12 GB 27B's artifact, `qwen3.8-27b-12g`
+The 12 GB 27B's artifact, `qwen3.8-27b-12g`
 ([the `rtx-12gb` profile](../concepts/profiles.md#rtx-12gb)), with the same 70
 matrices re-quantized from the abliterated weights, made the way the 16 GB one
 was. The other 1,152 of its 1,222 objects are the 12 GB artifact's, byte for

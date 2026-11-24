@@ -5,10 +5,9 @@ sidebar:
   order: 2
 ---
 
-From 0.11.0, chat completions on the 27B serve `response_format`, streamed or
+Chat completions on the 27B serve `response_format`, streamed or
 not: `{"type": "json_object"}` holds the answer to a valid JSON object, and
-`{"type": "json_schema", ...}` to your schema. 0.10.0 refuses both with a
-`400`.
+`{"type": "json_schema", ...}` to your schema.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -52,7 +51,7 @@ of it:
 
 ## A schema: `json_schema`
 
-From 0.11.0. The answer is a JSON value valid under the schema you send:
+The answer is a JSON value valid under the schema you send:
 
 ```bash
 curl http://localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -82,7 +81,7 @@ says.
 
 ### The schema, described to the model
 
-From 0.11.0, ignis tells the model the schema it answers to. After the
+ignis tells the model the schema it answers to. After the
 conversation, where the assistant's turn opens, the prompt gains one block,
 the one a system message after the first renders as:
 
@@ -252,7 +251,7 @@ released from the schema all the same, and the call is held to its tool
 
 ## Held tools: `strict: true`
 
-From 0.11.0, chat completions on the 27B hold the calls of a function tool
+Chat completions on the 27B hold the calls of a function tool
 sent with `strict: true`, a **strict tool**, to its `parameters`, with the
 same grammar that holds an answer: each sampled token is checked, and a miss
 is repaired. The Responses API holds them too
@@ -283,7 +282,7 @@ curl http://localhost:8000/v1/chat/completions -H 'content-type: application/jso
 - **The answer is free outside its calls.** The grammar arms at a call's
   `<tool_call>`, in the answer only, never in the reasoning, and is released
   at the call's close; each further call arms it again. A call `max_tokens`
-  cuts comes back as any cut call does (from 0.11.0): its name and the
+  cuts comes back as any cut call does: its name and the
   arguments written so far, each value ending where the call goes on, and
   `finish_reason: "length"`
   ([Chat completions](chat-completions.md)).
@@ -467,7 +466,7 @@ call is complete, with the `arguments` a non-streamed response returns.
 
 ### A tool sent without `strict`
 
-From 0.11.0, on the 27B, the Responses API normalizes a function tool sent
+On the 27B, the Responses API normalizes a function tool sent
 without `strict`, or with `strict: null`, into strict form and holds its
 calls, as OpenAI's Responses API does by default (GitHub #614):
 
@@ -519,7 +518,7 @@ normalized tool's misses and repairs count as a strict tool's, with the type
 
 ## Holding every tool
 
-From 0.11.0, on the 27B, an operator whose agents never send `strict: true`
+On the 27B, an operator whose agents never send `strict: true`
 can still have their calls held: `--model-tool-arguments held`
 (`IGNIS_MODEL_TOOL_ARGUMENTS=held`, or `model: { tool_arguments: held }` in
 the config file, [Prompting](../configuration/prompting.md)) normalizes every
@@ -581,7 +580,7 @@ ones after it are lost, to be drafted again in the next round. Greedy answers
 are the same with speculation on and off, up to the near-ties any request
 has.
 
-From 0.11.0, on a 27B load that drafts more than 7 tokens a round with DFlash2
+On a 27B load that drafts more than 7 tokens a round with DFlash2
 (`--spec-draft-tokens` 8 to 15), a structured request's rounds take the
 [round shape](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)
 its own earlier rounds earn, as any request's do: an answer the drafter

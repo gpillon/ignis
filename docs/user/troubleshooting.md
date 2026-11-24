@@ -48,7 +48,7 @@ alone: the 27B's NVFP4 artifact (its W4A4 prefill GEMMs), the image model, or
 Flash-Next's staged expert decode (`IGNIS_FN_MOE_STAGED=1`). The load is
 refused before it starts, under the event `ignis.model.route_unsupported`; a
 switch to it is refused the same way and the loaded model keeps serving. Load
-the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`, or from 0.11.0
+the 27B from its trellis artifact (`--model-id qwen3.8-27b-16g`, or
 `qwen3.8-27b-12g` on a 12 GB card), and unset `IGNIS_FN_MOE_STAGED`.
 
 On the same card `--model-exception-weights fp8` is refused naming that
@@ -72,13 +72,13 @@ RTX 30 or RTX 40 card refuses the NVFP4 artifact first), and only for a named
 as it was given, `IGNIS_MODEL_PREFILL_LINEAR` or a config file's key included,
 and the load is refused before it starts, under the event
 `ignis.model.route_unsupported`. Name `fp16` or unset the option, or load the
-trellis artifact (`--model-id qwen3.8-27b-16g`, or from 0.11.0 `qwen3.8-27b-12g`
+trellis artifact (`--model-id qwen3.8-27b-16g`, or `qwen3.8-27b-12g`
 on a 12 GB card).
 
 ### A start under `--profile auto` is refused, naming `--profile`
 
 The card's total memory is not one the built-in profiles serve (under 20 GiB,
-which from 0.11.0 is two classes, under 14 and from 14 up to 20; from 20 up to
+which is two classes, under 14 and from 14 up to 20; from 20 up to
 28, 28 to 40, 88 to 104), or NVML could not read it. Name the profile that fits the
 card, or `none` for the hardcoded defaults
 ([Profiles and defaults](concepts/profiles.md)).
@@ -191,7 +191,7 @@ cannot be bound refuses the start instead
 changed; `make build` is the fix ([Working with make](contributing/make.md)).
 Before GPU work, `make gpu-status` shows who holds the card, and a CUDA `run`
 or `start` runs a GPU guard that refuses when it is held (`GPU_CHECK=0` skips
-it). From 0.11.0 a GPU lock another run holds refuses the start too, naming
+it). A GPU lock another run holds refuses the start too, naming
 that run's pid, worktree and command, and `GPU_CHECK=0` does not skip it: wait
 for that run, or ask whoever started it.
 
@@ -369,7 +369,7 @@ them its message says so: start with
 ### WARN `ignis.runtime.cuda_context_fallback`
 
 "the CUDA context could not be measured (…): the VRAM plan charges it 452595712
-bytes, the RTX 5090's figure under Windows". From 0.11.0 the first load
+bytes, the RTX 5090's figure under Windows". The first load
 measures the CUDA context it creates, from the card's free memory read just
 before and after, and the plan charges that figure. When a reading fails, or
 the free memory did not fall because another program freed memory at that
@@ -384,7 +384,7 @@ to measure it again ([Every byte planned](why-ignis/every-byte-planned.md#how-it
 "verify graph capture: these widths of the round shape run this graph's part of
 their verify rounds eagerly", with the shape's draft `window`, the `graph`
 (`verify`, or `drafter_append`: DFlash2's append after the round), its `widths`
-and the capture's `error`. From 0.11.0 a 27B load captures each round shape's
+and the capture's `error`. A 27B load captures each round shape's
 verify graphs, and a DFlash2 load the drafter's append after them, at every
 lane count it serves (a DFlash2 load past 7 draft tokens has two shapes,
 [past seven drafts](concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes)).
@@ -397,7 +397,7 @@ server with the card quiet, or with more `--vram-headroom-bytes`.
 
 "mixed graph capture: the grant stops short of these mixes, at the last mix
 the load holds", with the `mixes` (each `w+n`, `w` extended lanes beside `n`
-base lanes) and the capture's `error`. From 0.11.0 a DFlash2 load of the 27B at
+base lanes) and the capture's `error`. A DFlash2 load of the 27B at
 15 draft tokens that asks for mixed rounds (rounds whose lanes take both
 [round shapes](concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes))
 captures the graphs of every mix its lanes hold, inside its
@@ -412,7 +412,7 @@ the server with the card quiet, or with more `--vram-headroom-bytes`.
 ### WARN `ignis.runtime.mixed_rounds_hold_no_mix`
 
 "the shape policy mixed: this load holds no mix (...), so it runs aggregate",
-with the load's `lanes` and `gdn_slots`. From 0.11.0 a mixed round of `w`
+with the load's `lanes` and `gdn_slots`. A mixed round of `w`
 extended lanes beside `n` base lanes takes `w + n` of the load's lanes and
 `2w + n` of its pool's GDN slots (the lanes and the device retained slots), so
 a load you gave `mixed` (`--spec-backend dflash2 --spec-draft-tokens 15
@@ -440,7 +440,7 @@ qwen3.8-flash-next` fetches both
 
 On the 27B's MTP load the settings only DFlash2 reads are refused where you
 named them: `--spec-draft-rule sampled`, `--spec-drafter-temperature-factor`,
-`--spec-drafter-top-p` and, from 0.11.0, the shape rule's
+`--spec-drafter-top-p` and the shape rule's
 `--spec-shape-enter-accepted` and `--spec-shape-stay-accepted` and the shape
 policy's `--spec-shape-policy`, `--spec-shape-estimate-rounds` and
 `--spec-shape-period-ratios` (by a flag or an env var at any value, in a config
@@ -451,7 +451,7 @@ file at a value other than the default) and
 
 ### `` `--spec-shape-stay-accepted …`: an extended round of `--spec-draft-tokens …` takes at most … drafts ``
 
-From 0.11.0, past 7 draft tokens, a request keeps the extended round shape
+Past 7 draft tokens, a request keeps the extended round shape
 while its extended rounds take at least `--spec-shape-stay-accepted` drafts
 (default 6), and an extended round takes no more drafts than the window. A
 threshold past `--spec-draft-tokens` could never keep a request there, so the
@@ -460,7 +460,7 @@ window ([speculative decoding](concepts/speculative-decoding.md#past-seven-draft
 
 ### Flash-Next refuses the start for its vision companion
 
-From 0.11.0, with vision on, Flash-Next's start opens its vision companion
+With vision on, Flash-Next's start opens its vision companion
 (`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact and refuses the
 start, naming the file, when it is missing (`model download
 qwen3.8-flash-next` fetches it, or start without vision) or is not this
@@ -473,7 +473,7 @@ move the companion and its `.conversion.json` aside first
 
 ### `` `--qwen38flashnext-vision-max-tokens …` requires vision on for Qwen3.8-Flash-Next ``
 
-From 0.11.0, a vision or media option named for one model (a `--qwen38flashnext-…` or
+A vision or media option named for one model (a `--qwen38flashnext-…` or
 `--qwen38-…` flag, its `IGNIS_QWEN38FLASHNEXT_…` variable, a
 `vision.qwen38flashnext` section of the config file) is that model's alone,
 and that model's vision is off: every built-in profile turns vision on for the
@@ -535,7 +535,7 @@ idle unload, or one a client asked for, was tearing the model down. Wait until
 
 ### `409 model_busy`
 
-From 0.11.0, `POST /v1/ignis/models/unload` found the model in use — a request
+`POST /v1/ignis/models/unload` found the model in use — a request
 admitted, waiting or running on it — or a load, a reload or another unload
 under way, or a model not loaded from an artifact, which could not be loaded
 again; or `POST /v1/ignis/models/load` saw a switch or an unload begin before
@@ -545,7 +545,7 @@ the requests are answered, or `GET /v1/models` says `serving` or `unloaded`
 
 ### `409 vision_companion_missing`
 
-From 0.11.0, a `POST /v1/models/switch` to Flash-Next with vision on lacks its
+A `POST /v1/models/switch` to Flash-Next with vision on lacks its
 vision companion (`qwen3_8_flash_next_vision-v2.ninfer`) beside the artifact,
 or the one there is not its own; the message names the file. Vision is on for
 Flash-Next when it is named on for it, or when the switch carries it from the
@@ -589,7 +589,7 @@ download ([Get a model](guides/models.md), [Switching models](api/model-switchin
 
 ### `404 connector_disabled`
 
-From 0.11.0: `/v1/mcp` or `/v1/connector/skill` answers it when the server was
+`/v1/mcp` or `/v1/connector/skill` answers it when the server was
 started with the connector off, `--connector-enabled false` (`connector.enabled`
 in the config file, `IGNIS_CONNECTOR_ENABLED`), named in the message. The field
 takes effect at start only, so `PATCH /v1/config` refuses it: turn it on where
@@ -600,7 +600,7 @@ the server starts and restart it ([The connector](guides/connector.md#the-settin
 The request or the switch names a catalog entry that needs a larger card than
 this one, such as Flash-Next on a 16 GB card. The message names both classes,
 and the loaded model keeps serving. Name an entry the card loads on
-([Get a model](guides/models.md)). On a 12 GB card, from 0.11.0, that is
+([Get a model](guides/models.md)). On a 12 GB card, that is
 `qwen3.8-27b-12g` or `qwen3.8-27b-abliterated-12g` among the text and image
 models: a client or a start naming a 16 GB entry is refused there, and so is
 one naming Swift 1.5, which has no 12 GB build; name `qwen3.8-27b` or
@@ -620,7 +620,7 @@ its name, compute capability and generation, and the entry's class as well
 when that is above the card's too; the loaded model keeps serving, and a start
 that would load it is refused. On such a card name `qwen3.8-27b`,
 `qwen3.8-27b-abliterated` or `swift-1.5-27b`, which their 16 GB entries serve
-there (on a 12 GB card, from 0.11.0, only `qwen3.8-27b` and
+there (on a 12 GB card, only `qwen3.8-27b` and
 `qwen3.8-27b-abliterated`, which their 12 GB entries serve), or one of
 those entries by its own id ([Get a model](guides/models.md#the-catalog)). An
 operator entry that states a `generation` its artifact does not need is
@@ -714,28 +714,27 @@ produces) is not decoded yet: send WAV, or convert it. A clip longer than
 
 `vision is disabled for this server`: an `image_url` part was sent and the
 server runs without `--vision-enabled`, whatever the artifact holds. Start with
-`--vision-enabled` (on Flash-Next from 0.11.0; 0.10.0 serves Flash-Next without images).
-From 0.11.0, a switch carries the vision of the model it replaces, so after a
+`--vision-enabled`.
+A switch carries the vision of the model it replaces, so after a
 switch a model serves without vision only when the model before it had none,
 or when vision is named off for it (`--qwen38flashnext-vision-enabled false`,
 its env var or its config file section), which the switch's
 `ignis.model.switch_vision_off` line names
 ([Model switching](api/model-switching.md)).
 
-`media_budget_exceeded`: from 0.11.0, several images that together pass
+`media_budget_exceeded`: several images that together pass
 `--vision-max-tokens` (32,768 by default) or the 256 MiB media byte budget are
-no longer refused: the oldest are dropped and the model reads a line of text
+not refused: the oldest are dropped and the model reads a line of text
 where each was ([Vision](configuration/vision.md)); a single oversized image is
 downscaled. What is still refused, wherever the image sits in the request: one
 image whose encoded bytes pass the byte budget, or whose frame passes the
 decoded-pixel limit (64 Mi pixels); more images than the item cap; image URLs
 whose fetched bytes together pass the byte budget (send them inline, as a
-harness does). 0.10.0 refuses several images whose total passes the budget,
-which an agent that resends its image history every turn reaches by itself.
+harness does).
 
 Every media refusal, these two and `invalid_media`, `video_unsupported`,
 `media_fetch_failed` or `media_fetch_timeout`, leaves a WARN line
-`ignis.media.refused` in the server's log from 0.11.0, with the `code`, the
+`ignis.media.refused` in the server's log, with the `code`, the
 `part` refused and, for a budget, the `budget`, its `limit` and the amount
 `requested` ([telemetry](guides/telemetry.md)): the request was
 answered before admission, so no `ignis.request.*` line names it.
@@ -749,7 +748,7 @@ is never clamped. Fix or remove the field the `param` names
 
 ### A `400` naming `response_format`
 
-`json_object` and `json_schema` are served on the 27B from 0.11.0. A schema
+`json_object` and `json_schema` are served on the 27B. A schema
 the grammar refuses answers with the refusal's own `code` and a message naming
 the keyword or the limit and where: under `strict: true`, a keyword outside
 OpenAI's strict subset (`unsupported_keyword`), an object that is not closed
@@ -764,7 +763,7 @@ structured output; send `tool_choice: "none"`
 
 ### A `400` naming `tools[i].function.parameters` or `tools[i].function.name`
 
-A strict tool (`strict: true`) is held on the 27B from 0.11.0, and its schema
+A strict tool (`strict: true`) is held on the 27B, and its schema
 is read as `response_format`'s is under `strict: true`: one outside OpenAI's
 strict subset answers with the same `code`, and a message naming the keyword
 and where, ``tools[1].function.parameters: strict tool refused, `minLength` at #/properties/a: `minLength` is outside the strict subset``.

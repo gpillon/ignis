@@ -20,7 +20,7 @@ make version-check               # all four files agree, before you tag
 `version-bump` edits and stops there: the commit and the tag are printed, not
 run, because pushing a `v*` tag publishes a release.
 
-Before the tag is pushed, from 0.11.0, the machine-local tests run for real on
+Before the tag is pushed, the machine-local tests run for real on
 the owner's machine, on the commit the tag will name. The test targets
 `mk/machine-local-tests.txt` lists read an artifact, a tokenizer, a recording
 or a venv only that machine holds, so on CI they print a skip and pass; no
@@ -194,9 +194,11 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 ```
 
 Each must be answered correctly: `Paris`, red, blue, and `Paris` on the MTP
-load. The release that ships the 27B's MTP head (0.11.0) is the first whose
-gate starts one: no RTX 30 or RTX 40 card was at hand when the head's route for
-them was written (#627), so that start is the route's first run on such a card.
+load. 0.11.0 shipped without the gate, though its range touched the kernel, so
+the release after it runs the gate whatever its own range touched, and that
+gate is the first to start the 27B's MTP head: no RTX 30 or RTX 40 card was at
+hand when the head's route for them was written (#627), so that start is the
+route's first run on such a card.
 
 The release binary must also carry machine code for 8.6 and 12.0: the release
 check above does that in CI, whatever list the build was given.

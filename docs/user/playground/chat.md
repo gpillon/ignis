@@ -461,7 +461,7 @@ From top to bottom:
    ([Tools and agents](tools-and-agents.md)).
 5. An **error line** for a request the server refused, with its status and
    message, such as `503: … engine full` over HTTP.
-6. From 0.11.0, an orange **Cut at the token limit** mark at the end of a reply
+6. An orange **Cut at the token limit** mark at the end of a reply
    that stopped at its token limit (finish `length`), whether or not it was
    writing a tool call. A turn cut this way runs none of its calls, the ones
    it had finished writing included, and goes no further: each call gets the

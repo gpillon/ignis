@@ -13,7 +13,7 @@ one container, verified against its provenance sidecar (`.graft.json` or
 
 The models the server knows how to fetch are its **catalog**
 ([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Fourteen entries
-are built into the binary (twelve in 0.10.0), ten text and image models, three speech models and a
+are built into the binary, ten text and image models, three speech models and a
 diarizer, each pinned file by file — byte count and SHA-256 — at a fixed
 revision of its Hugging Face repository:
 
@@ -21,14 +21,14 @@ revision of its Hugging Face repository:
 |---|---|---|
 | `qwen3.8-27b` (the default) | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-NInfer) | 18.1 GiB |
 | `qwen3.8-27b-abliterated` | [`gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer`](https://huggingface.co/gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer) | 18.1 GiB |
-| `qwen3.8-flash-next` | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 68.2 GiB (with its MTP and vision companions, from 0.11.0; 67.8 GiB with its MTP companion in 0.10.0) |
+| `qwen3.8-flash-next` | [`gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis`](https://huggingface.co/gpillon/Qwen3.8-Flash-Next-trellis-a25-ignis) | 68.2 GiB (with its MTP and vision companions) |
 | `ignis-image-2.1-turbo` | [`gpillon/ignis-image-2.1-turbo`](https://huggingface.co/gpillon/ignis-image-2.1-turbo) | 15.6 GiB (the [image model](../api/images.md); non-commercial licence) |
 | `qwen3.8-27b-16g` | [`gpillon/Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB (the 27B for 16 GB cards) |
 | `qwen3.8-27b-abliterated-16g` | [`gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-3bpw-abliterated-ignis) | 12.5 GiB (the [uncensored variant](uncensored.md) for 16 GB cards) |
 | `swift-1.5-27b` | [`gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis) | 18.1 GiB (Swift 1.5, a [fine-tune](fine-tunes.md) of the 27B; a license that restricts commercial use) |
 | `swift-1.5-27b-16g` | [`gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis`](https://huggingface.co/gpillon/Swift-1.5-Qwen3.8-27B-trellis-3bpw-ignis) | 12.5 GiB (Swift 1.5 for 16 GB cards) |
-| `qwen3.8-27b-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis) | 11.9 GiB (the 27B for 12 GB cards, about 2.8 bits per weight; from 0.11.0) |
-| `qwen3.8-27b-abliterated-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | 11.9 GiB (the [uncensored variant](uncensored.md) for 12 GB cards; from 0.11.0) |
+| `qwen3.8-27b-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-ignis) | 11.9 GiB (the 27B for 12 GB cards, about 2.8 bits per weight) |
+| `qwen3.8-27b-abliterated-12g` | [`gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis`](https://huggingface.co/gpillon/Qwen3.8-27B-trellis-2.8bpw-abliterated-ignis) | 11.9 GiB (the [uncensored variant](uncensored.md) for 12 GB cards) |
 | `qwen3-asr-1.7b` | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 1.5 GiB (the [speech model](../api/transcriptions.md), `speech.model: auto`: a Q4_K_M decoder and a Q8_0 audio encoder) |
 | `qwen3-asr-1.7b-q8` | [`gpillon/Qwen3-ASR-1.7B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-1.7B-GGUF-ignis) | 2.3 GiB (the same with a Q8_0 decoder) |
 | `qwen3-asr-0.6b` | [`gpillon/Qwen3-ASR-0.6B-GGUF-ignis`](https://huggingface.co/gpillon/Qwen3-ASR-0.6B-GGUF-ignis) | 0.9 GiB (the smaller speech model, for a weak CPU) |
@@ -67,12 +67,12 @@ another, and `ignis-server model download <id>` fetches it like any entry.
 Each entry states the smallest **card class** it loads on
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)): 32 GB,
 the RTX 5090's class, 16 GB or, for `qwen3.8-27b-12g` and
-`qwen3.8-27b-abliterated-12g` (from 0.11.0), 12 GB
+`qwen3.8-27b-abliterated-12g`, 12 GB
 for a built-in text or image model, none for the speech models and the
 diarizer;
 [Where each model loads](../reference/models.md#where-each-model-loads) gives
 each entry on every card, by its class and generation.
-On a card of a smaller class (16 or 24 GB, and from 0.11.0 the 12 GB class,
+On a card of a smaller class (16 or 24 GB, and the 12 GB class,
 below 14 GiB, where every built-in entry but the two `-12g` entries is above
 it),
 the server refuses an entry above it before unloading or fetching
@@ -82,7 +82,7 @@ serves on; a start with no artifact that would load it, and its
 `model download`, are refused; `GET /v1/models`, `GET /v1/models/catalog` and
 the Playground list it as unavailable, with the reason. An entry may answer to
 its family's default id as an **alias**: the 16 GB 27B answers to
-`qwen3.8-27b` on a 16 or 24 GB card, and from 0.11.0 the 12 GB 27B on a
+`qwen3.8-27b` on a 16 or 24 GB card, and the 12 GB 27B on a
 12 GB card, so a client configured with
 `qwen3.8-27b` is served by it, and the answer names it — only an entry whose
 artifact is of the 27B's family, by the artifact's header, answers to it; one
@@ -94,7 +94,7 @@ loads there, as on every larger card, by its own id. On a 12 GB card Swift
 1.5 has no build of the class, and its ids are refused there, as is every
 16 GB entry. An alias may also be another
 entry's id of the same family: `qwen3.8-27b-abliterated-16g` answers to
-`qwen3.8-27b-abliterated` on a 16 or 24 GB card, and from 0.11.0
+`qwen3.8-27b-abliterated` on a 16 or 24 GB card, and
 `qwen3.8-27b-abliterated-12g` on a 12 GB card
 ([the uncensored variant](uncensored.md)), `swift-1.5-27b-16g` to
 `swift-1.5-27b` ([fine-tunes](fine-tunes.md)), and an [operator's catalog](operator-catalog.md#an-entrys-family-and-an-alias-of-your-own)
@@ -114,7 +114,7 @@ The server reads the card's generation from its compute capability at start:
 An entry that states none loads on every generation the build runs on. On an
 RTX 3090 or RTX 4090, `qwen3.8-27b`, `qwen3.8-27b-abliterated` and
 `swift-1.5-27b` are served by their 16 GB entries through their aliases (on a
-12 GB RTX 30 or 40 card, from 0.11.0, `qwen3.8-27b` and
+12 GB RTX 30 or 40 card, `qwen3.8-27b` and
 `qwen3.8-27b-abliterated` by their 12 GB entries, which state no generation
 either), and an entry no alias serves is refused as for the class, with
 `409 model_above_gpu_generation`: a switch to it, a request naming it, a start
@@ -176,7 +176,7 @@ only when every entry verified. It reads the same configuration a start does
 (config file, environment, flags). It is fitted to the card of the machine it
 runs on: an id an entry answers to there fetches that entry
 (`model download qwen3.8-27b` on an RTX 3090 fetches `qwen3.8-27b-16g`, and
-from 0.11.0 on a 12 GB card `qwen3.8-27b-12g`, as
+on a 12 GB card `qwen3.8-27b-12g`, as
 `model download qwen3.8-27b-abliterated` there fetches
 `qwen3.8-27b-abliterated-12g`), and
 an entry above the card's class or its generation refuses the whole command

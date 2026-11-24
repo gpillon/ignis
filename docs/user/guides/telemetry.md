@@ -29,7 +29,7 @@ Everything goes through one structured log on stdout, in the format
   `done` line names no `lane` and carries the prefill fields instead, `prompt_tokens`,
   `prefill_chunks_consumed`, `prefill_chunks_solo` and `prefilled_tokens`,
   as does a decision's.
-- From 0.11.0, a request held to a grammar (`response_format`, or the calls
+- A request held to a grammar (`response_format`, or the calls
   of a held tool, see [Structured output](../api/structured-output.md))
   says so on the line it ends with, `done` or `cancelled`: `structured.type`
   (`json_object`, `json_schema`, or `tool` for held tool calls; a request
@@ -50,7 +50,7 @@ Everything goes through one structured log on stdout, in the format
   `done` or `cancelled`: `media.items`, `media.vision_tokens` (after any
   downscale to `--vision-max-tokens`) and `media.natural_vision_tokens`,
   `media.bytes`, `media.preprocess_seconds`, `media.encode_seconds` (the
-  vision tower), `media.cache_hits` and `media.cache_misses`. From 0.11.0, a
+  vision tower), `media.cache_hits` and `media.cache_misses`. A
   request whose images together pass `--vision-max-tokens` or the media byte
   budget loses its oldest ([Vision](../configuration/vision.md)), and says so
   on the same lines: `media.dropped_items`, `media.dropped_vision_tokens` and
@@ -72,7 +72,7 @@ Everything goes through one structured log on stdout, in the format
   head question whose image is not a grid the heads can read. It never
   reached the vision tower, and what preparing its image cost is on no
   line.
-- From 0.11.0, a request refused for its images leaves the WARN event
+- A request refused for its images leaves the WARN event
   `ignis.media.refused`: its media are acquired before admission, so the
   refusal has no request id and no `ignis.request.*` line. It carries the
   answer's `status` and `code` (`invalid_media`, `media_budget_exceeded`,
@@ -121,7 +121,7 @@ With metrics on (the default; `--server-metrics false` turns them off), the Prom
 rejections, KV pool pages and evictions, the KV-RAM arena, retained slots and
 what reuse held or gave up, the VRAM plan, decoded tokens, forced thinking
 closes, and decision counters with the answer-mass histogram ([ADR 0017](../../adr/0017-prometheus-metrics.md)).
-From 0.11.0, every tool call block the model writes is checked against its
+Every tool call block the model writes is checked against its
 tool's `parameters` as it closes, on chat completions and on the Responses API
 (HTTP and WebSocket), and counted, the check changing nothing the response
 carries: `ignis_tool_calls_total` by outcome (`valid`; `invalid`, arguments that

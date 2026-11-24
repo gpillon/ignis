@@ -24,7 +24,7 @@ download to land in it ([the image's user](install.md#the-container-image)).
 
 With no model in `/models`, the server fetches the default one, `qwen3.8-27b`:
 **18.1 GiB** from Hugging Face (on a 16 GB card, the id's 16 GB entry,
-`qwen3.8-27b-16g`, 12.5 GiB; on a 12 GB card, from 0.11.0, its 12 GB entry,
+`qwen3.8-27b-16g`, 12.5 GiB; on a 12 GB card, its 12 GB entry,
 `qwen3.8-27b-12g`, 11.9 GiB), every file checked against its pinned size and
 SHA-256 before it is used. On a terminal the server first asks (`[y/N]`, on
 stderr), naming the size, the source and the destination. In a container there

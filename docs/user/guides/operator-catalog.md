@@ -33,7 +33,7 @@ the form `<owner>/<name>`, an empty `revision`, an `artifact` not among its
 `files`, no sidecar (the artifact's name plus `.graft.json` or
 `.conversion.json`), a `sha256` that is not 64 lowercase hex digits, a `bytes`
 of 0, a file name that is not a plain name (a path separator, `..`, an
-absolute path), a `card_class` that is not 12 (from 0.11.0), 16, 24, 32 or 96, a `generation`
+absolute path), a `card_class` that is not 12, 16, 24, 32 or 96, a `generation`
 that is not `ampere`, `ada` or `blackwell` (lowercase), a `family` that is
 not a model family's default id (`qwen3.8-27b`, `qwen3.8-flash-next`,
 `ignis-image-2.1-turbo`, `nemotron-3-diarization`) or that contradicts what
@@ -43,7 +43,7 @@ an alias that is neither a model family's default id nor another entry's id
 entry's, names an entry whose family nothing states, or is already a built-in
 entry's or another entry's of the same `card_class` in your file (two of
 different classes may answer to one id, and where both fit the card the one
-of the larger class does, from 0.11.0; in 0.10.0 one entry at most). A relative `--download-catalog` set in a config file is read
+of the larger class does). A relative `--download-catalog` set in a config file is read
 from that file's directory; from a flag or an env var, from the working
 directory. An entry with no `card_class` states no class: it is never refused
 by class, so a catalog written before card classes still starts, and only the
@@ -131,7 +131,7 @@ on a card whose class is not known, by `acme-27b-ft` itself. `GET /v1/models`
 and `GET /v1/models/catalog` list `acme-27b-ft` as unavailable on the 16 GB
 card, the reason naming the entry that serves it there. The built-in `qwen3.8-27b-abliterated` and
 `qwen3.8-27b-abliterated-16g` are such a pair: both state `family: qwen3.8-27b`,
-and the 16 GB one answers to the other's id, as from 0.11.0
+and the 16 GB one answers to the other's id, as
 `qwen3.8-27b-abliterated-12g` does on a 12 GB card ([the uncensored variant](uncensored.md));
 so are `swift-1.5-27b` and `swift-1.5-27b-16g` ([fine-tunes](fine-tunes.md)).
 

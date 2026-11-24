@@ -49,7 +49,7 @@ scripts do so themselves.
 
 ## Unloading and loading on request
 
-From 0.11.0 a client can give the card back without waiting for the idle
+A client can give the card back without waiting for the idle
 time, and take it again without sending a generation: another program on the
 same card, a video encoder say, runs between the two calls while the server
 stays up. Both routes are ignis extensions, not OpenAI's model deletion: no
@@ -98,6 +98,6 @@ teardown and a cold load, not a VRAM-only suspension that keeps the KV: the
 first request after the load finds no retained prompt state.
 
 `GET /v1/models/{model}`, OpenAI's retrieve, answers the entry `GET
-/v1/models` lists under the id, from 0.11.0. Like the listing it neither loads
+/v1/models` lists under the id. Like the listing it neither loads
 the model nor counts as its use, so polling it does not keep the model loaded;
 an id the listing does not name is `404 model_not_found`.

@@ -43,7 +43,7 @@ Flash-Next has two **companion containers** beside the main one, each holding
 one optional part of the model. The **MTP companion** (about 1 GB) holds the
 multi-token-prediction head, and is bound only when MTP speculation is on
 ([speculative decoding](speculative-decoding.md)). The **vision companion**
-(about 0.5 GB, from 0.11.0) holds the checkpoint's vision encoder: its tower, every
+(about 0.5 GB) holds the checkpoint's vision encoder: its tower, every
 matrix at 8 bits, and the merger that writes Flash-Next's 2,560-wide
 embeddings. Each records which main container it belongs to, and a mismatched
 pair is refused by name. The catalog downloads both with the model, whether
@@ -71,7 +71,7 @@ state rather than a whole context, and why the KV pool can be shared by lanes
 
 It serves a fixed eight decode lanes, takes image input when
 `--vision-enabled` is set, and drafts with DFlash2, every profile's drafter,
-or, from 0.11.0, with its own MTP head when `--spec-backend mtp` names it, one or the other
+or with its own MTP head when `--spec-backend mtp` names it, one or the other
 for the life of a load
 ([the 27B's two drafters](speculative-decoding.md#the-27bs-two-drafters)).
 
@@ -119,7 +119,7 @@ the machine it needs.
   28.8 GB. It is never put on the device: rows are read from NVMe through a
   RAM cache of hot rows (1 GiB by default), or the whole table is held in RAM
   when `--ngram-hot-bytes` covers it ([n-gram cache](../configuration/ngram-cache.md)).
-- **Images**: from 0.11.0, Flash-Next takes image input when `--vision-enabled` is set,
+- **Images**: Flash-Next takes image input when `--vision-enabled` is set,
   from a vision companion beside its artifact (482 MB, fetched with the
   model). Under the default `host` residency the tower and its embedding pool
   sit in host RAM and an image is encoded in the prefill scratch the text
@@ -152,11 +152,10 @@ operator's `--model-id`, or the family's default when none is named.
 
 The **catalog** is the set of models the server knows how to fetch
 ([ADR 0047](../../adr/0047-a-catalog-the-operator-can-extend.md)). Fourteen entries
-(twelve in 0.10.0)
 are built into the binary, each pinned file by file at a fixed revision of its
 Hugging Face repository: ten text and image models, `qwen3.8-27b`,
-`qwen3.8-27b-16g`, `qwen3.8-27b-12g` (from 0.11.0), `qwen3.8-27b-abliterated`,
-`qwen3.8-27b-abliterated-16g`, `qwen3.8-27b-abliterated-12g` (from 0.11.0),
+`qwen3.8-27b-16g`, `qwen3.8-27b-12g`, `qwen3.8-27b-abliterated`,
+`qwen3.8-27b-abliterated-16g`, `qwen3.8-27b-abliterated-12g`,
 `swift-1.5-27b`, `swift-1.5-27b-16g`, `qwen3.8-flash-next` and
 `ignis-image-2.1-turbo`, plus three speech models and a diarizer. Each of the
 ten states the smallest **card class** it loads on: 32 GB for all but the
@@ -194,7 +193,7 @@ is the same container: 1,255 of its 1,325 objects are byte-identical to the
 default artifact, and only the 70 matrices the abliteration changed are
 re-encoded. Memory use is therefore the same as the default 27B. On a 16 GB
 card it is served by `qwen3.8-27b-abliterated-16g`, the 16 GB artifact with the
-same 70 matrices re-quantized, and on a 12 GB card, from 0.11.0, by
+same 70 matrices re-quantized, and on a 12 GB card, by
 `qwen3.8-27b-abliterated-12g`, the 12 GB artifact with them re-quantized the
 same way. It does not
 refuse requests, so guardrails belong in the layer that executes tools. The

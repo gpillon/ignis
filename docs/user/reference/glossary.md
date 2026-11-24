@@ -9,7 +9,7 @@ sidebar:
 abliteration applied: the same container with 70 matrices re-encoded, it does not
 refuse requests. On a 16 GB card `qwen3.8-27b-abliterated-16g`, the 16 GB
 artifact with the same 70 matrices re-quantized, serves it, and on a 12 GB
-card, from 0.11.0, `qwen3.8-27b-abliterated-12g`, the 12 GB artifact with
+card, `qwen3.8-27b-abliterated-12g`, the 12 GB artifact with
 them re-quantized the same way. See [models and artifacts](../concepts/models-and-artifacts.md)
 and [the uncensored variant](../guides/uncensored.md).
 
@@ -37,7 +37,7 @@ and chat template in one file, checked against its sidecar. See
 
 **Base shape.** The 27B's verify round at 8 columns a lane, the anchor and 7
 drafts, at every lane count: the one round shape of a load at 7 drafts or fewer,
-and from 0.11.0, beside the *extended shape*, the base shape of a DFlash2 load
+and, beside the *extended shape*, the base shape of a DFlash2 load
 past 7. See [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **Body format.** How an artifact stores its transformer layers (NVFP4 or
@@ -46,22 +46,22 @@ trellis). It is read from the artifact, never configured. See
 
 **Alias.** A second id a catalog entry answers to, within its own model family
 and only on a card it loads on: on a 16 GB card or an RTX 3090,
-`qwen3.8-27b-16g` answers to `qwen3.8-27b`, and on a 12 GB card, from 0.11.0,
+`qwen3.8-27b-16g` answers to `qwen3.8-27b`, and on a 12 GB card,
 `qwen3.8-27b-12g`; where both fit, the entry of the larger class answers. See
 [Get a model](../guides/models.md).
 
 **Card.** The GPU ignis runs on. The built-in profiles are written for the
-12 GB class (from 0.11.0), the 16 GB class, the 24 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and
+12 GB class, the 16 GB class, the 24 GB class, a 32 GB RTX 5090 and a 96 GB RTX PRO 6000, and
 `--profile auto` picks one by the card's memory. See [profiles](../concepts/profiles.md).
 
 **Card class.** The cards one built-in profile serves, named by their memory
-(12, 16, 24, 32 or 96 GB; 12 GB from 0.11.0, a total below 14 GiB), and the smallest
+(12, 16, 24, 32 or 96 GB; 12 GB, a total below 14 GiB), and the smallest
 one a catalog entry loads on. An entry above the card is refused before anything
 is unloaded or fetched. See [models and artifacts](../concepts/models-and-artifacts.md)
 and [profiles](../concepts/profiles.md).
 
 **Catalog.** The models the server knows how to fetch: fourteen entries built
-into the binary (twelve in 0.10.0), ten text and image models, three speech
+into the binary, ten text and image models, three speech
 models and a diarizer,
 pinned file by file, plus any an operator adds. See
 [models and artifacts](../concepts/models-and-artifacts.md) and
@@ -104,14 +104,14 @@ prefills (`--model-decode-share`, 25 percent by default). See
 
 **DFlash2.** The 27B's default speculative-decoding drafter, grafted into its
 artifact: a five-layer, sliding-window model that proposes 1 to 15 tokens per
-round (1 to 7 before 0.11.0). See [speculative decoding](../concepts/speculative-decoding.md).
+round. See [speculative decoding](../concepts/speculative-decoding.md).
 
 **Draft.** A token a drafter proposes ahead of the model, to be verified in the same
 pass. See [speculative decoding](../concepts/speculative-decoding.md).
 
 **Draft tokens.** The most tokens a lane drafts per round
-(`--spec-draft-tokens`), the draft window: 1 to 15 for DFlash2 (from 0.11.0,
-1 to 7 before; past 7 the load holds a *base shape* and an *extended shape*), 1
+(`--spec-draft-tokens`), the draft window: 1 to 15 for DFlash2
+(past 7 the load holds a *base shape* and an *extended shape*), 1
 to 7 for Flash-Next's MTP head, and 0 to 7 for the 27B's MTP head, where 0
 loads no speculation. See
 [speculative decoding](../concepts/speculative-decoding.md).
@@ -126,7 +126,7 @@ refused below 12 GiB. See
 [models and artifacts](../concepts/models-and-artifacts.md) and
 [the VRAM plan](../concepts/vram-plan.md).
 
-**Extended shape.** From 0.11.0, the 27B's verify round at the window + 1 columns
+**Extended shape.** The 27B's verify round at the window + 1 columns
 a lane (9 to 16), at up to 4 lanes in a round of one shape, and at 15 drafts up
 to 3 lanes beside lanes at the base shape in a *mixed round*: the second round
 shape of a DFlash2 load past 7 drafts, on the *base shape*'s buffers. See
@@ -221,7 +221,7 @@ protection and eviction order. See
 streams, and takes a persistent loop back. See
 [reasoning and the loop guard](../concepts/reasoning.md).
 
-**Mixed round.** From 0.11.0, a verify round of the 27B at 15 drafts whose
+**Mixed round.** A verify round of the 27B at 15 drafts whose
 requests run at both round shapes: one to three at the *extended shape*, 16
 columns each, beside one to six at the *base shape*, 8 columns each, 64 columns
 at most. Only the shape policy `mixed` grants one (the `rtx5090` profile's on
@@ -231,7 +231,7 @@ only at a mix whose graphs the load holds. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
 **MTP.** Multi-token prediction: a model's own draft head. The 27B's is in every
-27B artifact and drafts from 0.11.0, in place of DFlash2: the default under `rtx-12gb`
+27B artifact and drafts in place of DFlash2: the default under `rtx-12gb`
 and opt-in elsewhere (`--spec-backend mtp`), smaller
 weights and no drafter window, for one more attention layer in every KV page.
 Flash-Next's is shipped in a companion container, off on the RTX 5090 and on
@@ -264,7 +264,7 @@ read, by resuming from retained state that matches by content. See
 [the KV cache and prompt reuse](../concepts/kv-cache-and-prompt-reuse.md).
 
 **Profile.** A named bundle of hardware-shaped defaults, below the config file and
-above the built-in defaults: `rtx-12gb` (from 0.11.0), `rtx-16gb`, `rtx-24gb`,
+above the built-in defaults: `rtx-12gb`, `rtx-16gb`, `rtx-24gb`,
 `rtx5090` and `rtxpro6000` are built in, one for each card class, and `auto`
 picks the card's. See [profiles](../concepts/profiles.md).
 
@@ -299,7 +299,7 @@ text before the loop, with a nudge. See
 [reasoning and the loop guard](../concepts/reasoning.md).
 
 **Round shape.** The columns a lane and the most lanes of a 27B verify round:
-the *base shape*, or from 0.11.0 on a DFlash2 load past 7 drafts the *extended
+the *base shape*, or on a DFlash2 load past 7 drafts the *extended
 shape*, which the *shape rule* and the *shape policy* choose for each of a
 round's lanes; the policies `aggregate` and `all` give all of a round's lanes
 one shape. See
@@ -310,12 +310,12 @@ lanes (`--spec-draft-rows`, 8 by default). See
 [speculative decoding](../concepts/speculative-decoding.md).
 
 **Sampled draft.** A way for the 27B's DFlash2 to draft for a request that
-samples (`--spec-draft-rule sampled`, from 0.11.0): the drafter draws each draft
+samples (`--spec-draft-rule sampled`): the drafter draws each draft
 from its own distribution and the round takes it by the ratio of the model's
 probability to the drafter's, so the text keeps the model's distribution. See
 [speculative decoding](../concepts/speculative-decoding.md#acceptance-under-sampling).
 
-**Shape policy.** From 0.11.0, on a DFlash2 load past 7 drafts, how a verify
+**Shape policy.** On a DFlash2 load past 7 drafts, how a verify
 round's lanes take their shapes from what its requests ask
 (`--spec-shape-policy`): `aggregate`, the default on every profile but
 `rtx5090`, a round of 1 to 4 lanes
@@ -330,7 +330,7 @@ alone runs at the shape
 it asks under each. See
 [speculative decoding](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
 
-**Shape rule.** From 0.11.0, on a DFlash2 load past 7 drafts, what each request
+**Shape rule.** On a DFlash2 load past 7 drafts, what each request
 asks of its next verify round from its own earlier rounds: the *extended shape*
 after a base round that took all 7 drafts, while its extended rounds take 6 or
 more (`--spec-shape-enter-accepted`, `--spec-shape-stay-accepted`), the *base

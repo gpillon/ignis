@@ -24,14 +24,12 @@ left becomes the KV pool. Requests then allocate no device memory as they go,
 and a retained-state capture that finds no slot is skipped, not served with a
 fresh allocation ([ADR 0030](../../adr/0030-device-memory-reserved-at-load.md)).
 
-From 0.11.0 the CUDA context's line is measured on the card at the start: the
+The CUDA context's line is measured on the card at the start: the
 first load reads the free memory just before and after it creates the
 context, and the plan charges the difference, what the context takes on this
-card and this OS. 0.10.0 charged every card the 452,595,712 bytes measured on
-an RTX 5090 under Windows: too little under WSL, and on an RTX 5080 under
-Linux the 27B's cold start charged more than the process holds for its context
-and its own state together.
-A reading that fails falls back to that figure, with a WARN
+card and this OS.
+A reading that fails falls back to the 452,595,712 bytes measured on
+an RTX 5090 under Windows, with a WARN
 ([troubleshooting](../troubleshooting.md#warn-ignisruntimecuda_context_fallback)).
 A later load in the same process, a model switch or the reload after an idle
 unload, adds back what the process already holds: the driver's own figure
@@ -39,7 +37,7 @@ for the process where it reports one (native Linux), so the reload plans the
 pool its cold start planned, and elsewhere what the plan charges again for
 it, so the reload plans on the memory actually free
 ([ADR 0092](../../adr/0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md)).
-From 0.11.0 the 27B's share of what is charged again is what it leaves on an
+The 27B's share of what is charged again is what it leaves on an
 RTX 50 or RTX PRO card, whose decode graphs hold no copies. Where the graphs
 still copy (an RTX 30 or RTX 40 card, or `IGNIS_DECODE_GRAPH_COPIES=1`) the
 process holds 24 MiB more than that, so a reload there plans about 0.3% fewer
@@ -85,7 +83,7 @@ The budget, line by line, and why a refusal beats a run:
 | Prefill attention without prompt planes: 1,020,474,240 bytes less at 524K tokens | RTX 5090 | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
 | Token embedding in host memory: 1.35 GB of VRAM for about 146K more KV tokens, at -0.15% to -0.7% cold prefill (14K-105K) | RTX 5090 | [Token embedding in host memory](../../findings/2026-10-21-token-embedding-in-host-memory.md) |
 | The 5090 profile's 27B context 786,432 up to 917,504 with vision and DFlash2 on: KV pool 944,832 tokens; 950,272 refused by 59 MB, 1,048,576 refused 1.07 GB short | the plan raised until it refused | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
-| From 0.11.0, the plan at the 5090 profile's 917,504 tokens needs 28,608,687,108 bytes under the FP8 exception weights and 29,142,942,212 under BF16, so under its 1,200 MiB headroom the context holds unadapted with at least 28,483 MiB free at start against 28,993 MiB; with 28,549 MiB free BF16 adapted to 786,432 | RTX 5090, `rtx5090` profile, no config file, 2026-11-18 | [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
+| The plan at the 5090 profile's 917,504 tokens needs 28,608,687,108 bytes under the FP8 exception weights and 29,142,942,212 under BF16, so under its 1,200 MiB headroom the context holds unadapted with at least 28,483 MiB free at start against 28,993 MiB; with 28,549 MiB free BF16 adapted to 786,432 | RTX 5090, `rtx5090` profile, no config file, 2026-11-18 | [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
 | At a 1 GiB headroom Flash-Next decoded at 4.6 tok/s and the 27B at about 40 tok/s while a browser drew; at 1.5 GiB neither moved | Windows, RTX 5090 | [Headroom and WDDM paging](../../findings/2026-10-09-vram-headroom-wddm-paging.md) |
 
 :::note[Re-measure before you restate]

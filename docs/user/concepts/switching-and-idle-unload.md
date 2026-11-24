@@ -83,7 +83,7 @@ checksum that is not clean, a model id that belongs to the other model) leaves t
 serving. One that fails after the old model was unloaded loads the old model
 again, and `GET /v1/models` says `failed` with a reason until one serves.
 
-From 0.11.0, vision crosses a switch: a switch carries the vision of the
+Vision crosses a switch: a switch carries the vision of the
 model it replaces, so a 27B serving images, on `--vision-enabled` or on a
 built-in profile's vision (which turns it on for the 27B alone), switches to
 Flash-Next with vision on, and back. A model serving without vision carries
@@ -142,7 +142,7 @@ An unload and the load after it are logged (`ignis.model.unloaded`,
 
 ### On request
 
-From 0.11.0 a client need not wait for the idle time: `POST
+A client need not wait for the idle time: `POST
 /v1/ignis/models/unload` unloads the model the same way at once, refused while
 anything uses it, and `POST /v1/ignis/models/load` loads it again without a
 generation ([Unloading and loading on request](../api/idle-unload.md#unloading-and-loading-on-request)).

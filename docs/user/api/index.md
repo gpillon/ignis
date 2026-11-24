@@ -12,9 +12,9 @@ not.
 | Endpoint | Method | Notes |
 |---|---|---|
 | `/v1/models` | GET | The servable models: `data[0]` the loaded one (`active: true`; the speech model, when it can serve, comes right after it as `kind: "speech"`, and the top-level `speech` object says whether it can and why not, and in its `diarizer` member the same of the diarizer — [Speech to text](transcriptions.md)) — for a text model with the context it runs (`max_model_len`), the requests it decodes at once (`decode_lanes`), the steps its load took to fit the card's VRAM (`adapted`, `""` when none; [when a profile does not fit](../concepts/profiles.md#when-a-profile-does-not-fit)) and the prefill chunk a prompt takes while no lane decodes (`prefill_chunk_solo`, [the solo width](../configuration/context-and-speculation.md#the-solo-width)) — then every model a request naming it would switch to and be served by now — each catalog entry on disk, each known model whose artifact is a file; the loaded one alone with `--switch-allow-implicit false`. A catalog entry on disk the card cannot load, by its class or its GPU generation, is listed `available: false`, with the `reason` ([the catalog](../guides/models.md#the-catalog)). And `status`, about `data[0]`: `serving`, `switching`, `failed` ([Switching models](model-switching.md)), `unloaded` or `loading` ([idle unload](idle-unload.md)). |
-| `/v1/models/{model}` | GET | The entry `GET /v1/models` lists under the id, read without loading the model or counting as its use ([Unloading and loading on request](idle-unload.md#unloading-and-loading-on-request), from 0.11.0). |
-| `/v1/ignis/models/load` | POST | Load the active model out of `unloaded` and answer once it serves, without generating; an ignis extension ([Unloading and loading on request](idle-unload.md#unloading-and-loading-on-request), from 0.11.0). |
-| `/v1/ignis/models/unload` | POST | Unload the active model now, as idle unload does, refused while anything uses it; no file is touched; an ignis extension ([Unloading and loading on request](idle-unload.md#unloading-and-loading-on-request), from 0.11.0). |
+| `/v1/models/{model}` | GET | The entry `GET /v1/models` lists under the id, read without loading the model or counting as its use ([Unloading and loading on request](idle-unload.md#unloading-and-loading-on-request)). |
+| `/v1/ignis/models/load` | POST | Load the active model out of `unloaded` and answer once it serves, without generating; an ignis extension ([Unloading and loading on request](idle-unload.md#unloading-and-loading-on-request)). |
+| `/v1/ignis/models/unload` | POST | Unload the active model now, as idle unload does, refused while anything uses it; no file is touched; an ignis extension ([Unloading and loading on request](idle-unload.md#unloading-and-loading-on-request)). |
 | `/v1/models/switch` | POST | Replace the loaded model on the running process ([Switching models](model-switching.md)). |
 | `/v1/models/catalog` | GET | Every model the server can switch to or fetch, with its state on disk ([Switching models](model-switching.md)). |
 | `/v1/models/download` | POST | Download a catalog entry in the background while the server serves; the catalog's rows follow it ([Downloading from the Server view](../guides/models.md#downloading-from-the-server-view-post-v1modelsdownload)). |
@@ -25,16 +25,16 @@ not.
 | `/v1/audio/transcriptions` | POST | Transcribe audio with the speech model, multipart ([Speech to text](transcriptions.md)). Served on the CPU through a model switch. |
 | `/v1/realtime?intent=transcription` | GET | A live transcription session over a WebSocket, OpenAI's Realtime transcription subset ([Live transcription](realtime-transcription.md)). Served on the CPU through a model switch. |
 | `/v1/config` | GET, PATCH | The running configuration, and a change to it ([configuration](../configuration/index.md)). |
-| `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. `?group=<name>` keeps one group's fields, `?names=<group.field>,...` (one comma list) the named ones, from 0.11.0; an unknown group or name is `400 config_invalid`. |
+| `/v1/config/fields` | GET | What each visible configuration field is: kind, default, rule, families, whether a change reloads. `?group=<name>` keeps one group's fields, `?names=<group.field>,...` (one comma list) the named ones; an unknown group or name is `400 config_invalid`. |
 | `/v1/config/origins` | GET | Where each visible value in force comes from, shared and per model family: default, profile, card, file, env, flag or live. |
-| `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming; an answer held to a JSON object or to your JSON schema with `response_format` ([Structured output](structured-output.md), from 0.11.0). |
+| `/v1/chat/completions` | POST | Chat completions — streaming (`stream: true`, SSE) and non-streaming; an answer held to a JSON object or to your JSON schema with `response_format` ([Structured output](structured-output.md)). |
 | `/v1/responses` | POST | The OpenAI Responses API, streaming (`stream: true`, SSE) and non-streaming ([The Responses API](responses.md)). |
 | `/v1/responses` | GET | Its WebSocket mode: the upgrade, then `response.create` events ([The Responses API](responses.md)). |
 | `/v1/tokenize` | POST | A body's prompt-token count without serving it ([Counting a prompt](count.md)). |
 | `/v1/detokenize` | POST | Token ids back to text, through the same tokenizer. |
 | `/v1/decide` | POST | The decision endpoint ([Decisions](decide.md)). |
-| `/v1/mcp` | POST | The connector's MCP server, for a coding agent's harness: the server tools, over Streamable HTTP ([The connector](../guides/connector.md), from 0.11.0). Answers through a model switch; each tool's call meets its own route's checks. |
-| `/v1/connector/skill` | GET | The connector's skill, `ignis`, as a `tar.gz`: Node scripts that make and edit images and transcribe recordings on the harness's side, beside its files ([The connector](../guides/connector.md#the-skill), from 0.11.0). |
+| `/v1/mcp` | POST | The connector's MCP server, for a coding agent's harness: the server tools, over Streamable HTTP ([The connector](../guides/connector.md)). Answers through a model switch; each tool's call meets its own route's checks. |
+| `/v1/connector/skill` | GET | The connector's skill, `ignis`, as a `tar.gz`: Node scripts that make and edit images and transcribe recordings on the harness's side, beside its files ([The connector](../guides/connector.md#the-skill)). |
 | `/v1/systemone` | POST | The same handler on the System One API's own route ([Decisions](decide.md)). |
 | `/v1` | GET | The API reference — a 307 to `/v1/docs/` (ADR 0036). |
 | `/v1/docs/` | GET | Swagger UI over the document, from assets compiled into the binary: no CDN, nothing fetched. Open even with an API key set — it publishes the API's shape, not its load — and *Authorize* is how you drive the keyed routes from the page. |
@@ -51,7 +51,7 @@ load, 384 MiB with `--vision-enabled`, which takes images inline as base64 data 
 Both are past what their own load can use, so an oversized prompt meets the
 refusal that names the real limit — the context — rather than a byte count.
 A request whose declared length is past the limit is refused
-`413 request_body_too_large`, with the error JSON below from 0.11.0.
+`413 request_body_too_large`, with the error JSON below.
 
 **Errors** use OpenAI's `{"error": {message, type, code}}` body with the
 matching status: 400 bad request, 404 unknown model, 413 oversized request, 503

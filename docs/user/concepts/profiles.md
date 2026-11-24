@@ -28,7 +28,7 @@ counts as unset.
 Choose a profile with `--profile <name>`, `IGNIS_PROFILE`, or `profile:` in the
 config file. With none of them the profile is `auto`: the start reads the
 card's total memory from NVML and takes the built-in profile of its class,
-`rtx-12gb` under 14 GiB (from 0.11.0; 0.10.0 gives such a card `rtx-16gb`),
+`rtx-12gb` under 14 GiB,
 `rtx-16gb` from 14 GiB up to 20 GiB, `rtx-24gb` from
 20 GiB up to 28 GiB, `rtx5090` from
 28 to 40 GiB, `rtxpro6000` from 88 to 104 GiB. The log line
@@ -59,9 +59,9 @@ loads is the table of
 No profile here carries a speed for an RTX 30 or RTX 40 card: those come
 from the reports of people who have one, collected on
 [issue #643](https://github.com/gpillon/ignis/issues/643).
-Every profile drafts 7 tokens a round but `rtx5090`, which from 0.11.0
-drafts up to 15 (0.10.0: 7), measured on that card ([below](#rtx5090)).
-From 0.11.0 a DFlash2 load may name
+Every profile drafts 7 tokens a round but `rtx5090`, which
+drafts up to 15, measured on that card ([below](#rtx5090)).
+A DFlash2 load may name
 up to 15 on any card (`--spec-draft-tokens`), at the
 VRAM [the configuration reference](../configuration/context-and-speculation.md)
 states for the profile's lanes. Its rounds are held correct on the RTX 5090
@@ -72,7 +72,7 @@ base round's numerical class at its test's configuration (8 lanes, a
 off the RTX 5090, so no other profile's default moves. At 15 drafts a load
 of either artifact may also run
 [mixed rounds](speculative-decoding.md#past-seven-drafts-two-round-shapes):
-from 0.11.0 `rtx5090` runs them on the NVFP4 artifact, measured on that card
+`rtx5090` runs them on the NVFP4 artifact, measured on that card
 ([below](#rtx5090)), and a trellis artifact under it only where `mixed` is
 named; every other profile keeps them off and says below how to turn them on and
 what their graphs cost at its lanes.
@@ -90,8 +90,8 @@ The default: a 32 GB RTX 5090.
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context (`model.max_context`) | 917,504 | 589,824 |
-| Vision | on, tower and pool in host RAM (`vision.residency: host`) | off; from 0.11.0, with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in host RAM ([Flash-Next](../configuration/vision.md#flash-next)) |
-| Speculation | DFlash2, 15 draft tokens (from 0.11.0; 7 before), mixed rounds (`spec.shape_policy: mixed`, from 0.11.0) | off |
+| Vision | on, tower and pool in host RAM (`vision.residency: host`) | off; with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in host RAM ([Flash-Next](../configuration/vision.md#flash-next)) |
+| Speculation | DFlash2, 15 draft tokens, mixed rounds (`spec.shape_policy: mixed`) | off |
 | Decode lanes | 8 (the default) | 3 |
 | Prefill chunk | 2,048 | 8,192 |
 | VRAM headroom | 1,200 MiB | 1,536 MiB (the default) |
@@ -107,14 +107,14 @@ Why each:
   the `auto` rope scaling applies YaRN at `context / 262,144`: a factor of 3.5 for
   the 27B and 2.25 for Flash-Next
   ([ADR 0057](../../adr/0057-rope-scaling-is-auto-by-default.md),
-  [ADR 0059](../../adr/0059-flash-next-applies-yarn-on-q-and-k.md)). From 0.11.0
-  the 27B holds its exception tensors in FP8 here
+  [ADR 0059](../../adr/0059-flash-next-applies-yarn-on-q-and-k.md)).
+  The 27B holds its exception tensors in FP8 here
   ([`model.exception_weights`](../reference/configuration.md#modelexception_weights)),
   which leaves the KV pool 534.6 MB more: the 917,504 tokens hold unadapted
   with at least 28,483 MiB free at start, against 28,993 MiB with BF16, and on
   2026-11-18, with 28,549 MiB free, BF16 adapted to 786,432 tokens and yarn:3
   while FP8 kept them ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
-- **DFlash2 at 15 drafts**, from 0.11.0 (0.10.0 drafts 7). Each verify round
+- **DFlash2 at 15 drafts.** Each verify round
   takes the base shape, or the extended one while a request's text is
   predictable ([past seven drafts](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
   Served on this card against 7 drafts, one request at a time with the
@@ -128,9 +128,9 @@ Why each:
   the run resolves. At eight lanes both shapes are 64 columns, so the plan is
   528 bytes over a 7-draft load's, within one KV page
   ([finding](../../findings/2026-11-20-the-27bs-draft-window-of-15-served-on-the-rtx-5090.md)).
-  `--spec-draft-tokens 7` runs the round of 0.10.0. The RTX PRO 6000 has yet
+  `--spec-draft-tokens 7` runs a 7-draft load's round. The RTX PRO 6000 has yet
   to measure a window past 7, so `rtxpro6000` keeps 7.
-- **Mixed rounds**, from 0.11.0 (`spec.shape_policy: mixed`; 0.10.0 has none).
+- **Mixed rounds** (`spec.shape_policy: mixed`).
   A round's requests take their shapes one by one, so a predictable request
   drafts 15 beside others at 7
   ([past seven drafts](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
@@ -209,7 +209,7 @@ Linux ([finding](../../findings/2026-10-18-rtxpro6000-profile-measured.md)).
 | Field | 27B | Flash-Next |
 |---|---|---|
 | Context | 1,048,576 | 1,048,576 |
-| Vision | on, tower and pool in VRAM (`vision.residency: device`) | off; from 0.11.0, with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in VRAM |
+| Vision | on, tower and pool in VRAM (`vision.residency: device`) | off; with `--vision-enabled` or after a switch from the 27B serving images, tower and pool in VRAM |
 | Speculation | DFlash2, 7 draft tokens | MTP, 3 draft tokens |
 | Decode lanes | 8 (the default) | 8 |
 | Prefill chunk | 2,048 | 8,192 |
@@ -237,7 +237,7 @@ Why each:
   ([n-gram cache](../configuration/ngram-cache.md)).
 - **No pinned hot set.** The profile leaves `vram.pinned_expert_bytes` at its
   default, 0.
-- **Mixed rounds off**, as on every profile but `rtx5090`. From 0.11.0
+- **Mixed rounds off**, as on every profile but `rtx5090`.
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on for the 27B; its eight lanes hold all twelve mixes, the
   plan's line for their graphs 66 MiB, as on `rtx5090`. Neither the window
@@ -284,7 +284,7 @@ Why each:
   shape; whether it is faster on a 16 GB card is not measured, so the
   default stays 7. Off compute capability 12.0 the extended round attends on
   the vendored chunked route.
-- **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`). From 0.11.0
+- **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost
@@ -314,7 +314,7 @@ Why each:
 
 ### `rtx-12gb`
 
-From 0.11.0. The 12 GB class: the RTX 5070, the 12 GB RTX 4070 family, the
+The 12 GB class: the RTX 5070, the 12 GB RTX 4070 family, the
 RTX 3060 12 GB and the RTX 3080 Ti, a total memory below 14 GiB. It is sized
 for one person with a desktop on the card, and its context is what the
 desktop leaves
@@ -440,7 +440,7 @@ Why each:
 - **The 5090's values for the 27B, but its draft window.** The headroom, the
   2,048-token chunk, DFlash2 and vision in host RAM are what `rtx5090` gives
   the 27B; the lanes and the drafter's head stay at their defaults, and the
-  window stays 7 where `rtx5090` drafts 15 from 0.11.0.
+  window stays 7 where `rtx5090` drafts 15.
 - **Past 7 drafts, within one KV page.** At eight lanes both
   [round shapes](speculative-decoding.md#past-seven-drafts-two-round-shapes)
   are 64 columns, so `--spec-draft-tokens 15` plans 528 bytes more than 7,
@@ -451,7 +451,7 @@ Why each:
   whether it is faster on a 24 GB card is not measured, so the default stays
   7, and off compute capability 12.0 the extended round attends on the
   vendored chunked route.
-- **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`). From 0.11.0
+- **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (the shape options are refused without a named
   `--spec-backend`), and the grant reads the trellis artifact's own cost

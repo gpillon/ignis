@@ -60,8 +60,8 @@ as the sampler would have drawn it, whatever the drafter proposed.
   always proposed the model's most likely token would see it refused whenever
   the sampler picks another one: on recorded agent turns at temperature 1, 18
   percent of first drafts.
-- **The sampled draft** (`--spec-draft-rule sampled`, the default from
-  0.11.0, the 27B only). The drafter draws d from its own distribution q over its 16
+- **The sampled draft** (`--spec-draft-rule sampled`, the default,
+  the 27B only). The drafter draws d from its own distribution q over its 16
   candidates, at 0.9 times the request's temperature and top-p 0.95, and the
   round takes it with probability min(1, p(d)/q(d)). When it refuses, the
   lane's token is drawn from what the model's distribution has left over the
@@ -82,12 +82,12 @@ reasoning budget or a JSON schema does to the run the round commits.
 
 ## The 27B's two drafters
 
-From 0.11.0 the 27B drafts with **DFlash2** or with its own **MTP head**, one
-per load, chosen at start with `--spec-backend`; earlier releases refuse
-`--spec-backend mtp` on the 27B. DFlash2 is the default on every card class
+The 27B drafts with **DFlash2** or with its own **MTP head**, one
+per load, chosen at start with `--spec-backend`.
+DFlash2 is the default on every card class
 but the 12 GB one: every built-in profile but `rtx-12gb` loads it, at 7 draft
-tokens, and from 0.11.0 `rtx5090` at 15. MTP is the 12 GB class's default,
-from 0.11.0, and opt-in on the
+tokens, and `rtx5090` at 15. MTP is the 12 GB class's default,
+and opt-in on the
 others (`--spec-backend mtp`), for the card where DFlash2's memory is what the
 context lacks. Both are verified by the same rounds, so neither changes the
 text: greedy output is the spec-off text up to near-ties, and sampling keeps
@@ -98,10 +98,10 @@ with, under `--profile auto`:
 
 | Card class | Profile | The 27B's drafter |
 |---|---|---|
-| 12 GB, below 14 GiB (from 0.11.0) | `rtx-12gb` | MTP, 7 draft tokens: DFlash2's 0.7 GB more is the context there ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)) |
+| 12 GB, below 14 GiB | `rtx-12gb` | MTP, 7 draft tokens: DFlash2's 0.7 GB more is the context there ([ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md)) |
 | 16 GB | `rtx-16gb` | DFlash2, 7 draft tokens |
 | 24 GB | `rtx-24gb` | DFlash2, 7 draft tokens |
-| 32 GB | `rtx5090` | DFlash2, 15 draft tokens (from 0.11.0; 7 before) |
+| 32 GB | `rtx5090` | DFlash2, 15 draft tokens |
 | 96 GB | `rtxpro6000` | DFlash2, 7 draft tokens |
 
 Either drafter can be named on any class: `--spec-backend mtp` on the larger
@@ -118,7 +118,7 @@ it.
 | Prefill | scratch for its taps in every chunk | the head runs over every prompt position, and every column the head reads is normalized |
 | A shared prefix | shared as on any load | each holder keeps its own copy of the prefix's last page, which the VRAM plan holds beside the context |
 | Draft rule | the sampled draft (default) or the fixed draft | the fixed draft only |
-| Draft tokens | 1 to 15 (1 to 7 before 0.11.0), required; past 7, [two round shapes](#past-seven-drafts-two-round-shapes) | 0 to 7, default 7; 0 loads no speculation |
+| Draft tokens | 1 to 15, required; past 7, [two round shapes](#past-seven-drafts-two-round-shapes) | 0 to 7, default 7; 0 loads no speculation |
 | Tokens a round, recorded agent turns at 7 drafts | 3.83 (sampled draft), 3.45 (fixed) | 3.90 (NVFP4), 3.88 (16 GB) |
 | Images | drafts after them | drafts after them |
 
@@ -132,7 +132,7 @@ a reload ([the VRAM plan](vram-plan.md) shows each one's lines).
 DFlash2 is a small drafter grafted into the 27B's artifact: five layers that
 read the target's own hidden states over a sliding window of the last 2,048
 positions. It is loaded when `--spec-backend dflash2` is set, together with
-`--spec-draft-tokens` (1 to 15; from 0.11.0, 1 to 7 before), and costs no VRAM
+`--spec-draft-tokens` (1 to 15), and costs no VRAM
 when speculation is off. The
 reference also keeps a rewrite checkpoint of the drafter's window, restored
 when a turn rewrites text past its chat template's rewrite boundary; ignis
@@ -140,8 +140,8 @@ never read one and retired it (snapshot format 5), because a prompt checkpoint
 taken at the opener already carries the window as it stood there.
 
 - **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
-  1, it averaged 3.83 tokens a round under the sampled draft, the default from
-  0.11.0, and 3.45 under the fixed draft (one is the anchor), at 7 draft tokens
+  1, it averaged 3.83 tokens a round under the sampled draft, the default,
+  and 3.45 under the fixed draft (one is the anchor), at 7 draft tokens
   ([the sampled draft served](../../findings/2026-11-13-the-sampled-draft-served-on-the-27b.md),
   [DFlash2 sampled acceptance](../../findings/2026-09-24-dflash2-sampled-acceptance.md)).
   Code is more predictable than prose: on one RTX 5090 lane the 27B ran about
@@ -151,7 +151,7 @@ taken at the opener already carries the window as it stood there.
   ([retained slots on the host](../../findings/2026-09-28-retained-slots-on-the-host.md),
   [upstream quick wins](../../findings/2026-09-24-upstream-quick-wins-ab.md)).
 - **How many drafts.** Seven is what the built-in profiles use but
-  `rtx5090`, which from 0.11.0 drafts up to 15
+  `rtx5090`, which drafts up to 15
   ([past seven drafts](#past-seven-drafts-two-round-shapes)): served on the
   RTX 5090 against 7, structured output decoded 25 to 64% faster and no
   free-text cell fell more than 2% below
@@ -172,8 +172,8 @@ taken at the opener already carries the window as it stood there.
 
 ### Past seven drafts: two round shapes
 
-From 0.11.0, `--spec-draft-tokens` takes 8 to 15 with DFlash2 (the 0.10
-releases refuse past 7). The number is still the widest window of the load,
+`--spec-draft-tokens` takes 8 to 15 with DFlash2.
+The number is still the widest window of the load,
 and such a load holds two **round shapes**, on one set of buffers:
 
 - the **base shape**, 8 columns a lane (the anchor and 7 drafts) at every
@@ -222,7 +222,7 @@ lanes they differ in who pays the wider round:
   pays the wider round for another: beside a conversation the JSON answer
   then goes extended only in the rounds where the conversation asks too
   (10.6% of that pair's rounds), and the conversation keeps its speed.
-- `mixed` (from 0.11.0) grants the extended shape request by request, so a
+- `mixed` grants the extended shape request by request, so a
   round may carry both shapes, a **mixed round**: at 2 to 7 lanes the asking
   requests are taken one by one, the highest expected extra tokens first (at a
   tie the one refused longest), and each is granted when the drafts it is
@@ -240,8 +240,8 @@ lanes they differ in who pays the wider round:
   (`shape_policy=aggregate shape_policy_given=mixed`, or
   `shape_policy_profile=mixed` where the profile gave it). A request held to a
   grammar is granted as any other: the grammar's check cuts its run at its
-  first miss at the shape it was granted, in a mixed round too. From 0.11.0
-  the `rtx5090` profile gives `mixed` to the NVFP4 artifact, the one served
+  first miss at the shape it was granted, in a mixed round too.
+  The `rtx5090` profile gives `mixed` to the NVFP4 artifact, the one served
   below, and every other profile `aggregate`; a trellis artifact runs
   `aggregate` under `rtx5090` too unless you name `mixed`, and its load log
   says so (`shape_policy=aggregate shape_policy_profile=mixed`).
@@ -324,7 +324,7 @@ The two shapes compute a column's logits up to rounding, not bit for bit:
 past 8 columns a lane the round takes other routes, and the extended round is
 held to the base round's numerical class, not to its bytes
 ([ADR 0104](../../adr/0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md)),
-and so is a mixed round (from 0.11.0), whose lanes take both shapes
+and so is a mixed round, whose lanes take both shapes
 ([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)):
 on the NVFP4 artifact its rows are held to the base round's, and on the
 trellis artifact, whose rows follow a round's columns rather than its
@@ -353,11 +353,11 @@ one, up to the draft window.
   ([finding](../../findings/2026-11-15-the-27bs-mtp-head-measured-on-the-rtx-5090.md)).
   A window of 0 loads no speculation: the same load as
   `--spec-backend off`, with nothing of the head bound and the same VRAM plan.
-  A window a profile gives beside its own DFlash2 (`rtx5090`'s 15 from
-  0.11.0, every other built-in profile's 7 but `rtx-12gb`'s, which is the
+  A window a profile gives beside its own DFlash2 (`rtx5090`'s 15,
+  every other built-in profile's 7 but `rtx-12gb`'s, which is the
   head's own) is DFlash2's: `--spec-backend mtp` over it takes the head's own
   default. So is the shape policy a profile gives beside its own DFlash2
-  (`rtx5090`'s `mixed`, from 0.11.0): the head's load does not take it, and
+  (`rtx5090`'s `mixed`): the head's load does not take it, and
   its effective configuration names the default.
 - **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
   1, the head committed 3.9 tokens a round at 7 draft tokens on both artifacts
@@ -447,7 +447,7 @@ percent of the first four drafts on the engine's own states
 It costs about 1.1 GB of VRAM, taken from the expert cache rather than the
 context, whatever the number of drafts.
 
-From 0.11.0, which gives Flash-Next images, MTP stays on for prompts with
+MTP stays on for prompts with
 images, with nothing to set. Where the next token
 is an image placeholder, the head takes the image's row that the model itself
 took there, and it reads the image's positions as the model does. Greedy output

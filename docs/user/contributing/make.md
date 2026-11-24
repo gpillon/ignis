@@ -22,12 +22,12 @@ Git for Windows' `usr\bin` on `PATH`). `make` alone lists every target.
 | `make smoke` / `canary` | One `/v1/models` + a short completion / the canary suite. |
 | `make metrics` | Scrape the metrics listener (on by default; a server started with `METRICS=0` has none). |
 | `make test` / `test-all` / `ci` | `cargo test` / plus web typecheck, vitest and the connector skill's script tests / what a CI job runs. |
-| `make test-connector` | From 0.11.0: the connector skill's script tests, `node --test` in `connector/`; Node alone, no `npm`. |
-| `make test-machine-local` | From 0.11.0: the test targets `mk/machine-local-tests.txt` lists, which read a fixture only the owner's machine holds and skip on CI, run for real; once per release, before the tag ([Cutting a release](releases.md)). CPU only, no GPU lock; it ends with the skip lines the tests printed. |
-| `make grammar-venv` | From 0.11.0: the Python venv at `.scratch/grammar-venv` with the independent JSON Schema validator the structured-output tests check every served answer with. Without it those checks are skipped, saying so; CI installs it, and there a missing one fails them. |
-| `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card, the GPU lock's holder among it / refuse when it is held / the explicit GPU test profile, whole or (from 0.11.0) only the tests it is given. |
-| `make gpu-run CMD="…"` | From 0.11.0: one sh line under the GPU lock, for GPU work no other target runs (an example run in process, a server started by hand for a bench): waits for the lock up to `GPU_LOCK_WAIT` seconds, runs the guard, then the command as written (`$HOME` reaches sh, not make). |
-| `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch); from 0.11.0 `CUDA=1` runs it under the GPU lock. |
+| `make test-connector` | The connector skill's script tests, `node --test` in `connector/`; Node alone, no `npm`. |
+| `make test-machine-local` | The test targets `mk/machine-local-tests.txt` lists, which read a fixture only the owner's machine holds and skip on CI, run for real; once per release, before the tag ([Cutting a release](releases.md)). CPU only, no GPU lock; it ends with the skip lines the tests printed. |
+| `make grammar-venv` | The Python venv at `.scratch/grammar-venv` with the independent JSON Schema validator the structured-output tests check every served answer with. Without it those checks are skipped, saying so; CI installs it, and there a missing one fails them. |
+| `make gpu-status` / `gpu-guard` / `gpu-profile` | Who holds the card, the GPU lock's holder among it / refuse when it is held / the explicit GPU test profile, whole or only the tests it is given. |
+| `make gpu-run CMD="…"` | One sh line under the GPU lock, for GPU work no other target runs (an example run in process, a server started by hand for a bench): waits for the lock up to `GPU_LOCK_WAIT` seconds, runs the guard, then the command as written (`$HOME` reaches sh, not make). |
+| `make watch CUDA=0` | Rebuild + restart on every Rust change (cargo-watch); `CUDA=1` runs it under the GPU lock. |
 | `make clean` / `distclean` | This profile's binary / everything. |
 
 Knobs go on the command line (`make dev CUDA=0 PROFILE=dev`,
@@ -61,9 +61,9 @@ speculates with dflash2). `VISION=1` loads the vision tower, `VISION=0`
 leaves it out over a profile that loads it (`--vision-enabled false`), and an empty
 `VISION` leaves it to the profile: every built-in profile loads it for the 27B
 and leaves it out on Flash-Next, where `VISION=1` loads its vision companion's
-tower from 0.11.0 (0.10.0 refuses it there) ([Vision](../configuration/vision.md)). `VISION_MAX_TOKENS` is passed whenever
+tower ([Vision](../configuration/vision.md)). `VISION_MAX_TOKENS` is passed whenever
 it is set, and a start with vision off for both models refuses it;
-from 0.11.0, with an empty `VISION` under a built-in profile it applies to the 27B alone, and the start's
+with an empty `VISION` under a built-in profile it applies to the 27B alone, and the start's
 `ignis.config.vision_options` line says so; `UNCENSORED=1` loads
 [the uncensored variant](../guides/uncensored.md) in place of the default
 image, served as `qwen3.8-27b-abliterated`; `ROPE_SCALING=yarn:4` pins the
@@ -77,7 +77,7 @@ verbatim.
 A CUDA `run` or `start` first runs a GPU guard (the preflight plus a check for
 other Ignis GPU work), skippable with `GPU_CHECK=0`.
 
-From 0.11.0 the card also has a GPU lock: one per card, a record that names its
+The card also has a GPU lock: one per card, a record that names its
 holder (pid, worktree, command, since when), in `%ProgramData%\ignis\gpu-lock\`
 on Windows and `/tmp/ignis-gpu-lock/` on Linux (`IGNIS_GPU_LOCK_DIR` moves it).
 A CUDA `start`, `run` or `run-ui` takes it before the server starts and hands it
@@ -118,7 +118,7 @@ the server gets SIGTERM, its graceful shutdown, and is killed if it still runs
 the same three stages, the same marker, the same exit codes. Its switches go
 in `GPU_PROFILE_ARGS`: `-SkipKernelBuild`, `-SkipCargoTests` and
 `-ThresholdMiB 4096` on Windows, `--skip-kernel-build`, `--skip-cargo-tests`
-and `--threshold-mib 4096` on Linux. From 0.11.0, `-Test a_test,b_test` on
+and `--threshold-mib 4096` on Linux. `-Test a_test,b_test` on
 Windows and `--test a_test --test b_test` on Linux run only those `#[ignore]`d
 tests, each alone, under the lock, the preflight and the marker
 (`make gpu-profile GPU_PROFILE_ARGS='-Test a_test,b_test'`); a name that is no

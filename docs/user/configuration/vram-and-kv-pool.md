@@ -35,7 +35,7 @@ start):
 `--vram-kv-pool-bytes` replaces either size. On a resident load it becomes the pool
 and the rest of the budget stays unused.
 
-**The 27B's MTP head** (`--spec-backend mtp`, from 0.11.0) changes the 27B's pool twice.
+**The 27B's MTP head** (`--spec-backend mtp`) changes the 27B's pool twice.
 Its attention state is one more layer in every page, so a page holds the same
 64 tokens in 17/16 of the bytes and the same budget buys about 6% fewer tokens
 (DFlash2 keeps its own state outside the pool, in 40 MiB a lane and a retained
@@ -85,7 +85,7 @@ class is refused whatever the flag says.
 
 ## The 12 GB class
 
-From 0.11.0 a card below 14 GiB starts on the
+A card below 14 GiB starts on the
 [`rtx-12gb` profile](../concepts/profiles.md#rtx-12gb), which derives the
 27B's budget from 512 MiB of headroom (`vram.qwen38.headroom_bytes`): the
 memory free at the start less 512 MiB, where the larger classes leave

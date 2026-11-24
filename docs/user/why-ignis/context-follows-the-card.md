@@ -39,7 +39,7 @@ two runs of the 27B must pin `max_context`: when free VRAM changes the
 context a load can hold, the factor changes with it. On the RTX 5090 that is a
 few hundred MiB: under the profile's 1,200 MiB headroom the 27B keeps 917,504
 tokens (yarn:3.5) with at least 28,993 MiB free at start under BF16 exception
-weights, and from 0.11.0, under the FP8 default, with 28,483 MiB; a desktop
+weights, and under the FP8 default, with 28,483 MiB; a desktop
 that leaves less adapts it to 786,432 (yarn:3) ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
 
 Which contexts fit on which card, and what they cost in KV, is in
@@ -51,7 +51,7 @@ Which contexts fit on which card, and what they cost in KV, is in
 |---|---|---|
 | Trained envelope 262,144 positions; factor = `max_context` / 262,144; widest factor 64 | the rule, not a measurement | [ADR 0057](../../adr/0057-rope-scaling-is-auto-by-default.md) |
 | The 5090 profile's 27B context 917,504 tokens with vision and DFlash2 on and a KV pool of 944,832 tokens; 950,272 is refused by 59 MB | RTX 5090, the plan raised until it refuses | [Prefill attention without prompt planes](../../findings/2026-10-21-prefill-attention-without-prompt-planes.md) |
-| From 0.11.0, 917,504 tokens (yarn:3.5) held unadapted with at least 28,483 MiB free at start under the FP8 exception weights, 28,993 MiB under BF16; with 28,549 MiB free BF16 adapted to 786,432 (yarn:3), and under a 1,500 MiB headroom BF16 to 720,896 (yarn:2.75) and FP8 to 786,432 (yarn:3) | RTX 5090, `rtx5090` profile (1,200 MiB headroom), no config file, 2026-11-18 | [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
+| 917,504 tokens (yarn:3.5) held unadapted with at least 28,483 MiB free at start under the FP8 exception weights, 28,993 MiB under BF16; with 28,549 MiB free BF16 adapted to 786,432 (yarn:3), and under a 1,500 MiB headroom BF16 to 720,896 (yarn:2.75) and FP8 to 786,432 (yarn:3) | RTX 5090, `rtx5090` profile (1,200 MiB headroom), no config file, 2026-11-18 | [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
 | A needle at 320,076 tokens is recalled both with `yarn:4` and with `none` | 27B, one needle | [YaRN needle at 320K does not discriminate](../../findings/2026-09-19-yarn-needle-320k-not-discriminating.md) |
 | Flash-Next at about 512K on the 5090: `auto` 5/5 needles and 1/2 chains, `none` 4/5 and 1/2. At 1M on the RTX PRO 6000 with MTP: `auto` 4/5 and 0/2, `none` 5/5 and 1/2 | one seed, one filler, one question per cell | [Flash-Next YaRN in the reference engines](../../findings/2026-10-19-flash-next-yarn-in-the-reference-engines.md) |
 
