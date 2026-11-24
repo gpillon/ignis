@@ -33,8 +33,8 @@ In one paragraph, for "what is github.com/gpillon/ignis?":
 > Lovelace card,
 > [the finding](../../findings/2026-11-08-sm86-gate-on-the-release-range.md));
 > the 27B's 12 GB build on a 12 GB card of any of the three (RTX
-> 5070, the 12 GB RTX 4070 family, RTX 3060 12 GB, RTX 3080 Ti), which one
-> RTX 3060 12 GB has run so far
+> 5070, the 12 GB RTX 4070 family, RTX 3060 12 GB, RTX 3080 Ti), which an
+> RTX 3060 12 GB and an RTX 5070 have run so far
 > ([issue #639](https://github.com/gpillon/ignis/issues/639)). It
 > serves them over an OpenAI-compatible HTTP API, with a browser Playground
 > and Prometheus metrics in the same binary, on Windows and Linux on x86-64.
