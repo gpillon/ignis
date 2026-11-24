@@ -1818,11 +1818,73 @@ fn spec_mtp_spec_off_and_draft_rows_parse() {
     }
 }
 
+/// With no window anywhere, not named and not a profile's (GitHub #733: a
+/// profile's window for the 27B is the unscoped backend's too).
 #[test]
 fn spec_without_a_draft_window_is_refused() {
-    let err = refused(&["--spec-backend", "dflash2"]);
+    let err = refused(&["--profile", "none", "--spec-backend", "dflash2"]);
     // GitHub #687: the window DFlash2 asks for is one of its own 1..=15.
     assert!(err.contains("--spec-draft-tokens") && err.contains("1..=15"), "{err}");
+    assert_eq!(err, refused(&["--profile", "none", "--spec-backend", "dflash2", "--qwen38flashnext-spec-backend", "mtp"]));
+}
+
+/// GitHub #733: an unscoped `--spec-backend dflash2` with no window named,
+/// as make's start names it (`SPEC=dflash2`, `DRAFT_TOKENS` empty since
+/// #684), takes the window the profile gives the 27B: under every built-in
+/// profile the 27B fits it as it fits `--qwen38-spec-backend dflash2`, and
+/// under `rtx5090` as it fits no spec flag at all. A switch to Flash-Next
+/// drops it, and a start on Flash-Next refuses it naming Flash-Next's
+/// drafter, as each does beside a named window; the effective document it
+/// writes reads back to the same load.
+#[test]
+fn an_unscoped_dflash2_takes_the_window_the_profile_gives_the_27b() {
+    use ignis_core::ShapePolicy;
+    let on_27b = |config: &Config| config.for_family(ModelFamily::Qwen38_27b).map(|fitted| fitted.speculation);
+    for name in profile::built_in().keys() {
+        let under = |backend: &'static str| resolve(&args(&["--profile", name.as_str(), backend, "dflash2"]), no_env).map(expect_config);
+        let scoped = under("--qwen38-spec-backend").and_then(|config| on_27b(&config));
+        let scoped = scoped.unwrap_or_else(|e| panic!("`{name}`, scoped: {e}"));
+        let unscoped = under("--spec-backend").unwrap_or_else(|e| panic!("`{name}`: {e}"));
+        assert_eq!(on_27b(&unscoped).unwrap_or_else(|e| panic!("`{name}`: {e}")), scoped, "the `{name}` profile");
+        assert_eq!(scoped.map(|s| s.backend()), Some(SpeculativeBackend::Dflash2), "the `{name}` profile");
+    }
+    let runs = |speculation: Option<Speculation>| speculation.map(|s| (s.backend(), s.draft_tokens(), s.shape_policy_runs()));
+    let unscoped = config(&["--profile", "rtx5090", "--spec-backend", "dflash2"]);
+    assert_eq!(runs(on_27b(&unscoped).unwrap()), Some((SpeculativeBackend::Dflash2, 15, ShapePolicy::Mixed)));
+    assert_eq!(on_27b(&unscoped).unwrap(), on_27b(&config(&["--profile", "rtx5090"])).unwrap(), "as with no spec flag");
+
+    // make's start line on a CUDA build, as `make config` prints it.
+    let make = config(&[
+        "--server-bind",
+        "127.0.0.1:8000",
+        "--model-artifact",
+        "./models/qwen3_8_27b_nvfp4full-v2.ninfer",
+        "--model-kv-format",
+        "hq-e8-2b",
+        "--reuse-kv-host-pool-bytes",
+        "8G",
+        "--qwen38flashnext-reuse-kv-host-pool-bytes",
+        "2G",
+        "--spec-backend",
+        "dflash2",
+        "--server-ui",
+        "--server-system-message-policy",
+        "merge",
+        "--server-developer-message-policy",
+        "inplace",
+    ]);
+    assert_eq!(runs(on_27b(&make).unwrap()), Some((SpeculativeBackend::Dflash2, 15, ShapePolicy::Mixed)), "make's start");
+
+    let qwen = unscoped.for_family(ModelFamily::Qwen38_27b).unwrap();
+    let (switched, dropped) = fit_to_family(&qwen, ModelFamily::FlashNext).expect("a switch to Flash-Next");
+    assert!(switched.speculation.is_none(), "{:?}", switched.speculation);
+    assert!(dropped.iter().any(|flag| flag == "--spec-backend"), "{dropped:?}");
+    let err = unscoped.for_family(ModelFamily::FlashNext).expect_err("Flash-Next drafts with its head").0;
+    assert!(err.contains("--spec-backend dflash2") && err.contains("Qwen3.8-Flash-Next") && err.contains("mtp"), "{err}");
+
+    let files = MemFiles::with(&[("c.yaml", &Format::Yaml.write(&file::effective_document(&unscoped)))]);
+    let read = with_files(&["--config", "c.yaml"], no_env, &files).expect("the effective document reads back");
+    assert_eq!(on_27b(&read).unwrap(), on_27b(&unscoped).unwrap());
 }
 
 #[test]

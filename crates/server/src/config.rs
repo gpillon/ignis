@@ -1297,7 +1297,8 @@ fn derive(
         )));
     }
 
-    let (speculation, speculation_off) = derive_speculation(&resolution, family, &spelled)?;
+    let drafters = drafters_window(sources, &resolution, family, fit)?;
+    let (speculation, speculation_off) = derive_speculation(&resolution, family, &spelled, drafters)?;
     let vision = derive_vision(&resolution, sources, family, &spelled)?;
     let media = derive_media(&resolution, sources, family, vision.is_some())?;
 
@@ -1713,10 +1714,49 @@ pub(crate) const DRAFT_FIELDS: [&str; 10] = [
     "shape_period_ratios",
 ];
 
+/// GitHub #733: the window an unscoped backend takes where `resolution`,
+/// for `family` or for none, resolved none: the one the resolution of the
+/// model that drafts with it gives, where that resolution ends at the same
+/// backend. DFlash2 is the 27B's alone, so `--spec-backend dflash2` takes
+/// the window a profile gives the 27B (`spec.qwen38.draft_tokens`) before
+/// the family is known and on Flash-Next, where `fit_family` then drops or
+/// refuses the backend as it does beside a named window. `None` where the
+/// family drafts with the backend itself, its own resolution deciding; for a
+/// backend named for this family alone (`--qwen38flashnext-spec-backend
+/// dflash2`), which is not the 27B's; and for an MTP head, which has a
+/// default window of its own.
+fn drafters_window(
+    sources: &Sources,
+    resolution: &Resolution,
+    family: Option<ModelFamily>,
+    fit: Fit,
+) -> Result<Option<u32>, ConfigError> {
+    let s = &resolution.settings.spec;
+    let Some(backend) = s.backend.and_then(SpecChoice::backend) else {
+        return Ok(None);
+    };
+    let scoped = resolution.origin("spec", "backend").is_some_and(|origin| origin.scoped);
+    if backend == SpeculativeBackend::Mtp
+        || scoped
+        || s.draft_tokens.is_some()
+        || family.is_some_and(|family| family.drafts_with(backend))
+    {
+        return Ok(None);
+    }
+    for drafter in field::FAMILIES.into_iter().filter(|drafter| drafter.drafts_with(backend)) {
+        let theirs = source::resolve_settings(sources, Some(drafter), fit)?.settings.spec;
+        if theirs.backend.and_then(SpecChoice::backend) == Some(backend) && theirs.draft_tokens.is_some() {
+            return Ok(theirs.draft_tokens);
+        }
+    }
+    Ok(None)
+}
+
 fn derive_speculation(
     resolution: &Resolution,
     family: Option<ModelFamily>,
     spelled: &impl Fn(&str, &str) -> String,
+    drafters: Option<u32>,
 ) -> Result<(Option<Speculation>, bool), ConfigError> {
     let s = &resolution.settings.spec;
     let named = |name: &str| resolution.explicit("spec", name);
@@ -1788,14 +1828,15 @@ fn derive_speculation(
         None if the_27bs_mtp => QWEN38_MTP_DEFAULT_DRAFT_TOKENS,
         // GitHub #307: Flash-Next's head has a measured default window.
         None if backend == SpeculativeBackend::Mtp => FLASH_NEXT_DEFAULT_DRAFT_TOKENS,
-        None => {
-            return Err(ConfigError(format!(
+        // GitHub #733: DFlash2's, the window of the model that drafts with it.
+        None => drafters.ok_or_else(|| {
+            ConfigError(format!(
                 "`{} {}` requires `--spec-draft-tokens N` (N in 1..={})",
                 spelled("spec", "backend"),
                 backend.as_str(),
                 backend.max_draft_tokens()
-            )));
-        }
+            ))
+        })?,
     };
     // GitHub #623: a window of 0 is the 27B's MTP head drafting nothing, a
     // load with no speculation (`fit_family` refuses it on Flash-Next's

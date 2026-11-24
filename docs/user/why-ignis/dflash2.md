@@ -78,7 +78,9 @@ round for every lane](decode-round.md).
 - **The backend**: [`spec.backend`](../reference/configuration.md#specbackend)
   (`dflash2`, `mtp` or `off`) and
   [`spec.draft_tokens`](../reference/configuration.md#specdraft_tokens), 1 to 15
-  (from 0.11.0; 1 to 7 before) and required with `dflash2`; past 7 the load holds
+  (from 0.11.0; 1 to 7 before) and required with `dflash2` where the profile
+  gives the 27B none (from 0.11.0 `--spec-backend dflash2` takes the profile's,
+  [the window](../configuration/context-and-speculation.md)); past 7 the load holds
   [two round shapes](../concepts/speculative-decoding.md#past-seven-drafts-two-round-shapes).
   The built-in `rtx5090` profile sets `dflash2` at 15 (from 0.11.0; 7
   before), and `rtxpro6000`, `rtx-16gb` and `rtx-24gb` at 7.

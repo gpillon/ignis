@@ -640,9 +640,11 @@ config_group! {
         /// companion container beside the artifact), or `off`. Unset, no
         /// speculation.
         backend: Opt<SpecBackend> = None, Validator::OneOf(&["dflash2", "mtp", "off"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
-        /// The draft window, the most drafts a lane verifies: 1..=15, required
-        /// with `dflash2` (past 7 the 27B's verify rounds take a base or an
-        /// extended round shape); with `mtp` on the 27B 0..=7 (default 7,
+        /// The draft window, the most drafts a lane verifies: 1..=15 with
+        /// `dflash2`, required where no profile gives the 27B one (every
+        /// built-in profile does, and `dflash2` named for both models takes
+        /// the 27B's); past 7 the 27B's verify rounds take a base or an
+        /// extended round shape. With `mtp` on the 27B 0..=7 (default 7,
         /// where 0 loads no speculation), on Flash-Next 1..=7 (default 2).
         /// Needs a backend.
         draft_tokens: Opt<Tokens> = None, between(0, ignis_core::WIDEST_DRAFT_TOKENS as i64), ALL, [Visible, Patchable, ReloadRequired, Scoped];

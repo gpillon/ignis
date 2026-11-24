@@ -449,7 +449,7 @@ pub fn effective_document(config: &Config) -> Value {
         if the_27bs_mtp && spec.draft_tokens.is_some() {
             let spelled = |group: &str, name: &str| resolution.spelled(group, name);
             if let (Ok((Some(runs), _)), Some(written)) =
-                (super::derive_speculation(&resolution, Some(family), &spelled), scoped.get_mut("spec").and_then(Value::as_object_mut))
+                (super::derive_speculation(&resolution, Some(family), &spelled, None), scoped.get_mut("spec").and_then(Value::as_object_mut))
             {
                 written.insert("draft_tokens".to_owned(), Value::from(runs.draft_tokens()));
             }
