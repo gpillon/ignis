@@ -191,6 +191,39 @@ COPY LICENSE NOTICE README.md /
 COPY kernel/NOTICE /NOTICE-kernel
 
 # --- the runtime image ------------------------------------------------------
+# --- the kernel's microbenchmarks, on request alone (ADR 0107) ---------------
+#
+#   podman build --target benches --build-arg CUDA_ARCHITECTURES='80;120a' -f Containerfile .
+#
+# The two timing tools that say which body a card wants (trellis or NVFP4 on
+# the A16 routes) and from which width the A16 tensor-core route pays: they
+# need no fixture, and a timing is a finding, not a pass/fail
+# (docs/agents/testing.md). Nothing above or below depends on these stages,
+# so a build of `runtime` or `artifacts` never compiles them; `runtime` stays
+# the last stage, the image a plain build makes.
+FROM toolchain AS bench-build
+ARG KERNEL_BUILD_JOBS=
+ARG CUDA_ARCHITECTURES=
+ENV IGNIS_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES}
+COPY kernel/ kernel/
+RUN cmake -S kernel -B kernel/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+    && cmake --build kernel/build --parallel ${KERNEL_BUILD_JOBS:-$(nproc)} \
+        --target ignis_nvfp4_a16_mma_bench ignis_kernel_trellis_linear_bench \
+    && mkdir /out \
+    && cp kernel/build/tests/ignis_nvfp4_a16_mma_bench kernel/build/tests/ignis_kernel_trellis_linear_bench /out/
+
+FROM docker.io/nvidia/cuda:13.1.1-base-ubuntu24.04 AS benches
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 ignis
+COPY --from=bench-build /out/ /usr/local/bin/
+COPY LICENSE NOTICE /usr/share/doc/ignis/
+COPY kernel/NOTICE /usr/share/doc/ignis/NOTICE-kernel
+USER ignis
+WORKDIR /home/ignis
+ENTRYPOINT ["/usr/local/bin/ignis_nvfp4_a16_mma_bench"]
+
 FROM docker.io/nvidia/cuda:13.1.1-base-ubuntu24.04 AS runtime
 
 # ca-certificates: media acquisition (GitHub #179) fetches image URLs over

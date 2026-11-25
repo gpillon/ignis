@@ -7,7 +7,9 @@
 #   push to image/**    the branch's head, with the default list
 #
 # Published as ghcr.io/<repo>:archs-<list>-<short sha> and
-# ghcr.io/<repo>:archs-<list> (the list's `;` as `-`): never `latest`,
+# ghcr.io/<repo>:archs-<list> (the list's `;` as `-`), and the kernel's
+# microbenchmarks for the same list (the Containerfile's `benches` stage) as
+# ghcr.io/<repo>:archs-<list>-benches-<short sha>: never `latest`,
 # `develop` or a version, which are the release's (release.yml). The image is
 # the release's Containerfile, built the same way; only the list differs, and
 # the binaries are held to it by mk/cuda-build-check.sh (`--require`).
@@ -99,3 +101,63 @@ jobs:
             KERNEL_BUILD_JOBS=3
             CUDA_ARCHITECTURES=${{ env.ARCHITECTURES }}
             CUDA_REQUIRED_ARCHITECTURES=${{ env.ARCHITECTURES }}
+
+  benches:
+    if: github.repository == 'gpillon/ignis'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          for d in /usr/share/dotnet /usr/share/swift /usr/local/lib/android \
+                   /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+                   /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$d" &
+          done
+          wait
+          df -h /
+
+      - name: Name the tag
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          list="${ARCHITECTURES//;/-}"
+          if ! [[ "$list" =~ ^[0-9a-z-]+$ ]]; then
+            echo "architectures '$ARCHITECTURES' is not a CMake list such as 80;120a" >&2
+            exit 1
+          fi
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:archs-$list-benches-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the benches image
+        uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          file: ./Containerfile
+          target: benches
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.tag }}
+          labels: |
+            org.opencontainers.image.description=ignis kernel microbenchmarks for the CUDA architectures ${{ env.ARCHITECTURES }} (ADR 0107)
+          cache-from: type=gha,scope=archs-benches-${{ env.ARCHITECTURES }}
+          cache-to: type=gha,mode=max,scope=archs-benches-${{ env.ARCHITECTURES }}
+          build-args: |
+            KERNEL_BUILD_JOBS=3
+            CUDA_ARCHITECTURES=${{ env.ARCHITECTURES }}
