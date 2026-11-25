@@ -522,14 +522,62 @@ struct Conditions {
 
 /// Decode an edit's condition images in order ([`Conditions`]), each at most
 /// `max_pixels`; `Err` names the first that is not one. Blocking.
+///
+/// The images decode and resize side by side, on as many threads as the host
+/// has cores (never more than there are images): the two are pure functions of
+/// one image, and a ten-image edit spent ~1 s on one core in them while the
+/// card waited. At most `image.max_condition_images` frames of
+/// `image.max_condition_mipx` are held at once, the bound
+/// `image.max_condition_decodes` already counts. The result is the serial one:
+/// in order, and the error of the lowest-numbered bad image, with the images
+/// after a failure left undecoded as they were.
 fn decode_conditions(images: &[Vec<u8>], max_pixels: u64) -> Result<Conditions, String> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     let area = f64::from(budget::CONDITION_SIDE) * f64::from(budget::CONDITION_SIDE);
-    let mut conditions = Conditions::default();
-    for (i, bytes) in images.iter().enumerate() {
-        let image = crate::media::decode_condition_image(bytes, max_pixels).map_err(|why| format!("condition image {i}: {why}"))?;
+    let one = |i: usize| -> Result<(RgbaImage, ImageSize), String> {
+        let image = crate::media::decode_condition_image(&images[i], max_pixels).map_err(|why| format!("condition image {i}: {why}"))?;
         let ratio = f64::from(image.size.width) / f64::from(image.size.height);
-        conditions.images.push(crate::media::resize_rgba(&image, budget::condition_size(area, ratio)));
-        conditions.sources.push(image.size);
+        Ok((crate::media::resize_rgba(&image, budget::condition_size(area, ratio)), image.size))
+    };
+    let slots: Vec<Mutex<Option<Result<(RgbaImage, ImageSize), String>>>> = images.iter().map(|_| Mutex::new(None)).collect();
+    let (next, failed) = (AtomicUsize::new(0), AtomicBool::new(false));
+    // Images are claimed in order, so when image j fails every i < j has been
+    // claimed and finishes: the first error found in order is the serial one.
+    let work = || {
+        while !failed.load(Ordering::Relaxed) {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= images.len() {
+                break;
+            }
+            let done = one(i);
+            if done.is_err() {
+                failed.store(true, Ordering::Relaxed);
+            }
+            *slots[i].lock().expect("a slot is written once") = Some(done);
+        }
+    };
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(images.len());
+    if workers <= 1 {
+        work();
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                scope.spawn(&work);
+            }
+            work();
+        });
+    }
+    let mut conditions = Conditions::default();
+    for slot in slots {
+        match slot.into_inner().expect("a slot is written once") {
+            Some(Ok((image, source))) => {
+                conditions.images.push(image);
+                conditions.sources.push(source);
+            }
+            Some(Err(why)) => return Err(why),
+            None => return Err("a condition image was left undecoded".to_owned()),
+        }
     }
     Ok(conditions)
 }
@@ -1227,6 +1275,34 @@ mod tests {
         assert_eq!(decoded.images[1], image(1024, 1024), "an image at its size already is kept as it is");
         let refused = decode_conditions(&[pngs[0].clone(), b"not an image".to_vec()], 1 << 20).unwrap_err();
         assert!(refused.starts_with("condition image 1: "), "{refused}");
+    }
+
+    /// Decoded side by side, the images come back in order and a failure is the
+    /// serial one: the lowest-numbered bad image, whichever thread meets which.
+    #[test]
+    fn condition_images_decoded_side_by_side_keep_their_order_and_their_first_error() {
+        let image = |width: u32, height: u32, v: u8| RgbaImage { size: ImageSize::new(width, height), pixels: vec![v; (width * height * 4) as usize] };
+        let sizes = [(64, 32), (96, 96), (32, 128), (200, 40), (48, 48), (80, 120), (16, 16), (1024, 1024)];
+        let pngs: Vec<Vec<u8>> = sizes.iter().enumerate().map(|(i, &(w, h))| job::encode_png(&image(w, h, 10 + i as u8))).collect();
+        let serial: Vec<(RgbaImage, ImageSize)> = pngs
+            .iter()
+            .map(|bytes| {
+                let decoded = crate::media::decode_condition_image(bytes, 1 << 20).unwrap();
+                let ratio = f64::from(decoded.size.width) / f64::from(decoded.size.height);
+                let area = f64::from(budget::CONDITION_SIDE) * f64::from(budget::CONDITION_SIDE);
+                (crate::media::resize_rgba(&decoded, budget::condition_size(area, ratio)), decoded.size)
+            })
+            .collect();
+        let together = decode_conditions(&pngs, 1 << 20).unwrap();
+        assert_eq!(together.sources, serial.iter().map(|(_, size)| *size).collect::<Vec<_>>());
+        assert_eq!(together.images, serial.iter().map(|(image, _)| image.clone()).collect::<Vec<_>>());
+        for _ in 0..20 {
+            let mut bad = pngs.clone();
+            bad[5] = b"not an image".to_vec();
+            bad[2] = b"nor this".to_vec();
+            let refused = decode_conditions(&bad, 1 << 20).unwrap_err();
+            assert!(refused.starts_with("condition image 2: "), "{refused}");
+        }
     }
 
     /// An edit's text parts parse as the JSON fields do, and a malformed

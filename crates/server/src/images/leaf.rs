@@ -100,15 +100,25 @@ fn target_rope_layout(prefix: u32, images: &[ImageSize]) -> (u32, Vec<u32>, Vec<
     (prefix + 1, starts, shapes)
 }
 
+/// Cells a transpose handles at a time: each channel's run of writes (or reads)
+/// is this many contiguous floats, and the strided side stays inside the L1.
+/// A power-of-two grid (2048x2048 is 128 x 128 = 16,384 cells, a 64 KiB stride
+/// between channels) otherwise puts all 64 channels' writes on the same cache
+/// sets: `channels` took 14-22 ms a step there, and 0.4 ms at 2752x2752.
+const TRANSPOSE_TILE: usize = 128;
+
 /// `latents` as the leaf's image slot holds them: `packed[y · w + x][c] =
 /// latents[c][y][x]`.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn packed(latents: &TargetLatents) -> Vec<f32> {
     let cells = latents.size.latent_cells();
     let mut out = vec![0.0; LATENT_CHANNELS * cells];
-    for (c, channel) in latents.values.chunks_exact(cells.max(1)).enumerate() {
-        for (cell, &value) in channel.iter().enumerate() {
-            out[cell * LATENT_CHANNELS + c] = value;
+    for start in (0..cells).step_by(TRANSPOSE_TILE) {
+        let end = (start + TRANSPOSE_TILE).min(cells);
+        for (c, channel) in latents.values.chunks_exact(cells.max(1)).enumerate() {
+            for (cell, &value) in (start..end).zip(&channel[start..end]) {
+                out[cell * LATENT_CHANNELS + c] = value;
+            }
         }
     }
     out
@@ -119,9 +129,13 @@ fn packed(latents: &TargetLatents) -> Vec<f32> {
 fn channels(size: ImageSize, packed: &[f32]) -> TargetLatents {
     let cells = size.latent_cells();
     let mut latents = TargetLatents::zeros(size);
-    for (cell, values) in packed.chunks_exact(LATENT_CHANNELS).enumerate() {
-        for (c, &value) in values.iter().enumerate() {
-            latents.values[c * cells + cell] = value;
+    for start in (0..cells).step_by(TRANSPOSE_TILE) {
+        let end = (start + TRANSPOSE_TILE).min(cells);
+        for c in 0..LATENT_CHANNELS {
+            let run = &mut latents.values[c * cells + start..c * cells + end];
+            for (value, cell) in run.iter_mut().zip(start..end) {
+                *value = packed[cell * LATENT_CHANNELS + c];
+            }
         }
     }
     latents
@@ -415,6 +429,31 @@ mod tests {
         assert_eq!(up[5 * LATENT_CHANNELS + 5], 5005.0);
         assert_eq!(up[..3], [0.0, 1000.0, 2000.0], "cell 0's first three channels");
         assert_eq!(channels(latents.size, &up), latents);
+    }
+
+    /// The tiled transposes are the plain ones, value for value: over cell
+    /// counts that end a tile exactly, mid-tile, and below one, and over the
+    /// 2048x2048 grid (16,384 cells) whose power-of-two stride made the plain
+    /// `channels` 50x slower.
+    #[test]
+    fn the_tiled_transposes_move_every_value_where_the_plain_ones_did() {
+        for (width, height) in [(16, 16), (48, 32), (128 * 16, 16), (130 * 16, 16), (300 * 16, 16), (2048, 2048)] {
+            let size = ImageSize::new(width, height);
+            let cells = size.latent_cells();
+            let mut latents = TargetLatents::zeros(size);
+            for (i, v) in latents.values.iter_mut().enumerate() {
+                *v = (i as f32).sin();
+            }
+            let mut plain = vec![0.0f32; LATENT_CHANNELS * cells];
+            for c in 0..LATENT_CHANNELS {
+                for cell in 0..cells {
+                    plain[cell * LATENT_CHANNELS + c] = latents.values[c * cells + cell];
+                }
+            }
+            let up = packed(&latents);
+            assert_eq!(up, plain, "packed, {width}x{height}");
+            assert_eq!(channels(size, &up), latents, "channels, {width}x{height}");
+        }
     }
 
     /// A step is the sampler's pair (σ, σ_next) bit for bit, the last one
