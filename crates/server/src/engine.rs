@@ -74,6 +74,7 @@ enum Command {
     Submit {
         input: RequestInput,
         class: RequestClass,
+        verified_parent: Option<ignis_core::scheduler::VerifiedWarmParent>,
         /// What the request log says about the request beyond its input
         /// (media, GitHub #179; a dropped thinking budget, spec server/08),
         /// carried with the submission so it reaches telemetry before
@@ -192,6 +193,7 @@ pub struct Engine {
     /// When a lane is expected to free (GitHub #327), as the telemetry
     /// consumer last published it: what a `503 engine_full` says to wait.
     lane_free: LaneFree,
+    pub(crate) read_continuations: Option<Arc<crate::read_continuation::Grants>>,
 }
 
 /// When a lane is expected to free, on the telemetry clock (GitHub #327):
@@ -261,6 +263,7 @@ impl Clone for Engine {
             counters: Arc::clone(&self.counters),
             freed: self.freed.clone(),
             lane_free: self.lane_free.clone(),
+            read_continuations: self.read_continuations.clone(),
         }
     }
 }
@@ -304,6 +307,7 @@ impl Engine {
         let max_in_flight = scheduler.max_in_flight();
         let prefill_chunk_solo = scheduler.prefill_chunk_solo();
         let artifact = scheduler.artifact();
+        let read_continuations = scheduler.read_continuation_priority().then(Arc::default);
         let (command_tx, command_rx) = std_mpsc::channel();
         let (facts_tx, facts_rx) = unbounded_channel();
         let counters = Arc::new(ArcSwap::from_pointee(IntervalCounters::default()));
@@ -335,6 +339,7 @@ impl Engine {
                 counters,
                 freed,
                 lane_free,
+                read_continuations,
             },
             driver,
         )
@@ -469,8 +474,19 @@ impl Engine {
         notes: RequestNotes,
         first_stop: Option<FirstTokenStop>,
     ) -> Result<(RequestId, EventStream), SubmitError> {
+        self.submit_stopping_with_parent(input, class, notes, first_stop, None).await
+    }
+
+    pub(crate) async fn submit_stopping_with_parent(
+        &self,
+        input: RequestInput,
+        class: RequestClass,
+        notes: RequestNotes,
+        first_stop: Option<FirstTokenStop>,
+        verified_parent: Option<ignis_core::scheduler::VerifiedWarmParent>,
+    ) -> Result<(RequestId, EventStream), SubmitError> {
         let (reply, reply_rx) = oneshot::channel();
-        if self.commands.send(Command::Submit { input, class, notes, first_stop, reply }).is_err() {
+        if self.commands.send(Command::Submit { input, class, verified_parent, notes, first_stop, reply }).is_err() {
             return Err(SubmitError::Full);
         }
         let mut pending = Unread { engine: self, reply: reply_rx, read: false };
@@ -703,13 +719,16 @@ fn handle_command(
     freed: &watch::Sender<u64>,
 ) -> bool {
     match command {
-        Command::Submit { input, class, notes, first_stop, reply } => {
+        Command::Submit { input, class, verified_parent, notes, first_stop, reply } => {
             // P3-06: the request log's `prompt_tokens` field is read here,
             // before `input` moves into `submit` — the scheduler's own
             // `Request` is not reachable from the telemetry consumer.
             let prompt_tokens = input.tokens.len() as u32;
             let notes = RequestNotes { structured: input.grammar.as_ref().map(|grammar| grammar.kind()), ..notes };
             let result = scheduler.submit(input, class).map(|id| {
+                if let Some(parent) = verified_parent {
+                    scheduler.set_verified_warm_parent(id, parent);
+                }
                 let (route, stream) = unbounded_channel();
                 streams.insert(id, route);
                 if let Some(first_stop) = first_stop {
@@ -1251,6 +1270,28 @@ mod tests {
         // engine's real token ids in order.
         assert_eq!(tokens, vec![compute.token_for(id, 0), compute.token_for(id, 1)]);
         assert_eq!(reason, FinishReason::Length);
+    }
+
+    #[tokio::test]
+    async fn continuation_submission_keeps_first_stop_before_decode() {
+        for parent in [None, Some(ignis_core::scheduler::VerifiedWarmParent::from_server_grant(42))] {
+            let (engine, compute) = test_engine();
+            let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let probe = Arc::clone(&asked);
+            let (_, mut rx) = engine.submit_stopping_with_parent(
+                input("test-model", vec![1, 2, 3], Some(8)), RequestClass::Interactive,
+                RequestNotes::default(), Some(Box::new(move |_| {
+                    probe.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    true
+                })), parent,
+            ).await.unwrap();
+            let (tokens, reason) = tokio::time::timeout(Duration::from_secs(10), drain_to_done(&mut rx))
+                .await.expect("the first stop must end the request");
+            assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(reason, FinishReason::Stop);
+            assert!(compute.decode_calls().is_empty(), "no decode after a first-token stop");
+        }
     }
 
     #[tokio::test]
@@ -1910,6 +1951,7 @@ mod tests {
             artifact: ignis_core::ArtifactHash::UNKNOWN,
             freed,
             lane_free,
+            read_continuations: None,
         };
         let recorder = tokio::spawn(async move {
             let mut ticks = Vec::new();
@@ -1991,6 +2033,7 @@ mod tests {
             artifact: ignis_core::ArtifactHash::UNKNOWN,
             freed,
             lane_free,
+            read_continuations: None,
         };
         // With metrics on, a scraper renders the projection for as long as
         // the workload runs (GitHub #90): scraping must not change the facts

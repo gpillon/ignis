@@ -111,8 +111,10 @@ that part of prefill.
 Prefill runs the prompt through the model once to fill its KV pages and
 recurrent state and to draw the first token. Two rules shape it:
 
-- **One prompt prefills at a time.** There is a single prefill lane; other
-  prompts wait their turn behind it.
+- **One prompt holds multi-chunk prefill progress.** Other prompts normally
+  wait behind it. The opt-in
+  [read continuation priority](../configuration/context-and-speculation.md#read-continuation-priority)
+  can lend a chunk to an eligible cached turn before the long prompt resumes.
 - **A prompt is prefilled in chunks, and decode takes turns with it.** The
   scheduler hands the leaf one chunk (`--model-prefill-chunk`, 1,024 tokens by
   default, 2,048 for the 27B under the built-in profiles) and runs a decode

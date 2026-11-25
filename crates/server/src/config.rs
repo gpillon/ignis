@@ -444,6 +444,8 @@ pub struct Config {
     /// claims none, so a cold bench measures a cold engine and a correctness
     /// oracle prefills every prompt it is given.
     pub prompt_reuse: bool,
+    /// Enable bounded prefill turns for short requests and read continuations.
+    pub read_continuation_priority: bool,
     /// The load's retained slots (GitHub #215, #281, ADR 0030): places for
     /// one mutable-state image each, reserved at load, where every prompt
     /// checkpoint and shared prefix keeps its image. Device slots
@@ -1426,6 +1428,7 @@ fn derive(
             cache_bytes: usize::try_from(s.model.grammar_cache_bytes).unwrap_or(usize::MAX),
         },
         prompt_reuse,
+        read_continuation_priority: s.model.read_continuation_priority,
         // A profile's device slots serve prompt reuse (`rtx-24gb`'s, GitHub
         // #508): with it off they are not reserved; a count the operator
         // names still shares heads between live siblings.

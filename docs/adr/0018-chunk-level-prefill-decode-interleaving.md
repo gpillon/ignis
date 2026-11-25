@@ -8,12 +8,13 @@ status: accepted
 
 Prefill and decode take turns on the one model stream at chunk granularity,
 and the Rust scheduler drives the chunk loop, with no callback from the leaf.
-One `advance()` runs at most one prefill call and one decode round. Exactly
-one request at a time holds multi-chunk prefill progress, `Prefilling` is
+One `advance()` runs at most one prefill call and one decode round. Normally
+one request at a time holds multi-chunk prefill progress; the opt-in
+exception below lends only a single chunk at a time. `Prefilling` is
 durable, and cancel is abort. True prefill/decode overlap on separate streams
 is still not built.
 
-Three GitHub issues amended this ADR in place:
+Amendments to this ADR:
 
 - **The decode share replaces K = 1** (#306). After a chunk that took `t`,
   the prompt's next chunk waits until the decoding lanes have had
@@ -31,6 +32,9 @@ Three GitHub issues amended this ADR in place:
 - **The prefill phase hands its events over mid-tick** (#518), before the
   lane deal and the decode round, so a prompt's first token waits for the
   prefill alone.
+- **Cached read continuations may borrow a chunk** (#739), opt in only.
+  The long prompt commits a chunk between borrows; only the second borrow
+  lets a verified continuation pass eligible waiters, within fixed bounds.
 
 The host tier the Consequences wait for exists: a lane-less `Prefilling`
 request is an eviction candidate at a chunk boundary (ADR 0023, GitHub
@@ -269,3 +273,34 @@ A tick stays one call, but its prefill phase now ends with a hand-off.
 - **The first round takes the first token as its anchor** and does not emit it
   again, so the stream sends every token once, in order, and the first
   token's wait is the prefill alone, not a lane deal and a round more.
+
+### Amendment — opt-in read continuation priority (#739)
+
+A long prefill can keep an interactive tool turn waiting even when its
+conversation is already cached and only a short tail needs prefill. The
+exception is off by default (`--model-read-continuation-priority`). It
+changes who takes a chunk at a safe boundary, not how prefill and decode
+run on the model stream.
+
+- **Bound the borrow.** An active long prefill can lend at most two
+  single-chunk turns to eligible cached interactive text requests. The
+  borrower must fit with a usable on-device prefix or checkpoint; this
+  path does not move or evict another sequence to make room. The second
+  borrow is not available until the long request commits a nonempty
+  prefill chunk after the first. It does not interrupt a chunk already
+  running or add a second stream.
+- **Keep queue order except for the second borrow.** Take an eligible
+  head first. Only on the second borrow may a verified continuation of
+  the first borrower pass up to two eligible waiters of the same class
+  that are newer than that first borrower. A waiter that has been passed
+  cannot be passed again while awaiting service, including across a
+  requeue or a change of the active long prompt. Ordinary admission
+  protection and restore ordering still apply.
+- **Verify the continuation in the server.** On Chat Completions the
+  server records its own ID for a clean, complete single `read` call.
+  A follow-up must preserve the preceding history and return that call
+  and its matching tool result. The match is single-use, and it does not
+  stand in for the scheduler's on-device cache match or resource checks.
+  The client sends ordinary chat messages, not a priority field, a relay
+  credential or a new header. A missed match leaves normal queue order
+  in place.

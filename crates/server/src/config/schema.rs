@@ -376,6 +376,9 @@ config_group! {
         /// The prefill chunk width, in tokens, while a lane is decoding.
         prefill_chunk: Tokens = super::DEFAULT_PREFILL_CHUNK, Validator::MultipleOf(super::PREFILL_CHUNK_ALIGNMENT as u64), ALL,
             [Visible, Patchable, ReloadRequired, Scoped];
+        /// Let a short, verified read continuation take a bounded prefill turn.
+        read_continuation_priority: Bool = false, NO_RULE, ALL,
+            [Visible, Patchable, ReloadRequired, Scoped];
         /// The prefill chunk width, in tokens, while no lane is decoding (the
         /// solo width), its prefill scratch planned at load. `auto` is the
         /// widest of 8192, 4096 and 2048 above `prefill_chunk` that the VRAM

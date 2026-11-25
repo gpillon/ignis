@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use ignis_core::types::{DecodeParams, N_DECODE_LANES, RequestClass, RequestInput, SchedEvent};
-use ignis_core::{ConcreteScheduler, MockCompute, Scheduler};
+use ignis_core::{ConcreteScheduler, MockCompute, Scheduler, SchedulerConfig};
 
 fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
     RequestInput {
@@ -29,6 +29,112 @@ fn input(model: &str, tokens: &[u32], max_tokens: Option<u32>) -> RequestInput {
         grammar: None,
         warm_up: false,
     }
+}
+
+#[test]
+fn warm_short_prefill_uses_retained_device_history_and_preserves_long_offset() {
+    let model = "qwen3.8-27b";
+    for (enabled, matching, tail, borrows) in [
+        (false, true, 14, false),
+        (true, false, 14, false),
+        (true, true, 96, false),
+        (true, true, 14, true),
+    ] {
+        let compute = Arc::new(MockCompute::new());
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: model.into(), serving_chunk_tokens: 32, kv_page_tokens: 16,
+                resident_slot_capacity: 4, prompt_reuse: true,
+                read_continuation_priority: enabled,
+                ..SchedulerConfig::default()
+            },
+            compute.clone(),
+        );
+        let head: Vec<u32> = (100..228).collect();
+        let mut first = input(model, &[head.as_slice(), &[5; 5]].concat(), Some(1));
+        first.system_block_tokens = Some(128);
+        first.opener_tokens = Some(133);
+        sched.submit(first, RequestClass::Interactive).unwrap();
+        for _ in 0..30 {
+            if sched.is_idle() { break; }
+            sched.advance();
+        }
+        assert!(sched.is_idle(), "warm fixture did not finish");
+        let long = sched.submit(input(model, &[9; 256], Some(1)), RequestClass::Agent).unwrap();
+        sched.advance();
+        let mut next = [head.as_slice(), &vec![6; tail]].concat();
+        if !matching { next[0] = 37; }
+        let short = sched.submit(input(model, &next, Some(1)), RequestClass::Interactive).unwrap();
+        sched.advance();
+        sched.advance();
+        let jobs: Vec<_> = compute.prefill_calls().iter().flatten()
+            .filter(|job| job.request == long || job.request == short)
+            .map(|job| (job.request, job.start_position, job.tokens.len())).collect();
+        if borrows {
+            assert_eq!(jobs, [(long, 0, 32), (short, 128, 14), (long, 32, 32)]);
+        } else {
+            assert_eq!(jobs, [(long, 0, 32), (long, 32, 32), (long, 64, 32)]);
+        }
+    }
+}
+
+fn short_prefill_case(
+    enabled: bool,
+    slots: u32,
+    fail_short: bool,
+) -> (Vec<(u64, u32, usize)>, u64, u64, u64) {
+    let model = "qwen3.8-27b";
+    let compute = Arc::new(MockCompute::new());
+    let mut sched = ConcreteScheduler::with_config(
+        SchedulerConfig {
+            model: model.into(),
+            serving_chunk_tokens: 32,
+            resident_slot_capacity: slots,
+            read_continuation_priority: enabled,
+            ..SchedulerConfig::default()
+        },
+        compute.clone(),
+    );
+    let long = sched.submit(input(model, &[9; 256], Some(2)), RequestClass::Agent).unwrap();
+    sched.advance();
+    let short = sched.submit(input(model, &[5; 18], Some(2)), RequestClass::Interactive).unwrap();
+    let next = sched.submit(input(model, &[6; 18], Some(2)), RequestClass::Interactive).unwrap();
+    if fail_short {
+        compute.fail_prefill(short);
+    }
+    sched.advance();
+    if fail_short {
+        assert!(sched.last_error().is_some(), "the borrowed prefill must reach the fault");
+    }
+    for _ in 0..2 {
+        sched.advance();
+    }
+    let jobs = compute.prefill_calls().iter().flatten()
+        .map(|job| (job.request, job.start_position, job.tokens.len())).collect();
+    (jobs, long, short, next)
+}
+
+#[test]
+fn cold_short_prefill_borrows_one_tick_and_long_resumes_at_its_exact_offset() {
+    let (jobs, long, short, next) = short_prefill_case(true, 4, false);
+    assert_eq!(jobs, [(long, 0, 32), (short, 0, 18), (long, 32, 32), (long, 64, 32)]);
+    assert!(!jobs.iter().any(|job| job.0 == next));
+}
+
+#[test]
+fn short_prefill_is_opt_in_and_never_evicts_to_make_room() {
+    for (enabled, slots) in [(false, 4), (true, 1)] {
+        let (jobs, long, _, _) = short_prefill_case(enabled, slots, false);
+        assert_eq!(jobs, [(long, 0, 32), (long, 32, 32), (long, 64, 32), (long, 96, 32)]);
+    }
+}
+
+#[test]
+fn a_short_prefill_fault_does_not_rewind_the_parked_sequence() {
+    let (jobs, long, _, _) = short_prefill_case(true, 4, true);
+    // MockCompute reports the failed call through last_error, not its
+    // successful-prefill trace.
+    assert_eq!(jobs, [(long, 0, 32), (long, 32, 32), (long, 64, 32)]);
 }
 
 #[test]
