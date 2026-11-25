@@ -449,7 +449,7 @@ impl PrefixCache {
     ///
     /// What matches is the entry's **match key** at its length (GitHub
     /// #193): the prompt's token ids *and* the media items inside that head.
-    fn longest_match(&self, prompt: &PromptKeys, floor: u32) -> Option<&PrefixEntry> {
+    pub(crate) fn longest_match(&self, prompt: &PromptKeys, floor: u32) -> Option<&PrefixEntry> {
         let candidates = self.claimable().filter(|e| e.length_tokens > floor);
         longest_keyed(prompt, candidates, |e| (e.key, e.length_tokens))
     }

@@ -243,6 +243,7 @@ async fn main() {
         // Read by the load, for its template's grammars.
         grammar: _,
         prompt_reuse: _,
+        read_continuation_priority: _,
         retained_device_slots: _,
         retained_host_slots: _,
         retained_host_named: _,

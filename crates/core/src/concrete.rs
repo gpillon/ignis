@@ -147,12 +147,12 @@ use crate::host::{
 };
 use crate::identity::{MatchKey, MediaKey, PromptContent, PromptKeys};
 use crate::prefix::{PrefixCache, PrefixId, Retention, SpilledPrefixId};
-use crate::request::{CaptureLink, PrefixReuse, Request};
+use crate::request::{CaptureLink, PrefixReuse, Request, ShortPrefillBorrow, WarmContinuation, WarmDeviceClaim};
 use crate::retained_slot::{RetainedHolder, RetainedSkip, RetainedSlotLedger};
 use crate::scheduler::{
     CheckpointClaim, Compute, DecodeJob, DecodeOutcome, DiskBlob, DiskBlobMeta, DiskEvent, DiskOp, DiskOutcome,
     DiskSource, DiskTarget, KvRamEvent, KvRamMove, KvRamOutcome, Occupancy, PrefillJob, PrefillOutcome, RepairJob,
-    RetainedAt, Scheduler, SharedPrefixClaim, PendingToken,
+    RetainedAt, Scheduler, SharedPrefixClaim, PendingToken, VerifiedWarmParent,
 };
 use crate::structured::Verdict;
 use crate::types::{
@@ -224,6 +224,8 @@ pub struct SchedulerConfig {
     /// lane is decode-ready; [`SchedulerConfig::solo_chunk_tokens`] is the
     /// one while none is.
     pub serving_chunk_tokens: u32,
+    /// Allow bounded prefill turns for short requests and verified read continuations.
+    pub read_continuation_priority: bool,
     /// The **solo width** (GitHub #489, ADR 0018 as amended): the prefill
     /// chunk while no lane is decode-ready, so nobody waits for it. A lane is
     /// decode-ready from the end of its request's prefill until the request
@@ -514,6 +516,7 @@ impl Default for SchedulerConfig {
             // byte flag rather than this default.
             host_capacity_bytes: (N_DECODE_LANES * (8192 / 16)) as u64,
             serving_chunk_tokens: DEFAULT_SERVING_CHUNK_TOKENS,
+            read_continuation_priority: false,
             // A test that narrows the chunk to drive several of them is not
             // widened behind its back.
             solo_chunk_tokens: None,
@@ -671,6 +674,13 @@ enum Restore {
     Checkpoint { request: RequestId, checkpoint: crate::checkpoint::CheckpointId },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WarmLookahead {
+    parent: RequestId,
+    claim: WarmDeviceClaim,
+    bypassed: [Option<RequestId>; 2],
+}
+
 /// The concrete N=8 resident-lane scheduler (v1). See the module docs
 /// for the per-advance phase structure.
 pub struct ConcreteScheduler {
@@ -742,6 +752,13 @@ pub struct ConcreteScheduler {
     /// Wall time, for retained state's idle age (GitHub #190) and the
     /// decode share's hold (GitHub #306).
     clock: Clock,
+    short_prefill_enabled: bool,
+    short_warm_prefill_enabled: bool,
+    short_warm_multimodal_prefill_enabled: bool,
+    short_warm_two_ticks_enabled: bool,
+    short_warm_continuation_lookahead_enabled: bool,
+    prefill_queue_trace_enabled: bool,
+    prefill_queue_trace_epoch: Option<Instant>,
     /// Until when the decode share holds the next prefill chunk (GitHub #306).
     prefill_held_until: Option<Instant>,
     // ── KV-disk, Tier 2 (spec vram-budget/03, ADR 0045) ─────────────────
@@ -856,6 +873,12 @@ impl ConcreteScheduler {
             moves_out_paused_until: None,
             disk_refusing: false,
             transfer_pass_micros: 0,
+            short_prefill_enabled: config.read_continuation_priority,
+            short_warm_prefill_enabled: config.read_continuation_priority,
+            short_warm_multimodal_prefill_enabled: config.read_continuation_priority,
+            short_warm_two_ticks_enabled: config.read_continuation_priority,
+            short_warm_continuation_lookahead_enabled: config.read_continuation_priority,
+            prefill_queue_trace_enabled: tracing::enabled!(tracing::Level::DEBUG),
             config,
             compute,
             request_ids: RequestIds::default(),
@@ -865,6 +888,7 @@ impl ConcreteScheduler {
             last_error: None,
             clock: Arc::new(Instant::now),
             prefill_held_until: None,
+            prefill_queue_trace_epoch: None,
         }
     }
 
@@ -983,6 +1007,186 @@ impl ConcreteScheduler {
             Some(solo) if solo > narrow && !self.requests.iter().any(Request::decode_ready) => solo,
             _ => narrow,
         }
+    }
+
+    fn short_prefill_candidate(&mut self, active: usize) -> Option<(usize, bool, Option<WarmLookahead>)> {
+        let running = &self.requests[active];
+        let width = self.config.serving_chunk_tokens;
+        let parked_multimodal = running.input.multimodal.is_some();
+        let borrow_state = running.short_prefill_borrow;
+        if !self.short_prefill_enabled
+            || matches!(borrow_state, ShortPrefillBorrow::Warm1NeedsChunk | ShortPrefillBorrow::Spent)
+            || !running.resident
+            || (parked_multimodal
+                && (!self.short_warm_multimodal_prefill_enabled || !self.short_warm_prefill_enabled))
+            || running.input.tokens.len() as u32 - running.prefill_progress <= width.saturating_mul(2)
+            || self.protection.is_some()
+            || self.free_lanes.is_empty()
+        {
+            return None;
+        }
+        let next = |s: &Self, after: Option<(RequestClass, RequestId)>| {
+            s.requests.iter().enumerate()
+                .filter(|(_, r)| r.state == RequestState::Admitted && !r.moving
+                    && after.is_none_or(|rank| (r.class, r.id) > rank))
+                .min_by_key(|(_, r)| (r.class, r.id))
+                .map(|(i, _)| i)
+        };
+        let mut i = next(self, None)?;
+        if let Ok(warm) = self.probe_short_prefill(active, i, None) {
+            return Some((i, warm, None));
+        }
+        if !self.short_warm_continuation_lookahead_enabled
+            || borrow_state != ShortPrefillBorrow::Warm1Ready
+            || !self.warm_lender_is_quiet(active)
+        {
+            return None;
+        }
+        let ticket = self.requests[active].warm_continuation.as_ref()?;
+        let (parent, claim) = (ticket.parent, ticket.claim);
+        if self.requests.iter().any(|r| r.id == parent && r.state != RequestState::Done) {
+            return None;
+        }
+        let mut bypassed = [None; 2];
+        for slot in 0..bypassed.len() {
+            let predecessor = &self.requests[i];
+            if predecessor.class != RequestClass::Interactive
+                || predecessor.id <= parent
+                || predecessor.warm_lookahead_bypassed
+                || !predecessor.waits_to_enter()
+                || predecessor.prefill_progress != 0
+                || predecessor.prefill_failures != 0
+                || predecessor.prefix_entry.is_some()
+                || predecessor.checkpoint_publisher.is_some()
+                || predecessor.kv_ram_claim.is_some()
+                || predecessor.disk_claim.is_some()
+                || predecessor.input.ends_at_prefill()
+            {
+                break;
+            }
+            bypassed[slot] = Some(predecessor.id);
+            i = next(self, Some((predecessor.class, predecessor.id)))?;
+            if self.requests[i].class != RequestClass::Interactive {
+                break;
+            }
+            let ticket = self.requests[active].warm_continuation.as_ref()?;
+            let proof = if self.requests[i].verified_warm_parent == Some(VerifiedWarmParent::from_server_grant(parent)) {
+                ticket.matches(&self.requests[i])
+            } else {
+                Err("unverified_parent")
+            };
+            match proof.and_then(|()| self.probe_short_prefill(active, i, Some(claim))) {
+                Ok(true) => return Some((i, true, Some(WarmLookahead { parent, claim, bypassed }))),
+                Ok(false) => return None,
+                Err(reason) => self.reject_warm_lookahead(active, i, parent, reason),
+            }
+        }
+        None
+    }
+
+    fn reject_warm_lookahead(&self, active: usize, candidate: usize, parent: RequestId, reason: &'static str) {
+        tracing::debug!(
+            name: "ignis.prefill_borrow.lookahead_reject",
+            request_id = self.requests[candidate].id,
+            long_request_id = self.requests[active].id,
+            parent_request_id = parent,
+            tick = self.tick,
+            reason,
+        );
+    }
+
+    fn probe_short_prefill(
+        &mut self,
+        active: usize,
+        i: usize,
+        expected: Option<WarmDeviceClaim>,
+    ) -> Result<bool, &'static str> {
+        let borrow_state = self.requests[active].short_prefill_borrow;
+        let parked_multimodal = self.requests[active].input.multimodal.is_some();
+        let width = self.config.serving_chunk_tokens;
+        let r = &self.requests[i];
+        if r.class != RequestClass::Interactive
+            || r.input.multimodal.is_some()
+            || r.input.is_decision()
+            || r.input.warm_up
+            || r.prefill_progress != 0
+            || r.resident
+            || r.checkpoint_publisher.is_some()
+            || r.prefix_entry.is_some()
+            || r.input.tokens.is_empty()
+            || !self.fits_for_materialization(r)
+            || self.outranked_by_a_moved_sequence(i)
+        {
+            return Err("borrower_ineligible");
+        }
+        // Inspect without taking a claim or starting a transfer. For a warm
+        // turn the normal claim path below will pick this same on-device head.
+        let total = r.input.tokens.len() as u32;
+        let single_cold_chunk = chunk_take(r, width) == total;
+        let keys = self.reuse_keys(i);
+        let live = self.live_requests();
+        let prefix = self.prefix.peek(&keys, |publisher| live.binary_search(&publisher).is_err());
+        let checkpoints = self.checkpoints.lookup(&keys);
+        if prefix.spilled.is_some()
+            || ReuseSource::ALL.iter().any(|&source| source != ReuseSource::Device && checkpoints.longest_in(source).is_some())
+        {
+            return Err("off_device_match");
+        }
+        let checkpoint = checkpoints.longest_in(ReuseSource::Device);
+        let checkpoint_tokens = checkpoint.map_or(0, |m| m.tokens);
+        let cached = prefix.device_tokens.max(checkpoint_tokens);
+        if let Some(expected) = expected {
+            // Use the same winner (including ties) as the real device claim,
+            // without taking a reference or touching a retention counter.
+            let actual = if let Some(p) = self.prefix.longest_match(&keys, checkpoint_tokens) {
+                Some(WarmDeviceClaim {
+                    kind: RetainedKind::Prefix, entry: p.id, publisher: p.publisher, tokens: p.length_tokens,
+                })
+            } else {
+                checkpoint.map(|m| WarmDeviceClaim {
+                    kind: RetainedKind::Checkpoint, entry: m.id, publisher: m.publisher, tokens: m.tokens,
+                })
+            };
+            if actual != Some(expected) {
+                return Err("device_claim_mismatch");
+            }
+        }
+        let budget = width.min(512);
+        if cached == 0 {
+            return (expected.is_none()
+                && !parked_multimodal
+                && borrow_state == ShortPrefillBorrow::Fresh
+                && total <= budget
+                && single_cold_chunk)
+                .then_some(false)
+                .ok_or("no_device_match");
+        }
+        if !self.short_warm_prefill_enabled || !self.config.prompt_reuse {
+            return Err("warm_disabled");
+        }
+        let tail = total.saturating_sub(cached);
+        if tail == 0 || tail > budget {
+            return Err("tail_size");
+        }
+        if !self.warm_lender_is_quiet(active) {
+            return Err("lender_not_quiet");
+        }
+        Ok(true)
+    }
+
+    fn warm_lender_is_quiet(&self, active: usize) -> bool {
+        let running = &self.requests[active];
+        let progress = running.prefill_progress as usize;
+        // Phase 2 restores before dealing lanes. Both warm caps use the
+        // same quiescence check, regardless of the long prompt's modality.
+        progress != 0
+            && running.gdn.position() == progress
+            && running.gdn.is_valid_snapshot_point(progress)
+            && !self.transfer_busy()
+            && self.moved_in_rank_order().is_empty()
+            && !self.requests.iter().enumerate().any(|(i, r)| {
+                i != active && r.state == RequestState::Prefilling
+            })
     }
 
     /// The KV-RAM tier, for observation.
@@ -2223,6 +2427,7 @@ impl ConcreteScheduler {
             return;
         }
         self.requests[idx].resident = false;
+        self.requests[idx].warm_continuation = None;
         self.resident_slots_used = self.resident_slots_used.saturating_sub(1);
         self.kv_used_pages = self
             .kv_used_pages
@@ -2825,6 +3030,14 @@ impl ConcreteScheduler {
             r.reasoning_redirected_at.filter(|&at| at < r.tokens)
         };
         let (request_id, tokens) = self.release_request(idx);
+        if let Some(epoch) = self.prefill_queue_trace_epoch {
+            tracing::debug!(
+                name: "ignis.prefill_queue.release",
+                request_id,
+                tick = self.tick,
+                clock_us = self.now().saturating_duration_since(epoch).as_micros() as u64,
+            );
+        }
         events.push(SchedEvent::Done {
             request: request_id,
             tokens,
@@ -4525,6 +4738,16 @@ impl ConcreteScheduler {
 }
 
 impl Scheduler for ConcreteScheduler {
+    fn set_verified_warm_parent(&mut self, request: RequestId, parent: VerifiedWarmParent) {
+        if let Some(r) = self.requests.last_mut().filter(|r| r.id == request && r.waits_to_enter()) {
+            r.verified_warm_parent = Some(parent);
+        }
+    }
+
+    fn read_continuation_priority(&self) -> bool {
+        self.config.read_continuation_priority
+    }
+
     fn share_request_ids(&mut self, ids: RequestIds) {
         self.request_ids = ids;
     }
@@ -4710,6 +4933,11 @@ impl Scheduler for ConcreteScheduler {
             request.input.system_block_tokens = None;
             request.input.reuse_boundaries.clear();
         }
+        if self.prefill_queue_trace_enabled {
+            let now = self.now();
+            self.prefill_queue_trace_epoch.get_or_insert(now);
+            request.prefill_queue_trace_start = Some(now);
+        }
         self.requests.push(request);
         Ok(id)
     }
@@ -4770,11 +4998,11 @@ impl Scheduler for ConcreteScheduler {
         self.transfer_pass_micros = pumped.elapsed().as_micros() as u64;
 
         // Phase 1 — chunked, interleaved prefill (P3-01, ADR 0018): at
-        // most one `prefill_step` call this tick. Exactly one request may
-        // hold multi-tick (device-resident) prefill progress at a time —
-        // find it first; if one exists, it alone is served this tick (the
-        // rest queue). Otherwise the batch is built fresh from the
-        // `Admitted` queue, same as before chunking existed.
+        // most one `prefill_step` call this tick. Normally a request that
+        // already holds multi-tick prefill progress gets the next chunk.
+        // The lab can lend a tick to a text prompt that finishes prefill in
+        // that tick. The borrower and the long request are never batched.
+        // With no active prefill, build the batch from the `Admitted` queue.
         // GitHub #306: no chunk at all while the decode share holds it.
         // GitHub #489: this tick's width, the solo width while no lane is
         // decode-ready, decided before anything below can move a lane.
@@ -4785,18 +5013,28 @@ impl Scheduler for ConcreteScheduler {
             .requests
             .iter()
             .position(|r| !held && r.state == RequestState::Prefilling && !r.prefill_complete() && !r.moving);
-        let batch: Vec<usize> = match active {
-            Some(idx) => vec![idx],
+        let borrowed = active.and_then(|idx| {
+            let (short, warm, lookahead) = self.short_prefill_candidate(idx)?;
+            if !warm { self.materialize(short); }
+            Some((short, warm, lookahead))
+        });
+        let warm = borrowed.is_some_and(|(_, warm, _)| warm);
+        let lookahead = borrowed.and_then(|(_, _, lookahead)| lookahead);
+        let mut short_prefill = borrowed.map(|(i, _, _)| i);
+        let batch: Vec<usize> = match active.filter(|_| !warm) {
+            Some(idx) => vec![short_prefill.unwrap_or(idx)],
             None => {
-                let mut b: Vec<usize> = self
-                    .requests
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, r)| !held && r.state == RequestState::Admitted && !r.moving)
-                    .map(|(i, _)| i)
-                    .collect();
-                b.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
-                b.truncate(self.config.max_prefill_batch);
+                let mut b = if let Some(short) = short_prefill {
+                    vec![short]
+                } else {
+                    let mut b: Vec<usize> = self.requests.iter().enumerate()
+                        .filter(|&(_, r)| !held && r.state == RequestState::Admitted && !r.moving)
+                        .map(|(i, _)| i)
+                        .collect();
+                    b.sort_by_key(|&i| (self.requests[i].class, self.requests[i].id));
+                    b.truncate(self.config.max_prefill_batch);
+                    b
+                };
 
                 // core-07 — sibling prefix claim: a *fresh* candidate
                 // claims the longest cached prefix of its prompt (skipping
@@ -4853,13 +5091,17 @@ impl Scheduler for ConcreteScheduler {
                         lookup.misses(tiers.of(RetainedKind::Checkpoint)),
                         peek.misses(tiers.of(RetainedKind::Prefix)),
                     );
-                    let mut retained = self.claimable(self.checkpoints.select(&lookup, device_prefix));
+                    let mut retained = if warm {
+                        lookup.longest_in(ReuseSource::Device).cloned()
+                    } else {
+                        self.claimable(self.checkpoints.select(&lookup, device_prefix))
+                    };
                     // GitHub #190: a retained prefix only KV-RAM still holds
                     // comes back to the device when it beats every device
                     // reuse by the restore floor and every KV-RAM checkpoint
                     // outright — and from then on the burst shares it there.
                     let mut returned_from_kv_ram = false;
-                    if let Some((spilled, length)) = spilled {
+                    if let Some((spilled, length)) = spilled.filter(|_| !warm) {
                         let device_checkpoint =
                             lookup.longest_in(ReuseSource::Device).map_or(0, |m| m.tokens);
                         let kv_ram_checkpoint = retained
@@ -4972,6 +5214,34 @@ impl Scheduler for ConcreteScheduler {
                     }
                 }
 
+                if let Some(i) = short_prefill.filter(|_| warm) {
+                    let r = &self.requests[i];
+                    let width = self.config.serving_chunk_tokens;
+                    let tail = (r.input.tokens.len() as u32).saturating_sub(r.prefill_progress);
+                    let device_claim = if r.checkpoint_publisher.is_some() {
+                        r.reuse_source == Some(ReuseSource::Device)
+                    } else {
+                        r.prefix_publisher.is_some()
+                            && r.prefix_reuse.is_some_and(|reuse| reuse.source == ReuseSource::Device)
+                    };
+                    // Only the already-resident match may borrow this tick.
+                    // If the real claim differs, release it and serve the
+                    // original long chunk rather than creating a second
+                    // partially read sequence or evicting retained state.
+                    if r.prefill_progress == 0 || tail == 0 || tail > width.min(512)
+                        || chunk_take(r, width) != tail || !self.fits_for_materialization(r)
+                        || !device_claim || !self.fits(r)
+                        || lookahead.is_some_and(|l| WarmDeviceClaim::of(r) != Some(l.claim))
+                    {
+                        if let (Some(l), Some(long)) = (lookahead, active) {
+                            self.reject_warm_lookahead(long, i, l.parent, "claim_or_fit_changed");
+                        }
+                        self.release_waiting_claim(i);
+                        short_prefill = None;
+                        b.clear();
+                    }
+                }
+
                 // A fresh batch (no active carry-over) may still pack
                 // several requests into this one call, but only while each
                 // finishes within its own single chunk (P3-01: nothing
@@ -5022,6 +5292,13 @@ impl Scheduler for ConcreteScheduler {
                 // earlier chunk's failure unmaterialized it.
                 let mut admitted = Vec::with_capacity(b.len());
                 for i in b {
+                    if warm {
+                        // The singleton device claim already fits. Never
+                        // enter the fresh-admission reclaim or restore path.
+                        self.materialize(i);
+                        admitted.push(i);
+                        continue;
+                    }
                     // Spec vram-budget/03: a checkpoint claimant whose state
                     // came back from the disk is charged already, its
                     // sequence built; this is its first chunk.
@@ -5067,7 +5344,12 @@ impl Scheduler for ConcreteScheduler {
                     self.materialize(i);
                     admitted.push(i);
                 }
-                admitted
+                if warm && admitted.is_empty() {
+                    short_prefill = None;
+                    vec![active.expect("warm borrow requires an active prefill")]
+                } else {
+                    admitted
+                }
             }
         };
         // P4-10 (GitHub #126) — one publisher per prompt head per batch.
@@ -5090,6 +5372,12 @@ impl Scheduler for ConcreteScheduler {
         let mut publish_points: Vec<u32> = {
             let mut points: Vec<u32> = Vec::with_capacity(batch.len());
             for (n, &i) in batch.iter().enumerate() {
+                // A borrowed tick must finish the short prompt without
+                // splitting at a prefix or spending a retained slot.
+                if short_prefill == Some(i) {
+                    points.push(0);
+                    continue;
+                }
                 let at = self.requests[i].publish_point(self.config.kv_page_tokens);
                 let taken = at > 0 && self.taken_earlier(&batch, &points, n, at);
                 points.push(if taken { 0 } else { at });
@@ -5111,7 +5399,7 @@ impl Scheduler for ConcreteScheduler {
                 .map(|(n, &i)| {
                     // `--reuse-prompt off` captures nothing, whatever slots the
                     // load gives live siblings (GitHub #215).
-                    if !self.config.prompt_reuse {
+                    if !self.config.prompt_reuse || short_prefill == Some(i) {
                         return 0;
                     }
                     let r = &self.requests[i];
@@ -5408,19 +5696,100 @@ impl Scheduler for ConcreteScheduler {
         // job emits.
         let mut first_tokens: Vec<(usize, DecodeOutcome)> = Vec::new();
         if !jobs.is_empty() {
+            // A failed compute call spends a tick; a rejected claim does not.
+            let borrow_dispatch = short_prefill.zip(active).map(|(short, long)| {
+                debug_assert_eq!(batch.as_slice(), &[short]);
+                if let Some(l) = lookahead {
+                    for r in self.requests.iter_mut().filter(|r| l.bypassed.contains(&Some(r.id))) {
+                        debug_assert!(r.waits_to_enter() && !r.warm_lookahead_bypassed);
+                        r.warm_lookahead_bypassed = true;
+                    }
+                }
+                let long = &mut self.requests[long];
+                let ordinal = if long.short_prefill_borrow == ShortPrefillBorrow::Warm1Ready { 2 } else { 1 };
+                long.short_prefill_borrow = if warm && ordinal == 1 && self.short_warm_two_ticks_enabled {
+                    ShortPrefillBorrow::Warm1NeedsChunk
+                } else {
+                    ShortPrefillBorrow::Spent
+                };
+                if ordinal == 2 {
+                    long.warm_continuation = None;
+                }
+                let job = &jobs[0];
+                if let Some(l) = lookahead {
+                    tracing::debug!(
+                        name: "ignis.prefill_borrow.lookahead_dispatch",
+                        request_id = job.request,
+                        long_request_id = long.id,
+                        parent_request_id = l.parent,
+                        tick = self.tick,
+                        ordinal,
+                        bypassed_1 = l.bypassed[0],
+                        bypassed_2 = l.bypassed[1],
+                        cache_kind = l.claim.kind.as_str(),
+                        cache_entry = l.claim.entry,
+                        cache_publisher = l.claim.publisher,
+                        cache_tokens = l.claim.tokens,
+                    );
+                }
+                tracing::debug!(
+                    name: "ignis.prefill_borrow.dispatch",
+                    request_id = job.request,
+                    long_request_id = long.id,
+                    tick = self.tick,
+                    ordinal,
+                    warm,
+                    long_position = long.prefill_progress,
+                    start_position = job.start_position,
+                    chunk_tokens = job.tokens.len() as u64,
+                );
+                (long.id, ordinal)
+            });
             let began = self.now();
+            if let Some(epoch) = self.prefill_queue_trace_epoch {
+                for (&index, job) in batch.iter().zip(&jobs) {
+                    if let Some(queued) = self.requests[index].prefill_queue_trace_start.take() {
+                        tracing::debug!(
+                            name: "ignis.prefill_queue.first_dispatch",
+                            request_id = job.request,
+                            tick = self.tick,
+                            queue_us = began.saturating_duration_since(queued).as_micros() as u64,
+                            clock_us = began.saturating_duration_since(epoch).as_micros() as u64,
+                            start_position = job.start_position,
+                            chunk_tokens = job.tokens.len() as u64,
+                        );
+                    }
+                }
+            }
             let result = self.compute.prefill_step(&jobs);
             let last_chunk = batch
                 .iter()
                 .zip(&jobs)
                 .all(|(&i, job)| job.start_position as usize + job.tokens.len() >= self.requests[i].input.tokens.len());
-            self.hold_prefill(began, last_chunk, solo);
+            if short_prefill.is_none() {
+                self.hold_prefill(began, last_chunk, solo);
+            }
             match result {
                 Ok(outcomes) => {
+                    let prefill_finished_us = self.prefill_queue_trace_epoch
+                        .filter(|_| outcomes.len() == jobs.len())
+                        .map(|epoch| self.now().saturating_duration_since(epoch).as_micros() as u64);
                     // One outcome per job, in order (GitHub #192). A backend
                     // that returns fewer would have its chunks misattributed
                     // by the zip below rather than caught.
-                    debug_assert_eq!(outcomes.len(), jobs.len(), "one prefill outcome per job");
+                    let all_outcomes = outcomes.len() == jobs.len();
+                    debug_assert!(all_outcomes, "one prefill outcome per job");
+                    if self.short_warm_continuation_lookahead_enabled && warm && all_outcomes {
+                        if let Some((short, long)) = short_prefill.zip(active) {
+                            if self.requests[long].short_prefill_borrow == ShortPrefillBorrow::Warm1NeedsChunk {
+                                let ticket = WarmContinuation::record(&self.requests[short]);
+                                if ticket.is_none() {
+                                    self.reject_warm_lookahead(long, short, self.requests[short].id, "no_parent_proof");
+                                }
+                                self.requests[long].warm_continuation = ticket;
+                            }
+                        }
+                    }
                     for ((&i, job), outcome) in batch.iter().zip(&jobs).zip(
                         outcomes.iter().cloned().chain(std::iter::repeat(PrefillOutcome::default())),
                     ) {
@@ -5450,6 +5819,17 @@ impl Scheduler for ConcreteScheduler {
                             r.advance(RequestState::Prefilling);
                         }
                         r.prefill_progress += job.tokens.len() as u32;
+                        if let Some(clock_us) = prefill_finished_us {
+                            if r.prefill_complete() {
+                                tracing::debug!(
+                                    name: "ignis.prefill_queue.prefill_finished",
+                                    request_id,
+                                    tick = self.tick,
+                                    clock_us,
+                                    input_tokens = r.prefill_progress,
+                                );
+                            }
+                        }
                         // GitHub #238: a decision's answer, off the one
                         // chunk that asked for it. Held on the request
                         // rather than emitted here, because a decision
@@ -5472,6 +5852,32 @@ impl Scheduler for ConcreteScheduler {
                         // is this request's last chunk.
                         let new_position = r.prefill_progress as usize;
                         r.checkpoint(new_position);
+                        if all_outcomes {
+                            if let Some((long_request_id, ordinal)) = borrow_dispatch {
+                                tracing::debug!(
+                                    name: "ignis.prefill_borrow.commit",
+                                    request_id,
+                                    long_request_id,
+                                    tick = self.tick,
+                                    ordinal,
+                                    warm,
+                                    prefilled_tokens = r.prefill_progress,
+                                );
+                            } else if active == Some(i)
+                                && !job.tokens.is_empty()
+                                && r.short_prefill_borrow == ShortPrefillBorrow::Warm1NeedsChunk
+                            {
+                                r.short_prefill_borrow = ShortPrefillBorrow::Warm1Ready;
+                                tracing::debug!(
+                                    name: "ignis.prefill_borrow.rearm",
+                                    request_id,
+                                    long_request_id = request_id,
+                                    tick = self.tick,
+                                    start_position = job.start_position,
+                                    long_position = r.prefill_progress,
+                                );
+                            }
+                        }
                         // P3-06: the request log's per-phase fields (prefill
                         // chunks consumed, prefilled tokens) are counted
                         // from this event, not read back off `Request` —
@@ -6152,6 +6558,572 @@ mod tests {
     use crate::gdn::GdnState;
     use crate::host::{HostEntry, ResumePhase, RetainedKvRamEntry, Tier};
     use crate::mock::MockCompute;
+    use crate::vision::{Grid, MediaItem, Multimodal, TokenSpan};
+
+    fn lab_text(tokens: Vec<u32>, max_tokens: u32) -> RequestInput {
+        RequestInput {
+            model: "qwen3.8-27b".into(),
+            tokens,
+            params: DecodeParams { max_tokens: Some(max_tokens), ..DecodeParams::default() },
+            decision: None,
+            multimodal: None,
+            opener_tokens: None,
+            user_turn_tokens: None,
+            system_block_tokens: None,
+            reuse_boundaries: Vec::new(),
+            constrained: None,
+            forced_literal: None,
+            grammar: None,
+            warm_up: false,
+        }
+    }
+
+    fn lab_image(input: &mut RequestInput, begin: usize, count: usize) {
+        input.multimodal = Some(Arc::new(Multimodal {
+            positions: (0..3).flat_map(|_| 0..input.tokens.len() as i32).collect(),
+            rope_delta: -2,
+            media: vec![MediaItem {
+                grid: Grid { t: 1, h: 2, w: 2 * count as u32 },
+                token_span: TokenSpan { begin, count },
+                patches: vec![0; 4 * count * 1536],
+                content_digest: [7; 32],
+            }],
+        }));
+    }
+
+    fn lab_seed(slots: u32) -> (ConcreteScheduler, Arc<MockCompute>, RequestId) {
+        let compute = Arc::new(MockCompute::new());
+        let mut sched = ConcreteScheduler::with_config(
+            SchedulerConfig {
+                model: "qwen3.8-27b".into(),
+                serving_chunk_tokens: 32,
+                kv_page_tokens: 16,
+                resident_slot_capacity: slots,
+                prompt_reuse: true,
+                read_continuation_priority: true,
+                ..SchedulerConfig::default()
+            },
+            compute.clone(),
+        );
+        sched.short_warm_multimodal_prefill_enabled = true;
+        sched.short_warm_two_ticks_enabled = false;
+        sched.short_warm_continuation_lookahead_enabled = false;
+        let mut seed = lab_text((100..234).collect(), 1);
+        seed.system_block_tokens = Some(128);
+        seed.opener_tokens = Some(133);
+        let seed = sched.submit(seed, RequestClass::Interactive).unwrap();
+        for _ in 0..16 {
+            if sched.is_idle() { break; }
+            sched.advance();
+        }
+        assert!(sched.is_idle(), "seed must finish and leave a device claim");
+        (sched, compute, seed)
+    }
+
+    fn lab_start_image(sched: &mut ConcreteScheduler, begin: usize, count: usize) -> RequestId {
+        let mut input = lab_text(vec![9; 256], 2);
+        lab_image(&mut input, begin, count);
+        let long = sched.submit(input, RequestClass::Agent).unwrap();
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(32));
+        assert_eq!(sched.gdn_position(long), Some(32));
+        long
+    }
+
+    #[test]
+    fn warm_v011_solo_borrow_preserves_hold_and_emits_first_token_once() {
+        let (mut sched, compute, _) = lab_seed(4);
+        sched.config.solo_chunk_tokens = Some(128);
+        sched.config.decode_share = 0.5;
+        let long = sched.submit(lab_text(vec![9; 1024], 2), RequestClass::Agent).unwrap();
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(128));
+        assert!(sched.prefill_held_until.is_none(), "solo prefill owes no decode share");
+        let hold = sched.now() + std::time::Duration::from_secs(60);
+        sched.prefill_held_until = Some(hold);
+        let mut followup = lab_followup(128);
+        followup.params.max_tokens = Some(1);
+        let short = sched.submit(followup, RequestClass::Interactive).unwrap();
+        let events = sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(128));
+        assert_eq!(sched.prefill_held_until, Some(hold), "borrow cannot reset the lender's hold");
+        assert_eq!(events.iter().filter(|e| matches!(e, SchedEvent::Token { request, .. } if *request == short)).count(), 1);
+        assert_eq!(sched.request_state(short), Some(RequestState::Done));
+        assert_eq!(compute.prefill_calls().last().unwrap()[0].request, short);
+        let events = sched.advance();
+        assert!(!events.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if *request == short)));
+        assert_eq!(sched.prefill_progress(long), Some(256));
+        assert!(sched.prefill_held_until.is_none());
+        let calls = compute.prefill_calls();
+        let job = &calls.last().unwrap()[0];
+        assert_eq!((job.request, job.start_position, job.tokens.len()), (long, 128, 128));
+    }
+
+    fn lab_followup(cached: u32) -> RequestInput {
+        lab_text((100..100 + cached).chain(1000..1014).collect(), 2)
+    }
+
+    fn lab_start_text(sched: &mut ConcreteScheduler) -> RequestId {
+        let long = sched.submit(lab_text(vec![9; 256], 2), RequestClass::Agent).unwrap();
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(32));
+        long
+    }
+
+    fn lab_continuation_pair() -> (RequestInput, RequestInput) {
+        let mut first = lab_followup(128);
+        first.user_turn_tokens = Some(128);
+        first.opener_tokens = Some(138);
+        let mut answer = first.clone();
+        answer.tokens.extend(2000..2008);
+        answer.opener_tokens = Some(148);
+        (first, answer)
+    }
+
+    fn lab_continuation_lender(sched: &mut ConcreteScheduler, first: RequestInput) -> (RequestId, RequestId) {
+        sched.short_warm_two_ticks_enabled = true;
+        let long = lab_start_text(sched);
+        let parent = sched.submit(first, RequestClass::Interactive).unwrap();
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(32));
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(64));
+        assert_eq!(sched.request_state(parent), Some(RequestState::Done));
+        (long, parent)
+    }
+
+    fn lab_proven_child(sched: &mut ConcreteScheduler, input: RequestInput, parent: RequestId) -> RequestId {
+        let child = sched.submit(input, RequestClass::Interactive).unwrap();
+        sched.set_verified_warm_parent(child, VerifiedWarmParent::from_server_grant(parent));
+        child
+    }
+
+    #[test]
+    fn warm_continuation_bypasses_only_two_and_preserves_their_service_order() {
+        let (mut sched, compute, _) = lab_seed(4);
+        sched.short_warm_continuation_lookahead_enabled = true;
+        // A selected borrow is a singleton even if rank three lies outside
+        // the ordinary batch truncation.
+        sched.config.max_prefill_batch = 1;
+        let (first, answer) = lab_continuation_pair();
+        let (long, parent) = lab_continuation_lender(&mut sched, first);
+        let a = sched.submit(lab_text(vec![7; 64], 1), RequestClass::Interactive).unwrap();
+        let b = sched.submit(lab_text(vec![8; 12], 1), RequestClass::Interactive).unwrap();
+        let second = lab_proven_child(&mut sched, answer.clone(), parent);
+        let third = sched.submit(answer, RequestClass::Interactive).unwrap();
+        let long_idx = sched.requests.iter().position(|r| r.id == long).unwrap();
+        let (short, warm, lookahead) = sched.short_prefill_candidate(long_idx).unwrap();
+        assert!(warm);
+        assert_eq!(sched.requests[short].id, second);
+        let lookahead = lookahead.unwrap();
+        assert_eq!(lookahead.parent, parent);
+        assert_eq!(lookahead.bypassed, [Some(a), Some(b)]);
+        let before = compute.prefill_calls().len();
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(64));
+        for id in [a, b, third] {
+            assert_eq!(sched.request_state(id), Some(RequestState::Admitted));
+            assert_eq!(sched.prefill_progress(id), Some(0));
+            let r = sched.requests.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(r.warm_lookahead_bypassed, id != third);
+        }
+        for _ in 0..24 {
+            if sched.is_idle() { break; }
+            sched.advance();
+        }
+        assert!(sched.is_idle());
+        let calls = compute.prefill_calls();
+        let jobs: Vec<_> = calls[before..].iter().flatten().collect();
+        assert_eq!((jobs[0].request, jobs[0].start_position), (second, 128));
+        assert_eq!((jobs[1].request, jobs[1].start_position), (long, 64));
+        let first_job = |id| jobs.iter().position(|job| job.request == id).unwrap();
+        assert!(first_job(a) < first_job(b) && first_job(b) < first_job(third));
+    }
+
+    #[test]
+    fn warm_continuation_fairness_stops_a_second_lender_after_waiter_requeue() {
+        for fail_first in [false, true] {
+            let (mut sched, compute, _) = lab_seed(4);
+            sched.short_warm_continuation_lookahead_enabled = true;
+            sched.config.max_prefill_batch = 1;
+            let index = |s: &ConcreteScheduler, id| s.requests.iter().position(|r| r.id == id).unwrap();
+            let (first, answer) = lab_continuation_pair();
+            let (long1, parent1) = lab_continuation_lender(&mut sched, first.clone());
+
+            // Stage the second parent out of the admit queue, but with an
+            // older ID than the waiter. This adversarial fixture controls
+            // queue visibility; both lenders still earn their tickets
+            // through real prefill dispatches and long-chunk commits.
+            let parent2 = sched.submit(first, RequestClass::Interactive).unwrap();
+            let parent2_idx = index(&sched, parent2);
+            sched.requests[parent2_idx].state = RequestState::Evicted;
+            let waiter = sched.submit(lab_text(vec![7; 64], 1), RequestClass::Interactive).unwrap();
+            let answer1 = lab_proven_child(&mut sched, answer.clone(), parent1);
+            let before = compute.prefill_calls().len();
+            if fail_first {
+                compute.fail_prefill(answer1);
+            }
+            sched.advance();
+            assert_eq!(sched.last_error().is_some(), fail_first);
+            if !fail_first {
+                let calls = compute.prefill_calls();
+                assert_eq!(calls.len(), before + 1);
+                assert_eq!((calls[before][0].request, calls[before][0].start_position), (answer1, 128));
+            }
+            let waiter_idx = index(&sched, waiter);
+            assert!(sched.requests[waiter_idx].waits_to_enter());
+            assert!(sched.requests[waiter_idx].warm_lookahead_bypassed);
+
+            // Park the same unmaterialized waiter during the lender handoff,
+            // then use the scheduler's requeue path without changing its ID.
+            assert!(sched.cancel(long1));
+            sched.cancel(answer1);
+            sched.requests[waiter_idx].state = RequestState::Evicted;
+            let handoff = compute.prefill_calls().len();
+            let long2 = lab_start_text(&mut sched);
+            let parent2_idx = index(&sched, parent2);
+            sched.requeue_request(parent2_idx, &mut Vec::new());
+            sched.advance();
+            sched.advance();
+            assert_eq!(sched.request_state(parent2), Some(RequestState::Done));
+            assert_eq!(sched.prefill_progress(long2), Some(64));
+            let calls = compute.prefill_calls();
+            let trace: Vec<_> = calls[handoff..].iter().flatten()
+                .map(|job| (job.request, job.start_position)).collect();
+            assert_eq!(trace, [(long2, 0), (parent2, 128), (long2, 32)]);
+
+            let waiter_idx = index(&sched, waiter);
+            sched.requeue_request(waiter_idx, &mut Vec::new());
+            assert!(sched.requests[waiter_idx].waits_to_enter());
+            assert!(sched.requests[waiter_idx].warm_lookahead_bypassed);
+            let answer2 = lab_proven_child(&mut sched, answer, parent2);
+            let long2_idx = index(&sched, long2);
+            assert_eq!(sched.requests[long2_idx].short_prefill_borrow, ShortPrefillBorrow::Warm1Ready);
+            // Prove the second continuation would qualify absent the charge.
+            sched.requests[waiter_idx].warm_lookahead_bypassed = false;
+            let (short, true, Some(bypass)) = sched.short_prefill_candidate(long2_idx).unwrap() else {
+                panic!("uncharged waiter should allow this second lookahead");
+            };
+            assert_eq!(sched.requests[short].id, answer2);
+            assert_eq!(bypass.bypassed, [Some(waiter), None]);
+            sched.requests[waiter_idx].warm_lookahead_bypassed = true;
+
+            let before = compute.prefill_calls().len();
+            let mut waiter_departed = false;
+            for _ in 0..24 {
+                if sched.is_idle() { break; }
+                sched.advance();
+                if let Some(r) = sched.requests.iter().find(|r| r.id == waiter && r.state == RequestState::Done) {
+                    assert!(!r.warm_lookahead_bypassed);
+                    waiter_departed = true;
+                }
+            }
+            assert!(sched.is_idle());
+            assert!(waiter_departed);
+            let calls = compute.prefill_calls();
+            let jobs: Vec<_> = calls[before..].iter().flatten().collect();
+            assert_eq!((jobs[0].request, jobs[0].start_position), (long2, 64));
+            let first_job = |id| jobs.iter().position(|job| job.request == id).unwrap();
+            assert!(first_job(waiter) < first_job(answer2));
+        }
+    }
+
+    #[test]
+    fn warm_continuation_declines_wrong_history_or_cache_claim_and_is_opt_in() {
+        for case in ["off", "unverified", "wrong parent", "prefix", "new turn", "device claim", "post-claim fit"] {
+            let (mut sched, compute, _) = lab_seed(4);
+            sched.short_warm_continuation_lookahead_enabled = case != "off";
+            let (mut first, mut answer) = lab_continuation_pair();
+            match case {
+                // The mismatch is after the common cached prefix but
+                // before the first opener. Same cache must not suffice.
+                "prefix" => answer.tokens[132] ^= 1,
+                "new turn" => answer.user_turn_tokens = Some(129),
+                "device claim" => {
+                    first.user_turn_tokens = Some(120);
+                    first.opener_tokens = Some(128);
+                    answer = lab_followup(133);
+                    answer.user_turn_tokens = Some(120);
+                    answer.opener_tokens = Some(144);
+                }
+                _ => {}
+            }
+            let (long, parent) = lab_continuation_lender(&mut sched, first);
+            let waiter = sched.submit(lab_text(vec![7; 64], 1), RequestClass::Interactive).unwrap();
+            let second = match case {
+                "unverified" => sched.submit(answer, RequestClass::Interactive).unwrap(),
+                "wrong parent" => lab_proven_child(&mut sched, answer, long),
+                _ => lab_proven_child(&mut sched, answer, parent),
+            };
+            let long_idx = sched.requests.iter().position(|r| r.id == long).unwrap();
+            let second_idx = sched.requests.iter().position(|r| r.id == second).unwrap();
+            if case == "post-claim fit" {
+                sched.requests[second_idx].resources.backend_pages = sched.capacity.backend_pages + 1;
+                assert!(sched.short_prefill_candidate(long_idx).is_some());
+            } else {
+                assert!(sched.short_prefill_candidate(long_idx).is_none(), "{case}");
+            }
+            sched.advance();
+            let calls = compute.prefill_calls();
+            let job = &calls.last().unwrap()[0];
+            assert_eq!((job.request, job.start_position), (long, 64), "{case}");
+            assert_eq!(sched.prefill_progress(second), Some(0));
+            assert!(!sched.requests.iter().find(|r| r.id == waiter).unwrap().warm_lookahead_bypassed, "{case}");
+            let lender = sched.requests.iter().find(|r| r.id == long).unwrap();
+            assert_eq!(lender.short_prefill_borrow, ShortPrefillBorrow::Warm1Ready);
+        }
+    }
+
+    #[test]
+    fn warm_continuation_keeps_an_eligible_head_and_never_searches_rank_four() {
+        for eligible_head in [true, false] {
+            let (mut sched, compute, _) = lab_seed(4);
+            sched.short_warm_continuation_lookahead_enabled = true;
+            let (first, answer) = lab_continuation_pair();
+            let (long, parent) = lab_continuation_lender(&mut sched, first);
+            let head = if eligible_head { lab_followup(128) } else { lab_text(vec![7; 64], 1) };
+            let head = sched.submit(head, RequestClass::Interactive).unwrap();
+            if !eligible_head {
+                sched.submit(lab_text(vec![8; 12], 1), RequestClass::Interactive).unwrap();
+                sched.submit(lab_text(vec![10; 12], 1), RequestClass::Interactive).unwrap();
+            }
+            lab_proven_child(&mut sched, answer, parent);
+            sched.advance();
+            let calls = compute.prefill_calls();
+            assert_eq!(calls.last().unwrap()[0].request, if eligible_head { head } else { long });
+        }
+    }
+
+    #[test]
+    fn warm_continuation_ticket_dies_when_the_lender_leaves_device() {
+        let (mut sched, compute, _) = lab_seed(4);
+        sched.short_warm_continuation_lookahead_enabled = true;
+        let (first, answer) = lab_continuation_pair();
+        let (long, parent) = lab_continuation_lender(&mut sched, first);
+        let long_idx = sched.requests.iter().position(|r| r.id == long).unwrap();
+        assert!(sched.requests[long_idx].warm_continuation.is_some());
+        assert_eq!(sched.snapshot_and_evict(long_idx, ResumePhase::Prefilling, None, &mut Vec::new()), Moved::Now);
+        assert!(sched.requests[long_idx].warm_continuation.is_none());
+        sched.advance();
+        assert_eq!(sched.request_state(long), Some(RequestState::Prefilling));
+        sched.submit(lab_text(vec![7; 64], 1), RequestClass::Interactive).unwrap();
+        lab_proven_child(&mut sched, answer, parent);
+        sched.advance();
+        let calls = compute.prefill_calls();
+        let job = &calls.last().unwrap()[0];
+        assert_eq!((job.request, job.start_position), (long, 64));
+    }
+
+    #[test]
+    fn warm_two_ticks_requires_a_long_chunk_and_never_lends_a_third_tick() {
+        for (two, vision) in [(false, false), (true, false), (true, true)] {
+            let (mut sched, compute, _) = lab_seed(4);
+            sched.short_warm_two_ticks_enabled = two;
+            let before = compute.prefill_calls().len();
+            let long = if vision {
+                lab_start_image(&mut sched, 10, 40)
+            } else {
+                lab_start_text(&mut sched)
+            };
+            let first = sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+            let second = sched.submit(lab_followup(133), RequestClass::Interactive).unwrap();
+            sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+            for _ in 0..5 {
+                sched.advance();
+            }
+            let calls = compute.prefill_calls();
+            let trace: Vec<_> = calls[before..].iter().map(|batch| {
+                assert_eq!(batch.len(), 1);
+                let job = &batch[0];
+                (job.request, job.start_position, job.tokens.len())
+            }).collect();
+            let prefix = [(long, 0, 32), (first, 128, 14), (long, 32, 32)];
+            assert_eq!(trace[..3], prefix);
+            if two {
+                assert_eq!(trace[3..], [(second, 133, 14), (long, 64, 32), (long, 96, 32)]);
+            } else {
+                assert_eq!(trace[3..], [(long, 64, 32), (long, 96, 32), (long, 128, 32)]);
+            }
+        }
+    }
+
+    #[test]
+    fn warm_two_ticks_never_combines_cold_and_warm_borrows() {
+        for cold_first in [true, false] {
+            let (mut sched, compute, _) = lab_seed(4);
+            sched.short_warm_two_ticks_enabled = true;
+            let long = lab_start_text(&mut sched);
+            let (first_cached, next_cached) = if cold_first { (0, 128) } else { (128, 0) };
+            let first = sched.submit(lab_followup(first_cached), RequestClass::Interactive).unwrap();
+            sched.submit(lab_followup(next_cached), RequestClass::Interactive).unwrap();
+            sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+            let before = compute.prefill_calls().len();
+            for _ in 0..3 {
+                sched.advance();
+            }
+            let calls = compute.prefill_calls();
+            let trace: Vec<_> = calls[before..].iter().flatten()
+                .map(|job| (job.request, job.start_position)).collect();
+            assert_eq!(trace, [(first, first_cached), (long, 32), (long, 64)]);
+        }
+    }
+
+    #[test]
+    fn warm_two_ticks_rejected_device_claim_does_not_spend_a_slot() {
+        let (mut sched, compute, _) = lab_seed(4);
+        sched.short_warm_two_ticks_enabled = true;
+        let long = lab_start_text(&mut sched);
+        let short = sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+        let long_idx = sched.requests.iter().position(|r| r.id == long).unwrap();
+        let short_idx = sched.requests.iter().position(|r| r.id == short).unwrap();
+        // Make the post-claim lane fit fail without changing the pre-claim
+        // resident-slot or KV fit. Submit normally reserves no backend pages.
+        sched.requests[short_idx].resources.backend_pages = sched.capacity.backend_pages + 1;
+        assert_eq!(sched.short_prefill_candidate(long_idx), Some((short_idx, true, None)));
+        sched.advance();
+        assert_eq!(sched.prefill_progress(long), Some(64));
+        assert_eq!(sched.prefill_progress(short), Some(0));
+        assert!(sched.requests[short_idx].prefix_entry.is_none());
+        assert_eq!(sched.requests[long_idx].short_prefill_borrow, ShortPrefillBorrow::Fresh);
+        sched.requests[short_idx].resources.backend_pages = 0;
+        sched.advance();
+        let calls = compute.prefill_calls();
+        let job = &calls.last().unwrap()[0];
+        assert_eq!((job.request, job.start_position), (short, 128));
+        assert_eq!(sched.requests[long_idx].short_prefill_borrow, ShortPrefillBorrow::Warm1NeedsChunk);
+    }
+
+    #[test]
+    fn warm_two_ticks_spends_a_failed_dispatch_but_rearms_only_after_a_commit() {
+        for fail_long in [false, true] {
+            let (mut sched, compute, _) = lab_seed(4);
+            sched.short_warm_two_ticks_enabled = true;
+            let long = lab_start_text(&mut sched);
+            let first = sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+            let long_borrow = |s: &ConcreteScheduler| {
+                s.requests.iter().find(|r| r.id == long).unwrap().short_prefill_borrow
+            };
+            compute.fail_prefill(first);
+            sched.advance();
+            assert!(sched.last_error().is_some());
+            assert_eq!(sched.prefill_progress(long), Some(32));
+            assert_eq!(long_borrow(&sched), ShortPrefillBorrow::Warm1NeedsChunk);
+            assert!(sched.cancel(first));
+            let second = sched.submit(lab_followup(133), RequestClass::Interactive).unwrap();
+            if fail_long {
+                compute.fail_prefill(long);
+            }
+            sched.advance();
+            if fail_long {
+                assert!(sched.last_error().is_some());
+                assert_eq!(long_borrow(&sched), ShortPrefillBorrow::Warm1NeedsChunk);
+            } else {
+                assert_eq!(sched.prefill_progress(long), Some(64));
+                assert_eq!(long_borrow(&sched), ShortPrefillBorrow::Warm1Ready);
+                sched.advance();
+                let calls = compute.prefill_calls();
+                let job = &calls.last().unwrap()[0];
+                assert_eq!((job.request, job.start_position), (second, 133));
+                assert_eq!(long_borrow(&sched), ShortPrefillBorrow::Spent);
+            }
+        }
+    }
+
+    #[test]
+    fn warm_multimodal_borrow_uses_one_device_tail_at_committed_image_boundaries() {
+        // At position 32, the image is still ahead, straddles the frontier,
+        // or has finished. Exercise both types of device claim.
+        for (begin, count, cached) in [(50, 8, 128), (10, 40, 128), (10, 40, 133), (8, 16, 133)] {
+            let (mut sched, compute, seed) = lab_seed(4);
+            let before = compute.prefill_calls().len();
+            let long = lab_start_image(&mut sched, begin, count);
+            let short = sched.submit(lab_followup(cached), RequestClass::Interactive).unwrap();
+            sched.submit(lab_followup(cached), RequestClass::Interactive).unwrap();
+            let events = sched.advance();
+            assert!(events.iter().any(|e| matches!(e, SchedEvent::Token { request, .. } if *request == short)));
+            assert_eq!(sched.prefill_progress(long), Some(32));
+            assert_eq!(sched.gdn_position(long), Some(32));
+            sched.advance();
+            sched.advance();
+            let calls = compute.prefill_calls();
+            let trace: Vec<_> = calls[before..].iter().map(|batch| {
+                assert_eq!(batch.len(), 1);
+                let job = &batch[0];
+                (job.request, job.start_position, job.tokens.len())
+            }).collect();
+            assert_eq!(trace, [(long, 0, 32), (short, cached, 14), (long, 32, 32), (long, 64, 32)]);
+            let short_job = &calls[before + 1][0];
+            assert!(short_job.multimodal.is_none());
+            assert!(short_job.publish_prefix.is_none() && short_job.capture_checkpoint.is_none());
+            if cached == 128 {
+                assert_eq!(short_job.shared_prefix.as_ref().unwrap().publisher, seed);
+            } else {
+                let claim = short_job.checkpoint.as_ref().unwrap();
+                assert_eq!((claim.publisher, claim.source), (seed, ReuseSource::Device));
+            }
+            let resumed = &calls[before + 2][0];
+            assert!(Arc::ptr_eq(
+                resumed.multimodal.as_ref().unwrap(),
+                calls[before][0].multimodal.as_ref().unwrap(),
+            ));
+        }
+    }
+
+    #[test]
+    fn warm_multimodal_borrow_rejects_disabled_cold_image_and_slot_pressure() {
+        for case in ["flag off", "warm off", "cold text", "warm image", "no slot"] {
+            let (mut sched, compute, _) = lab_seed(if case == "no slot" { 1 } else { 4 });
+            sched.short_warm_multimodal_prefill_enabled = case != "flag off";
+            sched.short_warm_prefill_enabled = case != "warm off";
+            let long = lab_start_image(&mut sched, 10, 40);
+            let mut short = lab_followup(if case == "cold text" { 0 } else { 128 });
+            if case == "warm image" {
+                lab_image(&mut short, 130, 4);
+            }
+            sched.submit(short, RequestClass::Interactive).unwrap();
+            sched.advance();
+            let calls = compute.prefill_calls();
+            let job = &calls.last().unwrap()[0];
+            assert_eq!((job.request, job.start_position), (long, 32), "{case}");
+        }
+    }
+
+    #[test]
+    fn warm_multimodal_borrow_failure_leaves_the_image_at_its_frontier() {
+        let (mut sched, compute, _) = lab_seed(4);
+        let long = lab_start_image(&mut sched, 10, 40);
+        let short = sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+        compute.fail_prefill(short);
+        sched.advance();
+        assert!(sched.last_error().is_some());
+        assert_eq!(sched.prefill_progress(long), Some(32));
+        assert_eq!(sched.gdn_position(long), Some(32));
+        sched.advance();
+        let calls = compute.prefill_calls();
+        let job = &calls.last().unwrap()[0];
+        assert_eq!((job.request, job.start_position), (long, 32));
+    }
+
+    #[test]
+    fn warm_multimodal_borrow_defers_to_even_a_lower_ranked_live_restore() {
+        let (mut sched, compute, _) = lab_seed(4);
+        let victim = sched.submit(lab_text(vec![7], 20), RequestClass::Agent).unwrap();
+        sched.advance();
+        let long = lab_start_image(&mut sched, 10, 40);
+        let victim_idx = sched.requests.iter().position(|r| r.id == victim).unwrap();
+        let lane = sched.requests[victim_idx].lane;
+        assert!(lane.is_some());
+        assert_eq!(sched.snapshot_and_evict(victim_idx, ResumePhase::Running, lane, &mut Vec::new()), Moved::Now);
+        assert!(!sched.transfer_busy());
+        let short = sched.submit(lab_followup(128), RequestClass::Interactive).unwrap();
+        let short_idx = sched.requests.iter().position(|r| r.id == short).unwrap();
+        assert!(!sched.outranked_by_a_moved_sequence(short_idx));
+        let events = sched.advance();
+        assert!(events.iter().any(|e| matches!(e, SchedEvent::Restored { request, .. } if *request == victim)));
+        let calls = compute.prefill_calls();
+        let job = &calls.last().unwrap()[0];
+        assert_eq!((job.request, job.start_position), (long, 32));
+    }
 
     /// GitHub #197: the duplicate check walks the prompt only on the chunk
     /// that lands on the capture point, judged on the chunk's pre-cut width.

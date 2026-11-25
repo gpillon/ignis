@@ -1039,6 +1039,14 @@ pub trait Compute: Send + Sync {
     fn disk_abandon_restore(&self, _request: RequestId) {}
 }
 
+/// Internal scheduling metadata issued only by the server's lab grant path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedWarmParent(RequestId);
+
+impl VerifiedWarmParent {
+    pub fn from_server_grant(parent: RequestId) -> Self { Self(parent) }
+}
+
 /// The engine's scheduling interface — what the server drives.
 ///
 /// The server submits requests and calls [`Scheduler::advance`] in a loop,
@@ -1057,6 +1065,15 @@ pub trait Scheduler: Send {
         input: RequestInput,
         class: RequestClass,
     ) -> Result<RequestId, SubmitError>;
+
+    /// Attach provenance before the first advance. Other schedulers ignore it.
+    #[doc(hidden)]
+    fn set_verified_warm_parent(&mut self, _request: RequestId, _parent: VerifiedWarmParent) {}
+
+    /// Whether the serving API should track its completed read calls.
+    fn read_continuation_priority(&self) -> bool {
+        false
+    }
 
     /// Whether [`Scheduler::submit`] would refuse `input` for good — an
     /// unknown model, a request past the context, one the pool can never

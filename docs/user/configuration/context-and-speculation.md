@@ -12,6 +12,7 @@ sidebar:
 | `--model-default-max-tokens <n\|0>` | `IGNIS_MODEL_DEFAULT_MAX_TOKENS` | `38912` | The `max_tokens` of a request that sends none (see [Chat completions](../api/chat-completions.md)), its reasoning included, on both models. Never more than what the prompt leaves of `--model-max-context`, so a long prompt is never refused for it. An explicit cap always wins. `0` = none: such a request may generate to the end of the context, as before. (`make` knob `DEFAULT_MAX_TOKENS`.) |
 | `--model-prefill-chunk <tokens>` | `IGNIS_MODEL_PREFILL_CHUNK` | `1024`; under the built-in profiles `2048` for the 27B, and for Flash-Next `8192` under `rtx5090` and `rtxpro6000`, `4096` under `rtx-24gb`, `2048` under `rtx-16gb` | The prefill chunk width while a lane decodes, a nonzero multiple of 128. The program's prefill scratch is reserved at load for the wider of it and [the solo width](#the-solo-width). The 27B's NVFP4 artifact computes its MLP the same way at every chunk width from 1,024 tokens, its gate and up product and SwiGLU in one kernel, which writes the down product's quantized input directly: in earlier releases a chunk exactly 1,024 tokens wide, the default's every chunk and the last chunk of some prompts, rounded that product once fewer than a wider chunk, so a greedy answer whose prompt had such a chunk can differ from an earlier release's at a near-tie, where two tokens are almost equally likely ([ADR 0007](../../adr/0007-performance-gate-not-parity.md)). The route has no option: the load logs it as `prefill_swiglu` on `ignis.runtime.prefill_routes` (`quant`; `none` on the trellis artifacts and below a 1,024-token chunk, where it never runs), and the measurement switch that selects the earlier route for a comparison is a contributor's ([Testing](../contributing/testing.md#measurement-switches)). |
 | `--model-prefill-chunk-solo <tokens\|auto>` | `IGNIS_MODEL_PREFILL_CHUNK_SOLO` | `auto`; the prefill chunk under `rtx-16gb` and `rtx-24gb` | The prefill chunk width while no lane decodes, [the solo width](#the-solo-width): `auto` is 8192, 4096 or 2048 above the prefill chunk for the 27B on an RTX 30 or RTX 40 card, the widest the VRAM plan holds with nothing else adapted and room for a second request, and the prefill chunk everywhere else; a width is a nonzero multiple of 128, at least the prefill chunk, at most `--model-max-context`. (`make` knob `PREFILL_CHUNK_SOLO`.) |
+| `--model-read-continuation-priority <bool>` | `IGNIS_MODEL_READ_CONTINUATION_PRIORITY` | `false` | Opt in to [bounded prefill priority for cached read continuations](#read-continuation-priority). Requires a reload. |
 | `--spec-decode-lanes <n>` | `IGNIS_SPEC_DECODE_LANES` | the model's own: `8` on the 27B, `3` on Flash-Next | `1..=8`, both models: the sequences decoded at once. Scoped like any field both models take (`--qwen38-spec-decode-lanes`, `--qwen38flashnext-spec-decode-lanes`); a general value is both models' on a switch. On the 27B each lane reserves its state (~233 MB with DFlash2 under hq-e8-2b, 40 MiB of it DFlash2's window, which the MTP head does not keep) and its share of the round buffers (~35 MB at a 7-token draft window: sampling, the decode and verify rounds, the drafter's), its decode and verify graphs are captured at widths up to the lanes, and the default host retained slots are two per lane: `2` frees ~1.6 GB of VRAM for the KV pool against `8`. On Flash-Next the lanes share the KV pool ([The KV pool](vram-and-kv-pool.md#the-kv-pool)): min(524,288 tokens, lanes × `--model-max-context`), never below one `--model-max-context` sequence and a page per retained slot. At `make`'s 262,144 tokens that is one context at one lane and 524,288 tokens from two lanes on, so one lane leaves the expert cache about 1 GiB more, and further lanes cost only their state; at 131,072 tokens three lanes get 393,216. `make MODEL=flash-next` runs 3 lanes at up to 262,144 tokens each (the checkpoint's trained positions); the `make` knob is `LANES`, passed in the started model's own section. |
 | `--model-decode-share <percent>` | `IGNIS_MODEL_DECODE_SHARE` | `25` on both models | The part of the time decoding lanes keep while a prompt prefills, 0-99: after a chunk that took `t`, the next chunk of the same prompt waits `t * s / (1 - s)` of wall time while they decode, and nothing waits when no lane decodes or after the prompt's last chunk. It trades the prefilling request's TTFT (about x1.33 at 25, x2 at 50, only while lanes decode) for the lanes' rate (15.6-18.3 tok/s on Flash-Next instead of ~1; why 25: [ADR 0018](../../adr/0018-chunk-level-prefill-decode-interleaving.md)). `--model-decode-share 0` restores one decode round per chunk, the pacing before [#92](../../findings/2026-10-07-27b-prefill-chunk-width.md); 50 splits time evenly. A prompt alone is unaffected. |
 | `--model-kv-format <fmt>` | `IGNIS_MODEL_KV_FORMAT` | `hq-e8-2b` | `hq-e8-2b` (serving) or `bf16` (retained; the format every correctness oracle runs against — [ADR 0022](../../adr/0022-two-kv-formats-bf16-as-oracle.md)). Decides what a pool byte budget is worth in tokens. On an RTX 50 or RTX PRO card, the 27B's decode and verify rounds read `hq-e8-2b` on ignis's own attention route in place of the vendored one; the two write the same bytes, so the route changes no token of any lane, and the VRAM plan is the same; an RTX 30 or RTX 40 card, and a `bf16` load, keep the vendored route. The route has no option: the load logs it as `ignis.runtime.decode_routes` (`hq_decode_attention`: `ours` or `vendored`), and the measurement switch that selects the vendored route for a comparison is a contributor's ([Testing](../contributing/testing.md#measurement-switches)). |
@@ -95,9 +96,30 @@ the 27B's dense prefill decodes every matrix once per chunk. The **solo width**
   `prefill_chunk_solo`, always a number; `GET /v1/config` keeps `auto`. The
   request log's `ignis.request.admitted` line counts the chunks a prompt ran at
   it, `prefill_chunks_solo`, beside `prefill_chunks_consumed`.
-- **What it costs.** One request prefills at a time, so a request that
-  arrives during a solo chunk waits for the whole prompt in progress at either
-  width. The one that waits longer is a request restored from KV-RAM or
-  KV-disk while a prompt prefills: at most one solo chunk, then the chunks
-  narrow. The same prompt can end in logits that differ in the last bits
-  depending on whether lanes were decoding; the quality gates measure KLD.
+- **What it costs.** By default a new prefill waits for the prompt in progress
+  at either width. A request restored onto a lane from KV-RAM or KV-disk waits
+  at most one solo chunk for its next round; the chunks then narrow. The same
+  prompt can end in logits that differ in the last bits depending on whether
+  lanes were decoding; the quality gates measure KLD.
+
+## Read continuation priority
+
+`--model-read-continuation-priority true` opts in to a narrow scheduling
+exception for interactive Chat Completions. The default is `false`. It is
+for a cached text turn that would otherwise wait behind a long prompt's
+prefill, not for making a model generate tokens faster.
+
+With a matching prefix or checkpoint still on the GPU, a short uncached
+tail, and room to run without evicting another sequence, an eligible turn
+may borrow one prefill chunk. A long prompt yields at most twice and must
+complete a chunk of its own between the two borrows. The eligible head of
+the queue goes first. Only a verified continuation of the first borrower's
+`read` call may use the second turn to pass up to two newer waiters in the
+same class. Each of those waiters can be passed only once while awaiting
+service.
+
+Use the normal [Chat Completions tool flow](../api/chat-completions.md#continuing-a-read-call).
+The match alone does not guarantee earlier service: missing cache state, no
+room, or an ineligible waiter can leave the request in ordinary queue order.
+This does not enable simultaneous prefill on the GPU or change the context
+limit. See [ADR 0018](../../adr/0018-chunk-level-prefill-decode-interleaving.md).

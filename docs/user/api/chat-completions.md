@@ -176,3 +176,22 @@ Accepts `messages` (role + content), `model`, `stream`, `max_tokens`,
   unless the operator holds every tool, which normalizes them as the
   Responses API does ([Holding every tool](structured-output.md#holding-every-tool));
   on Flash-Next `strict` is accepted and inert (GitHub #581).
+
+## Continuing a read call
+
+When the operator enables
+[read continuation priority](../configuration/context-and-speculation.md#read-continuation-priority),
+an interactive text chat can be eligible for earlier service after a
+single, complete `read` call. Both turns must stream with
+`stream_options.include_usage: true`. No Ignis-specific request field,
+header, or relay is needed. Keep the original messages, append the
+assistant message containing the returned call, then append its `role: "tool"` result with
+`tool_call_id` set to the server-issued call ID. Do not replace the ID or
+rewrite the preceding history.
+
+The server checks the history and recorded call together; the match can be
+used only once and expires after 30 seconds. A fabricated or replayed ID,
+a different history, or a cut call does not qualify for the exception.
+Ignis does not run the tool or
+verify the contents of its result. Normal tool handling still applies when
+the request does not qualify for priority.

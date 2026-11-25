@@ -3717,7 +3717,20 @@ async fn chat_completions(
             probe.fired()
         }) as crate::engine::FirstTokenStop
     });
-    let (request_id, stream) = match engine.submit_stopping(input, class, notes, first_stop).await {
+    let continuations = if req.stream
+        && req.stream_options.as_ref().is_some_and(|o| o.include_usage)
+        && input.multimodal.is_none()
+        && class == RequestClass::Interactive
+    {
+        engine.read_continuations.as_deref()
+    } else {
+        None
+    };
+    let verified_parent = continuations.and_then(|grants| {
+        grants.consume(&req.messages, std::time::Instant::now)
+    });
+    let pending_parent = continuations.and_then(|_| crate::read_continuation::Pending::new(&req.messages));
+    let (request_id, stream) = match engine.submit_stopping_with_parent(input, class, notes, first_stop, verified_parent).await {
         Ok(x) => x,
         Err(err) => return submit_error(&server, err),
     };
@@ -3755,7 +3768,8 @@ async fn chat_completions(
             include_usage,
             StreamDeadline::after(Timeout::of(&live, true), running, live.timeout_reply),
         )
-        .with_rewound(rewound))
+        .with_rewound(rewound)
+        .with_read_parent(request_id, pending_parent))
         .into_response();
     }
     // GitHub #327: an answer nobody waits for any more — past the request
@@ -4491,6 +4505,7 @@ struct ChunkStream {
     emitted_content_or_call: bool,
     /// `server.stream_timeout` from admission; none at `0`.
     deadline: Option<StreamDeadline>,
+    read_parent: Option<(RequestId, crate::read_continuation::Pending)>,
 }
 
 /// Cancels its request when dropped before the request has completed. An SSE
@@ -4583,6 +4598,7 @@ impl ChunkStream {
             emitted_reasoning: false,
             emitted_content_or_call: false,
             deadline,
+            read_parent: None,
         }
     }
 
@@ -4590,6 +4606,22 @@ impl ChunkStream {
     fn with_rewound(mut self, rewound: crate::loop_guard::Rewound) -> Self {
         self.rewound = rewound;
         self
+    }
+
+    fn with_read_parent(mut self, original: RequestId, pending: Option<crate::read_continuation::Pending>) -> Self {
+        self.read_parent = pending.map(|pending| (original, pending));
+        self
+    }
+
+    fn issue_read_parent(&mut self, request: RequestId, clean_tool_stop: bool) {
+        if let Some((original, pending)) = self.read_parent.take() {
+            if clean_tool_stop && request == original && self.cancel.request.get() == original
+                && self.rewound.taken() == 0
+                && let Some(grants) = &self.cancel.engine.read_continuations
+            {
+                grants.issue_on_success(pending, original, std::time::Instant::now());
+            }
+        }
     }
 
     /// The deadline's end, once the request was cancelled and `owed` — what
@@ -4617,7 +4649,16 @@ impl ChunkStream {
     /// deltas, a complete tool call as its own (GitHub #121). Pieces are
     /// never empty ([`push_piece`]).
     fn queue_pieces(&mut self, pieces: Vec<Piece>) {
-        for piece in pieces {
+        for mut piece in pieces {
+            if let Some((_, pending)) = self.read_parent.as_mut() {
+                let eligible = match &mut piece {
+                    Piece::Call(call) => pending.observe_call(call),
+                    Piece::Content(_) | Piece::Reasoning(_) => false,
+                };
+                if !eligible {
+                    self.read_parent = None;
+                }
+            }
             let chunk = match piece {
                 Piece::Reasoning(text) => {
                     self.emitted_reasoning = true;
@@ -4798,8 +4839,9 @@ impl Stream for ChunkStream {
                     // held back, then the finish-reason chunk, then
                     // (opt-in) the usage chunk — all queued ahead of
                     // `[DONE]`.
-                    SchedEvent::Done { reason, tokens, thinking, .. } => {
+                    SchedEvent::Done { request, reason, tokens, thinking, .. } => {
                         this.cancel.completed();
+                        let natural_stop = reason == FinishReason::Stop;
                         // `mid_call` is read before the scanner's flush
                         // clears it (GitHub #121 acceptance criterion 3): a
                         // stop/cancel landing mid-call must never be
@@ -4821,6 +4863,9 @@ impl Stream for ChunkStream {
                             continue;
                         }
                         let finish_reason = resolve_finish_reason(reason, this.pipeline.any_calls(), mid_call);
+                        this.issue_read_parent(
+                            request, natural_stop && !this.pipeline.fired() && finish_reason == "tool_calls",
+                        );
                         this.queue_finish(finish_reason, thinking.and_then(|b| b.forced_at), tokens);
                     }
                     // Other events for this request (admissions,
@@ -5141,6 +5186,73 @@ mod tests {
         assert_eq!(held["usage"]["completion_tokens"], 9, "the stream's 4 and the 5 the holdback never sent");
         for none in [streamed_usage(Some((0, 0))).await, streamed_usage(None).await] {
             assert!(none["usage"].get("completion_tokens_details").is_none(), "{none}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_continuation_only_clean_original_done_mints_a_grant() {
+        use crate::read_continuation::tests::messages;
+        for case in ["clean", "strict", "wire-only", "rewound", "wrong-request", "error", "length", "strict-length", "one-call"] {
+            let scheduler = ignis_core::ConcreteScheduler::with_config(
+                ignis_core::SchedulerConfig {
+                    model: "m".into(),
+                    read_continuation_priority: true,
+                    ..ignis_core::SchedulerConfig::default()
+                },
+                Arc::new(ignis_core::MockCompute::new()),
+            );
+            let engine = Engine::new(Box::new(scheduler));
+            let (route, stream) = tokio::sync::mpsc::unbounded_channel();
+            let parent = vec![ChatMessage::text("user", "Read the file.")];
+            let pending = crate::read_continuation::Pending::new(&parent).unwrap();
+            let schemas = if case.starts_with("strict") {
+                ToolSchemas::from_tools(&[]).holding(std::collections::HashMap::from([
+                    ("read".to_owned(), ignis_grammar::call::Parameters::new(["filePath"], ["filePath"])),
+                ]))
+            } else {
+                ToolSchemas::from_tools(&[])
+            };
+            let mut chunks = ChunkStream::new(
+                stream, CancelOnDrop::new(engine.clone(), 11), "chatcmpl-11".into(), 0, "m".into(),
+                AnswerPipeline::new(OutputDecoder::new(Box::new(Words), false), schemas, Vec::new())
+                    .ending_at_first_call(case == "one-call"),
+                1, true, None,
+            ).with_read_parent(11, Some(pending));
+            let events = chunks.pipeline.scanner.feed(
+                "<tool_call>\n<function=read>\n<parameter=filePath>\na.txt\n</parameter>\n</function>\n</tool_call>",
+            );
+            let [ToolEvent::Call(call)] = events.as_slice() else { panic!("expected one complete call") };
+            chunks.queue_pieces(vec![Piece::Call(call.clone())]);
+            if case == "wire-only" {
+                // A finish chunk without a successful engine Done is not proof.
+                chunks.queue_finish("tool_calls", None, 1);
+            } else {
+                route.send(SchedEvent::Done {
+                    request: if case == "wrong-request" { 12 } else { 11 },
+                    reason: match case {
+                        "error" => FinishReason::Error,
+                        "length" | "strict-length" => FinishReason::Length,
+                        _ => FinishReason::Stop,
+                    },
+                    tokens: 1, spec: None, readout: None, attention: None, drawn: None,
+                    thinking: None, reasoning_redirected_at: None,
+                }).unwrap();
+            }
+            if case == "rewound" {
+                chunks = chunks.with_rewound(Arc::new(crate::loop_guard::RewoundTokens::new(1, 0)));
+            }
+            drop(route);
+            let body = Sse::new(chunks).into_response().into_body();
+            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            let id = std::str::from_utf8(&body).unwrap().lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+                .find_map(|chunk| chunk["choices"][0]["delta"]["tool_calls"][0]["id"].as_str().map(str::to_owned))
+                .expect("the complete tool call must carry its wire ID");
+            assert_ne!(id, call.id, "{case}");
+            let (_, child) = messages(&id);
+            let grant = engine.read_continuations.as_ref().unwrap().consume(&child, std::time::Instant::now);
+            assert_eq!(grant.is_some(), matches!(case, "clean" | "strict"), "{case}");
         }
     }
 

@@ -309,6 +309,20 @@ How the 27B holds its nine BF16 exception tensors on the device (GitHub #341, #6
 
 The prefill chunk width, in tokens, while a lane is decoding.
 
+### `model.read_continuation_priority`
+
+| | |
+|---|---|
+| Flag | `--model-read-continuation-priority` (may stand bare: `true`) |
+| Env var | `IGNIS_MODEL_READ_CONTINUATION_PRIORITY` |
+| Kind | `bool` |
+| Default | `false` |
+| Models | all |
+| Per model | `--qwen38-model-read-continuation-priority`, `--qwen38flashnext-model-read-continuation-priority` |
+| `/v1/config` | shown by `GET`, patchable, with a model reload |
+
+Let a short, verified read continuation take a bounded prefill turn.
+
 ### `model.prefill_chunk_solo`
 
 | | |

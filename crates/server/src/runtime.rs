@@ -69,6 +69,8 @@ pub struct EngineShape {
     pub host_margin_bytes: u64,
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
+    /// Whether the serving scheduler prioritizes verified read continuations.
+    pub read_continuation_priority: bool,
     /// Whether the generation opener's page rides the checkpoint capture (ADR
     /// 0029 as amended 2026-10-07 and 2026-11-05, GitHub #306, #508): decided
     /// by [`crate::config::arch::opener_page_rides_capture`] for the family
@@ -177,6 +179,7 @@ impl Default for EngineShape {
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: crate::config::DEFAULT_PROMPT_REUSE,
+            read_continuation_priority: false,
             opener_page_rides_capture: false,
             second_tail_cut: false,
             gpu_generation: None,
@@ -222,6 +225,7 @@ impl From<&crate::config::Config> for EngineShape {
             host_pool_bytes: config.host_pool_bytes,
             host_margin_bytes: config.host_margin_bytes,
             prompt_reuse: config.prompt_reuse,
+            read_continuation_priority: config.read_continuation_priority,
             // GitHub #508: a config fitted to a family decides it on the card;
             // one fitted to none leaves it to `for_family`. GitHub #649: the
             // measurement switch is the load's to read, not the config's.
@@ -550,6 +554,7 @@ fn scheduler_config_for_shape(
         solo_chunk_tokens: (shape.solo_width() > shape.prefill_chunk).then(|| shape.solo_width()),
         decode_share: f64::from(shape.decode_share_percent.unwrap_or(0)) / 100.0,
         prompt_reuse: shape.prompt_reuse,
+        read_continuation_priority: shape.read_continuation_priority,
         opener_page_rides_capture: shape.opener_page_rides_capture,
         // GitHub #215: the same count the leaf's pool reserved, so every slot
         // the scheduler hands out is one the pool holds -- both kinds, the
@@ -2454,6 +2459,7 @@ mod tests {
             host_pool_bytes: crate::config::DEFAULT_HOST_POOL_BYTES,
             host_margin_bytes: crate::config::DEFAULT_HOST_MARGIN_BYTES,
             prompt_reuse: true,
+            read_continuation_priority: false,
             opener_page_rides_capture: false,
             second_tail_cut: false,
             gpu_generation: None,
@@ -2649,6 +2655,23 @@ mod tests {
         let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 8);
         assert!(!config.prompt_reuse);
         assert_eq!(config.retained_slots, 0, "reuse off reserves no retained slot");
+    }
+
+    #[test]
+    fn read_continuation_priority_is_off_unless_enabled() {
+        for (args, expected) in [
+            (vec![], false),
+            (vec!["--model-read-continuation-priority".to_owned(), "true".to_owned()], true),
+        ] {
+            let crate::config::ConfigOutcome::Config(resolved) =
+                crate::config::resolve(&args, |_| None).expect("resolve")
+            else {
+                panic!("expected a runnable config");
+            };
+            let shape = EngineShape::from(&resolved);
+            let config = scheduler_config_for_shape("test-model".into(), shape, 64, 32_768, 8);
+            assert_eq!(config.read_continuation_priority, expected);
+        }
     }
 
     // ── the VRAM plan (GitHub #210) ──────────────────────────────────────

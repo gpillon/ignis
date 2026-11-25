@@ -17,6 +17,7 @@
 //! and supersedes them there.
 
 use crate::admission::AdmissionResources;
+use crate::checkpoint::{RetainedKind, ReuseSource};
 use crate::gdn::GdnState;
 use crate::prefix::PrefixId;
 use crate::types::{
@@ -64,6 +65,87 @@ impl CaptureLink {
     /// Whether the capture lends at all.
     pub fn lends(self) -> bool {
         self != CaptureLink::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortPrefillBorrow {
+    Fresh,
+    Warm1NeedsChunk,
+    Warm1Ready,
+    Spent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WarmDeviceClaim {
+    pub kind: RetainedKind,
+    pub entry: u64,
+    pub publisher: RequestId,
+    pub tokens: u32,
+}
+
+impl WarmDeviceClaim {
+    pub fn of(r: &Request) -> Option<Self> {
+        if let Some(publisher) = r.checkpoint_publisher {
+            if r.reuse_source != Some(ReuseSource::Device) {
+                return None;
+            }
+            Some(Self {
+                kind: RetainedKind::Checkpoint,
+                entry: r.checkpoint_entry?,
+                publisher,
+                tokens: r.checkpoint_tokens,
+            })
+        } else {
+            if r.prefix_reuse?.source != ReuseSource::Device {
+                return None;
+            }
+            Some(Self {
+                kind: RetainedKind::Prefix,
+                entry: r.prefix_entry?,
+                publisher: r.prefix_publisher?,
+                tokens: r.shared_prefix_tokens,
+            })
+        }
+    }
+}
+
+/// Lab-only content proof, not session provenance or a reference on cache state.
+#[derive(Debug, Clone)]
+pub(crate) struct WarmContinuation {
+    pub parent: RequestId,
+    pub claim: WarmDeviceClaim,
+    user_turn: u32,
+    opener_head: Box<[TokenId]>,
+}
+
+impl WarmContinuation {
+    pub fn record(r: &Request) -> Option<Self> {
+        let opener = r.input.opener_tokens?;
+        let user_turn = r.input.user_turn_tokens?;
+        if user_turn >= opener {
+            return None;
+        }
+        Some(Self {
+            parent: r.id,
+            claim: WarmDeviceClaim::of(r)?,
+            user_turn,
+            opener_head: r.input.tokens.get(..opener as usize)?.into(),
+        })
+    }
+
+    pub fn matches(&self, r: &Request) -> Result<(), &'static str> {
+        if r.id <= self.parent || r.input.user_turn_tokens != Some(self.user_turn) {
+            return Err("different_user_turn");
+        }
+        let opener = r.input.opener_tokens.map(|n| n as usize);
+        if !opener.is_some_and(|n| n > self.opener_head.len() && n <= r.input.tokens.len()) {
+            return Err("no_later_opener");
+        }
+        if !r.input.tokens.starts_with(&self.opener_head) {
+            return Err("opener_prefix_mismatch");
+        }
+        Ok(())
     }
 }
 
@@ -280,6 +362,13 @@ pub struct Request {
     /// [`crate::types::FinishReason::Error`] instead of retrying it forever
     /// (sooner for a job that cannot be retried, GitHub #296).
     pub prefill_failures: u32,
+    /// Experimental borrow budget, kept across suspend/resume and requeue.
+    pub(crate) short_prefill_borrow: ShortPrefillBorrow,
+    pub(crate) warm_continuation: Option<WarmContinuation>,
+    pub(crate) verified_warm_parent: Option<crate::scheduler::VerifiedWarmParent>,
+    /// One lookahead may pass a waiter, even across lender replacement.
+    pub(crate) warm_lookahead_bypassed: bool,
+    pub(crate) prefill_queue_trace_start: Option<std::time::Instant>,
 }
 
 /// A request's progress through its grammar before its first token (GitHub
@@ -345,6 +434,11 @@ impl Request {
             prefill_progress: 0,
             cancelled: false,
             prefill_failures: 0,
+            short_prefill_borrow: ShortPrefillBorrow::Fresh,
+            warm_continuation: None,
+            verified_warm_parent: None,
+            warm_lookahead_bypassed: false,
+            prefill_queue_trace_start: None,
         }
     }
 
@@ -720,6 +814,7 @@ impl Request {
         }
         self.state = RequestState::Done;
         self.lane = None;
+        self.warm_lookahead_bypassed = false;
         true
     }
 
