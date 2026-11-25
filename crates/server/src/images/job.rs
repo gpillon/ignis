@@ -425,11 +425,19 @@ pub fn on_white(image: &mut RgbaImage) {
 }
 
 /// `image` as an RGBA 8-bit PNG.
+///
+/// Deflated with the `png` crate's `Fast` level, not its default. The default
+/// took 0.55-1.2 s for a 2048x2048 picture on the host, between the decode and
+/// the response, with the card idle; `Fast` takes ~20 ms and, on a picture with
+/// real texture, writes the same size (within 1%, 6% on a smooth one). Only a
+/// flat picture grows (+47% on a perfectly flat one), the trade a client on a
+/// slow link would feel and a local one would not.
 pub fn encode_png(image: &RgbaImage) -> Vec<u8> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, image.size.width, image.size.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
     // Into memory, from a buffer of the header's size: nothing to fail on.
     let mut writer = encoder.write_header().expect("a PNG header into memory");
     writer.write_image_data(&image.pixels).expect("an RGBA frame of the image's size");
@@ -668,6 +676,27 @@ mod tests {
         let runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: budget, sample_sigmas: vec![1.0], ..fake_plan() });
         let held = runner.held_conditions();
         (ImageModel::new("ignis-image-2.1-turbo", Box::new(runner)), held)
+    }
+
+    /// The PNG is deflated at the `Fast` level (its zlib header's FLEVEL is 0,
+    /// "fastest algorithm"; the crate's default writes 2), and decodes to the
+    /// pixels it was given. A timing test would flake on CI: the header is what
+    /// tells the 20 ms encoder from the 0.5-1.2 s one on a 2048x2048 picture.
+    #[test]
+    fn a_png_is_deflated_fast_and_decodes_to_its_pixels() {
+        let size = ImageSize::new(96, 64);
+        let mut state = 1u32;
+        let pixels = (0..96 * 64 * 4)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((i / 7) as u8).wrapping_add((state >> 29) as u8)
+            })
+            .collect();
+        let image = RgbaImage { size, pixels };
+        let png = encode_png(&image);
+        assert_eq!(decode(&png), image, "lossless");
+        let idat = png.windows(4).position(|w| w == b"IDAT").expect("an IDAT chunk") + 4;
+        assert_eq!(png[idat + 1] >> 6, 0, "the zlib header names the fastest algorithm");
     }
 
     #[test]
