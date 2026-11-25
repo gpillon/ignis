@@ -99,6 +99,7 @@ pub mod pointing;
 pub mod exception_weights;
 pub mod prefill_attention;
 pub mod prefix;
+pub mod radix;
 pub mod constrained;
 pub mod request;
 pub mod residency;
