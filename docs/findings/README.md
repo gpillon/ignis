@@ -83,6 +83,7 @@ edited by hand.
 
 ## KV cache, formats and state tiers (`kv-and-state`)
 
+- 2026-11-25 [A worth-ranked radix index keeps more reusable state than today's retention at the same slot budget, in simulation](2026-11-25-radix-retention-policy-simulation.md): On four synthetic agent traces at 4, 8 and 16 slots a worth-ranked radix index never reuses less than ADR 0029's retention (ties on a swarm) and up to 16 points more (77.3% to 93.5%, context fork, 16 slots); fork discovery adds nothing.
 - 2026-10-08 [Growing a sequence's KV one page at a time moves the 27B's decode ITL p99, so P0 picks the fixed branch](2026-10-08-kv-page-growth-gate.md): Growing a sequence's KV one page at a time leaves decode tok/s and the greedy text unchanged, but its ~450 µs per call moves the 27B's 1-lane ITL p99 0.07-0.23 ms above the whole legs, so P0 picks the fixed branch.
 - 2026-10-08 [KV-disk contention on the volume](2026-10-08-kv-disk-contention-on-the-volume.md): A ~1 GB device-to-disk spill beside two decoding Flash-Next lanes costs their ITL p50 +3-8% and no p99 at the volume's 1.5-1.6 GiB/s, and the prefill gate keeps the tier's writes from slowing an uncovered gather (+18-37% ungated).
 - 2026-10-08 [Expert misses after a live move are the text's, not the move's](2026-10-08-expert-misses-after-a-move-are-the-text.md): Forced to generate the same text, the rounds after a 236K-token sequence's restore miss the expert cache as an unmoved run's do (-1.2% to +0.6%) after a ~20-round transient, so the doubling once read as the move's was the lanes' text.
