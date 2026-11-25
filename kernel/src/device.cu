@@ -17,6 +17,7 @@
 #include "ignis_device.h"
 #include "ignis_fp8_linear.h"
 #include "ignis_seq.h"
+#include "nvml_mig.h"
 #include "shared_library.h"
 
 #include <cuda_runtime.h>
@@ -55,6 +56,14 @@ struct Nvml {
   // Optional (GitHub #604): a driver without it reports no per-process
   // figure, and every query above still works.
   decltype(&nvmlDeviceGetComputeRunningProcesses_v3) compute_processes;
+  // Optional (ADR 0107): a MIG instance's own handle, by the UUID the CUDA
+  // runtime reports for the device. Without them every query reads the
+  // physical card, as before.
+  decltype(&nvmlDeviceGetHandleByUUID) handle_by_uuid;
+  decltype(&nvmlDeviceGetMigMode) mig_mode;
+  decltype(&nvmlDeviceGetMaxMigDeviceCount) max_mig_devices;
+  decltype(&nvmlDeviceGetMigDeviceHandleByIndex) mig_device_by_index;
+  decltype(&nvmlDeviceGetUUID) uuid;
 };
 
 template <typename Fn>
@@ -85,6 +94,16 @@ const Nvml *nvml() {
                           resolve_nvml(library, "nvmlDeviceGetName", &table.name);
     table.compute_processes = reinterpret_cast<decltype(table.compute_processes)>(
         ignis::shared_library_symbol(library, "nvmlDeviceGetComputeRunningProcesses_v3"));
+    table.handle_by_uuid = reinterpret_cast<decltype(table.handle_by_uuid)>(
+        ignis::shared_library_symbol(library, "nvmlDeviceGetHandleByUUID"));
+    table.mig_mode = reinterpret_cast<decltype(table.mig_mode)>(
+        ignis::shared_library_symbol(library, "nvmlDeviceGetMigMode"));
+    table.max_mig_devices = reinterpret_cast<decltype(table.max_mig_devices)>(
+        ignis::shared_library_symbol(library, "nvmlDeviceGetMaxMigDeviceCount"));
+    table.mig_device_by_index = reinterpret_cast<decltype(table.mig_device_by_index)>(
+        ignis::shared_library_symbol(library, "nvmlDeviceGetMigDeviceHandleByIndex"));
+    table.uuid = reinterpret_cast<decltype(table.uuid)>(
+        ignis::shared_library_symbol(library, "nvmlDeviceGetUUID"));
     return resolved ? &table : nullptr;
   }();
   return api;
@@ -99,6 +118,54 @@ T log_cuda_error(T value, const char *op, cudaError_t err) {
                  cudaGetErrorName(err), cudaGetErrorString(err));
   }
   return value;
+}
+
+// When `parent` (the handle of the PCI bus id) has MIG enabled, the handle of
+// the MIG instance CUDA device `device_id` runs on (kernel/src/nvml_mig.h).
+// False, and `*instance` untouched, on a card without MIG, a driver without
+// the queries, or no instance to choose. Creates no context.
+bool mig_instance(const Nvml *api, nvmlDevice_t parent, int device_id, nvmlDevice_t *instance) {
+  if (api->mig_mode == nullptr || api->max_mig_devices == nullptr || api->mig_device_by_index == nullptr) {
+    return false;
+  }
+  unsigned int current = 0;
+  unsigned int pending = 0;
+  if (api->mig_mode(parent, &current, &pending) != NVML_SUCCESS || current != NVML_DEVICE_MIG_ENABLE) {
+    return false;
+  }
+  char wanted[NVML_DEVICE_UUID_V2_BUFFER_SIZE] = {};
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, device_id) == cudaSuccess) {
+    ignis::nvml_mig::format_uuid("MIG-", reinterpret_cast<const unsigned char *>(prop.uuid.bytes), wanted,
+                                 sizeof(wanted));
+    nvmlDevice_t by_uuid = nullptr;
+    if (api->handle_by_uuid != nullptr && api->handle_by_uuid(wanted, &by_uuid) == NVML_SUCCESS) {
+      *instance = by_uuid;
+      return true;
+    }
+  }
+  unsigned int count = 0;
+  if (api->max_mig_devices(parent, &count) != NVML_SUCCESS || count == 0) {
+    return false;
+  }
+  std::vector<nvmlDevice_t> handles(count, nullptr);
+  std::vector<std::vector<char>> uuids(count, std::vector<char>(NVML_DEVICE_UUID_V2_BUFFER_SIZE, '\0'));
+  std::vector<ignis::nvml_mig::Slot> slots(count, ignis::nvml_mig::Slot{false, nullptr});
+  for (unsigned int i = 0; i < count; ++i) {
+    if (api->mig_device_by_index(parent, i, &handles[i]) != NVML_SUCCESS) {
+      continue;
+    }
+    slots[i].open = true;
+    if (api->uuid != nullptr && api->uuid(handles[i], uuids[i].data(), NVML_DEVICE_UUID_V2_BUFFER_SIZE) == NVML_SUCCESS) {
+      slots[i].uuid = uuids[i].data();
+    }
+  }
+  const int chosen = ignis::nvml_mig::choose(wanted, slots.data(), static_cast<int>(count));
+  if (chosen < 0) {
+    return false;
+  }
+  *instance = handles[chosen];
+  return true;
 }
 
 // Ask NVML `query(api, handle)` (`op` names it in a log line) of CUDA device
@@ -124,6 +191,12 @@ int32_t on_nvml_device(int device_id, const char *op, Query &&query) {
   nvmlDevice_t device = nullptr;
   rc = api->handle_by_pci_bus_id(bus_id, &device);
   if (rc == NVML_SUCCESS) {
+    // On a MIG-enabled card the bus id names the physical GPU, whose memory
+    // is not this process's: ask the MIG instance CUDA runs on instead.
+    nvmlDevice_t instance = nullptr;
+    if (mig_instance(api, device, device_id, &instance)) {
+      device = instance;
+    }
     rc = query(api, device);
   } else {
     op = "nvmlDeviceGetHandleByPciBusId_v2";

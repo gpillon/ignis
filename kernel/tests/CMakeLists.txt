@@ -518,6 +518,13 @@ target_include_directories(ignis_kernel_card_lever_test PRIVATE ${CMAKE_CURRENT_
 target_link_libraries(ignis_kernel_card_lever_test PRIVATE ignis_kernel ignis_vendor)
 add_test(NAME ignis_kernel_card_lever_test COMMAND ignis_kernel_card_lever_test)
 
+# Which NVML handle answers for a CUDA device on a MIG-enabled card
+# (kernel/src/nvml_mig.h): the instance with the device's UUID, else the only
+# one the process sees, else the physical card. Host-only.
+add_executable(ignis_kernel_nvml_mig_test test_nvml_mig.cpp)
+target_include_directories(ignis_kernel_nvml_mig_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_test(NAME ignis_kernel_nvml_mig_test COMMAND ignis_kernel_nvml_mig_test)
+
 # P4-04 (GitHub #122): OURS, not vendored -- the KV append path under both
 # storage formats. It builds two sequence pools differing only in
 # `ignis_seq_pool_spec::kv_format`, appends the same real fixture rows to a

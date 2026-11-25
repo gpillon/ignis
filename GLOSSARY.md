@@ -1859,8 +1859,9 @@ a value equal to the field's default is neither.
 
 **GPU generation**:
 The family of NVIDIA cards whose features the kernels and routes are reasoned
-about by: Ampere (RTX 30, compute capability 8.6), Ada (RTX 40, 8.9) and
-Blackwell (RTX 50 and RTX PRO, 12.0). The word a user meets.
+about by: Ampere (RTX 30, compute capability 8.6; the A100 and A30, 8.0, in a
+build that carries `80`, ADR 0107), Ada (RTX 40, 8.9) and Blackwell (RTX 50
+and RTX PRO, 12.0). The word a user meets.
 _Avoid_: architecture (the glossary's word for a **model family**), arch.
 
 **Compute capability**:

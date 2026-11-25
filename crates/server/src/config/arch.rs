@@ -51,12 +51,13 @@ impl GpuGeneration {
     /// Every generation, oldest first.
     pub const ALL: [GpuGeneration; 3] = [Self::Ampere, Self::Ada, Self::Blackwell];
 
-    /// The generation of a card of `capability`: 8.6 and 8.7 Ampere, 8.9
-    /// Ada, every 12.x Blackwell. `None` for any other, which no catalog
-    /// entry is refused on by generation.
+    /// The generation of a card of `capability`: 8.0 (A100, a build that
+    /// carries `80`), 8.6 and 8.7 Ampere, 8.9 Ada, every 12.x Blackwell.
+    /// `None` for any other, which no catalog entry is refused on by
+    /// generation.
     pub fn of(capability: ComputeCapability) -> Option<Self> {
         match (capability.major, capability.minor) {
-            (8, 6 | 7) => Some(Self::Ampere),
+            (8, 0 | 6 | 7) => Some(Self::Ampere),
             (8, 9) => Some(Self::Ada),
             (12, _) => Some(Self::Blackwell),
             _ => None,
@@ -654,16 +655,16 @@ mod tests {
     }
 
     /// Spec #474: the GPU generation follows from the compute capability the
-    /// start reads — 8.6 and 8.7 Ampere, 8.9 Ada, every 12.x Blackwell — and
+    /// start reads — 8.0 (A100), 8.6 and 8.7 Ampere, 8.9 Ada, every 12.x Blackwell — and
     /// a capability of none of them has none, which refuses nothing. The
     /// three are ordered by age, as a catalog entry's `generation` reads them.
     #[test]
     fn the_gpu_generation_follows_from_the_compute_capability() {
         use GpuGeneration::*;
-        for (capability, generation) in [(cc(8, 6), Ampere), (cc(8, 7), Ampere), (cc(8, 9), Ada), (cc(12, 0), Blackwell), (cc(12, 1), Blackwell)] {
+        for (capability, generation) in [(cc(8, 0), Ampere), (cc(8, 6), Ampere), (cc(8, 7), Ampere), (cc(8, 9), Ada), (cc(12, 0), Blackwell), (cc(12, 1), Blackwell)] {
             assert_eq!(GpuGeneration::of(capability), Some(generation), "{capability}");
         }
-        for capability in [cc(7, 5), cc(8, 0), cc(8, 8), cc(9, 0), cc(10, 0), cc(11, 0)] {
+        for capability in [cc(7, 5), cc(8, 8), cc(9, 0), cc(10, 0), cc(11, 0)] {
             assert_eq!(GpuGeneration::of(capability), None, "{capability}");
         }
         assert!(Ampere < Ada && Ada < Blackwell);
@@ -703,7 +704,8 @@ mod tests {
     }
 
     /// A plain entry's machine code runs on its major from its minor up: an
-    /// `86;120a` build covers 8.6 and 8.9, an `89;120a` one not 8.6.
+    /// `86;120a` build covers 8.6 and 8.9, an `89;120a` one not 8.6, an
+    /// `80;120a` one every 8.x.
     #[test]
     fn a_plain_entry_covers_its_major_from_its_minor_up() {
         let ampere = BuiltArchitectures::parse("86;120a").unwrap();
@@ -715,6 +717,13 @@ mod tests {
         }
         let ada = BuiltArchitectures::parse("89;120a").unwrap();
         assert!(ada.cover(cc(8, 9)) && !ada.cover(cc(8, 6)));
+        // ADR 0107: an `80;120a` build covers the A100 and the A30, and the
+        // RTX 30 and RTX 40 with the same code.
+        let datacenter = BuiltArchitectures::parse("80;120a").unwrap();
+        for covered in [cc(8, 0), cc(8, 6), cc(8, 9), cc(12, 0)] {
+            assert!(datacenter.cover(covered), "{covered}");
+        }
+        assert!(!datacenter.cover(cc(9, 0)) && !datacenter.cover(cc(7, 5)));
     }
 
     #[test]

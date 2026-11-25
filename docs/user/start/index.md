@@ -51,6 +51,13 @@ You can add models of your own with an
   - *Ampere.* The RTX 3090 and the RTX 3090 Ti (8.6, 24 GB) are
     supported, on the 16 GB entries (the 27B, its uncensored variant, Swift
     1.5).
+  - *Data-center Ampere.* The A100 and the A30 (8.0), whole or as a MIG
+    instance, need a build that carries `80`, which the releases do not
+    ([Other card architectures](../contributing/building.md#other-card-architectures)).
+    They load the same entries; a profile is named, `--profile rtx-24gb`,
+    since a whole card's total fits no class
+    ([ADR 0107](../../adr/0107-compute-capability-8-0-is-ampere-and-a-mig-instance-answers-for-its-own-memory.md)).
+    No speed is measured on them yet.
   - *Ada.* The RTX 4090 (24 GB) and the 16 GB RTX 40 cards (RTX
     4060 Ti 16 GB, RTX 4080) are verified for correctness, on the same entries:
     the release's [sm_86 gate](../contributing/releases.md#the-sm_86-gate) (the

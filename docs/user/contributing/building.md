@@ -73,7 +73,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File kernel\build.ps1
 ```
 
 `86;120a` adds Ampere (RTX 30). The sm_86 machine code also runs on Ada
-(RTX 40), and `89;120a` adds Ada alone. Each list keeps an arch-specific
+(RTX 40), and `89;120a` adds Ada alone. `80;120a` adds the data-center Ampere
+cards, the A100 and the A30 (8.0), whole or as a MIG instance; its sm_80 code
+also runs on the RTX 30 and RTX 40, outside the full-rate rule below, which
+reads sm_86 code alone ([ADR 0107](../../adr/0107-compute-capability-8-0-is-ampere-and-a-mig-instance-answers-for-its-own-memory.md)).
+`.github/workflows/image-architectures.yml` builds and publishes the container
+image for such a list: run by hand, or by a push to a branch under `image/`. Each list keeps an arch-specific
 Blackwell entry such as `120a`: the NVFP4 W4A4 prefill GEMMs, the block-scaled
 FP8 kernels and Flash-Next's decode clusters and staged kernel compile for that
 entry alone, and so do three vendored kernels that declare more than 48 KiB of
