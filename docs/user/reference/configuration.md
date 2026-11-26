@@ -1008,7 +1008,7 @@ The speculative backend: `dflash2` (the 27B's drafter, every profile's but `rtx-
 | Per model | `--qwen38-spec-draft-tokens`, `--qwen38flashnext-spec-draft-tokens` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The draft window, the most drafts a lane verifies: 1..=15 with `dflash2`, required where no profile gives the 27B one (every built-in profile does, and `dflash2` named for both models takes the 27B's); past 7 the 27B's verify rounds take a base or an extended round shape. With `mtp` on the 27B 0..=7 (default 7, where 0 loads no speculation), on Flash-Next 1..=7 (default 2). Needs a backend.
+The draft window, the most drafts a lane verifies: 1..=15 with `dflash2`, required where no profile gives the 27B one (every built-in profile does, and `dflash2` named for both models takes the 27B's); past 7 the 27B's verify rounds take a base or an extended round shape. With `mtp` on the 27B 0..=7 (default 7, where 0 loads no speculation), on Flash-Next 1..=7 (default 2). Ignored with no backend and under `off`.
 
 ### `spec.draft_rows`
 
@@ -1052,7 +1052,7 @@ The decode lanes: the sequences a model decodes at once. On the 27B each lane re
 | Per model | `--qwen38-spec-draft-head`, `--qwen38flashnext-spec-draft-head` |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The drafter's proposal head: `full` (the target's output head), `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the shortlist frees no VRAM and measured slower). Needs a backend; `mtp` has only `full`, on either model. Unset, `full`.
+The drafter's proposal head: `full` (the target's output head), `shortlist` (the artifact's Q4 head over the 131,072 most frequent tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the shortlist frees no VRAM and measured slower). DFlash2's alone: ignored with no backend, under `off` and beside `mtp`, whose one head is `full`, on either model. Unset, `full`.
 
 ### `spec.draft_rule`
 
@@ -1066,7 +1066,7 @@ The drafter's proposal head: `full` (the target's output head), `shortlist` (the
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the fixed draft, the drafter's single best draft taken with the target's probability of it, or `sampled`, the sampled draft, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. The default is `sampled` (GitHub #578); `fixed`, the rule of earlier releases, stays for a comparison or a way back. Needs `dflash2`: the 27B's MTP head drafts the fixed draft only, and refuses `sampled` and the two settings below when they are named.
+How the 27B's DFlash2 rounds draft and accept for a request that samples (ADR 0090): `fixed`, the fixed draft, the drafter's single best draft taken with the target's probability of it, or `sampled`, the sampled draft, a draft drawn from the drafter's own distribution and taken by the ratio of the two distributions. Both keep the text distributed as the model's sampler draws it; a seed's text differs between them. Greedy requests draft and accept the same way under either. The default is `sampled` (GitHub #578); `fixed`, the rule of earlier releases, stays for a comparison or a way back. Read by `dflash2` alone: with no backend, under `off`, beside an MTP head (which drafts the fixed draft) and on Flash-Next, it and the two settings below are ignored.
 
 ### `spec.drafter_temperature_factor`
 
@@ -1136,7 +1136,7 @@ The shape rule's stay: the drafts an extended round must take for its lane to ke
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-The shape policy, which turns the lanes' asks into a round's shape past 7 drafts: `aggregate` runs a round of 2 to 4 lanes extended when the drafts its asking lanes are expected to take past position 7 exceed what the wider round costs every lane in it, so a lane that does not ask pays for its neighbour when the round as a whole gains; `all` only when every lane asks, so no lane pays for another; `mixed` grants the extended shape lane by lane, at 2 to 7 lanes, the highest expected gain first, each when the drafts the lane is expected to take past position 7 exceed what its 8 more columns cost every lane, within 64 columns, so a round may mix both shapes (only at 15 drafts, on either artifact: any other load runs `aggregate`, as its load log says). A lane alone runs at the shape it asks under each. The `rtx5090` profile gives `mixed` to the NVFP4 artifact, measured on that card (a trellis artifact runs `aggregate` under it unless `mixed` is named); every other profile gives `aggregate`. A speed setting only.
+The shape policy, which turns the lanes' asks into a round's shape past 7 drafts: `aggregate` runs a round of 2 to 4 lanes extended when the drafts its asking lanes are expected to take past position 7 exceed what the wider round costs every lane in it, so a lane that does not ask pays for its neighbour when the round as a whole gains; `all` only when every lane asks, so no lane pays for another; `mixed` grants the extended shape lane by lane, at 2 to 7 lanes, the highest expected gain first, each when the drafts the lane is expected to take past position 7 exceed what its 8 more columns cost every lane, within 64 columns, so a round may mix both shapes (only at 15 drafts, on either artifact: any other load runs `aggregate`, as a WARN at load says). A lane alone runs at the shape it asks under each. The `rtx5090` profile gives `mixed` to the NVFP4 artifact, measured on that card (a trellis artifact runs `aggregate` under it, or under a profile of your own, unless `mixed` is named; `config generate` leaves it to the profile); every other profile gives `aggregate`. A speed setting only.
 
 ### `spec.shape_estimate_rounds`
 

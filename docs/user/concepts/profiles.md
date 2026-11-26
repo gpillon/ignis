@@ -155,14 +155,20 @@ Why each:
   need 66 MiB more free at start than the 28,483 MiB above to hold unadapted
   ([finding](../../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy aggregate`
-  gives the uniform rounds back (the shape options are refused without a named
-  `--spec-backend`), and a start that names `--spec-backend mtp`, `off` or a
-  window other than 15 runs no mixed round and plans no graph for one. The
+  gives the uniform rounds back (from 0.11.2 `--spec-shape-policy aggregate`
+  alone does, the profile's DFlash2 taking it; 0.11.1 refuses the shape options
+  without a named `--spec-backend`), and a start that names `--spec-backend
+  mtp`, `off` or a window other than 15 runs no mixed round and plans no graph
+  for one (a window other than 15 says so in a WARN, from 0.11.2,
+  [troubleshooting](../troubleshooting.md#warn-ignisruntimemixed_rounds_need_15_drafts)). The
   profile's `mixed` is the NVFP4 artifact's, the one served above: a trellis
   artifact loaded under `rtx5090` runs `aggregate` and plans no mixed graph
   (its load log says `shape_policy=aggregate shape_policy_profile=mixed`), and
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
-  turns them on there.
+  turns them on there. A profile you define under `profiles:` that gives
+  `mixed` is a profile too, its `mixed` the NVFP4 artifact's the same way, and
+  a file `config generate` writes under either leaves the policy to the
+  profile (from 0.11.2).
 - **The vision tower and pool in host RAM.** The 5090 stages the 296 MB tower
   for each image and maps the embedding pool in pinned host RAM, so a vision
   load keeps the KV pool of a text-only one ([Vision](../configuration/vision.md#where-the-vision-tower-and-the-embedding-pool-live)).
@@ -286,8 +292,8 @@ Why each:
   the vendored chunked route.
 - **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
-  turns them on (the shape options are refused without a named
-  `--spec-backend`), and the grant reads the trellis artifact's own cost
+  turns them on (from 0.11.2 the profile's DFlash2 takes the window and the
+  policy without `--spec-backend`, which 0.11.1 asks for), and the grant reads the trellis artifact's own cost
   table, measured on the RTX 5090 and indicative here until a run on one of
   these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
@@ -358,8 +364,9 @@ Why each:
 - **One lane.** A second costs about 0.87 GB, which the context pays: more
   than five of its 16,384-token steps.
   `--spec-decode-lanes 2` asks for two on a card with nothing else on it.
-- **No mixed rounds.** One lane holds no mix, and the MTP head refuses
-  `--spec-shape-policy` by name, as it refuses every shape option.
+- **No mixed rounds.** One lane holds no mix, and the MTP head ignores
+  `--spec-shape-policy`, as it ignores every shape option (from 0.11.2; 0.11.1
+  refuses them by name).
 - **131,072 tokens, adapting 16,384 at a time.** Every other profile adapts
   65,536 at a time. A 12 GB card's budget is derived from the memory free at
   the start, which the desktop sets, and the context is the largest of the
@@ -453,8 +460,8 @@ Why each:
   vendored chunked route.
 - **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
-  turns them on (the shape options are refused without a named
-  `--spec-backend`), and the grant reads the trellis artifact's own cost
+  turns them on (from 0.11.2 the profile's DFlash2 takes the window and the
+  policy without `--spec-backend`, which 0.11.1 asks for), and the grant reads the trellis artifact's own cost
   table, measured on the RTX 5090 and indicative here until a run on one of
   these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).

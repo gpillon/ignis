@@ -158,7 +158,7 @@ fn generate(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files:
         })?,
         (None, None) => return Err(ConfigError("`config generate` to stdout needs `--format json|yaml`".to_owned())),
     };
-    let mut document = file::effective_document(&config);
+    let mut document = file::generated_document(&config);
     if let Some(name) = profile {
         document.as_object_mut().expect("a document is a map").insert("profile".to_owned(), Value::String(name));
     }
@@ -413,7 +413,9 @@ mod tests {
     }
 
     /// Spec config-v2/01, Testing: `config generate` with no flags, read back
-    /// by a start, in both formats — and either model starts on it.
+    /// by a start, in both formats — and either model starts on it. Every
+    /// field is written but the shape policy the profile gives the 27B, which
+    /// is left to the profile (GitHub #729).
     #[test]
     fn generate_writes_every_default_and_a_start_reads_it_back() {
         let defaults = started(&[], &MemFiles::default());
@@ -427,7 +429,7 @@ mod tests {
                 read.for_family(family).unwrap_or_else(|e| panic!("{name}: {e}"));
             }
             let document = Format::of_path(&path).unwrap().read(&contents).unwrap();
-            for meta in all_fields() {
+            for meta in all_fields().filter(|meta| meta.file_key() != "spec.shape_policy") {
                 // A field only one family takes is never written at the
                 // general scope (GitHub #311's family-section fix, now also
                 // `effective_document`'s): it lives in that family's own
@@ -440,6 +442,30 @@ mod tests {
                 assert!(written.is_some(), "{name} writes {}", meta.file_key());
             }
         }
+    }
+
+    /// GitHub #729: the shape policy a profile gives the 27B (`rtx5090`'s
+    /// `mixed`, the NVFP4 body's) is left to the profile: the generated file
+    /// does not write it, so a start reading the file back takes it from the
+    /// profile, the file's `profile:` or the card's own under `auto`, and it
+    /// keeps the profile's origin. A policy the operator names is written.
+    #[test]
+    fn generate_leaves_a_profiles_shape_policy_to_the_profile() {
+        use ignis_core::ShapePolicy;
+        let policy_of = |text: &str| yaml(text)["spec"][scope(ModelFamily::Qwen38_27b)].get("shape_policy").cloned();
+        for flags in [&["--profile", "rtx5090"][..], &[]] {
+            let mut argv = vec!["config", "generate", "--format", "yaml"];
+            argv.extend_from_slice(flags);
+            let text = printed(run(&argv, &[], &MemFiles::default()).unwrap());
+            assert_eq!(policy_of(&text), None, "{flags:?}:\n{text}");
+            let files = MemFiles::with(&[("g.yaml", &text)]);
+            let read = started(&["--config", "g.yaml"], &files).for_family(ModelFamily::Qwen38_27b).unwrap();
+            assert_eq!(read.speculation.map(|s| s.shape_policy()), Some(ShapePolicy::Mixed), "{flags:?}");
+            let origin = read.basis.resolution().origin("spec", "shape_policy").map(|origin| origin.source);
+            assert_eq!(origin, Some(super::super::source::Source::Profile), "{flags:?}");
+        }
+        let named = printed(run(&["config", "generate", "--format", "yaml", "--spec-shape-policy", "mixed"], &[], &MemFiles::default()).unwrap());
+        assert_eq!(policy_of(&named), Some(Value::from("mixed")), "the operator's");
     }
 
     #[test]

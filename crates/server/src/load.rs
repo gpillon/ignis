@@ -724,6 +724,15 @@ fn cuda_scheduler_for(
              the lanes' and the device retained slots'; 1+1 two lanes and three slots), so it runs aggregate"
         );
     }
+    // GitHub #729: `mixed` at a window mixed rounds do not run at runs `aggregate`, which it says, and whose it was.
+    if let Some((draft_tokens, source)) = mixed_at_another_window(shape.speculation.filter(|_| family == ModelFamily::Qwen38_27b), given) {
+        tracing::warn!(
+            name: "ignis.runtime.mixed_rounds_need_15_drafts",
+            draft_tokens,
+            shape_policy_source = source.as_str(),
+            "the shape policy mixed runs mixed rounds at 15 drafts only, so this load of {draft_tokens} drafts runs aggregate"
+        );
+    }
     // GitHub #489: the solo width as configured and as the load resolved it.
     tracing::info!(
         name: "ignis.runtime.prefill_chunk_solo",
@@ -842,7 +851,10 @@ fn speculation_text(
                 ignis_core::ShapePolicy::Mixed if !holds_a_mix => ignis_core::ShapePolicy::Aggregate,
                 runs => runs,
             };
-            let given = if runs == given.policy { String::new() } else { format!(" {}={}", given.field(), given.policy.as_str()) };
+            // GitHub #729: a profile's `mixed` at a window mixed rounds do not run
+            // at is not named beside it; the load's WARN says so ([`mixed_at_another_window`]).
+            let named = runs != given.policy && (given.source != crate::config::source::Source::Profile || s.holds_mixed_rounds());
+            let given = if named { format!(" {}={}", given.field(), given.policy.as_str()) } else { String::new() };
             format!(
                 "{line} shape_enter_accepted={} shape_stay_accepted={} shape_policy={}{given} shape_estimate_rounds={} shape_period_ratios={}",
                 rule.enter_accepted(),
@@ -914,6 +926,19 @@ fn pool_without_a_mix(speculation: Option<ignis_core::Speculation>, given: Shape
     let mixed = speculation.filter(|s| given.source != crate::config::source::Source::Profile && s.shape_policy_runs() == ignis_core::ShapePolicy::Mixed)?;
     let held = ignis_core::lane_lines::mixed_graphs(Some(mixed), true, lanes, retained_device_slots, ignis_artifact::Body27b::Nvfp4);
     held.mixes.is_empty().then_some((lanes, lanes + retained_device_slots))
+}
+
+/// GitHub #729: a 27B load of `speculation` whose shape policy is `mixed`, a
+/// profile's or the operator's (`given`), at a DFlash2 window mixed rounds do
+/// not run at ([`ignis_core::Speculation::holds_mixed_rounds`], 15 drafts):
+/// its window and the policy's source, which its WARN names, the load running
+/// `aggregate`; `None` for any other load. `speculation` is the one the load
+/// runs ([`speculation_on`]): a profile's `mixed` on a trellis body is not in
+/// force there.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn mixed_at_another_window(speculation: Option<ignis_core::Speculation>, given: ShapePolicyGiven) -> Option<(u32, crate::config::source::Source)> {
+    let s = speculation.filter(|s| s.backend() == ignis_core::SpeculativeBackend::Dflash2 && s.shape_policy() == ignis_core::ShapePolicy::Mixed)?;
+    (!s.holds_mixed_rounds()).then_some((s.draft_tokens(), given.source))
 }
 
 #[cfg(all(test, not(feature = "cuda")))]
@@ -1376,10 +1401,12 @@ mod tests {
 
     /// GitHub #711: the no-mix WARN is the operator's `mixed`. Under the
     /// `rtx5090` profile's own, a load that holds no mix (one lane, two
-    /// without a retained slot, a trellis body, a window of 10 named) runs
-    /// `aggregate` without it, and its line names the profile's policy beside
-    /// the one it runs (`shape_policy_profile`); a load the operator gave
-    /// `mixed` warns at those lanes, and its line names the policy given.
+    /// without a retained slot, a trellis body) runs `aggregate` without it,
+    /// and its line names the profile's policy beside the one it runs
+    /// (`shape_policy_profile`); a load the operator gave `mixed` warns at
+    /// those lanes, and its line names the policy given. A window named past
+    /// the profile's is GitHub #729's
+    /// (`mixed_at_a_window_other_than_15_runs_aggregate_and_warns_naming_whose_it_was`).
     #[test]
     fn a_profiles_mixed_that_holds_no_mix_runs_aggregate_without_a_warn_and_its_line_says_whose_it_was() {
         use ignis_artifact::Body27b;
@@ -1403,8 +1430,45 @@ mod tests {
             assert_eq!(load(&named, Body27b::Nvfp4, lanes, retained), (warned, by_name.to_owned()), "named, at {lanes} lanes");
         }
         assert_eq!(load(&profile, Body27b::Trellis, 8, 0), (None, by_profile.to_owned()), "the profile's on a trellis body");
-        let ten = ["--profile", "rtx5090", "--spec-backend", "dflash2", "--spec-draft-tokens", "10"];
-        assert_eq!(load(&ten, Body27b::Nvfp4, 8, 0), (None, by_profile.to_owned()), "a window of 10 named");
+    }
+
+    /// GitHub #729: `mixed` at a DFlash2 window mixed rounds do not run at
+    /// (15) runs `aggregate`, and one WARN says so, naming the window and
+    /// whose `mixed` it was: the `rtx5090` profile's under a window the
+    /// operator names, whose line then names no policy beside the one it
+    /// runs, or the operator's, whose line still names it. At 15, where the
+    /// profile's `mixed` is not in force (a trellis body), for another policy
+    /// and on an MTP load there is none.
+    #[test]
+    fn mixed_at_a_window_other_than_15_runs_aggregate_and_warns_naming_whose_it_was() {
+        use crate::config::source::Source;
+        use ignis_artifact::Body27b;
+        let load = |args: &[&str], body| {
+            let config = the_27b(args, "");
+            let given = ShapePolicyGiven::of(&config);
+            let runs = speculation_on(config.speculation, given, body);
+            let line = speculation_text(ModelFamily::Qwen38_27b, LoadSpeculation::Runs(runs), given, Some(body), false);
+            let policy: Vec<&str> = line.split(' ').filter(|field| field.starts_with("shape_policy")).collect();
+            (mixed_at_another_window(runs, given), policy.join(" "))
+        };
+        let at = |window: &'static str, more: &[&'static str]| -> Vec<&'static str> {
+            ["--profile", "rtx5090", "--spec-backend", "dflash2", "--spec-draft-tokens", window].iter().chain(more).copied().collect()
+        };
+        for (window, drafts) in [("8", 8), ("10", 10), ("14", 14)] {
+            let by_profile = (Some((drafts, Source::Profile)), "shape_policy=aggregate".to_owned());
+            assert_eq!(load(&at(window, &[]), Body27b::Nvfp4), by_profile, "the profile's at {window}");
+            let by_name = (Some((drafts, Source::Flag)), "shape_policy=aggregate shape_policy_given=mixed".to_owned());
+            assert_eq!(load(&at(window, &["--spec-shape-policy", "mixed"]), Body27b::Nvfp4), by_name, "named at {window}");
+            assert_eq!(load(&at(window, &["--spec-shape-policy", "mixed"]), Body27b::Trellis).0, by_name.0, "named, on a trellis body");
+            assert_eq!(load(&at(window, &[]), Body27b::Trellis), (None, "shape_policy=aggregate".to_owned()), "the NVFP4 body's");
+            assert_eq!(load(&at(window, &["--spec-shape-policy", "all"]), Body27b::Nvfp4).0, None, "`all`");
+        }
+        // A load of one round shape names no policy, and still warns.
+        assert_eq!(load(&at("7", &[]), Body27b::Nvfp4), (Some((7, Source::Profile)), String::new()), "7 drafts");
+        assert_eq!(load(&["--profile", "rtx5090"], Body27b::Nvfp4).0, None, "the profile's own 15");
+        assert_eq!(load(&at("15", &["--spec-shape-policy", "mixed"]), Body27b::Nvfp4).0, None, "15 named");
+        let mtp = ["--profile", "rtx5090", "--spec-backend", "mtp"];
+        assert_eq!(load(&mtp, Body27b::Nvfp4).0, None, "the MTP head");
     }
 
     /// GitHub #623: the 27B's MTP load names its drafter and its window, and

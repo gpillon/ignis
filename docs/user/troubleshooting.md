@@ -424,9 +424,25 @@ runs `aggregate`, and its load log's `speculation` says
 gives two lanes the 1+1 mix
 ([Built-in profiles](concepts/profiles.md#rtx-16gb)). The `rtx5090`
 profile's own `mixed` gives no WARN: a load of it that holds no mix (one or
-two lanes named, lanes its adaptation lowered, a window of 8 to 14 named,
-a trellis artifact) runs `aggregate`, and its load log says
-`shape_policy=aggregate shape_policy_profile=mixed`.
+two lanes named, lanes its adaptation lowered, a trellis artifact) runs
+`aggregate`, and its load log says
+`shape_policy=aggregate shape_policy_profile=mixed`. A window other than 15
+is the next WARN's.
+
+### WARN `ignis.runtime.mixed_rounds_need_15_drafts`
+
+"the shape policy mixed runs mixed rounds at 15 drafts only, so this load of
+N drafts runs aggregate", with the load's `draft_tokens` and
+`shape_policy_source`, where `mixed` came from: `profile` for the `rtx5090`
+profile's (or a profile of your own under `profiles:`), `flag`, `env`, `file`
+or `patch` for yours. From 0.11.2, a load whose policy is `mixed` at a DFlash2
+window other than 15, the one mixed rounds run at, says so: under `rtx5090`
+with `--spec-draft-tokens 10` named, or with `--spec-shape-policy mixed` beside
+a window of 8 to 14. The load serves as `aggregate` serves, and its load log's
+`speculation` says `shape_policy=aggregate` (`shape_policy_given=mixed`
+beside it where the policy was yours). Name 15 drafts for mixed rounds, or
+`--spec-shape-policy aggregate` to say what runs. A profile's `mixed` on a
+trellis artifact, which runs `aggregate` there, gives no WARN.
 
 ### `--spec-backend mtp` refuses the start
 
@@ -438,8 +454,12 @@ qwen3.8-flash-next` fetches both
 
 ### `` `--spec-drafter-top-p …`: the drafter top-p is DFlash2's, and the 27B's MTP head … drafts the fixed draft only ``
 
-On the 27B's MTP load the settings only DFlash2 reads are refused where you
-named them: `--spec-draft-rule sampled`, `--spec-drafter-temperature-factor`,
+0.11.1 only: from 0.11.2 these settings are ignored on an MTP load, as under
+`off` and with no backend, and neither this refusal nor `… has nothing to
+configure under --spec-backend off` or `… requires --spec-backend` is given
+([where a draft setting counts](concepts/speculative-decoding.md#where-a-draft-setting-counts)).
+In 0.11.1, on the 27B's MTP load the settings only DFlash2 reads are refused
+where you named them: `--spec-draft-rule sampled`, `--spec-drafter-temperature-factor`,
 `--spec-drafter-top-p` and the shape rule's
 `--spec-shape-enter-accepted` and `--spec-shape-stay-accepted` and the shape
 policy's `--spec-shape-policy`, `--spec-shape-estimate-rounds` and

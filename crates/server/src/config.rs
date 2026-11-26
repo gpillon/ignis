@@ -1139,7 +1139,9 @@ fn refuse_for_family(patch: &source::Layer, family: ModelFamily) -> Result<(), C
         }
         let raw = candidate.raw.trim();
         let value = (meta.canonical)(raw).map_err(|reason| ConfigError(format!("`{}` {reason}", candidate.spelling)))?;
-        if meta.applies.refused_by(family) && value != (meta.default)() {
+        // GitHub #729: a draft setting only another model's drafter reads is
+        // ignored, as a start ignores it.
+        if meta.applies.refused_by(family) && value != (meta.default)() && !meta.is_draft_setting() {
             return Err(ConfigError(format!(
                 "`{} {raw}`: {} does not take it (a {} option)",
                 candidate.spelling,
@@ -1679,28 +1681,25 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 }
 
 /// `--spec-backend`, `--spec-draft-tokens` and `--spec-draft-head` (P5-02,
-/// GitHub #150, #307). No backend means off, and then a draft window or a
-/// head has nothing to configure, so naming one is refused rather than
-/// ignored; `off` refuses them too. `dflash2` requires its window — there is
-/// no default to guess — while `mtp` has a measured one. The MTP head
-/// proposes from its own logits: there is no second head to choose.
-/// GitHub #576 (ADR 0090): `--spec-draft-rule` and the drafter's two
-/// settings ride the speculation the same way; Flash-Next refuses them by
-/// their scope (the 27B's alone) before this runs.
+/// GitHub #150, #307). No backend means off. GitHub #729: a draft setting
+/// counts only where the speculation that reads it runs, so under `off`, with
+/// no backend, and (DFlash2's own) beside an MTP head, each is ignored rather
+/// than refused. `dflash2` requires its window — there is no default to
+/// guess — while `mtp` has a measured one. The MTP head proposes from its
+/// own logits: there is no second head to choose. GitHub #576 (ADR 0090):
+/// `--spec-draft-rule` and the drafter's two settings ride the speculation
+/// the same way; Flash-Next ignores them by their scope (the 27B's alone)
+/// before this runs ([`is_draft_setting`]).
 ///
 /// GitHub #623: `mtp` on the 27B (`family`) takes its own default window,
 /// and a window of 0 there is a load with no speculation, the one `off`
-/// makes. What else only the family decides -- Flash-Next's head refusing 0,
-/// the 27B's MTP load refusing DFlash2's own settings -- is [`fit_family`]'s,
-/// which runs only for the artifact that loads.
+/// makes. What else only the family decides -- Flash-Next's head refusing 0
+/// -- is [`fit_family`]'s, which runs only for the artifact that loads.
 /// Every `spec.` field that shapes a draft beside the backend: the window,
 /// the drafter's head, and DFlash2's own -- its draft rule and its drafter's
 /// sampling (GitHub #576), the shape rule's thresholds (GitHub #689) and the
 /// shape policy's three (GitHub #690). What a start drops with a backend its
-/// model does not draft with, and what a patch's `off` takes out
-/// (`config_http`). The two lists that spell DFlash2's eight with their
-/// values ([`derive_speculation`], [`refuse_dflash2s_settings_under_mtp`])
-/// name the same fields.
+/// model does not draft with.
 pub(crate) const DRAFT_FIELDS: [&str; 10] = [
     "draft_tokens",
     "draft_head",
@@ -1759,70 +1758,19 @@ fn derive_speculation(
     drafters: Option<u32>,
 ) -> Result<(Option<Speculation>, bool), ConfigError> {
     let s = &resolution.settings.spec;
-    let named = |name: &str| resolution.explicit("spec", name);
-    let shown = |name: &str, value: String| format!("`{} {value}`", spelled("spec", name));
-    let draft_tokens = s.draft_tokens.filter(|_| named("draft_tokens"));
-    let draft_head = s.draft_head.filter(|_| named("draft_head"));
-    // GitHub #576: the draft rule and the drafter's settings, where named.
-    let rule_options = [
-        ("draft_rule", Some(s.draft_rule.as_str().to_owned())),
-        ("drafter_temperature_factor", Some(decimal_text(s.drafter_temperature_factor))),
-        ("drafter_top_p", Some(decimal_text(s.drafter_top_p))),
-        // GitHub #689: the shape rule's thresholds.
-        ("shape_enter_accepted", Some(s.shape_enter_accepted.to_string())),
-        ("shape_stay_accepted", Some(s.shape_stay_accepted.to_string())),
-        // GitHub #690: the shape policy's three.
-        ("shape_policy", Some(s.shape_policy.as_str().to_owned())),
-        ("shape_estimate_rounds", Some(s.shape_estimate_rounds.to_string())),
-        ("shape_period_ratios", Some(setting_text(s.shape_period_ratios))),
-    ]
-    .map(|(name, value)| (name, value.filter(|_| named(name))));
+    // GitHub #729: a draft setting counts only where its speculation runs;
+    // under `off`, and with no backend, which reads as `off`, every one is
+    // ignored, whoever named it.
     let backend = match s.backend {
-        Some(SpecChoice::Off) => {
-            for (name, value) in [("draft_tokens", draft_tokens.map(|n| n.to_string())), ("draft_head", draft_head.map(|h| h.as_str().to_owned()))]
-                .into_iter()
-                .chain(rule_options.clone())
-            {
-                if let Some(value) = value {
-                    return Err(ConfigError(format!(
-                        "{} has nothing to configure under `--spec-backend off`",
-                        shown(name, value)
-                    )));
-                }
-            }
-            return Ok((None, true));
-        }
-        None => {
-            for (name, value) in [("draft_head", draft_head.map(|h| h.as_str().to_owned())), ("draft_tokens", draft_tokens.map(|n| n.to_string()))]
-                .into_iter()
-                .chain(rule_options.clone())
-            {
-                if let Some(value) = value {
-                    return Err(ConfigError(format!(
-                        "{} requires `--spec-backend` (speculation is off without it)",
-                        shown(name, value)
-                    )));
-                }
-            }
-            return Ok((None, false));
-        }
+        Some(SpecChoice::Off) => return Ok((None, true)),
+        None => return Ok((None, false)),
         Some(SpecChoice::Backend(backend)) => backend,
     };
-    // ADR 0063: `auto` resolves here, where the load's speculation is
-    // built, as `auto` rope scaling does: to the full head, MTP's only one.
-    let head = s.draft_head.map_or(ProposalHead::Full, |setting| setting.resolve());
-    if backend == SpeculativeBackend::Mtp && head != ProposalHead::Full {
-        return Err(ConfigError(format!(
-            "`{} {}`: `--spec-backend mtp` has no proposal head to choose (the shortlist is DFlash2's)",
-            spelled("spec", "draft_head"),
-            head.as_str()
-        )));
-    }
     // GitHub #623: the 27B's MTP window is the operator's, or a profile's that
     // chose MTP too; the window a profile gives beside its own DFlash2 (every
     // built-in profile's 7) is that drafter's, not the head's.
     let the_27bs_mtp = the_27bs_mtp(family, Some(backend));
-    let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_takes(resolution, "draft_tokens"));
+    let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_takes_window(resolution));
     let tokens = match window {
         Some(tokens) => tokens,
         None if the_27bs_mtp => QWEN38_MTP_DEFAULT_DRAFT_TOKENS,
@@ -1867,15 +1815,20 @@ fn derive_speculation(
             backend.max_draft_tokens()
         ))
     })?;
+    // GitHub #729: an MTP head drafts with none of DFlash2's own settings
+    // (the shortlist head, the draft rule and the drafter's sampling, the
+    // shape rule, the shape policy's three): beside `mtp` each is ignored, at
+    // any value, and the head drafts the fixed draft from its own logits.
+    if backend == SpeculativeBackend::Mtp {
+        return Ok((Some(speculation.with_draft_rule(DraftRule::Fixed, DrafterSampling::default())), false));
+    }
+    // ADR 0063: `auto` resolves here, where the load's speculation is
+    // built, as `auto` rope scaling does: to the full head.
+    let head = s.draft_head.map_or(ProposalHead::Full, |setting| setting.resolve());
     let drafter = DrafterSampling {
         temperature_factor_milli: s.drafter_temperature_factor,
         top_p_milli: s.drafter_top_p,
     };
-    // The rule's default is the 27B's: an MTP head drafts one rule only, the
-    // fixed draft. A value other than the default named there was refused by
-    // its scope before this ran (Flash-Next), or is refused by name where the
-    // family is fitted (the 27B, GitHub #623).
-    let rule = if backend == SpeculativeBackend::Mtp { DraftRule::Fixed } else { s.draft_rule };
     // GitHub #689: the shape rule's thresholds, each in its field's range. On
     // a load of two round shapes a stay threshold past the window could never
     // keep a lane at the extended shape, refused naming the field and the
@@ -1892,75 +1845,24 @@ fn derive_speculation(
     })?;
     // GitHub #690: the shape policy, its estimate window and its period
     // ratios, each in its field's range; every load without an extended shape
-    // never reads them. GitHub #722: the policy a profile gives beside its own
-    // DFlash2 (`rtx5090`'s `mixed`) is that drafter's, as its window is: the
-    // 27B's MTP load named over it carries the default.
+    // never reads them.
     let estimate = ignis_core::ShapeEstimate::new(s.shape_estimate_rounds, s.shape_period_ratios).map_err(ConfigError)?;
-    let speculation = speculation.with_shape_policy(shape_policy_carried(resolution, family), estimate);
-    Ok((Some(speculation.with_proposal_head(head).with_draft_rule(rule, drafter)), false))
+    let speculation = speculation.with_shape_policy(s.shape_policy, estimate);
+    Ok((Some(speculation.with_proposal_head(head).with_draft_rule(s.draft_rule, drafter)), false))
 }
 
-/// GitHub #722: the shape policy a load of `resolution` for `family` carries:
-/// the one resolved, but the default on the 27B's MTP load where that load
-/// does not take it ([`mtp_takes`]). The one rule both the load's speculation
-/// ([`derive_speculation`]) and the effective document
-/// ([`file::effective_document`]) read.
-fn shape_policy_carried(resolution: &Resolution, family: Option<ModelFamily>) -> ignis_core::ShapePolicy {
-    let s = &resolution.settings.spec;
-    if the_27bs_mtp(family, s.backend.and_then(SpecChoice::backend)) && !mtp_takes(resolution, "shape_policy") {
-        ignis_core::ShapePolicy::default()
-    } else {
-        s.shape_policy
-    }
-}
-
-/// Whether the 27B's MTP load takes the value `resolution` resolved for
-/// `spec.<name>`, the window (GitHub #623) or the shape policy (GitHub #722):
-/// one the operator named, or a profile's when the profile chose the backend
-/// too. A profile's value beside a backend the operator named is the
-/// profile's own drafter's, and the load takes the head's default.
-fn mtp_takes(resolution: &Resolution, name: &str) -> bool {
+/// Whether the 27B's MTP load takes the window `resolution` resolved
+/// (GitHub #623): one the operator named, or a profile's when the profile
+/// chose the backend too. A profile's window beside a backend the operator
+/// named is the profile's own drafter's, and the load takes the head's
+/// default.
+fn mtp_takes_window(resolution: &Resolution) -> bool {
     let source = |name: &str| resolution.origin("spec", name).map(|origin| origin.source);
-    match source(name) {
+    match source("draft_tokens") {
         Some(source::Source::Profile) => source("backend") == Some(source::Source::Profile),
         Some(given) => given.explicit(),
         None => false,
     }
-}
-
-/// GitHub #623: on the 27B's MTP load, DFlash2's own sampling settings
-/// refused by name where the operator named them
-/// ([`Resolution::named_by_operator`]): the sampled draft, and the drafter's
-/// temperature factor and top-p, which only the sampled draft reads. The head
-/// drafts the fixed draft, which `--spec-draft-rule fixed` names harmlessly;
-/// a default in force (the sampled draft is the 27B's since GitHub #578)
-/// refuses nothing. The shortlist head is refused where the speculation is
-/// built ([`derive_speculation`]), on either model's head.
-fn refuse_dflash2s_settings_under_mtp(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> String) -> Result<(), ConfigError> {
-    let s = &resolution.settings.spec;
-    let named = |name: &str| resolution.named_by_operator("spec", name);
-    let refused = [
-        ("draft_rule", (s.draft_rule == DraftRule::Sampled && named("draft_rule")).then(|| s.draft_rule.as_str().to_owned()), "the sampled draft"),
-        ("drafter_temperature_factor", named("drafter_temperature_factor").then(|| decimal_text(s.drafter_temperature_factor)), "the drafter temperature factor"),
-        ("drafter_top_p", named("drafter_top_p").then(|| decimal_text(s.drafter_top_p)), "the drafter top-p"),
-        // GitHub #689: the shape rule chooses between DFlash2's round shapes.
-        ("shape_enter_accepted", named("shape_enter_accepted").then(|| s.shape_enter_accepted.to_string()), "the shape rule"),
-        ("shape_stay_accepted", named("shape_stay_accepted").then(|| s.shape_stay_accepted.to_string()), "the shape rule"),
-        // GitHub #690: and the shape policy chooses each round's from them.
-        ("shape_policy", named("shape_policy").then(|| s.shape_policy.as_str().to_owned()), "the shape policy"),
-        ("shape_estimate_rounds", named("shape_estimate_rounds").then(|| s.shape_estimate_rounds.to_string()), "the shape policy"),
-        ("shape_period_ratios", named("shape_period_ratios").then(|| setting_text(s.shape_period_ratios)), "the shape policy"),
-    ];
-    for (name, value, what) in refused {
-        if let Some(value) = value {
-            return Err(ConfigError(format!(
-                "`{} {value}`: {what} is DFlash2's, and the 27B's MTP head (`{} mtp`) drafts the fixed draft only",
-                spelled("spec", name),
-                spelled("spec", "backend")
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// A decimal field's value as its flag would spell it (thousandths to `0.9`):
@@ -2150,9 +2052,9 @@ pub fn log_vision_options(config: &Config) {
 /// GitHub #623: what `mtp` takes differs by model, and a value named for the
 /// model that loads is judged as it is named, on a switch as at start (a
 /// bound, not a drop): Flash-Next's head drafts 1 to 7 tokens, so a window of
-/// 0, the 27B's no-speculation load, is refused there; the 27B's MTP load
-/// refuses DFlash2's own settings where the operator named them. It takes
-/// vision as DFlash2's does (GitHub #624).
+/// 0, the 27B's no-speculation load, is refused there (GitHub #729: DFlash2's
+/// own settings beside either head are ignored, [`derive_speculation`]). It
+/// takes vision as DFlash2's does (GitHub #624).
 fn fit_family(
     fitted: FamilyFit<'_>,
     resolution: &Resolution,
@@ -2201,9 +2103,6 @@ fn fit_family(
                     SpeculativeBackend::Mtp.max_draft_tokens(),
                     schema::field("spec", "draft_tokens").expect("declared").scoped_flag(ModelFamily::Qwen38_27b)
                 )));
-            }
-            ModelFamily::Qwen38_27b => {
-                refuse_dflash2s_settings_under_mtp(resolution, spelled)?;
             }
             _ => {}
         }

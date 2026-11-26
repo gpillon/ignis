@@ -647,7 +647,7 @@ config_group! {
         /// the 27B's); past 7 the 27B's verify rounds take a base or an
         /// extended round shape. With `mtp` on the 27B 0..=7 (default 7,
         /// where 0 loads no speculation), on Flash-Next 1..=7 (default 2).
-        /// Needs a backend.
+        /// Ignored with no backend and under `off`.
         draft_tokens: Opt<Tokens> = None, between(0, ignis_core::WIDEST_DRAFT_TOKENS as i64), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// Flash-Next's draft row budget: the rows a verify round takes across
         /// lanes, 0 (= 8) or 2..=32; past 8, five to eight lanes draft too.
@@ -664,8 +664,9 @@ config_group! {
         /// The drafter's proposal head: `full` (the target's output head),
         /// `shortlist` (the artifact's Q4 head over the 131,072 most frequent
         /// tokens, ~357 MB more VRAM) or `auto` (`full` on every card class: the
-        /// shortlist frees no VRAM and measured slower). Needs a backend; `mtp`
-        /// has only `full`, on either model. Unset, `full`.
+        /// shortlist frees no VRAM and measured slower). DFlash2's alone:
+        /// ignored with no backend, under `off` and beside `mtp`, whose one
+        /// head is `full`, on either model. Unset, `full`.
         draft_head: Opt<DraftHead> = None, Validator::OneOf(&["full", "shortlist", "auto"]), ALL, [Visible, Patchable, ReloadRequired, Scoped];
         /// How the 27B's DFlash2 rounds draft and accept for a request that
         /// samples (ADR 0090): `fixed`, the fixed draft, the drafter's single
@@ -676,9 +677,9 @@ config_group! {
         /// seed's text differs between them. Greedy requests draft and accept
         /// the same way under either. The default is `sampled` (GitHub #578);
         /// `fixed`, the rule of earlier releases, stays for a comparison or a
-        /// way back. Needs `dflash2`: the 27B's MTP head drafts the fixed
-        /// draft only, and refuses `sampled` and the two settings below when
-        /// they are named.
+        /// way back. Read by `dflash2` alone: with no backend, under `off`,
+        /// beside an MTP head (which drafts the fixed draft) and on
+        /// Flash-Next, it and the two settings below are ignored.
         draft_rule: DraftRuleKind = DraftRule::Sampled, Validator::OneOf(&DraftRule::NAMES), QWEN38_ONLY,
             [Visible, Patchable, ReloadRequired];
         /// Under `sampled`, the drafter's temperature as a factor of the
@@ -716,11 +717,12 @@ config_group! {
         /// the lane is expected to take past position 7 exceed what its 8
         /// more columns cost every lane, within 64 columns, so a round may
         /// mix both shapes (only at 15 drafts, on either artifact: any other
-        /// load runs `aggregate`, as its load log says). A lane alone
+        /// load runs `aggregate`, as a WARN at load says). A lane alone
         /// runs at the shape it asks under each. The `rtx5090` profile gives
         /// `mixed` to the NVFP4 artifact, measured on that card (a trellis
-        /// artifact runs `aggregate` under it unless `mixed` is named); every
-        /// other profile gives `aggregate`. A speed setting only.
+        /// artifact runs `aggregate` under it, or under a profile of your own,
+        /// unless `mixed` is named; `config generate` leaves it to the
+        /// profile); every other profile gives `aggregate`. A speed setting only.
         shape_policy: ShapePolicyKind = ignis_core::ShapePolicy::Aggregate, Validator::OneOf(&ignis_core::ShapePolicy::NAMES),
             QWEN38_ONLY, [Visible, Patchable, ReloadRequired];
         /// Under `aggregate` and `mixed`, the verify rounds of its own, the most recent,

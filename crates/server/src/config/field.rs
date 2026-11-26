@@ -366,6 +366,15 @@ impl FieldMeta {
         }
     }
 
+    /// GitHub #729: whether the field is a draft setting, read only by a
+    /// model's drafter: one of [`super::DRAFT_FIELDS`] or Flash-Next's draft
+    /// rows. A model whose drafter does not read it ignores a value named for
+    /// it, neither refused nor dropped, as a load whose speculation does not
+    /// run ignores every one.
+    pub fn is_draft_setting(&self) -> bool {
+        self.group == "spec" && (super::DRAFT_FIELDS.contains(&self.name) || self.name == "draft_rows")
+    }
+
     /// Whether a value of the field may sit in `family`'s own section (a
     /// file's `<group>.<family>.<field>`, an env var's `IGNIS_<FAMILY>_…`):
     /// a scoped field in either family's, and a field only one family takes

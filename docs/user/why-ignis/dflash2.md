@@ -105,8 +105,10 @@ round for every lane](decode-round.md).
 
 - Acceptance follows predictability. Free prose and sampled turns accept fewer
   drafts than code at temperature zero.
-- Speculation costs VRAM only when it is on, and it needs a backend:
-  `spec.draft_tokens` alone is refused.
+- Speculation costs VRAM only when it is on, and it needs a backend: a draft
+  setting where no backend runs changes nothing (from 0.11.2,
+  [where a draft setting counts](../concepts/speculative-decoding.md#where-a-draft-setting-counts);
+  0.11.1 refuses `spec.draft_tokens` alone).
 - The kernel replacement's gain is a one-lane figure. It shrinks to 4% at
   eight lanes.
 - The replacement is not at its own bound either: the finding measures it at

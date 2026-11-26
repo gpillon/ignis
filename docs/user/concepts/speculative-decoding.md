@@ -236,9 +236,10 @@ lanes they differ in who pays the wider round:
   beside three conversations can then draft 15 while they draft 7. Mixed rounds
   run only at 15 drafts, on either artifact (the trellis artifact the 16 GB and
   24 GB profiles load too, [Built-in profiles](profiles.md#rtx-24gb)): any
-  other load runs `mixed` as `aggregate`, and its load log says so
-  (`shape_policy=aggregate shape_policy_given=mixed`, or
-  `shape_policy_profile=mixed` where the profile gave it). A request held to a
+  other load runs `mixed` as `aggregate`, and from 0.11.2 a WARN at load says
+  so, naming the window and whose `mixed` it was
+  (`ignis.runtime.mixed_rounds_need_15_drafts`; 0.11.1's load log alone says
+  so). A request held to a
   grammar is granted as any other: the grammar's check cuts its run at its
   first miss at the shape it was granted, in a mixed round too.
   The `rtx5090` profile gives `mixed` to the NVFP4 artifact, the one served
@@ -409,9 +410,11 @@ one, up to the draft window.
   either, with a KV pool of 150,720 tokens against 214,144.
 - **One rule.** The head drafts the fixed draft at every temperature: a
   request that samples takes each draft with the model's probability of it.
-  DFlash2's own settings are refused by name on an MTP load: the shortlist
-  head, `--spec-draft-rule sampled`, and the drafter's temperature factor and
-  top-p ([context, KV and speculation](../configuration/context-and-speculation.md)).
+  DFlash2's own settings are ignored on an MTP load, wherever you name them:
+  the shortlist head, the draft rule, the drafter's temperature factor and
+  top-p, and the shape options (from 0.11.2,
+  [where a draft setting counts](#where-a-draft-setting-counts); 0.11.1
+  refuses them by name).
 - **On an RTX 30 or RTX 40 card.** The head drafts there as on Blackwell, on
   the 16 GB entries those cards load. Its five matrices multiply on ignis's own
   route, in the forms those cards run at full rate: on the CUDA cores for a
@@ -512,3 +515,32 @@ turns, four agents generated 1.21 times the tokens and eight 1.05 times
 the choice of when to turn Flash-Next's MTP on is worked through in
 [Flash-Next speculation](../configuration/flash-next-mtp.md). The profiles set
 them per card ([profiles](profiles.md)).
+
+### Where a draft setting counts
+
+From 0.11.2, a draft setting counts only where the speculation that reads it
+runs. Elsewhere it is ignored wherever you name it (a flag, an env var, a
+config file, a profile or a live change): nothing is refused, dropped or
+logged for it.
+
+- **Speculation off.** Under `--spec-backend off`, for both models or for one
+  (`--qwen38-spec-backend off`), and with no backend at all, every draft
+  setting is ignored: the window, the head, the draft rule and the drafter's
+  two settings, the shape options and Flash-Next's row budget. A config file
+  keeps them, and a `PATCH` that turns speculation off leaves them there, so
+  turning it back on runs them again.
+- **An MTP head.** Beside `--spec-backend mtp`, on either model, the settings
+  only DFlash2 reads are ignored: the shortlist head, the draft rule, the
+  drafter's two settings and the shape options. The head's own window counts,
+  and a window past its range is still refused.
+- **The other model's drafter.** A setting only the 27B's DFlash2 reads is
+  ignored on a Flash-Next load and on a switch to it, and Flash-Next's row
+  budget is ignored on the 27B.
+
+So a profile's DFlash2 settings beside `off` change nothing, and the effective
+configuration (`config generate`, `config print`, `GET /v1/config`) writes
+them as they resolved and reads back to the same load. 0.11.1 refuses such a
+setting by name (`… has nothing to configure under --spec-backend off`,
+`… requires --spec-backend`, `… drafts the fixed draft only`), so a file it
+generated under a profile with `--spec-backend off` does not start. What a
+load runs is in its `ignis.model.loaded` line.

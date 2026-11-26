@@ -199,13 +199,15 @@ so the group's value applies to that model again; at a group key, so the
 profile's or the built-in default applies — a flag or an env var that sets the
 field still outranks the file, and the answer names it. A field only one
 model takes (`spec.draft_rows`) is set and removed in that model's section,
-whichever key names it. Turning speculation off takes one step: a patch
-with `spec.backend: off` that names no `spec.draft_tokens` or
-`spec.draft_head` beside it removes the ones the file or an earlier patch holds
-at that same key, as if it said `null` for each, so
-`{"spec":{"qwen38flashnext":{"backend":"off"}}}` is enough; naming a count
-beside `off` in the same patch is still refused, and so is a count a flag or an
-env var sets (a patch cannot remove those). Either way it is
+whichever key names it. Turning speculation off takes one step:
+`{"spec":{"qwen38flashnext":{"backend":"off"}}}` is enough. From 0.11.2 such a
+patch leaves the draft options where they are, in the file and in the patches
+before it, ignored while speculation is off, so a patch that sets the backend
+again runs them; a count named beside `off`, or set by a flag or an env var, is
+ignored too ([where a draft setting counts](../concepts/speculative-decoding.md#where-a-draft-setting-counts)).
+0.11.1 removes the `spec.draft_tokens` and `spec.draft_head` the file or an
+earlier patch holds at that same key, as if the patch said `null` for each, and
+refuses a count named beside `off` or set by a flag or an env var. Either way it is
 written to the config file in use once it has taken, a removed key and the
 section it empties taken out. `GET /v1/config/fields` says what each of those fields
 is: its key, kind, default, rule, the model families that take it, and whether

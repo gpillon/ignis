@@ -440,10 +440,9 @@ pub fn effective_document(config: &Config) -> Value {
         // GitHub #623: the 27B's MTP load does not take a window a profile
         // gave beside its own DFlash2; written as it resolved, it would read
         // back as the operator's. The document writes the window that runs,
-        // the one the load's speculation was derived with. GitHub #722: and
-        // the shape policy the load carries, the default where the profile's
-        // was its DFlash2's ([`super::shape_policy_carried`]), at any window,
-        // 0 too.
+        // the one the load's speculation was derived with. GitHub #729:
+        // DFlash2's own settings are written as they resolved; the MTP load
+        // that reads them back ignores them.
         let spec = &resolution.settings.spec;
         let the_27bs_mtp = super::the_27bs_mtp(Some(family), spec.backend.and_then(super::SpecChoice::backend));
         if the_27bs_mtp && spec.draft_tokens.is_some() {
@@ -452,12 +451,6 @@ pub fn effective_document(config: &Config) -> Value {
                 (super::derive_speculation(&resolution, Some(family), &spelled, None), scoped.get_mut("spec").and_then(Value::as_object_mut))
             {
                 written.insert("draft_tokens".to_owned(), Value::from(runs.draft_tokens()));
-            }
-        }
-        let carried = super::shape_policy_carried(&resolution, Some(family));
-        if carried != spec.shape_policy {
-            if let Some(written) = scoped.get_mut("spec").and_then(Value::as_object_mut) {
-                written.insert("shape_policy".to_owned(), Value::from(carried.as_str()));
             }
         }
         for meta in all_fields().filter(|meta| meta.takes_scope(family)) {
@@ -470,6 +463,25 @@ pub fn effective_document(config: &Config) -> Value {
     }
     let mut document = Value::Object(general);
     merge(&mut document, changes);
+    document
+}
+
+/// GitHub #729: the file `config generate` writes of `config`: its
+/// [`effective_document`] without the shape policy a profile gives the 27B.
+/// That policy is the profile's own (`rtx5090`'s `mixed` is the NVFP4
+/// body's, ADR 0106), and a file value would read back as the operator's;
+/// the start reading the file takes it from the profile again. The document
+/// `GET /v1/config` and `config print` show keeps it, the value in force.
+pub fn generated_document(config: &Config) -> Value {
+    let mut document = effective_document(config);
+    let the_27b = ModelFamily::Qwen38_27b;
+    let (_, families) = resolutions(config);
+    let profiles = families.iter().find(|(family, _)| *family == the_27b).and_then(|(_, resolution)| resolution.origin("spec", "shape_policy"));
+    if profiles.is_some_and(|origin| origin.source == super::source::Source::Profile) {
+        if let Some(section) = document.get_mut("spec").and_then(|group| group.get_mut(scope(the_27b))).and_then(Value::as_object_mut) {
+            section.remove("shape_policy");
+        }
+    }
     document
 }
 
