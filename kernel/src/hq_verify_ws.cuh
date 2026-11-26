@@ -365,17 +365,17 @@ __launch_bounds__(kHqVerifyWsThreads, 1) __global__ void hq_verify_ws_kernel(
         const int total_calls = key_blocks * 2 * kCallsPerTile;
         // The page of the last tile this warp staged, from the block table: one load a tile
         // (GitHub #726; a 27B split outgrows any fixed table of its pages past 696,320 keys).
-        int page_tile = -1;
-        int page      = 0;
+        int cached_tile = -1;
+        int page        = 0;
         auto stage_call = [&](int g, int buf) {
             if (g < total_calls) {
                 const int r   = g / kCallsPerTile;
                 const int j   = g - r * kCallsPerTile;
                 const bool rv = (r & 1) != 0;
                 const int k0  = first_tile + (r >> 1) * Bc + j * kCallRows;
-                if ((r >> 1) != page_tile) {
-                    page_tile = r >> 1;
-                    page      = block_table[k0 >> kPagedKVPageShift];
+                if ((r >> 1) != cached_tile) {
+                    cached_tile = r >> 1;
+                    page        = block_table[k0 >> kPagedKVPageShift];
                 }
                 const std::uint8_t* codes =
                     (rv ? kv.codes_v : kv.codes_k) +

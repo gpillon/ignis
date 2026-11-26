@@ -344,23 +344,23 @@ void launch(Route route, const Case& c, const __nv_bfloat16* q, CacheInput input
             const std::int32_t* pos, GqaTcKVHq kv, const std::int32_t* table,
             const std::int32_t* table_rows, __nv_bfloat16* acc, float* m, float* l) {
     const dim3 grid(kHeads, kSplits, 1);
+    // The vendored kernel's two forms (IgnisThroughput).
+    auto vendored = [&](auto throughput) {
+        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, kTokenTile, 4, true, true, CacheInput,
+                                                     GqaTcKVHq, decltype(throughput)::value>
+            <<<grid, kGqaHqDecodeThreads>>>(q, input, pos, kv, table, nullptr, table_rows,
+                                            kLogicalPages, c.tokens, c.tokens, 0, kCapacity, kScale,
+                                            acc, m, l);
+    };
     if (route == Route::ws12) {
         ignis_hq_verify::hq_verify_ws_kernel<Geometry, CacheInput>
             <<<grid, ignis_hq_verify::kHqVerifyWsThreads>>>(
                 q, input, pos, kv, table, nullptr, table_rows, kLogicalPages, c.tokens, c.tokens, 0,
                 kCapacity, kScale, acc, m, l);
     } else if (route == Route::throughput) {
-        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, kTokenTile, 4, true, true, CacheInput,
-                                                     GqaTcKVHq, true>
-            <<<grid, kGqaHqDecodeThreads>>>(q, input, pos, kv, table, nullptr, table_rows,
-                                            kLogicalPages, c.tokens, c.tokens, 0, kCapacity, kScale,
-                                            acc, m, l);
+        vendored(std::true_type{});
     } else {
-        gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, kTokenTile, 4, true, true, CacheInput,
-                                                     GqaTcKVHq, false>
-            <<<grid, kGqaHqDecodeThreads>>>(q, input, pos, kv, table, nullptr, table_rows,
-                                            kLogicalPages, c.tokens, c.tokens, 0, kCapacity, kScale,
-                                            acc, m, l);
+        vendored(std::false_type{});
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
