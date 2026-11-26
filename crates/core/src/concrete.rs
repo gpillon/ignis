@@ -97,7 +97,9 @@
 //! A prefill that the backend keeps failing ends its request with
 //! [`FinishReason::Error`] after [`MAX_PREFILL_ATTEMPTS`] tries — at once
 //! when the failed job cannot build its sequence again
-//! ([`PrefillJob::builds_its_sequence`], GitHub #296).
+//! ([`PrefillJob::builds_its_sequence`], GitHub #296). Every request a failed
+//! prefill or decode round ends leaves one `ignis.request.engine_error` line
+//! (GitHub #598).
 //!
 //! **Request-lifecycle spans (GitHub #81, ADR 0012)** — the full hierarchy
 //! is documented once in `docs/design/tracing-spans.md`; this crate's own
@@ -319,6 +321,22 @@ pub const DEFAULT_SERVING_CHUNK_TOKENS: u32 = 1024;
 /// spins the model thread. The attempt that reaches this ends the request
 /// with [`FinishReason::Error`].
 pub const MAX_PREFILL_ATTEMPTS: u32 = 3;
+
+/// What a prefill job claimed, as the line a failed request leaves names it
+/// (GitHub #598): a shared prefix, a prompt checkpoint and where it lives, or
+/// nothing.
+fn claim_named(job: &PrefillJob) -> String {
+    match (&job.checkpoint, &job.shared_prefix) {
+        (Some(claim), _) => format!(
+            "prompt checkpoint of request {}, {} tokens, from {}",
+            claim.publisher,
+            claim.tokens,
+            claim.source.as_str()
+        ),
+        (None, Some(claim)) => format!("shared prefix of request {}, {} tokens", claim.publisher, claim.tokens),
+        (None, None) => "none".into(),
+    }
+}
 
 /// The media identity of `input`'s prompt, for the content match key
 /// (GitHub #189, #193).
@@ -1420,6 +1438,13 @@ impl ConcreteScheduler {
     /// the discard: the entry is already out of the pool, so nothing new can
     /// choose it, and its bytes go when that restore lands or is abandoned
     /// ([`Self::release_kv_ram_claim`]).
+    ///
+    /// A device image a waiting request has chosen does not: that request
+    /// gives its claim up first ([`Self::release_waiting_claim`]) and looks
+    /// again when it next comes up (GitHub #598). Its first chunk would have
+    /// been built from the image, and the backend no longer holds it. A
+    /// sibling's capture superseding the entry its twin waits on is how that
+    /// happens (GitHub #187); the other paths never choose a claimed image.
     fn discard_checkpoint(&mut self, entry: CheckpointEntry, events: &mut Vec<SchedEvent>) {
         events.push(SchedEvent::RetainedState {
             operation: RetainedStateOperation::Discard,
@@ -1428,6 +1453,17 @@ impl ConcreteScheduler {
         });
         match entry.tier {
             ReuseSource::Device => {
+                let waiting: Vec<usize> = (0..self.requests.len())
+                    .filter(|&i| {
+                        let r = &self.requests[i];
+                        r.waits_to_enter()
+                            && r.reuse_source == Some(ReuseSource::Device)
+                            && r.checkpoint_entry == Some(entry.id)
+                    })
+                    .collect();
+                for idx in waiting {
+                    self.release_waiting_claim(idx);
+                }
                 self.release_checkpoint_handle(entry.publisher);
                 self.release_prefix_claim(Some(entry.prefix));
             }
@@ -5446,6 +5482,7 @@ impl Scheduler for ConcreteScheduler {
                         self.materialize(i);
                         let r = &mut self.requests[i];
                         r.prefill_failures = 0;
+                        r.prefill_first_error = None;
                         if r.state == RequestState::Admitted {
                             r.advance(RequestState::Prefilling);
                         }
@@ -5748,7 +5785,9 @@ impl Scheduler for ConcreteScheduler {
                     // (`Self::materialize`, above).
                     for &i in &batch {
                         self.unmaterialize(i);
-                        self.requests[i].prefill_failures += 1;
+                        let r = &mut self.requests[i];
+                        r.prefill_failures += 1;
+                        r.prefill_first_error.get_or_insert_with(|| e.clone());
                     }
                     // GitHub #215: the backend unwound the batch's publishes
                     // and took no capture, so every slot this batch was given
@@ -5779,10 +5818,31 @@ impl Scheduler for ConcreteScheduler {
                     // ([`PrefillJob::builds_its_sequence`]): every retry
                     // would be refused, and hide the fault that actually
                     // happened behind that refusal.
+                    //
+                    // GitHub #598: each request ended here leaves one line,
+                    // since its client is sent to the server log. It names
+                    // the batch, because the failed job may be another's.
+                    let failed_batch =
+                        batch.iter().map(|&i| self.requests[i].id.to_string()).collect::<Vec<_>>().join(",");
                     for (n, &i) in batch.iter().enumerate() {
                         if !jobs[n].builds_its_sequence()
                             || self.requests[i].prefill_failures >= MAX_PREFILL_ATTEMPTS
                         {
+                            let r = &self.requests[i];
+                            let first = r.prefill_first_error.as_ref().filter(|first| **first != e);
+                            // hotpath-lint-allow: failure-only path (a request whose prefill failed ends here), reviewed exception (GitHub #598).
+                            tracing::error!(
+                                name: "ignis.request.engine_error",
+                                request_id = r.id,
+                                stage = "prefill",
+                                error = %e,
+                                first_error = first.map(tracing::field::display),
+                                attempts = r.prefill_failures,
+                                start_position = jobs[n].start_position,
+                                claim = %claim_named(&jobs[n]),
+                                batch = %failed_batch,
+                                "the engine ended a request: its prefill failed"
+                            );
                             self.mark_done(i, &mut events, FinishReason::Error);
                         }
                     }
@@ -6075,11 +6135,16 @@ impl Scheduler for ConcreteScheduler {
                     // request in this leaf batch still holds a live lane,
                     // so retrying it on the next tick would spin the model
                     // thread and keep that lane unavailable forever.
+                    // GitHub #598: one line for each, as for a prefill.
                     for &i in &to_decode {
-                        tracing::debug!(
+                        // hotpath-lint-allow: failure-only path (a decode round that failed ends its requests), reviewed exception (GitHub #598).
+                        tracing::error!(
+                            name: "ignis.request.engine_error",
                             request_id = self.requests[i].id,
+                            stage = "decode",
                             error = %e,
-                            "ignis.decode.error"
+                            lanes = to_decode.len(),
+                            "the engine ended a request: its decode round failed"
                         );
                         self.mark_done(i, &mut events, FinishReason::Error);
                     }

@@ -20,8 +20,8 @@ use crate::admission::AdmissionResources;
 use crate::gdn::GdnState;
 use crate::prefix::PrefixId;
 use crate::types::{
-    BackfillClass, BoundaryLifetime, LaneId, RequestClass, RequestId, RequestInput, RequestState,
-    ReuseBoundary, SpecCounters, TokenId,
+    BackfillClass, BoundaryLifetime, ComputeError, LaneId, RequestClass, RequestId, RequestInput,
+    RequestState, ReuseBoundary, SpecCounters, TokenId,
 };
 
 /// What a request's claim on a shared prefix reports, decided when it claims
@@ -280,6 +280,10 @@ pub struct Request {
     /// [`crate::types::FinishReason::Error`] instead of retrying it forever
     /// (sooner for a job that cannot be retried, GitHub #296).
     pub prefill_failures: u32,
+    /// The error of the first of those failed calls (GitHub #598), which the
+    /// line the scheduler logs when it ends the request names beside the
+    /// last one's where the two differ. Reset with `prefill_failures`.
+    pub prefill_first_error: Option<ComputeError>,
 }
 
 /// A request's progress through its grammar before its first token (GitHub
@@ -345,6 +349,7 @@ impl Request {
             prefill_progress: 0,
             cancelled: false,
             prefill_failures: 0,
+            prefill_first_error: None,
         }
     }
 
@@ -840,6 +845,7 @@ impl Request {
         // KV it warmed.
         self.prefill_progress = 0;
         self.prefill_failures = 0;
+        self.prefill_first_error = None;
         // GitHub #286: and so do its thinking budget and its forced literal
         // — the re-prefill draws its first token again, and a block it
         // closed before is open again. A budget left at its old close

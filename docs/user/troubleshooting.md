@@ -819,6 +819,31 @@ tokenizers read; an artifact packed from another checkpoint may not. Load one
 from the [catalog](reference/models.md), or send no `response_format`
 ([Structured output](api/structured-output.md)).
 
+### ERROR `ignis.request.engine_error`
+
+The engine ended a request because a step it ran on the card failed. The client
+gets `500 engine_error` ("the engine could not run the request; see the server
+log"), an `error` chunk on a stream, or `response.failed` on `/v1/responses`;
+the other requests are served on. The line names the request (`request_id`),
+the step (`stage`: `prefill` or `decode`) and the kernel leaf's error (`error`,
+`kernel error (rc = …)`).
+
+- **`prefill`**: a failed prompt chunk is tried again, up to three times in a
+  row, unless its request was already partway through its prompt. `attempts`
+  says how many ran, and `first_error` gives the first error where it differs
+  from the last. `start_position` is where the chunk started. `claim` is what
+  the chunk was built from: `none`, `shared prefix of request …, … tokens`, or
+  `prompt checkpoint of request …, … tokens, from device` (`kv_ram`, `disk`).
+  `batch` lists the requests whose chunks ran in the same call, since the
+  leaf's error does not say whose chunk failed.
+- **`decode`**: a failed round ends every request on it, each with its own line;
+  `lanes` is the number of lanes in the round.
+
+Neither is the client's fault: send the request again, and report the line with
+the server's version. Up to 0.11.1, a request sent at the same instant as an
+identical one, while the engine was busy, could end this way with no line in
+the log; from 0.11.2 both are answered.
+
 ### ERROR `ignis.structured.repair_failed` or `ignis.structured.no_pending_token`
 
 A request held to a grammar ended with an engine error: the engine could not

@@ -112,6 +112,11 @@ struct Inner {
     /// The tokens each captured checkpoint covers, by publisher: what its
     /// materialized blob is sized from.
     checkpoint_tokens: HashMap<RequestId, u32>,
+    /// The checkpoints whose device image the backend holds, by publisher
+    /// (GitHub #598): taken at a capture, gone at a release or a spill. A
+    /// device claim on one it no longer holds fails its batch, as the real
+    /// adapter's does.
+    device_checkpoints: std::collections::HashSet<RequestId>,
     /// The fake KV-disk (spec vram-budget/03), or `None`: a backend with no
     /// disk, which takes nothing -- every scenario that is not about the
     /// tier.
@@ -1043,6 +1048,16 @@ impl Compute for MockCompute {
         if jobs.iter().any(|job| g.prefill_failures.remove(&job.request)) {
             return Err(ComputeError::Kernel(-1));
         }
+        // GitHub #598: a sequence built from a device checkpoint is built
+        // from its image, which must still be here.
+        if jobs.iter().any(|job| {
+            job.checkpoint.is_some_and(|claim| {
+                claim.source == crate::checkpoint::ReuseSource::Device
+                    && !g.device_checkpoints.contains(&claim.publisher)
+            })
+        }) {
+            return Err(ComputeError::Kernel(-1));
+        }
         for job in jobs {
             // Learn the request's limits / seed from its params.
             g.limits.insert(job.request, job.params.max_tokens);
@@ -1112,6 +1127,7 @@ impl Compute for MockCompute {
                     if captured {
                         let tokens = job.start_position + job.tokens.len() as u32;
                         g.checkpoint_tokens.insert(job.request, tokens);
+                        g.device_checkpoints.insert(job.request);
                     }
                     captured
                 },
@@ -1154,11 +1170,9 @@ impl Compute for MockCompute {
         // The device image and, if the checkpoint had been spilled, its
         // KV-RAM blob: the real adapter drops both here.
         self.free_blob(MockBlob::Checkpoint(publisher));
-        self.inner
-            .lock()
-            .unwrap()
-            .checkpoints_released
-            .push(publisher);
+        let mut g = self.inner.lock().unwrap();
+        g.device_checkpoints.remove(&publisher);
+        g.checkpoints_released.push(publisher);
     }
 
     // GitHub #190: a materialized checkpoint blob is one nominal byte, so
@@ -1179,7 +1193,10 @@ impl Compute for MockCompute {
         if !self.place_blob(MockBlob::Checkpoint(publisher), bytes) {
             return Err(ComputeError::Kernel(NO_HOST_ROOM));
         }
-        self.inner.lock().unwrap().checkpoints_spilled.push(publisher);
+        let mut g = self.inner.lock().unwrap();
+        // The image moved to KV-RAM: the device holds it no more.
+        g.device_checkpoints.remove(&publisher);
+        g.checkpoints_spilled.push(publisher);
         Ok(bytes)
     }
 
