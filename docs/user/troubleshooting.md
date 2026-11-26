@@ -829,9 +829,9 @@ or `response.failed` on `/v1/responses`; the other requests are served on. The
 line names the request (`request_id`), the step (`stage`: `prefill` or
 `decode`) and the kernel leaf's error (`error`, `kernel error (rc = …)`).
 
-- **`prefill`**: a failed prompt chunk is tried again, up to three times in a
-  row, unless its request was already partway through its prompt. `attempts`
-  says how many ran, and `first_error` gives the first error where it differs
+- **`prefill`**: a failed prompt chunk runs at most three times in a row, once
+  only if its request was already partway through its prompt. `attempts` says
+  how many ran, and `first_error` gives the first error where it differs
   from the last. `start_position` is where the chunk started. `claim` is what
   the chunk was built from: `none`, `shared prefix of request …, … tokens`, or
   `prompt checkpoint of request …, … tokens, from device` (`kv_ram`, `disk`).
@@ -852,7 +852,8 @@ sample a missed position again (`repair_failed`, whose `error` says why: the
 scores the token was sampled from were already written over, the kernel
 leaf refused, or the grammar permitted no token there, "the mask permits no
 token", which a tokenizer that cannot write the call's tags would reach), or a round did not report the token it sampled for a request
-it was asked to check (`no_pending_token`). The client gets `500 engine_error`
+it was asked to check (`no_pending_token`; from 0.11.2 a prefill that did not
+report it logs the same line, where 0.11.1 logged nothing). The client gets `500 engine_error`
 ("the engine could not run the request; see the server log"), an `error`
 chunk on a stream, or `response.failed` on `/v1/responses`; the other requests
 are served on. Neither is a client's fault: send the request again, and report

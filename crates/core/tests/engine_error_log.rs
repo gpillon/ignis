@@ -15,7 +15,9 @@ use ignis_core::scheduler::{Compute, DecodeJob, DecodeOutcome, PrefillJob, Prefi
 use ignis_core::types::{
     ComputeError, DecodeParams, FinishReason, RequestClass, RequestId, RequestInput, SchedEvent,
 };
+use ignis_core::structured::{AnswerGrammar, StructuredKind};
 use ignis_core::{ConcreteScheduler, MAX_PREFILL_ATTEMPTS, MockCompute, Scheduler};
+use ignis_grammar::{GrammarCache, Vocab, VocabEntry, DEFAULT_CACHE_BYTES};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level};
 use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -282,4 +284,65 @@ fn a_failed_decode_round_leaves_one_line_per_request_it_ends() {
         assert_eq!(line.field("stage"), Some("decode"));
         assert_eq!(line.field("error"), Some("kernel error (rc = -9)"));
     }
+}
+
+/// A backend whose prefill leaves out the draw it was asked to keep for a
+/// check (GitHub #587): what the scheduler cannot hold to a grammar.
+struct DrawUnreported {
+    inner: MockCompute,
+}
+
+impl Compute for DrawUnreported {
+    fn prefill_step(&self, jobs: &[PrefillJob]) -> Result<Vec<PrefillOutcome>, ComputeError> {
+        let mut outcomes = self.inner.prefill_step(jobs)?;
+        for (outcome, job) in outcomes.iter_mut().zip(jobs) {
+            if job.checked {
+                outcome.emitted = None;
+            }
+        }
+        Ok(outcomes)
+    }
+
+    fn decode_step(&self, jobs: &[DecodeJob]) -> Result<Vec<DecodeOutcome>, ComputeError> {
+        self.inner.decode_step(jobs)
+    }
+}
+
+/// The prefill's side of a fault a round already logs: a structured answer
+/// whose first draw the backend did not report ends with an error, and says
+/// so.
+#[test]
+fn a_prefill_that_leaves_a_checked_draw_unreported_leaves_one_line() {
+    let ((id, events), lines) = capture_warnings(|| {
+        let vocab = Vocab::new(
+            (0..128u32)
+                .map(|id| match id {
+                    5 => VocabEntry::Control,
+                    32..=126 => VocabEntry::Text(vec![id as u8]),
+                    _ => VocabEntry::Absent,
+                })
+                .collect(),
+            &[5],
+        );
+        let grammar = GrammarCache::new(vocab, DEFAULT_CACHE_BYTES).json_object();
+        let mut sched = ConcreteScheduler::new("qwen3.8-27b", Arc::new(DrawUnreported { inner: MockCompute::new() }));
+        let id = sched
+            .submit(
+                RequestInput {
+                    grammar: Some(AnswerGrammar::new(grammar, StructuredKind::JsonObject)),
+                    ..input(vec![1, 2, 3], 4)
+                },
+                RequestClass::Interactive,
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        while !sched.is_idle() {
+            events.extend(sched.advance());
+        }
+        (id, events)
+    });
+    assert!(ended_with_error(&events, id), "the request ends with an error: {events:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].name, "ignis.structured.no_pending_token");
+    assert_eq!(lines[0].field("request_id"), Some(id.to_string().as_str()));
 }

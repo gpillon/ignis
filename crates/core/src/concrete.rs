@@ -5758,6 +5758,13 @@ impl Scheduler for ConcreteScheduler {
                                 // that the backend did not report would
                                 // leave with the first round unchecked.
                                 None if self.requests[i].input.checks_prefill_draw() => {
+                                    // GitHub #598: said, as a round's is.
+                                    // hotpath-lint-allow: failure-only path (a backend that did not report a draw it was asked for), reviewed exception (GitHub #598).
+                                    tracing::error!(
+                                        name: "ignis.structured.no_pending_token",
+                                        request_id,
+                                        "a prefill left a structured answer's draw unreported, so it cannot be checked"
+                                    );
                                     first_tokens.push((i, DecodeOutcome::finished(FinishReason::Error)));
                                 }
                                 None => {}
