@@ -1415,7 +1415,7 @@ down to none, to stay within the load's row budget, `--spec-draft-rows`).
 The 27B drafts with it as its second drafter, in place of **DFlash2** (#623),
 opt-in on every **card class** but the 12 GB one, whose profile defaults to it
 (ADR 0098): draft window 0..7, the **fixed draft** only, DFlash2's own settings
-refused by name where the operator names them, and drafting after images as
+ignored wherever they are named (a **draft setting**, #729), and drafting after images as
 DFlash2 does (#624: its rows rotate at their positions plus the **rope delta**
 and embed an image's column at a placeholder). It saves DFlash2's weights,
 **drafter window** and round, and costs one more attention layer in every KV
