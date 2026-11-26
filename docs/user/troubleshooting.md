@@ -821,12 +821,13 @@ from the [catalog](reference/models.md), or send no `response_format`
 
 ### ERROR `ignis.request.engine_error`
 
-The engine ended a request because a step it ran on the card failed. The client
-gets `500 engine_error` ("the engine could not run the request; see the server
-log"), an `error` chunk on a stream, or `response.failed` on `/v1/responses`;
-the other requests are served on. The line names the request (`request_id`),
-the step (`stage`: `prefill` or `decode`) and the kernel leaf's error (`error`,
-`kernel error (rc = …)`).
+From 0.11.2, a request the engine ends because a step it ran on the card failed
+leaves this line; 0.11.1 logged nothing for a failed prefill, and a failed
+decode round only at debug. The client gets `500 engine_error` ("the engine
+could not run the request; see the server log"), an `error` chunk on a stream,
+or `response.failed` on `/v1/responses`; the other requests are served on. The
+line names the request (`request_id`), the step (`stage`: `prefill` or
+`decode`) and the kernel leaf's error (`error`, `kernel error (rc = …)`).
 
 - **`prefill`**: a failed prompt chunk is tried again, up to three times in a
   row, unless its request was already partway through its prompt. `attempts`

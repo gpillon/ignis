@@ -174,6 +174,42 @@ fn a_failed_claimants_line_names_the_shared_prefix_it_claimed() {
     assert_eq!(line.field("batch"), Some(sub.to_string().as_str()));
 }
 
+/// A turn resuming from the device checkpoint its conversation's last turn
+/// left, whose every first job fails: its line names the checkpoint and where
+/// it lives, the claim the burst of GitHub #598 failed on.
+#[test]
+fn a_failed_claimants_line_names_the_prompt_checkpoint_it_claimed() {
+    let ((first, next, events), lines) = capture_warnings(|| {
+        let compute = Arc::new(MockCompute::new());
+        let mut sched = ConcreteScheduler::new("qwen3.8-27b", compute.clone());
+        let first = sched
+            .submit(RequestInput { opener_tokens: Some(37), ..input((1..=40).collect(), 4) }, RequestClass::Agent)
+            .unwrap();
+        while !sched.is_idle() {
+            sched.advance();
+        }
+        let prompt = [(1..=37).collect::<Vec<u32>>(), (500..523).collect()].concat();
+        let next = sched
+            .submit(RequestInput { opener_tokens: Some(57), ..input(prompt, 4) }, RequestClass::Agent)
+            .unwrap();
+        let mut events = Vec::new();
+        for _ in 0..MAX_PREFILL_ATTEMPTS {
+            compute.fail_prefill(next);
+            events.extend(sched.advance());
+        }
+        (first, next, events)
+    });
+    assert!(ended_with_error(&events, next), "the claimant ends with an error: {events:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(line.field("request_id"), Some(next.to_string().as_str()));
+    assert_eq!(
+        line.field("claim"),
+        Some(format!("prompt checkpoint of request {first}, 37 tokens, from device").as_str())
+    );
+    assert_eq!(line.field("start_position"), Some("37"));
+}
+
 /// A first error that differs from the one that ended the request is named
 /// beside it: the attempt that ended it is not always the one that went
 /// wrong first.
