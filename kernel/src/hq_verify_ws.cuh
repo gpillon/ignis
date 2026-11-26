@@ -9,8 +9,8 @@
 //       gqa_attention_small_t_tc_partial_bf16_kernel's hq route: the masked columns' count and
 //       the per-lane offsets of q, the positions, the new rows, the table row and the partials;
 //       write_neutral (the neutral partials); the bounds and their early returns; the split
-//       arithmetic (the active splits, tile or key units, the split's key range, its tiles and
-//       pages); the ring-valid row; the fused append's per-unit body (the encode, the residual
+//       arithmetic (the active splits, tile or key units, the split's key range, its tiles);
+//       the ring-valid row; the fused append's per-unit body (the encode, the residual
 //       row, the ring mark); and the epilogue (each output row un-rotated in shared memory, then
 //       the partial stores).
 // From the vendored reference, called and not copied: the geometry and partial-index helpers
@@ -41,11 +41,15 @@
 //     (un-rotation, partial stores) on every warp; the q staging and rotation on the consumers
 //     alone, while the producers decode the first tiles. The decoder is ours too
 //     (hq_decode_lean.cuh).
+//   - No page-id table: each producer takes a tile's page from the block table (GitHub #726).
+//     The reference staged a split's pages in 128 entries, which a 27B split outgrows past
+//     696,320 keys; the vendored kernel's hq source carries the same fix (ADR 0037).
 // The partial layout, the masks, the neutral partials, the fused append, the residual window
 // and the rotated frame are the vendored kernel's. Launch it as that kernel's hq route, with
 // its arguments, on its grid (KV heads, split capacity, lanes), kHqVerifyWsThreads threads and
-// no dynamic shared memory (87,408 bytes of static shared memory, one block per SM). Bit-exact
-// against both vendored routes: kernel/tests/test_hq_verify_exact.cu.
+// no dynamic shared memory (86,896 bytes of static shared memory, one block per SM). Bit-exact
+// against both vendored routes: kernel/tests/test_hq_verify_exact.cu, and past 696,320 keys
+// kernel/tests/test_hq_long_window.cu, which holds all three to an FP64 attention.
 //
 // Blackwell only (spec #570). The block's static shared memory is more than an sm_8x block
 // takes (ptxas refuses it there, kernel/CMakeLists.txt) and the ring waits on
@@ -166,7 +170,6 @@ __launch_bounds__(kHqVerifyWsThreads, 1) __global__ void hq_verify_ws_kernel(
     constexpr int OutNt     = D / 8 / Consumers;
     constexpr int QkWarps   = Groups * 2;
     constexpr int kQRows    = Geometry::GroupSize * TokenTile;
-    constexpr int PageIds   = 128;
     constexpr int Ring      = 3;
     constexpr int kCallRows = 4;                           // rows per producer warp call
     constexpr int kCallsPerTile = Bc / kCallRows;          // 8
@@ -183,7 +186,6 @@ __launch_bounds__(kHqVerifyWsThreads, 1) __global__ void hq_verify_ws_kernel(
     __shared__ __align__(16) std::uint8_t stage_s[Producers][2][kStageBytes];
     __shared__ __align__(8) std::uint64_t full_bar[Ring];
     __shared__ __align__(8) std::uint64_t empty_bar[Ring];
-    __shared__ std::int32_t physical_pages_s[PageIds];
     __shared__ std::int8_t signs_s[kGqaHeadDim];
     __shared__ float max_s[2][Br];
     __shared__ float alpha_s[Br];
@@ -281,11 +283,6 @@ __launch_bounds__(kHqVerifyWsThreads, 1) __global__ void hq_verify_ws_kernel(
     }
     const int first_tile = (split_start / Bc) * Bc;
     const int key_blocks = div_up(split_end - first_tile, Bc);
-    const int first_page = first_tile >> kPagedKVPageShift;
-    const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
-    for (int page = tid; page < page_count; page += Threads) {
-        physical_pages_s[page] = block_table[first_page + page];
-    }
     hq_engine_signs_fill(signs_s);
     if (tid == 0) {
 #pragma unroll
@@ -366,13 +363,20 @@ __launch_bounds__(kHqVerifyWsThreads, 1) __global__ void hq_verify_ws_kernel(
         // ---- producers ----
         const int pw          = warp - Consumers;
         const int total_calls = key_blocks * 2 * kCallsPerTile;
+        // The page of the last tile this warp staged, from the block table: one load a tile
+        // (GitHub #726; a 27B split outgrows any fixed table of its pages past 696,320 keys).
+        int page_tile = -1;
+        int page      = 0;
         auto stage_call = [&](int g, int buf) {
             if (g < total_calls) {
                 const int r   = g / kCallsPerTile;
                 const int j   = g - r * kCallsPerTile;
                 const bool rv = (r & 1) != 0;
                 const int k0  = first_tile + (r >> 1) * Bc + j * kCallRows;
-                const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+                if ((r >> 1) != page_tile) {
+                    page_tile = r >> 1;
+                    page      = block_table[k0 >> kPagedKVPageShift];
+                }
                 const std::uint8_t* codes =
                     (rv ? kv.codes_v : kv.codes_k) +
                     paged_kv_element_offset<kHqCodePlaneExtent, Geometry::KVHeads>(

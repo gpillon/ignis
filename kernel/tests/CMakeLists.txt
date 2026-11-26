@@ -439,6 +439,21 @@ target_include_directories(ignis_kernel_hq_verify_exact_test PRIVATE ${CMAKE_CUR
 target_link_libraries(ignis_kernel_hq_verify_exact_test PRIVATE ignis_vendor)
 add_test(NAME ignis_kernel_hq_verify_exact_test COMMAND ignis_kernel_hq_verify_exact_test)
 
+# GitHub #726: OURS -- the same three routes past 696,320 visible keys, up to the
+# 1,048,576-key envelope, where a 27B split spans more than 128 pages: each held
+# to an FP64 attention over the rows the block table addresses (the vendored
+# reference form ran the same page-id table, so it is no oracle there), bit for
+# bit to one another, and with the fused append every cache byte to the codec's
+# own encode of the new rows. One lane over a 258-page pool the 16,384 logical
+# pages alias onto. Not sm120a-only: an older card runs the vendored routes. No
+# SKIP_RETURN_CODE (ADR 0006).
+add_executable(ignis_kernel_hq_long_window_test test_hq_long_window.cu)
+target_compile_definitions(ignis_kernel_hq_long_window_test PRIVATE
+  IGNIS_HQ_KV_FIXTURE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/hq_kv_rows_27b.bin")
+target_include_directories(ignis_kernel_hq_long_window_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_link_libraries(ignis_kernel_hq_long_window_test PRIVATE ignis_vendor)
+add_test(NAME ignis_kernel_hq_long_window_test COMMAND ignis_kernel_hq_long_window_test)
+
 # GitHub #572 (spec #570): OURS -- how a 27B load picks the attention route of
 # its decode and verify rounds over hq-e8-2b (kernel/src/hq_decode_attention.h):
 # the rule with the card's generation injected (Blackwell takes ignis's route

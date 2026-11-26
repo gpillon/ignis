@@ -1,5 +1,5 @@
 diff --git a/reference/src/ops/kernel/gqa_attention_decode_bf16.cuh b/vendor/src/ops/kernel/gqa_attention_decode_bf16.cuh
-index edcf6f2..8d26bef 100644
+index edcf6f2..956c20a 100644
 --- a/reference/src/ops/kernel/gqa_attention_decode_bf16.cuh
 +++ b/vendor/src/ops/kernel/gqa_attention_decode_bf16.cuh
 @@ -18,6 +18,14 @@
@@ -26,8 +26,15 @@ index edcf6f2..8d26bef 100644
  __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
      const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, KvSource kv,
      const std::int32_t* block_tables, const std::int32_t* valid_columns,
-@@ -58,7 +66,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
-     constexpr int PageIds       = 128;
+@@ -55,10 +63,22 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+     constexpr int PVKs    = Bc / 16;
+     // The BF16/I8 linear envelope ceiling (524288 keys) spans at most 98 pages in one 27B
+     // split; the absolute U8-only envelope never stages pages here.
+-    constexpr int PageIds       = 128;
++    // ignis (GitHub #726): the hq source stages none. A 27B split spans more than 128
++    // pages past 696,320 keys, where the reference's fill below ran over signs_s; every
++    // hq tile takes its page from the block table instead, and the table keeps one entry.
++    constexpr int PageIds       = KvSource::hq ? 1 : 128;
      constexpr float Log2E       = 1.4426950408889634074f;
      constexpr unsigned FullMask = 0xffffffffu;
 -    constexpr int QkvRows       = 2 * Bc;
@@ -44,7 +51,7 @@ index edcf6f2..8d26bef 100644
  
      static_assert(QkvRows >= Br);
  
-@@ -66,8 +83,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -66,8 +86,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
      __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
      __shared__ std::int32_t physical_pages_s[PageIds];
      __shared__ std::int8_t signs_s[KvSource::rotated ? kGqaHeadDim : 1];
@@ -61,17 +68,39 @@ index edcf6f2..8d26bef 100644
  
      const int kv_head     = static_cast<int>(blockIdx.x);
      const int split       = static_cast<int>(blockIdx.y);
-@@ -258,6 +281,46 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -172,8 +198,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+     const int key_blocks = div_up(split_end - first_tile, Bc);
+     const int first_page = first_tile >> kPagedKVPageShift;
+     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+-    for (int page = tid; page < page_count; page += Threads) {
+-        physical_pages_s[page] = block_table[first_page + page];
++    if constexpr (!KvSource::hq) {
++        for (int page = tid; page < page_count; page += Threads) {
++            physical_pages_s[page] = block_table[first_page + page];
++        }
+     }
+ 
+     if constexpr (KvSource::rotated) {
+@@ -258,6 +286,55 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
          __syncthreads();
      }
  
 +    // Throughput form: tile kb's rows of one role into the stage buffer (one
 +    // commit group per call on every thread). Issued after the fused append's
 +    // barrier, so the rows it just encoded are the ones staged.
++    // Each tile's page comes from the block table (GitHub #726), one role ahead of its use:
++    // the calls run K 0, V 0, K 1, V 1, ..., so V kb reuses K kb's page and loads K kb+1's.
++    int stage_page = 0;
++    int next_page  = 0;
 +    auto hq_stage_role = [&](int kb, bool role_v) {
 +        if constexpr (kFast) {
-+            const int k0   = first_tile + kb * Bc;
-+            const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
++            const int k0 = first_tile + kb * Bc;
++            if (!role_v) {
++                stage_page = kb == 0 ? block_table[k0 >> kPagedKVPageShift] : next_page;
++            } else if (kb + 1 < key_blocks) {
++                next_page = block_table[(k0 + Bc) >> kPagedKVPageShift];
++            }
++            const int page = stage_page;
 +            const std::uint8_t* codes =
 +                (role_v ? kv.codes_v : kv.codes_k) +
 +                paged_kv_element_offset<kHqCodePlaneExtent, Geometry::KVHeads>(
@@ -108,7 +137,7 @@ index edcf6f2..8d26bef 100644
      for (int idx = tid; idx < Br * D; idx += Threads) {
          const int row = idx / D;
          const int d   = idx - row * D;
-@@ -270,6 +333,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -270,6 +347,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
          }
          qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
      }
@@ -116,7 +145,7 @@ index edcf6f2..8d26bef 100644
      __syncthreads();
  
      if constexpr (KvSource::rotated) {
-@@ -306,13 +370,20 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -306,15 +384,22 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
      __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
  
      unsigned af_q[QKKs][4];
@@ -140,9 +169,12 @@ index edcf6f2..8d26bef 100644
 +    const bool mma_warp = !kFast || warp_row0 < kQRows;
 +    if constexpr (kFast) { ninfer::ops::cp_wait<0>(); }  // tile 0's staged rows
      __syncthreads();
-     int physical_page = physical_pages_s[0];
+-    int physical_page = physical_pages_s[0];
++    int physical_page = KvSource::hq ? 0 : physical_pages_s[0];
      float acc[PVNt][4];
-@@ -325,24 +396,28 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+ #pragma unroll
+     for (int n = 0; n < PVNt; ++n) {
+@@ -325,24 +410,28 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
  
      for (int kb = 0; kb < key_blocks; ++kb) {
          const int k0 = first_tile + kb * Bc;
@@ -175,7 +207,7 @@ index edcf6f2..8d26bef 100644
                  if (key >= split_start && key < split_end) {
                      const bool side_row =
                          kv.residual_k != nullptr &&
-@@ -359,12 +434,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -359,12 +448,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                                        load_vec<int4>(side + lane8 * 32 + j * 8));
                          }
                      } else {
@@ -198,7 +230,7 @@ index edcf6f2..8d26bef 100644
                      }
                  } else {
  #pragma unroll
-@@ -373,8 +452,25 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -373,8 +466,25 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                          store_vec(row_dst + chunk, make_int4(0, 0, 0, 0));
                      }
                  }
@@ -224,7 +256,7 @@ index edcf6f2..8d26bef 100644
          } else {
              if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
                  physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
-@@ -421,7 +517,36 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -421,7 +531,36 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
              __syncthreads();
          }
  
@@ -261,7 +293,7 @@ index edcf6f2..8d26bef 100644
  #pragma unroll
          for (int nt = 0; nt < QKNt; ++nt) {
              score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
-@@ -436,6 +561,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -436,6 +575,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                           af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
              }
          }
@@ -269,7 +301,7 @@ index edcf6f2..8d26bef 100644
  
          const int row0 = warp_row0 + gid;
          const int row1 = row0 + 8;
-@@ -518,7 +644,43 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -518,7 +658,43 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
              acc[n][3] *= alpha1;
          }
          __syncwarp();
@@ -313,7 +345,7 @@ index edcf6f2..8d26bef 100644
  #pragma unroll
          for (int n = 0; n < PVNt; ++n) {
  #pragma unroll
-@@ -536,6 +698,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
+@@ -536,6 +712,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                           vf[0], vf[1]);
              }
          }

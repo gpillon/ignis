@@ -63,7 +63,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     constexpr int PVKs    = Bc / 16;
     // The BF16/I8 linear envelope ceiling (524288 keys) spans at most 98 pages in one 27B
     // split; the absolute U8-only envelope never stages pages here.
-    constexpr int PageIds       = 128;
+    // ignis (GitHub #726): the hq source stages none. A 27B split spans more than 128
+    // pages past 696,320 keys, where the reference's fill below ran over signs_s; every
+    // hq tile takes its page from the block table instead, and the table keeps one entry.
+    constexpr int PageIds       = KvSource::hq ? 1 : 128;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
     // ignis (GitHub #268): with the hq source and at most 48 query rows (27B at
@@ -195,8 +198,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
-    for (int page = tid; page < page_count; page += Threads) {
-        physical_pages_s[page] = block_table[first_page + page];
+    if constexpr (!KvSource::hq) {
+        for (int page = tid; page < page_count; page += Threads) {
+            physical_pages_s[page] = block_table[first_page + page];
+        }
     }
 
     if constexpr (KvSource::rotated) {
@@ -284,10 +289,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // Throughput form: tile kb's rows of one role into the stage buffer (one
     // commit group per call on every thread). Issued after the fused append's
     // barrier, so the rows it just encoded are the ones staged.
+    // Each tile's page comes from the block table (GitHub #726), one role ahead of its use:
+    // the calls run K 0, V 0, K 1, V 1, ..., so V kb reuses K kb's page and loads K kb+1's.
+    int stage_page = 0;
+    int next_page  = 0;
     auto hq_stage_role = [&](int kb, bool role_v) {
         if constexpr (kFast) {
-            const int k0   = first_tile + kb * Bc;
-            const int page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
+            const int k0 = first_tile + kb * Bc;
+            if (!role_v) {
+                stage_page = kb == 0 ? block_table[k0 >> kPagedKVPageShift] : next_page;
+            } else if (kb + 1 < key_blocks) {
+                next_page = block_table[(k0 + Bc) >> kPagedKVPageShift];
+            }
+            const int page = stage_page;
             const std::uint8_t* codes =
                 (role_v ? kv.codes_v : kv.codes_k) +
                 paged_kv_element_offset<kHqCodePlaneExtent, Geometry::KVHeads>(
@@ -385,7 +399,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const bool mma_warp = !kFast || warp_row0 < kQRows;
     if constexpr (kFast) { ninfer::ops::cp_wait<0>(); }  // tile 0's staged rows
     __syncthreads();
-    int physical_page = physical_pages_s[0];
+    int physical_page = KvSource::hq ? 0 : physical_pages_s[0];
     float acc[PVNt][4];
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {

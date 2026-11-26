@@ -8,7 +8,7 @@
 //   - compute capability major 12 (Blackwell) takes it, unless the measurement switch
 //     IGNIS_HQ_DECODE_ATTENTION=vendored names today's route;
 //   - every other card keeps today's route whatever the switch says: the route was built and
-//     measured for Blackwell alone (its 87,408 bytes of static shared memory per block, its
+//     measured for Blackwell alone (its 86,896 bytes of static shared memory per block, its
 //     mbarrier ring);
 //   - and only where this binary holds the route's sm_120a image for the device (a build whose
 //     list has no entry for it, or a 12.x card such as sm_121 that the 120a code does not run on,

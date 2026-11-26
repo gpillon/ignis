@@ -360,7 +360,7 @@ file(GLOB_RECURSE IGNIS_KERNEL_SRCS CONFIGURE_DEPENDS
 # (thread-block clusters) and staged kernel (`mbarrier.try_wait`), neither its
 # default route, the image model's FP8 GEMM and attention (the
 # block-scaled FP8 MMA), and the 27B's warp-specialized hq-e8-2b attention
-# route in the decode and verify rounds (87,408 bytes of static shared memory
+# route in the decode and verify rounds (86,896 bytes of static shared memory
 # per block and `mbarrier.try_wait`, spec #570, GitHub #572), and the 27B
 # prefill's gate and up product with SwiGLU in its epilogue (the block-scaled
 # FP4 MMA and TMA, spec #646, GitHub #651), which runs where the W4A4 TMA
