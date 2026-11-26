@@ -55,6 +55,7 @@ use crate::download::command::OnDisk;
 use crate::download_http::DOWNLOAD_TOOL;
 use crate::model_switch::TextModel;
 use crate::Server;
+use crate::images::job::PngCompression;
 
 /// The tool's name, as its route's extension declares it.
 pub(crate) const TOOL: &str = "generate_image";
@@ -176,7 +177,7 @@ pub(super) async fn generate(
     };
     drop(turn);
     match made {
-        Ok(encoded) => shown(encoded).await,
+        Ok(encoded) => shown(encoded, connector.server.live().image.png_compression).await,
         Err(refused) => refused,
     }
 }
@@ -486,8 +487,8 @@ impl<'a> Progress<'a> {
 /// The image, `encoded`, as the harness reads it: the preview first, then
 /// one line of text. Decoding, resizing and encoding a picture of a few
 /// megapixels is CPU work: off the async workers.
-async fn shown(encoded: String) -> CallToolResult {
-    match tokio::task::spawn_blocking(move || preview(&encoded)).await {
+async fn shown(encoded: String, compression: PngCompression) -> CallToolResult {
+    match tokio::task::spawn_blocking(move || preview(&encoded, compression)).await {
         Ok(Ok(preview)) => {
             let image = ContentBlock::image(crate::images::job::base64(&preview.png), "image/png");
             CallToolResult::success(vec![image, ContentBlock::text(preview.line())])
@@ -520,7 +521,7 @@ impl Preview {
 
 /// The route's image, `encoded`, as a [`Preview`]: as it is when within
 /// [`PREVIEW_EDGE`], else resized to fit it, aspect kept.
-fn preview(encoded: &str) -> Result<Preview, String> {
+fn preview(encoded: &str, compression: PngCompression) -> Result<Preview, String> {
     let png = crate::media::base64_bytes(encoded).ok_or("the answer's image is not base64")?;
     // The route's own PNG: no bound of a client's to hold it to.
     let image = crate::media::decode_condition_image(&png, u64::MAX)?;
@@ -529,7 +530,7 @@ fn preview(encoded: &str) -> Result<Preview, String> {
         return Ok(Preview { png, made: image.size, shown });
     }
     let resized = crate::media::resize_rgba(&image, shown);
-    Ok(Preview { png: crate::images::job::encode_png(&resized), made: image.size, shown })
+    Ok(Preview { png: crate::images::job::encode_png(&resized, compression), made: image.size, shown })
 }
 
 /// `size` scaled so its longest edge is at most [`PREVIEW_EDGE`], each side

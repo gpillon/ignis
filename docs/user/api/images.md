@@ -54,6 +54,27 @@ for it is a `400` too, listing the sizes served. `auto` is 2048x2048 for a
 generation and, for an edit, the preset whose aspect ratio is nearest the last
 condition image's, always among the sizes served.
 
+**PNG compression (from 0.11.1).** `image.png_compression` defaults to `fast`,
+which spends less host CPU time encoding the PNG and can produce a larger file.
+Set it to `balanced` to restore the compression used through 0.11.0. Both are
+lossless: every RGBA pixel and the image dimensions stay the same. Larger PNGs
+also make the base64 response larger, so `balanced` can suit a slow connection.
+The setting applies to generated and edited images, connector previews, and
+the condition images shown to the prompt enhancer.
+
+```yaml
+image:
+  png_compression: balanced
+```
+
+The same setting is `--image-png-compression balanced` on the command line or
+`IGNIS_IMAGE_PNG_COMPRESSION=balanced` in the environment. It changes live:
+`PATCH /v1/config` with `{"image":{"png_compression":"balanced"}}` applies
+without reloading the model. A generated image job keeps the value taken when
+it was prepared across all its images; a live change applies to jobs prepared
+after it. Connector previews and prompt-enhancement images read the setting
+when they are prepared.
+
 **Condition images.** Each is resized to about 1024x1024 of area, keeping its
 aspect ratio, as soon as it is decoded. When the prompt and all of them exceed
 the condition budget, or the room the image model has for them, they are
@@ -81,6 +102,7 @@ job counts as use for [idle unload](idle-unload.md).
 |---|---|---|
 | `queue_depth` | `4` | Jobs that may wait behind the running one (0..64). |
 | `max_n` | `10` | The most images one request may ask for (1..64). |
+| `png_compression` | `fast` | From 0.11.1: `fast` saves host CPU time, potentially writing larger PNGs; `balanced` restores the previous compression. Both are lossless. |
 | `max_condition_images` | `10` | The most condition images one edit may send (1..10). |
 | `max_condition_mipx` | `16` | The largest a condition image may decode to, in Mi pixels of 1,048,576 each (1..64); a larger one is refused. 16 takes any phone camera and bounds each image's frame at 64 MiB; an edit decodes up to `max_condition_images` of them. |
 | `max_condition_decodes` | `1` | The most edits that decode their condition images at once (1..16); the others wait their turn. |

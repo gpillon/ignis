@@ -14,6 +14,7 @@ use ignis_core::image::RgbaImage;
 use ignis_core::{FinishReason, RequestClass};
 
 use super::prompts;
+use super::job::PngCompression;
 use crate::template::{ChatMessage, ContentPart, MessageContent};
 use crate::thinking::ThinkingOptions;
 use crate::Server;
@@ -72,7 +73,7 @@ impl Task {
     /// The rewrite's two turns: the system prompt, and the user turn — after
     /// `images` as `image_url` parts, the condition images an edit's
     /// enhancer can see, in order.
-    pub fn messages(self, prompt: &str, images: &[RgbaImage]) -> Vec<ChatMessage> {
+    pub fn messages(self, prompt: &str, images: &[RgbaImage], compression: PngCompression) -> Vec<ChatMessage> {
         let user_turn = self.user_turn(prompt);
         let user = if images.is_empty() {
             ChatMessage::text("user", user_turn)
@@ -85,7 +86,7 @@ impl Task {
             };
             let mut parts: Vec<ContentPart> = images
                 .iter()
-                .map(|image| part("image_url", None, Some(format!("data:image/png;base64,{}", super::job::base64(&super::job::encode_png(image))))))
+                .map(|image| part("image_url", None, Some(format!("data:image/png;base64,{}", super::job::base64(&super::job::encode_png(image, compression))))))
                 .collect();
             parts.push(part("text", Some(user_turn), None));
             ChatMessage { content: MessageContent::Parts(parts), ..ChatMessage::text("user", "") }
@@ -194,14 +195,15 @@ pub async fn rewrite(server: &Server, prompt: &str, images: &[RgbaImage], seed: 
             "prompt enhancement: {enhancer} has no vision tower loaded, so it rewrote the edit's prompt without seeing its condition images"
         ));
     }
+    let compression = server.live().image.png_compression;
     // An edit's images are PNG-encoded off the async workers.
     let messages = if sees {
         let (prompt, images) = (prompt.to_owned(), images.to_vec());
-        tokio::task::spawn_blocking(move || task.messages(&prompt, &images))
+        tokio::task::spawn_blocking(move || task.messages(&prompt, &images, compression))
             .await
             .map_err(|panicked| format!("encoding the condition images for {enhancer} panicked: {panicked}"))?
     } else {
-        task.messages(prompt, &[])
+        task.messages(prompt, &[], compression)
     };
     let thinking = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
     // An edit's answer is held to its schema where the model serves
@@ -291,11 +293,11 @@ mod tests {
             assert_eq!(Task::of(prompt, false), task, "{prompt}");
         }
         assert_eq!(Task::of("一只狐狸", true), Task::Edit);
-        let zh = Task::GenerationZh.messages("一只狐狸", &[]);
+        let zh = Task::GenerationZh.messages("一只狐狸", &[], PngCompression::Fast);
         assert_eq!((zh[0].role.as_str(), zh[0].content.text()), ("system", prompts::GENERATION_ZH.to_owned()));
         assert!(prompts::GENERATION_ZH.starts_with("# 图像 Prompt 改写专家"));
         assert_eq!(zh[1].content.text(), "用户输入：一只狐狸\n改写输出：");
-        let en = Task::GenerationEn.messages("  a fox ", &[]);
+        let en = Task::GenerationEn.messages("  a fox ", &[], PngCompression::Fast);
         assert!(en[0].content.text().starts_with("# Image Prompt Rewriting Expert"));
         assert_eq!(en[1].content.text(), "User Input: a fox\n\n Rewritten Prompt:");
         assert!(Task::Edit.system_prompt().starts_with("# Edit Prompt Enhancer"));
@@ -306,14 +308,30 @@ mod tests {
     #[test]
     fn an_edit_shows_its_images_before_the_instruction() {
         let image = RgbaImage { size: ImageSize::new(2, 1), pixels: vec![255, 0, 0, 128, 0, 255, 0, 255] };
-        let messages = Task::Edit.messages("make it blue", &[image.clone(), image]);
-        let MessageContent::Parts(parts) = &messages[1].content else { panic!("parts: {:?}", messages[1]) };
-        assert_eq!(parts.len(), 3);
-        for part in &parts[..2] {
-            assert_eq!(part.kind.as_deref(), Some("image_url"));
-            assert!(part.url.as_deref().is_some_and(|url| url.starts_with("data:image/png;base64,iVBOR")), "{part:?}");
+        for (compression, level) in [(PngCompression::Fast, 0), (PngCompression::Balanced, 2)] {
+            let messages = Task::Edit.messages("make it blue", &[image.clone(), image.clone()], compression);
+            let MessageContent::Parts(parts) = &messages[1].content else { panic!("parts: {:?}", messages[1]) };
+            assert_eq!(parts.len(), 3);
+            for part in &parts[..2] {
+                assert_eq!(part.kind.as_deref(), Some("image_url"));
+                let encoded = part.url.as_deref().unwrap().strip_prefix("data:image/png;base64,").unwrap();
+                let bytes = crate::media::base64_bytes(encoded).unwrap();
+                let mut offset = 8;
+                while &bytes[offset + 4..offset + 8] != b"IDAT" {
+                    let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += length + 12;
+                }
+                assert_eq!(bytes[offset + 9] >> 6, level, "{compression:?}");
+                let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+                let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+                let frame = reader.next_frame(&mut pixels).unwrap();
+                assert_eq!((frame.width, frame.height, frame.color_type, frame.bit_depth),
+                    (2, 1, png::ColorType::Rgba, png::BitDepth::Eight));
+                assert_eq!(&pixels[..frame.buffer_size()], image.pixels.as_slice(), "RGBA preserved");
+            }
+            assert_eq!((parts[2].kind.as_deref(), parts[2].text.as_deref()),
+                (Some("text"), Some("User Input: make it blue\n\nRewritten Prompt:")));
         }
-        assert_eq!((parts[2].kind.as_deref(), parts[2].text.as_deref()), (Some("text"), Some("User Input: make it blue\n\nRewritten Prompt:")));
     }
 
     /// The answer read as upstream reads it: lines joined, an edit's JSON

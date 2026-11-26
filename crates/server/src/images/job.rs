@@ -22,6 +22,15 @@ use super::{ImageModel, Waiting};
 use crate::deadline::Timeout;
 use crate::metrics::{ImageJobEnd, ImageOutcome};
 
+/// The lossless PNG compression an operator chooses for image outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PngCompression {
+    /// Less host CPU time, potentially larger PNGs.
+    Fast,
+    /// The `png` crate's previous default, trading CPU time for smaller PNGs.
+    Balanced,
+}
+
 /// What the client's `background` asks of the images' alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Background {
@@ -67,6 +76,8 @@ pub struct ImageJob {
     /// Image `i` starts from the noise of `seed + i`.
     pub seed: u64,
     pub background: Background,
+    /// Chosen when the route prepares this job; unchanged across its images.
+    pub png_compression: PngCompression,
 }
 
 /// The phase a progress event is in. The first three come before the image
@@ -258,7 +269,7 @@ pub fn run_timed<E: From<JobEvent>>(
         if job.background == Background::Opaque {
             on_white(&mut image);
         }
-        let _ = events.send(JobEvent::Image { index, png: encode_png(&image) }.into());
+        let _ = events.send(JobEvent::Image { index, png: encode_png(&image, job.png_compression) }.into());
         phases.images += 1;
     }
     Ok(())
@@ -424,20 +435,16 @@ pub fn on_white(image: &mut RgbaImage) {
     }
 }
 
-/// `image` as an RGBA 8-bit PNG.
-///
-/// Deflated with the `png` crate's `Fast` level, not its default. The default
-/// took 0.55-1.2 s for a 2048x2048 picture on the host, between the decode and
-/// the response, with the card idle; `Fast` takes ~20 ms and, on a picture with
-/// real texture, writes the same size (within 1%, 6% on a smooth one). Only a
-/// flat picture grows (+47% on a perfectly flat one), the trade a client on a
-/// slow link would feel and a local one would not.
-pub fn encode_png(image: &RgbaImage) -> Vec<u8> {
+/// `image` as a lossless RGBA 8-bit PNG at the chosen compression.
+pub fn encode_png(image: &RgbaImage, compression: PngCompression) -> Vec<u8> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, image.size.width, image.size.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    encoder.set_compression(png::Compression::Fast);
+    encoder.set_compression(match compression {
+        PngCompression::Fast => png::Compression::Fast,
+        PngCompression::Balanced => png::Compression::Balanced,
+    });
     // Into memory, from a buffer of the header's size: nothing to fail on.
     let mut writer = encoder.write_header().expect("a PNG header into memory");
     writer.write_image_data(&image.pixels).expect("an RGBA frame of the image's size");
@@ -479,6 +486,7 @@ mod tests {
             n,
             seed,
             background,
+            png_compression: crate::config::schema::ImageGroup::default().png_compression,
         }
     }
 
@@ -678,12 +686,10 @@ mod tests {
         (ImageModel::new("ignis-image-2.1-turbo", Box::new(runner)), held)
     }
 
-    /// The PNG is deflated at the `Fast` level (its zlib header's FLEVEL is 0,
-    /// "fastest algorithm"; the crate's default writes 2), and decodes to the
-    /// pixels it was given. A timing test would flake on CI: the header is what
-    /// tells the 20 ms encoder from the 0.5-1.2 s one on a 2048x2048 picture.
+    /// Both selected compression levels preserve RGBA pixels. Their zlib
+    /// FLEVEL distinguishes the modes without a timing assertion on CI.
     #[test]
-    fn a_png_is_deflated_fast_and_decodes_to_its_pixels() {
+    fn a_png_uses_its_compression_and_decodes_to_its_pixels() {
         let size = ImageSize::new(96, 64);
         let mut state = 1u32;
         let pixels = (0..96 * 64 * 4)
@@ -693,10 +699,16 @@ mod tests {
             })
             .collect();
         let image = RgbaImage { size, pixels };
-        let png = encode_png(&image);
-        assert_eq!(decode(&png), image, "lossless");
-        let idat = png.windows(4).position(|w| w == b"IDAT").expect("an IDAT chunk") + 4;
-        assert_eq!(png[idat + 1] >> 6, 0, "the zlib header names the fastest algorithm");
+        for (compression, level) in [(PngCompression::Fast, 0), (PngCompression::Balanced, 2)] {
+            let png = encode_png(&image, compression);
+            assert_eq!(decode(&png), image, "lossless");
+            let mut offset = 8;
+            while &png[offset + 4..offset + 8] != b"IDAT" {
+                let length = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
+                offset += length + 12;
+            }
+            assert_eq!(png[offset + 9] >> 6, level, "{compression:?}");
+        }
     }
 
     #[test]

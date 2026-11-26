@@ -372,7 +372,7 @@ async fn with_the_enhancer_loaded_the_rewrite_comes_first_and_the_request_switch
     assert_eq!(last, Some(LastSwitch { from: "mock-a".into(), to: IMAGE.into(), outcome: SwitchOutcome::Switched, host_plan: None }));
 
     let thinking_off = ThinkingOptions { enable_thinking: false, ..ThinkingOptions::default() };
-    let expected = SimpleTemplateProvider.apply_chat_template(&Task::GenerationZh.messages(prompt, &[]), &thinking_off, &[]).unwrap();
+    let expected = SimpleTemplateProvider.apply_chat_template(&Task::GenerationZh.messages(prompt, &[], ignis_server::images::job::PngCompression::Fast), &thinking_off, &[]).unwrap();
     let rewrites = prefilled(&compute);
     assert_eq!(rewrites.len(), 1, "one rewrite");
     let (_, tokens, params) = &rewrites[0];
@@ -830,7 +830,7 @@ async fn a_rewrite_its_engine_dropped_falls_back_saying_so() {
 fn enhanced_edit() -> Request<Body> {
     const BOUNDARY: &str = "ignis-enhancement-boundary";
     let image = ignis_core::image::RgbaImage { size: ignis_core::image::ImageSize::new(64, 64), pixels: vec![90; 64 * 64 * 4] };
-    let png = ignis_server::images::job::encode_png(&image);
+    let png = ignis_server::images::job::encode_png(&image, ignis_server::images::job::PngCompression::Fast);
     let mut body = Vec::new();
     for (name, value) in [("prompt", "make it blue"), ("model", IMAGE), ("size", "1024x1024"), ("prompt_enhancement", "true")] {
         body.extend(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").bytes());

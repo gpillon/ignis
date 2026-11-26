@@ -331,6 +331,66 @@ async fn a_generation_returns_n_rgba_pngs_with_its_seed_and_the_same_seed_the_sa
     assert!(harness.jobs().in_flight().is_idle());
 }
 
+/// #735: changing PNG compression live applies to generations and edits,
+/// including every image of a job, without changing their RGBA pixels.
+#[tokio::test]
+async fn image_png_compression_changes_live_without_changing_generated_or_edited_pixels() {
+    let harness = Harness::new(Gate::opened());
+    let flags: Vec<String> = ["--profile", "none", "--image-sizes", "64x64;128x64;96x64"]
+        .into_iter().map(str::to_owned).collect();
+    let ignis_server::config::ConfigOutcome::Config(config) =
+        ignis_server::config::resolve(&flags, |_| None).unwrap() else { panic!("config") };
+    let state = Arc::new(ignis_server::config_http::ConfigState::new(config.clone(), Arc::new(ignis_server::config::file::RealFiles)));
+    let server = harness.server.with_config(state);
+    server.apply_config(&config);
+    let app = server.app();
+    let mut reference = [Vec::<Vec<u8>>::new(), Vec::<Vec<u8>>::new()];
+    for (mode, level) in [("fast", 0), ("balanced", 2), ("fast", 0)] {
+        if !reference[0].is_empty() {
+            let patch = Request::builder().method(Method::PATCH).uri("/v1/config")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({ "image": { "png_compression": mode } }).to_string())).unwrap();
+            let (status, applied) = send(&app, patch).await;
+            assert_eq!(status, StatusCode::OK, "{applied}");
+            assert_eq!(applied["applied"], "live", "no model reload");
+            assert_eq!(applied["config"]["image"]["png_compression"], mode);
+        }
+        let generation = json_request("/v1/images/generations", &json!({ "prompt": "a fox", "size": "64x64", "n": 2, "seed": 11 }));
+        let edit = form_request(&[("prompt", Part::Text("a fox")), ("size", Part::Text("64x64")),
+            ("n", Part::Text("2")), ("seed", Part::Text("11")), ("image[]", Part::File(ALPHA_PNG))]);
+        for (route, request) in [generation, edit].into_iter().enumerate() {
+            let (status, answer) = send(&app, request).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            let data = answer["data"].as_array().unwrap();
+            assert_eq!(data.len(), 2);
+            for (index, image) in data.iter().enumerate() {
+                let bytes = unbase64(image["b64_json"].as_str().unwrap());
+                let mut offset = 8;
+                while &bytes[offset + 4..offset + 8] != b"IDAT" {
+                    let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += length + 12;
+                }
+                assert_eq!(bytes[offset + 9] >> 6, level, "{mode}, route {route}, image {index}");
+                let decoded = png_of(&image["b64_json"]);
+                assert_eq!((decoded.size, decoded.color, decoded.depth),
+                    (ImageSize::new(64, 64), png::ColorType::Rgba, png::BitDepth::Eight));
+                assert!(decoded.pixels.chunks_exact(4).any(|pixel| pixel[3] < 255), "alpha kept");
+                if reference[route].len() <= index {
+                    reference[route].push(decoded.pixels);
+                } else {
+                    assert_eq!(decoded.pixels, reference[route][index], "compression preserves RGBA");
+                }
+            }
+        }
+    }
+    let bad = Request::builder().method(Method::PATCH).uri("/v1/config")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"image":{"png_compression":"slow","max_n":1}}"#)).unwrap();
+    let (status, error) = send(&app, bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(server.live().image.max_n, 10, "an invalid compression applies none of the patch");
+}
+
 /// AC 3: `background=opaque` is alpha 255, the generated image composited on
 /// white; `transparent` is the alpha as generated.
 #[tokio::test]
@@ -437,7 +497,7 @@ async fn a_size_past_the_loads_largest_target_is_refused_and_auto_never_picks_it
 
 /// An RGBA image as a PNG.
 fn encode(image: &RgbaImage) -> Vec<u8> {
-    ignis_server::images::job::encode_png(image)
+    ignis_server::images::job::encode_png(image, ignis_server::images::job::PngCompression::Fast)
 }
 
 /// AC 5: 1 to 10 condition images in PNG, JPEG and WebP, with and without
