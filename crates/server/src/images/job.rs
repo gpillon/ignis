@@ -22,6 +22,19 @@ use super::{ImageModel, Waiting};
 use crate::deadline::Timeout;
 use crate::metrics::{ImageJobEnd, ImageOutcome};
 
+#[cfg(test)]
+#[path = "../../tests/support/png.rs"]
+pub(crate) mod png_test_support;
+
+/// The lossless PNG compression an operator chooses for image outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PngCompression {
+    /// Less host CPU time, potentially larger PNGs.
+    Fast,
+    /// The `png` crate's previous default, trading CPU time for smaller PNGs.
+    Balanced,
+}
+
 /// What the client's `background` asks of the images' alpha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Background {
@@ -67,6 +80,8 @@ pub struct ImageJob {
     /// Image `i` starts from the noise of `seed + i`.
     pub seed: u64,
     pub background: Background,
+    /// Chosen when the route prepares this job; unchanged across its images.
+    pub png_compression: PngCompression,
 }
 
 /// The phase a progress event is in. The first three come before the image
@@ -258,7 +273,7 @@ pub fn run_timed<E: From<JobEvent>>(
         if job.background == Background::Opaque {
             on_white(&mut image);
         }
-        let _ = events.send(JobEvent::Image { index, png: encode_png(&image) }.into());
+        let _ = events.send(JobEvent::Image { index, png: encode_png(&image, job.png_compression) }.into());
         phases.images += 1;
     }
     Ok(())
@@ -424,12 +439,16 @@ pub fn on_white(image: &mut RgbaImage) {
     }
 }
 
-/// `image` as an RGBA 8-bit PNG.
-pub fn encode_png(image: &RgbaImage) -> Vec<u8> {
+/// `image` as a lossless RGBA 8-bit PNG at the chosen compression.
+pub fn encode_png(image: &RgbaImage, compression: PngCompression) -> Vec<u8> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, image.size.width, image.size.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(match compression {
+        PngCompression::Fast => png::Compression::Fast,
+        PngCompression::Balanced => png::Compression::Balanced,
+    });
     // Into memory, from a buffer of the header's size: nothing to fail on.
     let mut writer = encoder.write_header().expect("a PNG header into memory");
     writer.write_image_data(&image.pixels).expect("an RGBA frame of the image's size");
@@ -471,6 +490,7 @@ mod tests {
             n,
             seed,
             background,
+            png_compression: crate::config::schema::ImageGroup::default().png_compression,
         }
     }
 
@@ -668,6 +688,26 @@ mod tests {
         let runner = FakeImageRunner::new(ImagePlan { condition_budget_tokens: budget, sample_sigmas: vec![1.0], ..fake_plan() });
         let held = runner.held_conditions();
         (ImageModel::new("ignis-image-2.1-turbo", Box::new(runner)), held)
+    }
+
+    /// Both selected compression levels preserve RGBA pixels. Their zlib
+    /// FLEVEL distinguishes the modes without a timing assertion on CI.
+    #[test]
+    fn a_png_uses_its_compression_and_decodes_to_its_pixels() {
+        let size = ImageSize::new(96, 64);
+        let mut state = 1u32;
+        let pixels = (0..96 * 64 * 4)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((i / 7) as u8).wrapping_add((state >> 29) as u8)
+            })
+            .collect();
+        let image = RgbaImage { size, pixels };
+        for (compression, level) in [(PngCompression::Fast, 0), (PngCompression::Balanced, 2)] {
+            let png = encode_png(&image, compression);
+            assert_eq!(decode(&png), image, "lossless");
+            assert_eq!(png_test_support::compression_level(&png), level, "{compression:?}");
+        }
     }
 
     #[test]

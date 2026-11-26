@@ -39,6 +39,7 @@ use super::kind::*;
 use super::source::Resolver;
 use super::ConfigError;
 use crate::instruction::{DeveloperMessagePolicy, SystemMessagePolicy};
+use crate::images::job::PngCompression;
 
 /// Expand one group's field list into its settings struct, its `FIELDS`
 /// table, and the resolve/render functions the rest of the module reads
@@ -814,6 +815,11 @@ config_group! {
         /// The most images one request may ask for (`n`), made one after
         /// another over the job's one condition prefix.
         max_n: Images = 10, between(1, 64), ALL, [Visible, Patchable];
+        /// Lossless PNG compression for generated images, connector previews
+        /// and prompt enhancement's condition images: fast saves host CPU
+        /// time, potentially writing larger PNGs; balanced restores the
+        /// previous compression. Both preserve every RGBA pixel.
+        png_compression: PngCompressionKind = PngCompression::Fast, NO_RULE, ALL, [Visible, Patchable];
         /// The most condition images one edit may send. At most 10, what the
         /// image model's encoder holds.
         max_condition_images: Images = 10, between(1, 10), ALL, [Visible, Patchable];

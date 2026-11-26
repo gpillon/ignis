@@ -775,6 +775,31 @@ impl FieldKind for DeveloperPolicy {
     }
 }
 
+/// The lossless compression of image PNGs.
+pub struct PngCompressionKind;
+
+impl FieldKind for PngCompressionKind {
+    type Value = crate::images::job::PngCompression;
+    const TAG: &'static str = "png-compression";
+
+    fn parse(raw: &str) -> Result<Self::Value, String> {
+        use crate::images::job::PngCompression;
+        match raw.to_ascii_lowercase().as_str() {
+            "fast" => Ok(PngCompression::Fast),
+            "balanced" => Ok(PngCompression::Balanced),
+            _ => Err(format!("must be fast or balanced, got `{raw}`")),
+        }
+    }
+
+    fn render(value: &Self::Value) -> Value {
+        use crate::images::job::PngCompression;
+        Value::String(match value {
+            PngCompression::Fast => "fast",
+            PngCompression::Balanced => "balanced",
+        }.to_owned())
+    }
+}
+
 /// What a request past its deadline is answered (ADR 0058).
 pub struct TimeoutReplyKind;
 

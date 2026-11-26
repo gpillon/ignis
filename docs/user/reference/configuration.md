@@ -1287,6 +1287,19 @@ The image jobs that may wait behind the one running, in order; one more is refus
 
 The most images one request may ask for (`n`), made one after another over the job's one condition prefix.
 
+### `image.png_compression`
+
+| | |
+|---|---|
+| Flag | `--image-png-compression` |
+| Env var | `IGNIS_IMAGE_PNG_COMPRESSION` |
+| Kind | `png-compression` |
+| Default | `fast` |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+Lossless PNG compression for generated images, connector previews and prompt enhancement's condition images: fast saves host CPU time, potentially writing larger PNGs; balanced restores the previous compression. Both preserve every RGBA pixel.
+
 ### `image.max_condition_images`
 
 | | |

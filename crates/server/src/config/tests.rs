@@ -3867,11 +3867,25 @@ fn help_lists_the_expose_flag() {
 /// config file with config v2's precedence — the flag over the env var over
 /// the file over the default — and the server's live knobs carry it.
 #[test]
+fn image_png_compression_defaults_to_fast_and_accepts_balanced_from_every_source() {
+    let value = |config: &Config| config.settings().render()["image"]["png_compression"].clone();
+    assert_eq!(value(&config(&[])), "fast");
+    assert_eq!(value(&config(&["--image-png-compression", "balanced"])), "balanced");
+    let env = env_map(&[("IGNIS_IMAGE_PNG_COMPRESSION", "balanced")]);
+    assert_eq!(value(&expect_config(resolve(&[], env).unwrap())), "balanced");
+    let files = MemFiles::with(&[("c.yaml", "image:\n  png_compression: balanced\n")]);
+    assert_eq!(value(&with_files(&["--config", "c.yaml"], no_env, &files).unwrap()), "balanced");
+    let error = refused(&["--image-png-compression", "slow"]);
+    assert!(error.contains("--image-png-compression") && error.contains("fast") && error.contains("balanced"), "{error}");
+}
+
+#[test]
 fn every_image_field_resolves_from_flag_env_and_file_by_precedence() {
     // Per field: the file's value, the env var's, the flag's.
     let cases = [
         ("queue_depth", "1", "2", "3"),
         ("max_n", "4", "5", "6"),
+        ("png_compression", "balanced", "fast", "balanced"),
         ("max_condition_images", "7", "8", "9"),
         ("max_condition_mipx", "4", "8", "32"),
         ("max_condition_decodes", "2", "3", "4"),

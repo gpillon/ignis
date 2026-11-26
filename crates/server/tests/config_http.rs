@@ -1416,7 +1416,7 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     assert_eq!(
         names,
         [
-            "queue_depth", "max_n", "max_condition_images", "max_condition_mipx", "max_condition_decodes", "sizes", "max_target_cells",
+            "queue_depth", "max_n", "png_compression", "max_condition_images", "max_condition_mipx", "max_condition_decodes", "sizes", "max_target_cells",
             "condition_budget_tokens", "min_condition_budget_tokens", "condition_floor_px",
             "prompt_enhancement", "prompt_enhancer", "prompt_enhancer_max_tokens",
         ]
@@ -1431,15 +1431,19 @@ async fn the_image_fields_are_listed_and_change_live_within_their_bounds() {
     assert_eq!(declaration(&fields, "image.max_target_cells")["rule"], json!({ "min": 1, "max": 1 << 20 }));
     assert_eq!(declaration(&fields, "image.max_condition_mipx")["rule"], json!({ "min": 1, "max": 64 }));
     assert_eq!(declaration(&fields, "image.sizes")["default"][7], "1024x1024");
+    assert_eq!(declaration(&fields, "image.png_compression")["default"], "fast");
     let (_, document) = send(&app, Method::GET, "/v1/config", None).await;
     assert_eq!(document["image"]["queue_depth"], 3, "{document}");
+    assert_eq!(document["image"]["png_compression"], "fast");
     assert_eq!(server.live().image.queue_depth, 3);
 
-    let body = json!({ "image": { "queue_depth": 2, "sizes": ["1024x1024"], "prompt_enhancement": true } });
+    let body = json!({ "image": { "queue_depth": 2, "sizes": ["1024x1024"], "prompt_enhancement": true, "png_compression": "balanced" } });
     let (status, applied) = send(&app, Method::PATCH, "/v1/config", Some(body)).await;
     assert_eq!((status, applied["applied"].as_str()), (StatusCode::OK, Some("live")), "{applied}");
     let image = &server.live().image;
     assert_eq!((image.queue_depth, image.sizes.len(), image.prompt_enhancement), (2, 1, true));
+    assert_eq!(image.render()["png_compression"], "balanced");
+    assert_eq!(read_yaml(&path)["image"]["png_compression"], "balanced", "the choice is persisted");
     assert!(loader.prepared_options().is_empty(), "no model was touched");
 
     let (status, refused) = send(&app, Method::PATCH, "/v1/config", Some(json!({ "image": { "max_n": 65, "queue_depth": 1 } }))).await;

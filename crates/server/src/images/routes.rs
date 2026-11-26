@@ -1011,7 +1011,7 @@ fn prepare(
         .zip(&fitted.sizes)
         .map(|(image, &size)| if image.size == size { image } else { crate::media::resize_rgba(&image, size) })
         .collect();
-    let job = ImageJob { condition: ImageCondition { prompt, images }, size, n, seed, background };
+    let job = ImageJob { condition: ImageCondition { prompt, images }, size, n, seed, background, png_compression: limits.png_compression };
     Ok(Prepared { model, job, fitted })
 }
 
@@ -1219,7 +1219,8 @@ mod tests {
     #[test]
     fn condition_images_are_resized_as_they_are_decoded() {
         let image = |width: u32, height: u32| RgbaImage { size: ImageSize::new(width, height), pixels: vec![120; (width * height * 4) as usize] };
-        let pngs = [job::encode_png(&image(64, 32)), job::encode_png(&image(1024, 1024))];
+        let compression = ImageGroup::default().png_compression;
+        let pngs = [job::encode_png(&image(64, 32), compression), job::encode_png(&image(1024, 1024), compression)];
         let decoded = decode_conditions(&pngs, 1 << 20).unwrap();
         assert_eq!(decoded.sources, [ImageSize::new(64, 32), ImageSize::new(1024, 1024)]);
         let sizes: Vec<ImageSize> = decoded.images.iter().map(|image| image.size).collect();

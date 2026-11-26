@@ -100,6 +100,9 @@ async fn generate(app: &axum::Router, arguments: Value, key: Option<&str>) -> Va
     rpc(app, "tools/call", json!({ "name": "generate_image", "arguments": arguments }), key).await
 }
 
+#[path = "support/png.rs"]
+mod png_test_support;
+
 fn unbase64(text: &str) -> Vec<u8> {
     let value = |c: u8| match c {
         b'A'..=b'Z' => c - b'A',
@@ -153,6 +156,36 @@ async fn generate_image_answers_a_preview_of_at_most_512_px_and_one_line_of_text
     let content = result["content"].as_array().expect("content");
     assert_eq!(image_size(&content[0]), (256, 128), "{result}");
     assert!(content[1]["text"].as_str().unwrap().contains("256x128"), "{result}");
+}
+
+/// #735: previews re-encoded to 512 px use the selected compression;
+/// images already below it retain their job's selected compression.
+#[tokio::test]
+async fn image_png_compression_applies_to_resized_and_native_connector_previews() {
+    use ignis_server::images::job::PngCompression;
+    let (_, server) = image_server("png-compression", &[IMAGE, "mock-a"], true);
+    let server = server.with_seedless_seed(11);
+    let app = server.app();
+    let mut reference = [Vec::<u8>::new(), Vec::<u8>::new()];
+    for (compression, level) in [(PngCompression::Fast, 0), (PngCompression::Balanced, 2)] {
+        server.update_live(|live| live.image.png_compression = compression);
+        for (index, size) in ["1024x640", "256x128"].into_iter().enumerate() {
+            let result = generate(&app, json!({ "prompt": "a red fox", "size": size }), None).await;
+            assert_ne!(result["isError"], json!(true), "{result}");
+            let bytes = unbase64(result["content"][0]["data"].as_str().unwrap());
+            assert_eq!(png_test_support::compression_level(&bytes), level, "{compression:?}, {size}");
+            let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+            let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+            let frame = reader.next_frame(&mut pixels).unwrap();
+            pixels.truncate(frame.buffer_size());
+            assert_eq!(frame.color_type, png::ColorType::Rgba);
+            if reference[index].is_empty() {
+                reference[index] = pixels;
+            } else {
+                assert_eq!(pixels, reference[index], "preview pixels preserved");
+            }
+        }
+    }
 }
 
 /// A chat turn naming `model`, sent with `key`, as a harness's next turn.
