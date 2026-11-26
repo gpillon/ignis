@@ -846,11 +846,10 @@ loops, set `--model-loop-guard log`; `off` turns the guard off
 
 On 0.11.0 and earlier, a 27B conversation on `hq-e8-2b`, the default KV
 format, can go wrong once its context passes 696,320 tokens: the decode and
-verify attention then reads a wrong cache page or a wrong rotation. The request
-stops on a CUDA error (`an illegal memory access`), or the answer is wrong and
-the rows the round wrote to the cache with it. Only a context set above that
-reaches it: the `rtx5090` profile's 917,504 tokens, and the 1,048,576 of
-`rtxpro6000` and `rtx-24gb`. On those releases, start with
+verify attention then reads a wrong cache page or a wrong rotation, so the
+request can stop on a CUDA error or the answer can be wrong. Only a context set
+above that reaches it: the `rtx5090` profile's 917,504 tokens, and the
+1,048,576 of `rtxpro6000` and `rtx-24gb`. On those releases, start with
 `--model-max-context 696320`
 ([Context and speculation](configuration/context-and-speculation.md)). From
 0.11.1 the attention serves every context up to the 1,048,576-token ceiling.
