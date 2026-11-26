@@ -262,6 +262,9 @@ async fn send(app: &axum::Router, request: Request<Body>) -> (StatusCode, Value)
     (status, body)
 }
 
+#[path = "support/png.rs"]
+mod png_test_support;
+
 /// Standard base64, padded.
 fn unbase64(text: &str) -> Vec<u8> {
     let value = |c: u8| match c {
@@ -365,12 +368,7 @@ async fn image_png_compression_changes_live_without_changing_generated_or_edited
             assert_eq!(data.len(), 2);
             for (index, image) in data.iter().enumerate() {
                 let bytes = unbase64(image["b64_json"].as_str().unwrap());
-                let mut offset = 8;
-                while &bytes[offset + 4..offset + 8] != b"IDAT" {
-                    let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += length + 12;
-                }
-                assert_eq!(bytes[offset + 9] >> 6, level, "{mode}, route {route}, image {index}");
+                assert_eq!(png_test_support::compression_level(&bytes), level, "{mode}, route {route}, image {index}");
                 let decoded = png_of(&image["b64_json"]);
                 assert_eq!((decoded.size, decoded.color, decoded.depth),
                     (ImageSize::new(64, 64), png::ColorType::Rgba, png::BitDepth::Eight));

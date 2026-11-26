@@ -100,6 +100,9 @@ async fn generate(app: &axum::Router, arguments: Value, key: Option<&str>) -> Va
     rpc(app, "tools/call", json!({ "name": "generate_image", "arguments": arguments }), key).await
 }
 
+#[path = "support/png.rs"]
+mod png_test_support;
+
 fn unbase64(text: &str) -> Vec<u8> {
     let value = |c: u8| match c {
         b'A'..=b'Z' => c - b'A',
@@ -170,12 +173,7 @@ async fn image_png_compression_applies_to_resized_and_native_connector_previews(
             let result = generate(&app, json!({ "prompt": "a red fox", "size": size }), None).await;
             assert_ne!(result["isError"], json!(true), "{result}");
             let bytes = unbase64(result["content"][0]["data"].as_str().unwrap());
-            let mut offset = 8;
-            while &bytes[offset + 4..offset + 8] != b"IDAT" {
-                let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-                offset += length + 12;
-            }
-            assert_eq!(bytes[offset + 9] >> 6, level, "{compression:?}, {size}");
+            assert_eq!(png_test_support::compression_level(&bytes), level, "{compression:?}, {size}");
             let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
             let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
             let frame = reader.next_frame(&mut pixels).unwrap();

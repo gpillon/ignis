@@ -316,12 +316,7 @@ mod tests {
                 assert_eq!(part.kind.as_deref(), Some("image_url"));
                 let encoded = part.url.as_deref().unwrap().strip_prefix("data:image/png;base64,").unwrap();
                 let bytes = crate::media::base64_bytes(encoded).unwrap();
-                let mut offset = 8;
-                while &bytes[offset + 4..offset + 8] != b"IDAT" {
-                    let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += length + 12;
-                }
-                assert_eq!(bytes[offset + 9] >> 6, level, "{compression:?}");
+                assert_eq!(crate::images::job::png_test_support::compression_level(&bytes), level, "{compression:?}");
                 let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
                 let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
                 let frame = reader.next_frame(&mut pixels).unwrap();

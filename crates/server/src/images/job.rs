@@ -22,6 +22,10 @@ use super::{ImageModel, Waiting};
 use crate::deadline::Timeout;
 use crate::metrics::{ImageJobEnd, ImageOutcome};
 
+#[cfg(test)]
+#[path = "../../tests/support/png.rs"]
+pub(crate) mod png_test_support;
+
 /// The lossless PNG compression an operator chooses for image outputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PngCompression {
@@ -702,12 +706,7 @@ mod tests {
         for (compression, level) in [(PngCompression::Fast, 0), (PngCompression::Balanced, 2)] {
             let png = encode_png(&image, compression);
             assert_eq!(decode(&png), image, "lossless");
-            let mut offset = 8;
-            while &png[offset + 4..offset + 8] != b"IDAT" {
-                let length = u32::from_be_bytes(png[offset..offset + 4].try_into().unwrap()) as usize;
-                offset += length + 12;
-            }
-            assert_eq!(png[offset + 9] >> 6, level, "{compression:?}");
+            assert_eq!(png_test_support::compression_level(&png), level, "{compression:?}");
         }
     }
 
