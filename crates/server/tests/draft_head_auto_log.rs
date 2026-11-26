@@ -14,13 +14,18 @@ use tracing_subscriber::layer::SubscriberExt;
 
 /// The options of a start with `flags`, fitted to the 27B.
 fn the_27b(flags: &[&str]) -> ignis_server::config::Config {
+    fitted(flags, ModelFamily::Qwen38_27b)
+}
+
+/// The options of a start with `flags`, fitted to `family`.
+fn fitted(flags: &[&str], family: ModelFamily) -> ignis_server::config::Config {
     let args: Vec<String> = flags.iter().map(|flag| flag.to_string()).collect();
     let ignis_server::config::ConfigOutcome::Config(config) =
         ignis_server::config::resolve(&args, |_| None).expect("resolve")
     else {
         panic!("expected a runnable config");
     };
-    config.for_family(ModelFamily::Qwen38_27b).expect("the 27B")
+    config.for_family(family).expect("the family's start")
 }
 
 /// The `ignis.runtime.draft_head` events a load of `config` logs as it
@@ -59,5 +64,11 @@ fn a_head_left_to_auto_says_it_is_the_full_head_and_a_named_or_unset_one_says_no
         &["--profile", "rtx5090"],
     ] {
         assert_eq!(draft_head_events(&the_27b(flags)), Vec::<serde_json::Value>::new(), "{flags:?}");
+    }
+    // GitHub #729: an MTP head, on either model, ignores the head setting and
+    // says nothing of it.
+    let mtp = ["--profile", "rtx5090", "--spec-backend", "mtp", "--spec-draft-head", "auto"];
+    for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
+        assert_eq!(draft_head_events(&fitted(&mtp, family)), Vec::<serde_json::Value>::new(), "{family:?}'s MTP head");
     }
 }

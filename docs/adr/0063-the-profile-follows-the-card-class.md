@@ -33,7 +33,7 @@ their prefill chunk, 1,024 and 2,048.
 
 ### Status
 
-Accepted (2026-10-21, after the owner's review: "accetto tutto"). Proposed the same day. Owner decisions in the 16 GB grill:
+Accepted (2026-10-21, after the owner's review: "accetto tutto"). Proposed the same day. Edited 2026-11-26 (#729). Owner decisions in the 16 GB grill:
 - the profile is `auto` by card class;
 - one 16 GB profile in phase 1;
 - per-card profiles only if real-card measurements justify them;
@@ -150,9 +150,9 @@ on a wrong premise:
   - `auto` is a third spelling of the field (`full | shortlist | auto`), not a third head:
     `ignis_core::ProposalHeadSetting` beside `ProposalHead`, as `RopeSetting` is beside `RopeScaling` (ADR 0057).
   - It resolves where the load's speculation is built (`derive_speculation`). `GET /v1/config` keeps `auto`.
-  - It is valid with `dflash2` and with `mtp`, whose only head is `full`. Without a backend it is refused, as any head
-    is.
-  - A load whose head is `auto` logs `ignis.runtime.draft_head`: `draft_head auto -> full`, once, where the load
+  - It is valid with `dflash2`; beside `mtp`, whose only head is `full`, under `off` and without a backend it is
+    ignored, as any head is (edited 2026-11-26, #729).
+  - A DFlash2 load whose head is `auto` logs `ignis.runtime.draft_head`: `draft_head auto -> full`, once, where the load
     derives its shape from the resolution (`load::load_shape`). A CPU test reads it through that function, in its
     own test binary (`tests/draft_head_auto_log.rs`); the GPU leg reads it from a load through `load::load_model`.
 - **Step 1 drops a `shortlist` only.** A head the profile or the default gave falls to `full` when it is `shortlist`.

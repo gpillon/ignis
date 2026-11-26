@@ -438,7 +438,8 @@ profile's (or a profile of your own under `profiles:`), `flag`, `env`, `file`
 or `patch` for yours. From 0.11.2, a load whose policy is `mixed` at a DFlash2
 window other than 15, the one mixed rounds run at, says so: under `rtx5090`
 with `--spec-draft-tokens 10` named, or with `--spec-shape-policy mixed` beside
-a window of 8 to 14. The load serves as `aggregate` serves, and its load log's
+a window of 1 to 14 (at 7 or fewer the load holds one round shape, and the
+policy changes nothing else). The load serves as `aggregate` serves, and its load log's
 `speculation` says `shape_policy=aggregate` (`shape_policy_given=mixed`
 beside it where the policy was yours). Name 15 drafts for mixed rounds, or
 `--spec-shape-policy aggregate` to say what runs. A profile's `mixed` on a

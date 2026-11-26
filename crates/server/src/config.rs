@@ -1689,7 +1689,7 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 /// own logits: there is no second head to choose. GitHub #576 (ADR 0090):
 /// `--spec-draft-rule` and the drafter's two settings ride the speculation
 /// the same way; Flash-Next ignores them by their scope (the 27B's alone)
-/// before this runs ([`is_draft_setting`]).
+/// before this runs ([`field::FieldMeta::is_draft_setting`]).
 ///
 /// GitHub #623: `mtp` on the 27B (`family`) takes its own default window,
 /// and a window of 0 there is a load with no speculation, the one `off`
@@ -1698,8 +1698,10 @@ fn derive_diarizer(resolution: &Resolution, spelled: &impl Fn(&str, &str) -> Str
 /// Every `spec.` field that shapes a draft beside the backend: the window,
 /// the drafter's head, and DFlash2's own -- its draft rule and its drafter's
 /// sampling (GitHub #576), the shape rule's thresholds (GitHub #689) and the
-/// shape policy's three (GitHub #690). What a start drops with a backend its
-/// model does not draft with.
+/// shape policy's three (GitHub #690). What a switch drops with a backend its
+/// model does not draft with; with Flash-Next's draft rows, the draft
+/// settings a load whose drafter does not read them ignores (GitHub #729,
+/// [`field::FieldMeta::is_draft_setting`]).
 pub(crate) const DRAFT_FIELDS: [&str; 10] = [
     "draft_tokens",
     "draft_head",

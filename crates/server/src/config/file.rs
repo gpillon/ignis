@@ -476,8 +476,8 @@ pub fn generated_document(config: &Config) -> Value {
     let mut document = effective_document(config);
     let the_27b = ModelFamily::Qwen38_27b;
     let (_, families) = resolutions(config);
-    let profiles = families.iter().find(|(family, _)| *family == the_27b).and_then(|(_, resolution)| resolution.origin("spec", "shape_policy"));
-    if profiles.is_some_and(|origin| origin.source == super::source::Source::Profile) {
+    let policy_origin = families.iter().find(|(family, _)| *family == the_27b).and_then(|(_, resolution)| resolution.origin("spec", "shape_policy"));
+    if policy_origin.is_some_and(|origin| origin.source == super::source::Source::Profile) {
         if let Some(section) = document.get_mut("spec").and_then(|group| group.get_mut(scope(the_27b))).and_then(Value::as_object_mut) {
             section.remove("shape_policy");
         }

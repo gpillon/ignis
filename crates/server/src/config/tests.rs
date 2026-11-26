@@ -2649,10 +2649,11 @@ fn a_draft_setting_only_the_other_models_drafter_reads_is_ignored_where_it_is_na
 /// GitHub #729, AC 1: under every built-in profile, with speculation off for
 /// both models or for one, no backend named, either head, and DFlash2 with
 /// the profile's window and each window that holds two round shapes, the
-/// effective document of each model's start reads back, in both formats, to
-/// the same load. Every start starts but the one refused by design,
-/// Flash-Next's beside an unscoped `dflash2` (GitHub #733), which has no
-/// document to read back.
+/// effective document of each model's start, and the file `config generate`
+/// writes of it, read back, in both formats, to the same load. Every start
+/// starts but the one refused by design, Flash-Next's beside an unscoped
+/// `dflash2`, refused naming its drafter (GitHub #733), which has no document
+/// to read back.
 #[test]
 fn every_profiles_effective_document_reads_back_under_every_backend() {
     let windows: Vec<String> = (8..=15).map(|window| window.to_string()).collect();
@@ -2672,11 +2673,17 @@ fn every_profiles_effective_document_reads_back_under_every_backend() {
             for family in [ModelFamily::Qwen38_27b, ModelFamily::FlashNext] {
                 let started = match config(&flags).for_family(family) {
                     Ok(started) => started,
-                    Err(_) if family == ModelFamily::FlashNext && backend.contains(&"dflash2") => continue,
+                    Err(e) if family == ModelFamily::FlashNext && backend.contains(&"dflash2") => {
+                        assert!(e.0.contains("--spec-backend dflash2") && e.0.contains("Qwen3.8-Flash-Next drafts with mtp"), "{flags:?}: {e}");
+                        continue;
+                    }
                     Err(e) => panic!("{flags:?} on {family:?}: {e}"),
                 };
-                let document = file::effective_document(&started);
-                for (file, format) in [("c.yaml", Format::Yaml), ("c.json", Format::Json)] {
+                for (file, format, document) in [
+                    ("c.yaml", Format::Yaml, file::effective_document(&started)),
+                    ("c.json", Format::Json, file::effective_document(&started)),
+                    ("g.yaml", Format::Yaml, file::generated_document(&started)),
+                ] {
                     let files = MemFiles::with(&[(file, &format.write(&document))]);
                     let read = with_files(&["--config", file, "--profile", name.as_str()], no_env, &files).and_then(|read| read.for_family(family));
                     let read = read.unwrap_or_else(|e| panic!("{flags:?} on {family:?}, {file}: {e}\n{document}"));

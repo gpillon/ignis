@@ -238,16 +238,11 @@ and on a switch alike (a bound, as a context past the 27B's envelope is, not a d
 DFlash2 refuses 0 everywhere. A rule only the loading model decides runs where the configuration is fitted to it,
 never where every model's values are validated, or a value for one would refuse a start of the other.
 
-DFlash2's own settings are refused by name on the head's load, and only where the operator named them, never because
-a default is in force: the sampled draft has been the 27B's default since #578, so the head's load drafts the fixed
-draft, its only rule, without anyone having to say so. "Named" is new here, because the repository's rule that
-naming a default says nothing would let `--spec-draft-rule sampled` pass silently and leave the shortlist head the
-only setting the head could refuse: a flag or an env var names its value even at the default; a config file and a
-live patch name a value only away from the default, because a file `config generate` wrote holds every field at its
-default and must start either drafter (`Resolution::named_by_operator`). So `--spec-draft-rule sampled`, and the
-drafter's temperature factor and top-p at any value, are refused by a flag or an env var; a file's `fixed` names the
-head's own rule and is taken; the shortlist head is refused as it was, by either model's head. The effective
-configuration document of a head's load reads back to the same speculation.
+DFlash2's own settings are ignored on the head's load, wherever and at whatever value they are named: the head
+drafts the fixed draft, its only rule, through its one head, and its speculation is the one `mtp` alone builds, as
+under `off` and with no backend, where every draft setting is ignored (edited 2026-11-26, #729; they were refused
+by name where the operator named them, the shortlist head by either model's head). The effective configuration
+document of a head's load reads back to the same speculation.
 
 **The head drafts after images** (#624). Until then the head's load refused vision on, at start, on a switch and on
 a live change, by one predicate in the configuration's fit, because every built-in profile turns the 27B's vision on

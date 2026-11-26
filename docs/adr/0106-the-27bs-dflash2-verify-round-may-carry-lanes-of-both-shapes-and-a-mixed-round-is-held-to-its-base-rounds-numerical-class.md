@@ -55,8 +55,8 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   the slowest conversation lane -7.9%, and missed the 2% line by the letter on two sampled one-lane cells (-2.05% and
   -2.45%) and a cold first token 7 ms later. The owner made `mixed` the `rtx5090` profile's default on 2026-11-23 all
   the same: one lane forms no mix, and seeded, a request alone wrote the same text in the same rounds under both
-  builds. Beside the 27B's MTP head the policy is ignored, as under `off` and as every draft setting is where its
-  speculation does not run (edited 2026-11-26, #729). It is the NVFP4 body's too, the one the gate served: the trellis bodies keep
+  builds. Beside the 27B's MTP head the policy is ignored, as under `off` (edited 2026-11-26, #729), as every draft
+  setting is where its speculation does not run. It is the NVFP4 body's too, the one the gate served: the trellis bodies keep
   `aggregate`, under `rtx5090` as under their own profiles, and a trellis body at 15 drafts runs `mixed` where the
   operator names it (a flag, the environment, a file or a patch); a run on a 16 GB or 24 GB card would be a new
   decision. A load given `mixed` that holds no mix runs `aggregate`, and its startup line names both, the policy it was

@@ -1106,6 +1106,15 @@ load's widest window, its **extended shape**'s, and a round at its **base
 shape** drafts 7: the window a round drafts is its round shape's. Not to be
 confused with the drafter's own 2048-token sliding **drafter window**.
 
+**Draft setting**:
+A `spec` field only a drafter reads: the **draft window**, the proposal head,
+the **draft rule** and the drafter's temperature factor and top-p, the
+**shape rule**'s thresholds, the **shape policy** with its estimate rounds and
+cost table, and Flash-Next's row budget (`spec.draft_rows`). It counts only
+where the speculation that reads it runs: under `off`, with no backend, beside
+an **MTP head** (DFlash2's own) and on the model whose drafter does not read
+it, it is ignored, neither refused nor dropped (#729).
+
 **Drafter window**:
 A sequence's DFlash2 context: every drafter layer's BF16 K and V for the last
 2048 positions (40 MiB). Per-sequence state in the sequence pool, one lane per

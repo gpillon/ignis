@@ -548,11 +548,11 @@ pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>
         ..shape
     };
     // GitHub #623: the 27B's MTP head has no head to choose, whatever a
-    // profile's `auto` says (rtx-16gb's).
-    let the_27bs_mtp = |s: &ignis_core::Speculation| crate::config::the_27bs_mtp(config.basis.family(), Some(s.backend()));
+    // profile's `auto` says (rtx-16gb's); GitHub #729: nor has Flash-Next's,
+    // beside which the setting is ignored.
     if let Some(speculation) = shape
         .speculation
-        .filter(|s| !the_27bs_mtp(s) && config.settings().spec.draft_head.is_some_and(|head| head.is_auto()))
+        .filter(|s| s.backend() != ignis_core::SpeculativeBackend::Mtp && config.settings().spec.draft_head.is_some_and(|head| head.is_auto()))
     {
         crate::runtime::log_draft_head_auto(speculation.proposal_head());
     }
@@ -1469,6 +1469,22 @@ mod tests {
         assert_eq!(load(&at("15", &["--spec-shape-policy", "mixed"]), Body27b::Nvfp4).0, None, "15 named");
         let mtp = ["--profile", "rtx5090", "--spec-backend", "mtp"];
         assert_eq!(load(&mtp, Body27b::Nvfp4).0, None, "the MTP head");
+    }
+
+    /// GitHub #729: a file `config generate` writes under `rtx5090` leaves the
+    /// profile's `mixed` to the profile, so a start from it keeps the policy
+    /// the NVFP4 body's: a trellis body runs `aggregate`, and the NVFP4 body
+    /// `mixed`.
+    #[test]
+    fn a_generated_files_profile_mixed_stays_the_nvfp4_bodys() {
+        use crate::config::file::{generated_document, Format};
+        use ignis_artifact::Body27b;
+        let text = Format::Yaml.write(&generated_document(&the_27b(&["--profile", "rtx5090"], "")));
+        let read = the_27b(&[], &text);
+        let given = ShapePolicyGiven::of(&read);
+        let runs = |body| speculation_on(read.speculation, given, body).map(|s| s.shape_policy());
+        assert_eq!(runs(Body27b::Trellis), Some(ignis_core::ShapePolicy::Aggregate), "{text}");
+        assert_eq!(runs(Body27b::Nvfp4), Some(ignis_core::ShapePolicy::Mixed));
     }
 
     /// GitHub #623: the 27B's MTP load names its drafter and its window, and

@@ -357,9 +357,10 @@ one, up to the draft window.
   A window a profile gives beside its own DFlash2 (`rtx5090`'s 15,
   every other built-in profile's 7 but `rtx-12gb`'s, which is the
   head's own) is DFlash2's: `--spec-backend mtp` over it takes the head's own
-  default. So is the shape policy a profile gives beside its own DFlash2
-  (`rtx5090`'s `mixed`): the head's load does not take it, and
-  its effective configuration names the default.
+  default. The shape policy a profile gives beside its own DFlash2
+  (`rtx5090`'s `mixed`) the head's load ignores, as it ignores every shape
+  option (from 0.11.2; 0.11.1's effective configuration names the default
+  there).
 - **Acceptance.** On a replay of 200 real agent turns, sampled at temperature
   1, the head committed 3.9 tokens a round at 7 draft tokens on both artifacts
   (one is the anchor): its first draft was taken 74% of the time, its seventh
@@ -538,8 +539,12 @@ logged for it.
   budget is ignored on the 27B.
 
 So a profile's DFlash2 settings beside `off` change nothing, and the effective
-configuration (`config generate`, `config print`, `GET /v1/config`) writes
-them as they resolved and reads back to the same load. 0.11.1 refuses such a
+configuration (`config print`, `GET /v1/config`) writes them as they resolved
+and reads back to the same load. A file `config generate` writes does too,
+but for the 27B's shape policy where a profile gave it, which the file leaves
+to the profile, so that a start from it keeps `rtx5090`'s `mixed` the NVFP4
+artifact's ([profiles](profiles.md#rtx5090)); written as `config print` or
+the Playground's download shows it, the policy reads back as yours. 0.11.1 refuses such a
 setting by name (`… has nothing to configure under --spec-backend off`,
 `… requires --spec-backend`, `… drafts the fixed draft only`), so a file it
 generated under a profile with `--spec-backend off` does not start. What a

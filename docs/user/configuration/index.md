@@ -178,7 +178,10 @@ something to `--profile`, so such a profile could never be reached.
 `config generate` writes every resolved value as a value of the FILE, the
 profile's among them: a file generated under `auto` carries the numbers of the
 card class it was generated on, and a value in a file never adapts to the card
-that reads it. Generate with `--profile none` for a file that does not depend on
+that reads it. From 0.11.2 the one exception is the 27B's shape policy where a
+profile gave it (`rtx5090`'s `mixed`), which the file leaves to the profile:
+a start from it takes the profile's again, the NVFP4 artifact's
+([speculative decoding](../concepts/speculative-decoding.md#where-a-draft-setting-counts)). Generate with `--profile none` for a file that does not depend on
 the card.
 
 **At runtime.** `GET /v1/config` shows the running configuration (fields

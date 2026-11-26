@@ -20,7 +20,11 @@ running on the old model get `--switch-drain-timeout` (30 s) to finish; one
 still running then ends with an `engine_error`. The new model loads on the
 flags the server started with, except the ones it cannot take, which are left
 off for it and named in the log (the 27B's `--spec-backend dflash2` on
-Flash-Next; Flash-Next's own knobs on the 27B). `--spec-backend mtp`
+Flash-Next; Flash-Next's own knobs on the 27B). From 0.11.2 a draft setting
+only the other model's drafter reads (the 27B's `--spec-draft-rule` on
+Flash-Next, Flash-Next's `--spec-draft-rows` on the 27B) is ignored instead,
+and not named
+([speculative decoding](../concepts/speculative-decoding.md#where-a-draft-setting-counts)). `--spec-backend mtp`
 is both models' and crosses the switch: the 27B loads its own MTP head, at its
 own default window when none is named, beside the vision the switch carries
 ([the 27B's two drafters](../concepts/speculative-decoding.md#the-27bs-two-drafters)).

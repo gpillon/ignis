@@ -160,8 +160,8 @@ Why each:
   without a named `--spec-backend`), and a start that names `--spec-backend
   mtp`, `off` or a window other than 15 runs no mixed round and plans no graph
   for one (a window other than 15 says so in a WARN, from 0.11.2,
-  [troubleshooting](../troubleshooting.md#warn-ignisruntimemixed_rounds_need_15_drafts)). The
-  profile's `mixed` is the NVFP4 artifact's, the one served above: a trellis
+  [troubleshooting](../troubleshooting.md#warn-ignisruntimemixed_rounds_need_15_drafts)).
+  The profile's `mixed` is the NVFP4 artifact's, the one served above: a trellis
   artifact loaded under `rtx5090` runs `aggregate` and plans no mixed graph
   (its load log says `shape_policy=aggregate shape_policy_profile=mixed`), and
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
@@ -293,7 +293,8 @@ Why each:
 - **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (from 0.11.2 the profile's DFlash2 takes the window and the
-  policy without `--spec-backend`, which 0.11.1 asks for), and the grant reads the trellis artifact's own cost
+  policy without `--spec-backend`, which 0.11.1 asks for), and the grant reads
+  the trellis artifact's own cost
   table, measured on the RTX 5090 and indicative here until a run on one of
   these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
@@ -461,7 +462,8 @@ Why each:
 - **Mixed rounds off**, as on every profile but `rtx5090` (`aggregate`).
   `--spec-backend dflash2 --spec-draft-tokens 15 --spec-shape-policy mixed`
   turns them on (from 0.11.2 the profile's DFlash2 takes the window and the
-  policy without `--spec-backend`, which 0.11.1 asks for), and the grant reads the trellis artifact's own cost
+  policy without `--spec-backend`, which 0.11.1 asks for), and the grant reads
+  the trellis artifact's own cost
   table, measured on the RTX 5090 and indicative here until a run on one of
   these cards
   ([speculative decoding](speculative-decoding.md#past-seven-drafts-two-round-shapes)).
@@ -540,7 +542,10 @@ profiles:
 
 A built-in profile is only the default contents of the same mechanism, so one you
 define resolves exactly as they do. A profile in the file with a built-in's name
-replaces it for that file. A good profile is found the way the built-in ones
+replaces it for that file. A profile you define that gives the 27B
+`shape_policy: mixed` gives it to the NVFP4 artifact, as `rtx5090` does: a
+trellis artifact runs `aggregate` under it unless `mixed` is named
+([`rtx5090`](#rtx5090)). A good profile is found the way the built-in ones
 were: start from a candidate context, raise it until the load is refused, back
 off, and write down what you measured
 ([the VRAM plan](vram-plan.md)).
