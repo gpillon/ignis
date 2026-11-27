@@ -7,8 +7,8 @@ status: accepted
 ## Status
 
 Accepted (2026-10-25, owner): the Transcribe grill of 2026-10-25, Q104 (option (i)), Q106-Q118, after the spike
-Q91 asked for. Specs `docs/specs/speech/07-transcribe.md` (the Playground view) and
-`docs/specs/speech/08-diarization.md` (the diarizer).
+Q91 asked for. Specs: GitHub #362 (the Playground view) and
+GitHub #361 (the diarizer).
 - **Holds ADR 0067**: the diarizer, like the speech model, is loaded beside the text or image model and never
   resident in VRAM.
 - **Holds ADR 0068**: the diarizer's forward pass is ours, in Rust, on the CPU, with no vendored runtime.

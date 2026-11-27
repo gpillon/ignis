@@ -6,7 +6,7 @@ status: accepted
 
 ## Status
 
-Accepted (2026-09-27, owner — spec `docs/specs/decide/18-locate-by-attention.md`
+Accepted (2026-09-27, owner — spec 18's
 phase B, read as spec 19's track L registered it, GitHub #275). **The vote is
 no longer `locate`'s default** since ADR 0042 (GitHub #278): it is served
 unchanged as `method: "vote"`, and the readout decided here reads the

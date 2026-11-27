@@ -6,7 +6,7 @@ status: accepted
 
 ## Status
 
-Accepted (2026-09-23, owner — spec `docs/specs/decide/14-point-and-box-from-the-head-set.md`,
+Accepted (2026-09-23, owner — spec 14 of `/v1/decide`,
 GitHub #263). **Extends ADR 0038**, whose title and first decision say "one
 attention head". **Extended by ADR 0041** (GitHub #275): a set may be read in
 whole rows over a text span, where one key a head cannot give a segment's

@@ -9,7 +9,7 @@ amended-by: [ADR-0051, ADR-0082]
 ## Status
 
 Accepted (2026-10-04): the owner approved the Flash-Next specs
-(`docs/specs/flash-next/`) and asked for their tickets. Spec `flash-next/04`'s
+(GitHub #298) and asked for their tickets. Spec `flash-next/04`'s
 acceptance verifies it; its numbers are written here when it holds.
 **Amends** the "one model family" scope (`GLOSSARY.md`, *ignis*).
 **Extends ADR 0010**: ops with no ninfer provenance are our own
