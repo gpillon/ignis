@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0043]
 ---
 
 # ADR 0051 — kernel code is ours, adapted from a named source, or vendored

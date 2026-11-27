@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0043]
 supersedes: [ADR-0014, ADR-0015, ADR-0021]
 ---
 

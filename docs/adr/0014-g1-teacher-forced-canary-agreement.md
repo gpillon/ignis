@@ -1,6 +1,5 @@
 ---
 status: superseded by ADR-0082
-amended-by: [ADR-0043]
 ---
 
 # ADR 0014 — G1's cross-engine canary floor is teacher-forced next-token agreement
