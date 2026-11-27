@@ -35,7 +35,7 @@ edit it by hand.
 | [0019](0019-decode-cuda-graph-slot-indirection.md) | decode CUDA graph replay via device-resident slot indirection | accepted | [0020](0020-batch-wide-decode-round.md) |
 | [0020](0020-batch-wide-decode-round.md) | the decode round is one batch-wide model traversal | accepted | |
 | [0021](0021-live-live-launch-pooling.md) | a live/live gate pools at least two independent process launches per engine | superseded by [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) | |
-| [0022](0022-two-kv-formats-bf16-as-oracle.md) | two KV formats, with BF16 retained as the correctness oracle | accepted | |
+| [0022](0022-two-kv-formats-bf16-as-oracle.md) | Two KV formats, with BF16 retained as the correctness oracle | accepted | |
 | [0023](0023-unified-eviction-priority.md) | one eviction priority across GPU residency and the host tier | accepted | [0029](0029-cross-request-state-reuse.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) |
 | [0024](0024-sequence-state-transfer.md) | sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse | accepted | [0029](0029-cross-request-state-reuse.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md) |
 | [0025](0025-scheduler-interval-as-a-log-event.md) | Scheduler interval counters are a DEBUG log event | accepted | |
