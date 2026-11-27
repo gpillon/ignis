@@ -2,270 +2,66 @@
 status: accepted
 ---
 
-# ADR 0018 — Prefill and decode interleave at chunk granularity, driven by the Rust scheduler
+# Prefill and decode interleave at chunk granularity, driven by the Rust scheduler
 
-## Current decision
+Prefill and decode take turns on the one model stream at chunk granularity: the Rust scheduler drives the chunk
+loop, handing the leaf one chunk-wide span per call, and one `advance()` runs at most one prefill call and one
+decode round. Nothing runs concurrently on the GPU. A prefill call that ran a whole span stopped every decoding
+lane for its length, about 3.8 s for a 32K prompt when this was decided against about 0.1 s for one 1,024-token
+chunk, and this decision fixes the serving loop's shape: a loop frozen around "a prefill call runs to completion"
+and a request state machine around "a request is never observably half-prefilled" could later be undone only by
+rewriting the scheduler.
 
-Prefill and decode take turns on the one model stream at chunk granularity,
-and the Rust scheduler drives the chunk loop, with no callback from the leaf.
-One `advance()` runs at most one prefill call and one decode round. Exactly
-one request at a time holds multi-chunk prefill progress, `Prefilling` is
-durable, and cancel is abort. True prefill/decode overlap on separate streams
-is still not built.
+- **No callback from the leaf into Rust.** It would put scheduling below the step boundary, against ADR 0009. The
+  leaf keeps its own loop over a long span, which the per-token self-oracle and the GPU tests use.
+- **Exactly one request at a time holds multi-chunk prefill progress**, and the others queue. A paused prefill
+  holds its KV pages, GDN slot and conv taps, so several at once would multiply that VRAM. Interleaving the chunks
+  of several prompts would buy fairness for a short prompt behind a long one, never throughput, and is not built.
+- **`Prefilling` is a durable state that carries prefill progress.** Resuming needs no primitive: it is the
+  scheduling of the next chunk. **Cancel is abort, not suspend.**
+- **A completed chunk boundary is a GDN resumable boundary**, as consistent as a decode round's, and a snapshot
+  point for the whole sequence state that exists. A new section of sequence state must be checked against this
+  property before it is captured there. A lane-less `Prefilling` request is an eviction candidate at a chunk
+  boundary (ADR 0023).
+- **A load plans two chunk widths and the scheduler picks between them at every chunk boundary**: the prefill chunk
+  while a lane is decode-ready, the solo width while none is, so the width can change within a prompt. The prefill
+  scratch is reserved once, at load, for the wider (ADR 0030): serving narrows without allocating anything, never
+  runs a chunk wider than the load reserved for, and borrows nothing from the KV pool. The solo width's default
+  follows the card class (ADR 0063).
+- **The decode share paces a prompt's chunks.** After a chunk that took `t`, the same prompt's next chunk waits
+  until the decoding lanes have had `t * s / (1 - s)` of wall time; a share of 0 is one decode round per chunk,
+  which held while a chunk took about 0.1 s. Flash-Next's chunk takes seconds, and one round per chunk left its
+  other lanes at about 1 tok/s during a long prefill. The total work is the same at any share, only who waits
+  changes, and a prompt alone is unaffected. The default share keeps the decoding lanes fluent for a reader, who
+  reads about 5 to 8 tok/s, while a long prompt's time to first token under load grows by about a third instead of
+  doubling as at an even split.
+- **The prefill phase hands its events over mid-tick**, before the lane deal and the decode round, so a prompt's
+  first token waits for the prefill alone, and every token is still sent once, in order.
 
-Three GitHub issues amended this ADR in place:
+When a lane counts as decode-ready, when the decode share holds nothing, what a cancel releases and what the
+hand-off carries are the scheduler's rules, in the opening comment of `crates/core/src/concrete.rs`.
 
-- **The decode share replaces K = 1** (#306). After a chunk that took `t`,
-  the prompt's next chunk waits until the decoding lanes have had
-  `t * s / (1 - s)` of wall time. `--model-decode-share` defaults to 25 on
-  both families; 0 is this ADR's one round per chunk. The longest gap a lane
-  sees is still one chunk's wall time, which only the width moves.
-- **Two planned widths, chosen at every chunk boundary** (#489). The prefill
-  chunk (`model.prefill_chunk`) runs while a lane is decode-ready, the solo
-  width (`model.prefill_chunk_solo`) while none is, and the scratch is
-  reserved at load for the wider (ADR 0030). The solo width's `auto` default
-  tries 8192, 4096 and 2048 above the prefill chunk for the 27B on RTX 30 and
-  RTX 40 cards, unless the 16 GB or 24 GB profile pins it to the chunk; on
-  Blackwell and for Flash-Next it is the prefill chunk
-  ([ADR 0063](0063-the-profile-follows-the-card-class.md) as amended).
-- **The prefill phase hands its events over mid-tick** (#518), before the
-  lane deal and the decode round, so a prompt's first token waits for the
-  prefill alone.
+## Considered Options
 
-The host tier the Consequences wait for exists: a lane-less `Prefilling`
-request is an eviction candidate at a chunk boundary (ADR 0023, GitHub
-#127).
+- **Serialize prefill and decode.** The reference does not overlap them at all, so the gate of the time, which
+  compared inter-token latency under a concurrent prefill with the reference's, would have passed with nothing
+  built. Rejected for the loop shape it freezes, above.
+- **True overlap on separate streams**, prefill and decode resident together and contending for SMs: the largest
+  win and the largest unknown. It is not built, on grounds of risk and not because it is unwanted, since it is the
+  differentiator the north star names: SM contention has no partitioning story, the workspace arena is not built for
+  two writers, and it conflicts with capturing decode CUDA graphs while another stream is live.
+- **A count of decode rounds per chunk, K, as the dial.** Per cycle a lane sees `K-1` short gaps and exactly one
+  long one, so the long gaps stay the top `1/K` of the distribution and the p95 inter-token latency does not move
+  until `K >= 20`, a 240% inflation of the time to first token.
 
-## History
+## Consequences
 
-### Status
-
-Accepted (2026-09-09, grilling session for GitHub #64 / G3). Builds on ADR
-0009 (step-level device-resident ABI) and ADR 0016 (extensible per-call
-options). Does not amend either.
-
-**Amended by #306** (2026-10-07): the decode share, for Flash-Next's
-seconds-long chunk. **Amended by #489** (2026-11-06): two planned widths, the
-prefill chunk and the solo width, chosen at every chunk boundary. **Amended
-by #518** (2026-11-06): the prefill phase's events, a prompt's first token
-included, reach the engine before the lane deal and the decode round. See the
-amendments at the end.
-
-Sources: `records-2026-11-27:docs/archive/ROADMAP.md` phase 3,
-`records-2026-11-27:docs/archive/REVIEW-2026-09-05.md` §6.
-
-### Context
-
-Until G3 the serving loop had no opinion about what decode does while a
-prefill runs, because there was nothing to have an opinion about: the
-scheduler's `advance()` ran a prefill phase to completion and then a decode
-phase, on one thread, and a prefill call returned only when the whole span
-was done. A 32K prompt therefore stopped every decoding lane for the length
-of the prefill.
-
-The measured cost of that at G2 is not marginal. A 1024-token prefill chunk
-costs ~110 ms (94–119 ms across runs), a 32K span is 32 of them, and a
-reference decode step is 13.2 ms. Serialized, a 32K prefill inserts a
-~3820 ms gap into every decoding lane's token stream. The G3 gate asks for
-p95 inter-token latency under a concurrent prefill to sit inside the
-reference's envelope.
-
-The reference does not overlap prefill and decode at all. So the gate clause
-as written could be satisfied by building nothing: whatever ignis does, it
-would be inside an envelope that is itself a full-length stall. That is
-precisely why this is a design decision and not an optimization — the
-question is not whether the gate passes but what shape the serving loop is
-frozen into, since G3 is the phase that defines it.
-
-Three options:
-
-- **(a) Serialize, and pass the clause literally.** No work now, the whole
-  concern deferred to the north-star phase. But the loop shape gets frozen
-  around "a prefill call runs to completion", and the request state machine
-  around "a request is never observably half-prefilled". Undoing both later
-  is a rewrite of the scheduler, not an addition to it.
-- **(b) Interleave at chunk granularity on the one model stream.** The
-  scheduler hands the leaf one chunk per call and puts a decode round between
-  chunks. Nothing runs concurrently on the GPU; the two take turns. Costs the
-  decode lanes one chunk of latency (~123 ms) instead of a whole span
-  (~3820 ms), and costs the prefill one decode round per chunk (+11% TTFT at
-  one round per chunk).
-- **(c) True overlap on separate streams.** Prefill and decode resident
-  together, contending for SMs. The largest win and the largest unknown:
-  SM contention with no partitioning story, a workspace arena that is not
-  built for two writers, and a direct conflict with capturing decode CUDA
-  graphs while another stream is live.
-
-### Decision
-
-- **(b).** Prefill and decode interleave at **chunk granularity on the single
-  model stream**. One `advance()` performs at most one prefill chunk and one
-  decode round.
-- **The Rust scheduler drives the chunk loop.** It calls the leaf with
-  one chunk-wide span at a time. The leaf keeps its own loop over a long
-  span — the per-token self-oracle and the GPU tests use it — but it is no
-  longer the only thing that loops. There is **no callback from the leaf into
-  Rust**: that would put scheduling below the step boundary, against ADR 0009.
-- **True prefill/decode overlap is explicitly out of scope for G3**, and stays
-  a roadmap phase-6 item. It is excluded on grounds of risk and of conflict
-  with the decode graph model, not because it is unwanted — it is the
-  differentiator the north star names.
-- **A serving prefill chunk width** is introduced, constrained to `<=` the
-  width the program scratch was reserved for at model load (P2-01 / #83).
-  Shrinking at serving time is free; growing is not. Its default is the load
-  width, and its value is chosen empirically from the live/live gate run, not
-  argued in advance. No adaptive policy in G3.
-- **One decode round per prefill chunk (K=1)** is the G3 default. K is a
-  measured baseline, not a claim: it is turned only if the C=4 cell fails.
-- **Exactly one active prefill.** One request at a time holds device-resident
-  prefill progress and consumes chunks; others queue. Multi-prefill chunk
-  interleaving — which buys fairness for a short prompt stuck behind a long
-  one, never throughput — is deferred to G4 alongside burst scheduling and
-  packed prefill.
-- **A completed chunk boundary is recorded as a GDN resumable boundary**
-  (`GdnState::checkpoint`, not `advance`). That module's rule was written when
-  prefill was atomic, so "mid-prefill" and "mid-chunk" were the same position;
-  chunked prefill separates them, and a chunk boundary is as consistent as a
-  decode round's. Whether the *whole* sequence state may be captured there is
-  a separate property — see **snapshot point** in `GLOSSARY.md` — and it holds
-  today for the state that exists.
-- **`Prefilling` becomes a durable state carrying prefill progress**, since a
-  request now lives in it for tens of ticks. Resumption needs no primitive:
-  it is the absence of a scheduled next chunk. **Cancel is abort, not
-  suspend** — the in-flight chunk finishes, then the sequence is aborted and
-  its KV pages, GDN slot and conv taps are released. G3 ships no explicit
-  suspend/resume; priority preemption of a prefill is G4.
-
-### Consequences
-
-- The p95 inter-token latency under a prefill is floored by the chunk time
-  plus a decode round, and by nothing else. K, the number of decode rounds
-  between two chunks, does not move it over any affordable range: per cycle a
-  lane sees `K-1` short gaps and exactly one long one, so the long gaps are
-  the top `1/K` of the distribution and the p95 stays in that group until
-  `K >= 20` — a 240% TTFT inflation. Chunk width is the only dial that moves
-  the gate metric, which is why it is the knob G3 introduces.
-- A half-prefilled sequence can be paused but not evicted, because the KV-RAM
-  host tier is a G4 feature — **not** because its state is uncapturable.
-  Verified in the leaf: `causal_conv1d_silu` advances the sequence's own
-  persistent conv slot in place, the GDN recurrent slot likewise, KV pages are
-  appended, and `seq->position` moves only after the chunk's synchronization
-  returns. All four are consistent together at a completed chunk boundary, so
-  a chunk boundary is a valid whole-sequence snapshot point for the state that
-  exists today. G4's hq-e8-2b exact-key side store is new state and must be
-  re-checked against this property when it lands. Meanwhile pausing holds the
-  KV pages, GDN slot and conv taps, which is the constraint behind "exactly
-  one active prefill": N active prefills would multiply VRAM that no tier can
-  yet reclaim.
-- A sequence cannot accidentally decode mid-prefill: `pending_token` is
-  written only by the last chunk, and `ignis_program_decode` rejects a
-  sequence without one.
-- Decode CUDA-graph staging buffers must be a reservation **separate** from
-  the prefill scratch. A graph replays fixed device addresses; a prefill chunk
-  landing between two replays would otherwise clobber what the graph expects
-  to reread. The failure would be silent and batch-width dependent, the same
-  class of bug #96 cost this project a gate run.
-- Prefix-cache registration moves to the end of the last chunk rather than the
-  return of a single prefill call.
-- The scheduler acquires a second reason to be woken that is not a command:
-  a request mid-prefill. `model_thread_loop` already ticks while anything is
-  in flight, so this is a state question, not a threading change.
-
-### Amendment (2026-10-07) — the decode share (#306)
-
-Flash-Next breaks the "one decode round per chunk" premise. Its 8192-token
-chunk takes ~3.2 s of wall time (a ~1.3 s host n-gram gather, then ~1.9 s on
-the card), against the 27B's ~110 ms. One round per chunk left the other lanes
-at 1.0-1.1 tok/s while a 34K prompt prefilled.
-
-- **K becomes time-based, and was 1 on the 27B.** The **decode share** `s`
-  (`--decode-share`, in percent) holds the next chunk until the decoding lanes
-  have had `t * s / (1 - s)` of wall time after a chunk that took `t`. With no
-  lane decoding, nothing is held, and nothing is held after a prompt's last
-  chunk either: the hold is between chunks of the same prompt, so a newcomer
-  queued behind it is not made to wait for lanes that already had their turn. The family default was 0 on the 27B (this
-  ADR's K = 1) and 50 on Flash-Next; since #92 (2026-10-07) it is 50 on the
-  27B too, and by owner decision the same day it became **25 on both**: a
-  reader reads ~5-8 tok/s, so at 25 the decoding lanes stay fluent
-  (15.6-18.3 tok/s below) while a long prompt's TTFT under load grows ~x1.33
-  instead of ~x2 at 50. The total work is the same at any share, only who
-  waits changes, and a prompt alone is unaffected. `--decode-share 0` is this
-  ADR's K = 1; 50 splits time evenly.
-- **The Consequences above still hold for the gap.** The share moves the
-  lanes' rate during a prefill, not the longest gap: that remains one chunk's
-  wall time, and only the chunk width moves it.
-- Measured on the 5090, 34K prompt with two decoding lanes: share 0 gives the
-  lanes 1.0-1.1 tok/s and the prompt a 15.2-15.3 s TTFT; share 25 gives
-  15.6-18.3 tok/s at 19.4-20.2 s; share 50 gives 30.8-32.6 tok/s at
-  30.1-31.6 s. The longest gap was 3.2 s in all three. A 2048-token chunk
-  instead halves the gap (1.7 s) but leaves the lanes at ~1 tok/s and costs
-  28.3-28.7 s of TTFT even with nobody decoding
-  ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
-
-### Amendment (2026-11-06) — two planned widths, chosen at every chunk boundary (#489)
-
-The serving width stops being one number fixed for the scheduler's life. A
-load plans two, and the scheduler picks between them at every chunk boundary.
-
-- **The solo width** (`model.prefill_chunk_solo`) is the prefill chunk while
-  no lane is decode-ready. A lane is decode-ready from the end of its prefill
-  until its request ends, whether it holds a lane or waits for one; a
-  suspended sequence is not. The prefill chunk (`model.prefill_chunk`) is the
-  width while at least one lane is. The width changes within a prompt: a long
-  prompt that starts while a lane decodes widens once that lane ends, and
-  narrows again at the next boundary when a sequence is restored onto a lane.
-- **Both widths are planned at load
-  ([ADR 0030](0030-device-memory-reserved-at-load.md)).** The prefill scratch
-  is reserved once, for the solo width, the wider; serving narrows to the
-  prefill chunk without allocating anything, which is this ADR's "shrinking at
-  serving time is free". Nothing is borrowed from the KV pool.
-- **The cost lands only on a lane that starts decoding mid-prefill.** One
-  request holds multi-chunk prefill progress at a time, so a request that
-  arrives during a solo chunk waits for that whole prefill at either width. A
-  sequence restored from KV-RAM or KV-disk while a prompt prefills waits at
-  most one solo chunk, then the chunks narrow.
-- **A solo chunk owes no decode share.** No lane was decoding while it ran, so
-  the prompt is not held a share of its time after it; a lane dealt at its
-  end, or restored, takes its share of the narrow chunks that follow.
-- **`auto` is the default**, resolved at load
-  ([ADR 0063](0063-the-profile-follows-the-card-class.md) §3 as amended the
-  same day): 8192, 4096 or 2048 above the prefill chunk, for the 27B on an
-  RTX 30 or RTX 40 card where the plan holds it with nothing else adapted and
-  room for a second request, otherwise the prefill chunk; the 16 GB and 24 GB
-  profiles pin it to their chunk, the KV pool first. On
-  Blackwell `auto` is the prefill chunk: a wider chunk bought the 27B at most
-  4% of cold TTFT there
-  ([finding](../findings/2026-10-07-27b-prefill-chunk-width.md)), and the
-  `rtx5090` profile's margin does not hold 4096
-  ([finding](../findings/2026-10-21-the-27b-prefill-chunk-at-2048.md)).
-  Flash-Next's `auto` is its prefill chunk on every card: each chunk pays a
-  near-constant expert stream, so it wants its widest chunk with lanes
-  decoding as well
-  ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)),
-  and the Blackwell profiles set that chunk to 8192, as `make` already did
-  (`rtx-24gb` and `rtx-16gb` set 4096 and 2048, placeholders until Flash-Next
-  runs on those cards: GitHub #526).
-- **The same prompt can end in logits that differ in the last bits**,
-  depending on whether lanes were decoding. The quality gates use KLD; a test
-  that compares logits bit for bit pins both widths. At the prefill chunk, a
-  load with the solo scratch reserved runs the same kernels on the same cuts
-  as one without
-  ([finding](../findings/2026-11-06-the-solo-width-planned-at-load.md)).
-
-### Amendment (2026-11-06) — the prefill phase hands its events over mid-tick (#518)
-
-A tick stays one call, but its prefill phase now ends with a hand-off.
-
-- **What the prefill phase emitted leaves before the lane deal and the round.**
-  Its events are final when the phase ends: a prompt's chunks, a decision's
-  answer, and the prompt's first token, which the prefill drew and which no
-  round has to emit. `Scheduler::advance_with` hands them to the engine there,
-  and the engine routes them at once; the rest of the tick follows.
-- **The hand-off answers back.** The engine names the requests it ends on the
-  first token it was just handed: a stop sequence that token completes, which
-  only the server's answer pipeline can see. The scheduler ends each with
-  `stop` before phase 2, so it takes no lane and runs no decode round, as a
-  request that ends on `max_tokens: 1` or an end-of-sequence token.
-- **The first round takes the first token as its anchor** and does not emit it
-  again, so the stream sends every token once, in order, and the first
-  token's wait is the prefill alone, not a lane deal and a round more.
+- The longest gap a decoding lane sees under a prefill is one chunk's wall time plus a decode round, and only the
+  chunk width moves it. The decode share moves the lanes' rate during a prefill, not that gap.
+- The same prompt can end in logits that differ in the last bits, depending on whether lanes were decoding while
+  it prefilled. The quality gates use KLD; a test that compares logits bit for bit pins both widths.
+- A sequence cannot decode mid-prefill by accident: only a prompt's last chunk leaves it a pending token, and the
+  leaf's decode rejects a sequence without one.
+- The decode CUDA graphs' staging buffers must be a reservation separate from the prefill scratch. A graph replays
+  fixed device addresses, and a prefill chunk landing between two replays would otherwise clobber what the graph
+  expects to reread: a silent failure that depends on the batch width.

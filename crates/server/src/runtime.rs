@@ -2229,7 +2229,7 @@ mod tests {
         use ignis_core::compute::ModelFamily;
         let unnamed = EngineShape::default();
         let flash = unnamed.for_family(ModelFamily::FlashNext);
-        // Owner decision 2026-10-07 (ADR 0018's amendment): a quarter on both.
+        // Owner decision 2026-10-07 (ADR 0018): a quarter on both.
         assert_eq!(ModelFamily::FlashNext.default_decode_share_percent(), 25);
         assert_eq!(ModelFamily::Qwen38_27b.default_decode_share_percent(), 25);
         assert_eq!(flash.decode_share_percent, Some(25));
