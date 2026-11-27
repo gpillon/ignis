@@ -5,7 +5,7 @@
 //! on the *same* long prompt, and their teacher-forced next-token
 //! predictions must agree at the same >= 95% floor and with the same
 //! scoring `crates/server/tests/oracle_teacher_forced_gpu.rs` uses for the
-//! G1 canary (ADR 0014) -- only here the "oracle" is the per-token route
+//! G1 canary (ADR 0082) -- only here the "oracle" is the per-token route
 //! itself. Agreement proves the chunk loop, the state carry across chunk
 //! boundaries, and (once P2-03/P2-04 turn on the multi-token kernel routes)
 //! those routes did not change the function being computed.

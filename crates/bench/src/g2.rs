@@ -1,14 +1,18 @@
 //! The **G2 gate check** (P2-05, GitHub #87): two TTFT records in, one
 //! verdict out.
 //!
-//! Spec: GitHub #63; ADR 0015. G2 asks one
+//! Spec: GitHub #63. G2 asks one
 //! question per cell — is ignis's median time to first token within
 //! [`RATIO_THRESHOLD`] of the reference's? — and the answer is only
 //! meaningful if the two numbers were produced **live/live**: the same
-//! session, the same cells, and every sample provably cold.
+//! session, the same cells, and every sample provably cold. That is the
+//! crate's measuring rule (the crate's opening documentation), and this
+//! module holds its first item: both sides in one session. A side measured
+//! over several launches comes in as one record, pooled by
+//! [`crate::ttft::pool_launches`].
 //!
 //! Those preconditions are enforced *here*, in the tool, rather than left
-//! to the operator's discipline (ADR 0015). [`check`] returns a
+//! to the operator's discipline. [`check`] returns a
 //! [`Refusal`], not a failing verdict, when:
 //!
 //! - the two records do not share a session identifier — one of them is a
@@ -30,10 +34,10 @@ use crate::ttft::Record;
 
 /// The G2 threshold: ignis's median TTFT over the reference's, per cell.
 ///
-/// One number, applied per cell, so the verdict is unambiguous. It is a
-/// *floor* ("not meaningfully worse than the reference"), not a target —
-/// the project's north star is being at least as fast as the reference,
-/// and G3/G4 tighten this to 99%.
+/// One number, applied per cell, so the verdict is unambiguous. It was the
+/// phase-2 gate's *floor* ("not meaningfully worse than the reference"), not
+/// a target, and decides no gate since ADR 0082: the ratio is what a
+/// comparison reads.
 pub const RATIO_THRESHOLD: f64 = 1.5;
 
 /// Why the gate check will not produce a verdict at all.
@@ -152,16 +156,16 @@ impl Verdict {
 /// Compare two TTFT records and report the G2 verdict, or refuse.
 ///
 /// `ours` is the numerator (ignis), `reference` the denominator. See the
-/// module docs for the three refusals — they are the live/live contract
-/// (ADR 0015) expressed as code.
+/// module docs for the three refusals — they are the live/live rule
+/// expressed as code.
 pub fn check(ours: &Record, reference: &Record) -> Result<Verdict, Refusal> {
     // Live/live: the two records must come from the same measurement
     // session. This is also what stops the committed reference fixture
     // from ever being the live side of a gate.
     if ours.session != reference.session {
         return Err(Refusal(format!(
-            "the records are not from the same session ({} vs {}): G2 is judged live/live \
-             (ADR 0015), so both engines must be measured in one session on one machine",
+            "the records are not from the same session ({} vs {}): G2 is judged live/live, \
+             so both engines must be measured in one session on one machine",
             ours.session, reference.session
         )));
     }
@@ -376,7 +380,7 @@ mod tests {
 
     #[test]
     fn records_from_different_sessions_are_refused() {
-        // The live/live rule (ADR 0015) — and what stops a committed
+        // The live/live rule — and what stops a committed
         // fixture from deciding a gate.
         let ours = record("ignis", "S1", vec![cell(8192, &[100.0])]);
         let reference = record("reference", "S2-committed-fixture", vec![cell(8192, &[100.0])]);

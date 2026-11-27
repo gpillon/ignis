@@ -77,6 +77,8 @@ on:
       - "scripts/**"
   workflow_dispatch:
 
+# The workflow as a whole only reads. Write permission is granted to a job
+# that publishes, in that job's own `permissions:`, and never here.
 permissions:
   contents: read
 
