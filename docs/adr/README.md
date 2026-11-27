@@ -84,7 +84,6 @@ edit it by hand.
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
 | [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
 | [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
-| [0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md) | A spec is a GitHub issue and its tickets are sub-issues | accepted | |
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
 | [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |

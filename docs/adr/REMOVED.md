@@ -11,3 +11,4 @@ holds this list to the folder.
 
 | ADR | Title | File | Where it went |
 |---|---|---|---|
+| 0070 | A spec is a GitHub issue and its tickets are sub-issues | `0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md` | not a decision but the skills' default, which `docs/agents/issue-tracker.md` states; its list of where the repo differs from the skills is `docs/agents/skill-differences.md` |
