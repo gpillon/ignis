@@ -62,7 +62,7 @@ pub const CANARIES: &[Canary] = &[
 /// - Checking the **answer** is the canary oracle's job, and it already does
 ///   it properly: teacher-forced, token by token, against a recorded fixture,
 ///   with thinking off on purpose so there are answer tokens to compare
-///   (`crate::oracle`, ADR 0014). A bigger budget here would duplicate that
+///   (`crate::oracle`). A bigger budget here would duplicate that
 ///   badly — prose sanity instead of token agreement.
 /// - Every raise costs every canary run, and the suite is run at every gate.
 ///

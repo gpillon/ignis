@@ -88,7 +88,7 @@ fn a_ttft_cell_against_a_live_ignis_server_is_all_cold() {
     assert!(cell.error.is_none(), "the cell failed: {:?}", cell.error);
     assert_eq!(cell.samples.len(), CELL_SAMPLES);
     // The point of the run: every sample's prefix was cold, proved against
-    // the engine's own computed-prefill-token count (ADR 0015) — not
+    // the engine's own computed-prefill-token count — not
     // assumed because the prompts looked different.
     assert!(
         cell.all_cold(),

@@ -95,7 +95,7 @@ windows-sys = { workspace = true }
 # below): this crate again, with the feature on, so a shipped build has none.
 ignis-server = { path = ".", features = ["fake-speech"] }
 tracing-subscriber = { workspace = true }
-# The G1 canary gate (ADR 0014, GitHub #76): the teacher-forced agreement
+# The G1 canary floor (ADR 0082, GitHub #76): the teacher-forced agreement
 # scoring + the >= 95% floor live in `ignis_bench::oracle` so the arithmetic
 # is CPU-unit-tested there, while the GPU driver that produces the
 # predictions lives here (`tests/oracle_teacher_forced_gpu.rs`) -- it needs

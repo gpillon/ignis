@@ -31,7 +31,7 @@ keep the kernel from being compiled twice.
   which would pile up in the registry with nothing to prune them: the commit is in the image's revision label and
   in the prerelease's body.
 - **A push that changes no behaviour builds nothing.** A push to `main` or `ci/**` whose changed files are all
-  Markdown, `docs/`, `bench/` or `scripts/` starts no run: none of them is compiled, embedded, read by a test or
+  on the workflow's ignore list starts no run: nothing on that list is compiled, embedded, read by a test or
   used by the workflow, so the run would rebuild the same binaries and move `develop` to an identical build. A file
   that becomes embedded or read by a test must leave the ignore list. Tags are never path-filtered: a release
   always runs. `develop` therefore stays at the last push that changed code, and the `README.md` inside its archives

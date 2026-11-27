@@ -4,7 +4,7 @@
 //!
 //! This is the *tooling* half of the oracle (spec `01-device-resident-forward`
 //! §"Oracle (two levels)"): the fixture format, the recorder, and the
-//! agreement math for both scorings (ADR 0014) — teacher-forced next-token
+//! agreement math for both scorings — teacher-forced next-token
 //! agreement, which is the G1 correctness floor, and the free-running
 //! comparison, which is a diagnostic. Recording the fixture against the real
 //! reference engine is P1-05 (a human/GPU step); this module is fully
@@ -16,6 +16,25 @@
 //! committed and referenced by `GLOSSARY.md`'s "Canary suite" entry) — the
 //! oracle fixture and the self-consistency check (ADR 0007) run the *same*
 //! fixed prompt set, just checked two different ways.
+//!
+//! ## The scoring rule
+//!
+//! The floor is **teacher-forced**: at each position the engine is fed the
+//! fixture's own token prefix and its greedy next token is compared with the
+//! recorded one, so every position is scored on its own. A free-running
+//! comparison cannot be a floor: the candidate feeds its own token back in,
+//! so one divergence, even a coin flip between two tied logits, decorrelates
+//! every later position, and the figure says whether the continuations
+//! stayed identical, not whether the forward pass is right.
+//!
+//! The floor is [`G1_AGREEMENT_FLOOR`] of the suite's positions together,
+//! not a mean of per-canary rates, and **no mismatch is waived**: no tie
+//! waiver, no epsilon, no position or canary left out, no lower threshold.
+//! ignis's argmax breaks a tie on the lowest token id, as the engine the
+//! 27B's fixture was recorded on does, so a mismatch at a tie is a last-bits
+//! difference of the output head, counted like any other. It is a sanity
+//! floor for gross errors, an error detector of the GPU profile and not the
+//! gate (ADR 0082), and it stands beside the numeric checks, not for them.
 
 use std::path::Path;
 
@@ -57,7 +76,7 @@ pub struct FixturePrompt {
     /// when it is not the next fed token: Flash-Next's fixture feeds fixed
     /// canary text and expects the quantized reference's argmax (spec
     /// flash-next/04, ADR 0043). Absent, each fed token is its own expected
-    /// token (ADR 0014), which is the 27B's fixture.
+    /// token, which is the 27B's fixture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_argmax: Option<Vec<u32>>,
     /// The prompt as the fixture's recorder rendered and tokenized it, when
@@ -250,7 +269,7 @@ impl AgreementResult {
 /// truncated/early-stopped candidate is a divergence, not an excused gap).
 /// Pure and CPU-only — the core of the comparer.
 ///
-/// **Diagnostic only** (ADR 0014). This scores a *free-running* candidate:
+/// **Diagnostic only**. This scores a *free-running* candidate:
 /// the engine fed its own emitted tokens back in, so the two streams stop
 /// sharing a prefix after the first divergence and every later position is
 /// decorrelated. That measures continuation similarity, not whether the
@@ -306,7 +325,7 @@ pub fn compare_fixtures(
 /// matches over total compared positions (not a per-canary average — a
 /// canary with more compared tokens weighs proportionally more).
 ///
-/// **Diagnostic only** (ADR 0014): this is the free-running figure, and it
+/// **Diagnostic only**: this is the free-running figure, and it
 /// is no longer the G1 correctness floor. Use
 /// [`overall_teacher_forced_agreement`] for the gate.
 pub fn overall_agreement(results: &[AgreementResult]) -> f64 {
@@ -320,9 +339,9 @@ pub fn overall_agreement(results: &[AgreementResult]) -> f64 {
     }
 }
 
-// ── the G1 gate: teacher-forced next-token agreement (ADR 0014) ───────────
+// ── the G1 floor: teacher-forced next-token agreement ─────────────────────
 
-/// The G1 correctness floor (ADR 0014): overall teacher-forced next-token
+/// The G1 correctness floor (ADR 0082): overall teacher-forced next-token
 /// agreement across the canary suite. Deliberately a *sanity* floor — it
 /// exists to catch gross implementation errors (wrong layouts, missing ops,
 /// broken state wiring, wrong positions, corrupted activations), not to
@@ -332,7 +351,7 @@ pub const G1_AGREEMENT_FLOOR: f64 = 0.95;
 /// One position where the engine's teacher-forced next token differed from
 /// the oracle's. Recorded for reporting only — a mismatch is a mismatch, and
 /// no class of mismatch (exact BF16 logit ties included) is waived or
-/// excluded from the score (ADR 0014).
+/// excluded from the score.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeacherForcedMismatch {
     /// The 0-indexed oracle position.
@@ -361,7 +380,7 @@ pub struct TeacherForcedResult {
     pub mismatches: Vec<TeacherForcedMismatch>,
 }
 
-/// Score one canary teacher-forced (ADR 0014, the G1 metric).
+/// Score one canary teacher-forced (the G1 metric).
 ///
 /// `predictions[i]` is the engine's greedy next-token argmax **after being
 /// fed the oracle's tokens `[0..i)`** on top of the canary prompt — so
@@ -433,7 +452,7 @@ pub fn overall_teacher_forced_agreement(results: &[TeacherForcedResult]) -> f64 
 }
 
 /// Whether an overall teacher-forced agreement clears the G1 floor
-/// ([`G1_AGREEMENT_FLOOR`]). No tolerance, no tie waiver (ADR 0014).
+/// ([`G1_AGREEMENT_FLOOR`]). No tolerance, no tie waiver.
 pub fn meets_g1_floor(overall: f64) -> bool {
     overall >= G1_AGREEMENT_FLOOR
 }
@@ -690,7 +709,7 @@ mod tests {
         assert!(err.contains("engine down"));
     }
 
-    // ── the G1 gate: teacher-forced scoring (ADR 0014) ────────────────────
+    // ── the G1 floor: teacher-forced scoring ──────────────────────────────
 
     #[test]
     fn every_matching_prediction_is_full_teacher_forced_agreement() {
@@ -703,7 +722,7 @@ mod tests {
 
     #[test]
     fn a_teacher_forced_mismatch_does_not_cascade_into_later_positions() {
-        // The whole point of the metric (ADR 0014): position 0 is wrong, but
+        // The whole point of the metric: position 0 is wrong, but
         // every later position is still scored against the oracle's own
         // prefix, so it can still agree. Free-running comparison would have
         // decorrelated everything after the flip.
@@ -762,7 +781,7 @@ mod tests {
 
     #[test]
     fn the_recorded_g1_measurement_clears_the_floor_with_ties_counted_as_mismatches() {
-        // The 2026-09-07 measurement (ADR 0014), reproduced as arithmetic:
+        // The 2026-09-07 measurement, reproduced as arithmetic:
         // rust-hello 21/21, rust-sort 30/32, math-greedy 32/32,
         // explain-reverse 16/17 = 99/102. The two BF16 exact-tie positions
         // are counted as mismatches, not waived, and it still passes.
