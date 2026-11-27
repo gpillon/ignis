@@ -35,7 +35,8 @@ and is never reached by a switch (ADR 0067).
 
 - The image model has no performance gate and no reference engine to race, the exception ADRs 0005 and 0007 record
   for it: its speed is a target taken from the literature, not a measurement against an engine. ADR 0082's gate,
-  which admits a text family's artifacts, leaves it the checks `docs/agents/testing/image-model.md` names.
+  which admits a text family's artifacts, leaves it the correctness checks above and the fixtures
+  `docs/agents/testing/image-model.md` names.
 - 8 bits is lossy, and only the end-to-end comparison with diffusers checks it. In return the attention stops
   dominating at 2048², and twice as many condition images fit at full size: about 1 GiB of condition prefix per
   1024² condition image instead of 2.
