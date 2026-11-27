@@ -17,7 +17,7 @@ ABI change". The step-level, device-resident, opaque-handled design of ADR
 padding leaves `size` as it was, and a layout pin guards it; see the
 amendment at the end.
 
-Sources: `docs/specs/runtime/02-real-prefill.md` (GitHub #63).
+Sources: the spec of GitHub #63.
 
 ## Context
 

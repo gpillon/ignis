@@ -7,7 +7,7 @@ status: accepted
 ## Status
 
 Accepted (2026-10-10, owner). GitHub #315, spec
-`docs/specs/server/13-a-turn-that-ends-inside-its-reasoning.md`. Extends the
+linked from it. Extends the
 step ABI under ADR 0016 (a field append and a size bump on
 `ignis_sampling_params`, an output append on the decode and prefill options).
 

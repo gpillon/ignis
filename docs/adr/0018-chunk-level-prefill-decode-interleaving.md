@@ -51,8 +51,8 @@ by #518** (2026-11-06): the prefill phase's events, a prompt's first token
 included, reach the engine before the lane deal and the decode round. See the
 amendments at the end.
 
-Sources: `docs/archive/ROADMAP.md` phase 3,
-`docs/archive/REVIEW-2026-09-05.md` §6.
+Sources: `records-2026-11-27:docs/archive/ROADMAP.md` phase 3,
+`records-2026-11-27:docs/archive/REVIEW-2026-09-05.md` §6.
 
 ### Context
 

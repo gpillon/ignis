@@ -1,5 +1,4 @@
-//! The hq-e8-2b residual window's rule, on the host (GitHub #257, spec
-//! `docs/specs/runtime/06-hq-residual-window.md`).
+//! The hq-e8-2b residual window's rule, on the host (GitHub #257).
 //!
 //! Under hq-e8-2b the vendored attention kernels read a key exact instead of
 //! decoding it from three places: the current prefill chunk, the first
@@ -19,7 +18,7 @@
 //!
 //! **The prompt route reads the ring before its own chunk's append**
 //! ([`ring_before_chunk`]): an **Ignis-patched** behaviour (ADR 0037, GitHub
-//! #258, spec `docs/specs/runtime/07-hq-prefill-ring-read-before-append.md`).
+//! #258).
 //! The reference (ninfer `a00648cb`) enqueues the chunk's append (which
 //! dual-writes the chunk's last 512 keys into their ring slots and sets their
 //! bits) *before* the scratch decode that reads the ring for the 512 keys

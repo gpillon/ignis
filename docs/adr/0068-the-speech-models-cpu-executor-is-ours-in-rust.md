@@ -10,8 +10,8 @@ Accepted (2026-10-24, owner): decisions Q59-Q63 of the speech grill of
 2026-10-23/24 (ADR 0067 has the session), taken when the owner reviewed the
 vendoring the grill had first chosen, and the spike Q61 asked for, which
 passed every criterion fixed before it ran; Q64-Q68 settled the details the
-rewrite left open. Spec
-`docs/specs/speech/01-cpu-executor.md`.
+rewrite left open. Spec:
+GitHub #351.
 - **Replaces** the grill's Q27 and Q41 on the executor (vendored ggml, the
   graphs adapted from llama.cpp, a CMake build behind a cargo feature). Q41's
   pipeline in Rust stands. Q58 (that cargo feature) is moot.

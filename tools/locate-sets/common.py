@@ -2,7 +2,7 @@
 paraphrase split, and the question rows every family writes.
 
 The split is spec 18's guard against ICR's lexical bias
-(`docs/specs/decide/18-locate-by-attention.md` § Phase A): a **lexical**
+(the spec GitHub #274 links, § Phase A): a **lexical**
 question shares a rare word with its target -- one that appears in the target
 and in no other segment -- and a **paraphrase** question shares no content
 word with it at all. Both are checked here on every generated question rather

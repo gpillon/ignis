@@ -1,5 +1,5 @@
 """EXPERIMENT (branch locate-long-context): spec 21's judge, written before
-set R2's results were read (`docs/specs/decide/21-locate-in-real-logs.md`).
+set R2's results were read (`records-2026-11-27:docs/specs/decide/21-locate-in-real-logs.md`).
 
     python r2_judge.py --set <R2> --served R2-served.json --research <research/R2> \
         --folded-vote R2-folded-vote.json --folded-gen R2-folded-gen.json --out R2-judge.json

@@ -47,7 +47,7 @@ machines. The whole picture is in
 
 | Figure | Measured on | Source |
 |---|---|---|
-| 27B to the image model **10.0 s** (server side 9,962 ms: teardown 908, load 9,021); image model back to the 27B **11.3 s** (server side 11,246 ms) | RTX 5090, one live run | `docs/specs/image-model/05-image-serving.md`, the live run of 2026-10-14 |
+| 27B to the image model **10.0 s** (server side 9,962 ms: teardown 908, load 9,021); image model back to the 27B **11.3 s** (server side 11,246 ms) | RTX 5090, one live run | [Image serving spec, as built, issue #322](https://github.com/gpillon/ignis/issues/322), the live run of 2026-10-14 |
 | A cold load takes 13-33 s, which is what the first request after an idle unload pays | RTX 5090 | [ADR 0049](../../adr/0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) |
 | `model.idle_unload` 300 s, `switch.drain_timeout` 30 s | defaults | [Configuration](../reference/configuration.md#modelidle_unload) |
 

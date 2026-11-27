@@ -7,7 +7,7 @@ status: accepted
 ## Status
 
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
-`docs/specs/runtime/04-reference-feature-floor.md`.
+linked from the tickets of #65.
 
 ## Context
 

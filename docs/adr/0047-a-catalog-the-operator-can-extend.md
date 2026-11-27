@@ -9,7 +9,7 @@ amended-by: [ADR-0064, ADR-0074]
 ## Status
 
 Accepted (2026-10-10, owner decision in conversation — GitHub #313). Spec:
-`docs/specs/model-download/02-catalog-and-model-command.md`. **Amends ADR
+linked from #313. **Amends ADR
 0033**: its pins, its `.part`/resume/verify transfer and its start-time
 behaviour stand; what changes is the one option it rejected, "a `models.json`
 next to the binary", which comes back in a narrower form.

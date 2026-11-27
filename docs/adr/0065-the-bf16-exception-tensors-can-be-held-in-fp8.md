@@ -7,7 +7,7 @@ amended-by: [ADR-0103]
 
 ## Status
 
-Proposed (2026-10-21, GitHub #341, spec [prefill-5090/01](../specs/prefill-5090/01-the-prefill-fixed-part.md) lever 1).
+Proposed (2026-10-21, GitHub #341, spec prefill-5090/01 lever 1).
 Owner, the same day: no conversion at load if it lengthens the load, else the FP8 goes into the artifact. Measured:
 it does not (finding [2026-10-21-the-bf16-exception-tensors-in-fp8](../findings/2026-10-21-the-bf16-exception-tensors-in-fp8.md)).
 

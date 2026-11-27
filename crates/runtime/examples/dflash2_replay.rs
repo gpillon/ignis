@@ -1,5 +1,5 @@
-//! Teacher-forced DFlash2 replay of recorded agent turns (GitHub #267,
-//! docs/specs/runtime/08-dflash2-sampled-acceptance.md): per verify round, what
+//! Teacher-forced DFlash2 replay of recorded agent turns (GitHub #267):
+//! per verify round, what
 //! the drafter proposed, what the target thought of it, and how much of it the
 //! recorded text accepted. GitHub #340 runs it on both 27B bodies.
 //!

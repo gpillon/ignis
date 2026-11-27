@@ -3,7 +3,7 @@
 //! through its own HTTP surface (`POST /v1/models/switch`), and each
 //! direction's wall time — the request to `GET /v1/models` reporting the new
 //! id `serving` — is printed: the measured replacement for the 14-15 s /
-//! 8-10 s estimates in `docs/specs/flash-next/phase2-model-switch-notes.md`.
+//! 8-10 s estimates in `records-2026-11-27:docs/specs/flash-next/phase2-model-switch-notes.md`.
 //!
 //! The direct proof that the teardown ran is the 27B's KV-RAM arena, the
 //! process-wide one `ignis_core::seq::host_pool_stats` reads (Flash-Next

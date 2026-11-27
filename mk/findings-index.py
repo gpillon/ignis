@@ -34,6 +34,11 @@ KINDS = ("discovery", "research", "experiment")
 STATUSES = ("current", "corrected", "superseded", "archived")
 USABLE = ("current", "corrected")
 
+# The folders beside docs/findings/ whose files left the main branch whole and
+# are read under the tag records-2026-11-27 (docs/specs/README.md): a finding
+# that links one of them keeps its link, and the file is not looked for here.
+UNDER_THE_TAG = ("specs", "archive")
+
 # The Topic vocabulary, in the indexes' display order. A new topic is added
 # here and to the table in docs/agents/findings.md, in the same change.
 TOPICS = (
@@ -208,6 +213,8 @@ def check_values(finding):
             if SCHEME_RE.match(target) or target.startswith("#"):
                 continue
             local = urllib.parse.unquote(target.split("#", 1)[0])
+            if os.path.normpath(os.path.join("findings", local)).replace(os.sep, "/").split("/")[0] in UNDER_THE_TAG:
+                continue
             if not (finding.path.parent / local).is_file():
                 problems.append("`%s` links %s, which does not exist" % (name, target))
     return problems
@@ -582,6 +589,15 @@ def selftest():
         else:
             print("  ok    --write refuses a finding with a problem and writes nothing")
 
+        # A link into a folder kept under the tag asks for no file in the tree.
+        d = fresh("under the tag")
+        put(FIRST, status="corrected", extra=[(8, ("Corrected by", "[spec server/08](../specs/server/08-a-spec.md)"))])(d)
+        err = Sink()
+        if write(d, Sink(), err) != 0 or main(["--check"], d, Sink(), err) != 0:
+            fail("a `Corrected by` link into docs/specs/ is refused: %s" % err.lines)
+        else:
+            print("  ok    a `Corrected by` link into docs/specs/, kept under the tag, asks for no file")
+
         for what, breaks, where, phrase in CASES:
             d = fresh(what)
             breaks(d)
@@ -596,7 +612,7 @@ def selftest():
     if failed:
         print("selftest: %d failure(s)" % len(failed), file=sys.stderr)
         return 1
-    print("selftest ok: %d checks" % (len(expect) + 2 + len(CASES)))
+    print("selftest ok: %d checks" % (len(expect) + 3 + len(CASES)))
     return 0
 
 

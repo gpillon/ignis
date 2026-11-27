@@ -1,5 +1,4 @@
-//! YaRN RoPE scaling as a load option (GitHub #227, spec
-//! `docs/specs/rope-scaling/01-yarn.md`).
+//! YaRN RoPE scaling as a load option (GitHub #227).
 //!
 //! Like speculation and vision, the rotary table is engine residency: chosen
 //! at load, frozen for the life of that load, because a sequence's cached

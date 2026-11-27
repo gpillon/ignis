@@ -565,7 +565,7 @@ struct ignis_model_load_options {
    * (ignis_moe.h), every record a device pointer into weights the caller
    * keeps alive until ignis_model_free has returned; copied at load (a plan
    * does not read it). The head's 29 other tensors arrive among `tensors`,
-   * named `mtp.*` (the companion container's, docs/specs/flash-next/
+   * named `mtp.*` (the companion container's, docs/formats/
    * flash-next-layout.md section 13). NULL otherwise. */
   const struct ignis_moe_slot *mtp_expert_slots;
   /* enum ignis_prefill_attention (GitHub #335); anything else is refused.

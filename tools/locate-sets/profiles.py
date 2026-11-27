@@ -1,6 +1,6 @@
 """Read spec 18's dumps as profiles: spec 19 phase 0 (GitHub #276).
 
-Spec 19 (`docs/specs/decide/19-a-span-read-from-attention.md`) treats every
+Spec 19 (GitHub #276) treats every
 signal one prefill gives per state token as a *profile* of the input and asks
 which are worth reading. Phase 0 is what spec 18's dumps can already say, with
 no GPU: every GQA head's pre-softmax scores at the scaffold's last token over

@@ -28,8 +28,8 @@ use ignis_core::step::{ComputePolicy, PrefillRoute, prefill_program_with_policy}
 use ignis_bench::oracle::{G1_AGREEMENT_FLOOR, meets_g1_floor, score_teacher_forced};
 
 const ARTIFACT: &str = r"F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer";
-/// Same 8K span the self-oracle test warms over (`docs/specs/runtime/
-/// 02-real-prefill.md`): eight [1,024-token] traversals of the chunked
+/// Same 8K span the self-oracle test warms over (the spec of
+/// GitHub #63): eight [1,024-token] traversals of the chunked
 /// route, which is where the A4 multi-token kernels actually engage.
 const SPAN_TOKENS: usize = 8192;
 const PREFILL_CHUNK: u32 = 1024;

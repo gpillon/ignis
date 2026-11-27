@@ -6,7 +6,7 @@ status: accepted
 
 ## Status
 
-Accepted (2026-09-22, owner — spec `docs/specs/decide/13-point-by-attention-head.md`,
+Accepted (2026-09-22, owner — spec 13 of `/v1/decide`,
 GitHub #260). **Extended by ADR 0039** (GitHub #263): the readout also names
 a head set, read on every layer it arms; and **by ADR 0041** (GitHub #275):
 it reads a text span too, a head set in whole rows. **Extends ADR 0034**, which made the answer-token readout the

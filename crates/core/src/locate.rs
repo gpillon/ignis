@@ -3,10 +3,10 @@
 //!
 //! Two methods (ADR 0041, ADR 0042):
 //!
-//! - **the head vote** (spec `docs/specs/decide/18-locate-by-attention.md`
+//! - **the head vote** (spec 18's
 //!   phase B read as spec 19's track L registered it — GitHub #275, ADR
 //!   0041), up to the length it was measured at;
-//! - **the shortlist** (spec `docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`,
+//! - **the shortlist** (spec 22,
 //!   GitHub #278, ADR 0042): attention heads narrow a very long text to a few
 //!   candidates ([`reading`]) — after [`fold`]ing a log into templates, window
 //!   by window for prose and record arrays — and a labelled `choice` decides

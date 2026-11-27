@@ -52,11 +52,13 @@ Used by `/wayfinder`. The **map** is a single issue with **child** issues as tic
 
 ## Issues from before 2026-10-25: the spec is a file
 
-Until 2026-10-25 a spec lived as a file under `docs/specs/<feature>/`, and its
-issue carried only a short body linking it (`**Spec:** [docs/specs/...](...)`).
-For those issues the linked file is the spec and the ticket's brief: read it
-after the issue body. `docs/specs/` is frozen (`docs/specs/README.md`): a new
-spec is an issue.
+Until 2026-10-25 a spec was a file, and its issue carried only a short body
+linking it (`**Spec:** [docs/specs/...](...)`). For those issues the linked
+file is the spec and the ticket's brief: read it after the issue body. The
+files left the main branch and are whole under the tag `records-2026-11-27`:
+the issue's link opens the spec there, and in a clone
+`git show records-2026-11-27:docs/specs/<feature>/<file>.md` does
+(`docs/specs/README.md`). A new spec is an issue.
 
 ## Closing work
 
