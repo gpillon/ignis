@@ -58,7 +58,7 @@ IDENTITY = {"model_id": "qwen3.8-27b", "weights_id": "trellis-sc30"}
 SERVED_IDENTITY = {"model_id": "qwen3.8-27b", "weights_id": "nvfp4full"}
 REPO = "turboderp/Qwen3.8-27B-exl3"
 BRANCH = "SC_3.00bpw_H4"
-# The quant's recipe as its quantization_config.json states it (ADR 0060 §1, §4).
+# The quant's recipe as its quantization_config.json states it (ADR 0060).
 QUANT_CONFIG = {"quant_method": "exl3", "codebook": "mul1", "out_scales": "always", "bits": 3.0, "head_bits": 4}
 # The quant's files the converter reads, beside its shards.
 QUANT_META = ("model.safetensors.index.json", "quantization_config.json", "config.json")

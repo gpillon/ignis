@@ -1,16 +1,15 @@
 ---
 status: accepted
-amends: [ADR-0049]
 ---
 
 # A client may unload the active model at once, and load it again without generating
 
+Without the two routes of this decision,
 [ADR 0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) gives the card back only after
 `model.idle_unload` seconds with nobody using the model, and leaves `unloaded` only when a request needs the
-model, a switch or a reloading `PATCH /v1/config` loads one. A client sharing the card with another program, a
-video encoder on a 16 GB card in #723, cannot give it back when it knows it is done, nor take it again before its
-first request without generating. The owner accepted, on the contributed #724 (2026-11-22), two routes that do both
-on the active model, and OpenAI's retrieve beside them.
+model, a switch or a reloading `PATCH /v1/config` loads one: a client sharing the card with another program, a
+video encoder on a 16 GB card for instance, cannot give it back when it knows it is done, nor take it again before
+its first request without generating. So two routes do both on the active model, with OpenAI's retrieve beside them.
 
 - **`POST /v1/ignis/models/unload`** is an idle unload brought forward: the same teardown into the same `unloaded`
   state, under the same in-flight count's lock as the idle clock, so no request is admitted onto the engine being

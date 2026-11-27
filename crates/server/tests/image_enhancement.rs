@@ -488,7 +488,7 @@ async fn with_the_image_model_loaded_an_enhanced_request_visits_the_enhancer_and
     assert_eq!((loader.loads().len(), loader.encoded_prompts().last().map(String::as_str)), (5, Some("as sent")));
 }
 
-/// Review-322cf L2 (ADR 0049 §5): a visit from another text model ends on
+/// Review-322cf L2 (ADR 0049): a visit from another text model ends on
 /// the image model the request names — the request's switch, streamed as a
 /// visit's two — so each of its switches is written to `last_switch` as a
 /// switch is: the last, from the enhancer to the image model, once it lands;

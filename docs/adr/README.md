@@ -58,7 +58,7 @@ edit it by hand.
 | [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted | |
 | [0047](0047-a-catalog-the-operator-can-extend.md) | a model catalog the operator can extend, and a `model` command to fetch from it | accepted | [0064](0064-a-catalog-entry-states-its-card-class.md), [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) |
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | An end of turn drawn inside an open reasoning block closes the block instead | accepted | |
-| [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | an idle model is unloaded, and the next request loads it again | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md), [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) |
+| [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | An idle model is unloaded, and the next request loads it again | accepted | |
 | [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
 | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted | |
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | A reasoning loop is taken back, the model is nudged, and the client is told | accepted | |
@@ -68,12 +68,12 @@ edit it by hand.
 | [0057](0057-rope-scaling-is-auto-by-default.md) | Rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
 | [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | every route has a deadline, and a passed one answers what was generated | accepted | [0096](0096-a-cut-tool-call-reaches-the-client-as-generated-its-name-its-arguments-so-far-and-finish-reason-length.md) |
 | [0059](0059-flash-next-applies-yarn-on-q-and-k.md) | Flash-Next applies YaRN, the attention factor folded into cos and sin on q and k | accepted | |
-| [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | the 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
+| [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | The 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
 | [0061](0061-prefill-attention-reads-the-hq-codec.md) | prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
 | [0062](0062-the-token-embedding-lives-in-host-memory.md) | The 27B's token embedding lives in pinned host memory, on every card | accepted | |
 | [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0064](0064-a-catalog-entry-states-its-card-class.md) | a catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
-| [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | the 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | [0103](0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
+| [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | The 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | |
 | [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
 | [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
@@ -109,7 +109,6 @@ edit it by hand.
 | [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) | The 27B cuts a reusable prompt's tail once, at the generation opener, on every card | accepted | |
 | [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) | On Windows the VRAM plan reserves the W4A4 TMA products' descriptor slots as a line of their own | accepted | |
 | [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) | A request whose images pass the vision budget together drops its oldest, a block at a time, as text | accepted | |
-| [0103](0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) | On compute capability 12.0 the 27B holds its exception tensors in FP8 by default | accepted | |
 | [0104](0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round goes past 8 columns a lane, and is held to its base round's numerical class | accepted | |
 | [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) | A client may unload the active model at once, and load it again without generating | accepted | |
 | [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round may carry lanes of both shapes, and a mixed round is held to its base round's numerical class | accepted | |

@@ -1,4 +1,4 @@
-//! GitHub #682 (ADR 0103): a 27B load says which exception weights it holds,
+//! GitHub #682 (ADR 0065): a 27B load says which exception weights it holds,
 //! the setting they resolved from and where that setting came from, and on a
 //! trellis body, which has no BF16 exception tensor, that it holds none:
 //! through the shape the GPU load derives (`load::load_shape`) and the line it
