@@ -15,22 +15,21 @@ edit it by hand.
 
 | ADR | Title | Status | Amended by |
 |---|---|---|---|
-| [0001](0001-cpp-kernel-leaf-c-abi.md) | C++ kernel leaf behind a C ABI | accepted | [0009](0009-step-level-device-resident-abi.md) |
+| [0001](0001-cpp-kernel-leaf-c-abi.md) | C++ kernel leaf behind a C ABI | accepted | |
 | [0002](0002-load-ninfer-artifact.md) | The engine loads `.ninfer` artifacts directly | accepted | |
 | [0004](0004-full-admission-in-v1.md) | Full admission state machine in v1 | accepted | |
 | [0005](0005-performance-first-principle.md) | Performance-first as the organizing principle | accepted | |
 | [0006](0006-exclusive-gpu-testing.md) | Exclusive GPU testing (no concurrent engines) | accepted | |
 | [0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md) | Correctness is self-checked, not matched against a reference engine | accepted | |
-| [0008](0008-cuda-graph-staging-buffers.md) | CUDA-graph decode replay: persistent device staging buffers | superseded by [0009](0009-step-level-device-resident-abi.md) | [0019](0019-decode-cuda-graph-slot-indirection.md) |
-| [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted | [0016](0016-step-abi-extensible-options.md) |
+| [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted | |
 | [0010](0010-vendored-reference-kernels.md) | Kernel policy: vendor the reference ops verbatim, under a manifest | accepted | |
 | [0011](0011-tracing-for-structured-logging.md) | `tracing` + `tracing-subscriber` as the structured logging foundation | accepted | [0025](0025-scheduler-interval-as-a-log-event.md) |
 | [0012](0012-request-id-as-trace-id.md) | Internal tracing spans reuse `request.id` as the OTel `trace_id` | accepted | |
 | [0013](0013-no-typed-attribute-registry.md) | No typed attribute registry; discipline + regression tests only | accepted | |
-| [0016](0016-step-abi-extensible-options.md) | Step-ABI calls take extensible options structs, and G2 spends the one extension | accepted | [0024](0024-sequence-state-transfer.md) |
+| [0016](0016-step-abi-extensible-options.md) | Step-ABI calls take extensible options structs | accepted | |
 | [0017](0017-prometheus-metrics.md) | Opt-in Prometheus metrics with zero inference-path work | accepted | [0025](0025-scheduler-interval-as-a-log-event.md), [0030](0030-device-memory-reserved-at-load.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0046](0046-one-declaration-per-config-field.md), [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md), [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md), [0094](0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md), [0097](0097-a-normalized-tool-leaves-its-length-bounds-out-and-the-call-check-counts-the-parameters-held-would-close.md), [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) |
 | [0018](0018-chunk-level-prefill-decode-interleaving.md) | Prefill and decode interleave at chunk granularity, driven by the Rust scheduler | accepted | |
-| [0019](0019-decode-cuda-graph-slot-indirection.md) | decode CUDA graph replay via device-resident slot indirection | accepted | [0020](0020-batch-wide-decode-round.md) |
+| [0019](0019-decode-cuda-graph-slot-indirection.md) | decode CUDA graph replay via device-resident slot indirection | accepted | |
 | [0020](0020-batch-wide-decode-round.md) | the decode round is one batch-wide model traversal | accepted | |
 | [0022](0022-two-kv-formats-bf16-as-oracle.md) | two KV formats, with BF16 retained as the correctness oracle | accepted | |
 | [0023](0023-unified-eviction-priority.md) | one eviction priority across GPU residency and the host tier | accepted | [0029](0029-cross-request-state-reuse.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) |
