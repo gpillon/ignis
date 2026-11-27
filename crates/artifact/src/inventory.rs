@@ -18,6 +18,13 @@
 //! W8G32 (`text/token_embedding` + `text/output_head`), 314 BF16, 343
 //! FP32, 247 NVFP4 (the 27B model's GEMM weights + the norms / GDN
 //! params / `*_input_scale_divisor` scalars).
+//!
+//! **The trellis body** (ADR 0060). The 16 GB card class's artifact keeps
+//! this scope with every body linear and the output head in trellis
+//! (`text_scope_27b_trellis`). A fused NVFP4 plane is there as its split
+//! parts, under their exllamav3 names: the body is a repack of a public
+//! quant, and exllamav3 quantized those parts separately, each with its own
+//! scales, so they cannot be fused by concatenation.
 
 use crate::binder::{Binder, DeviceEncoding, MaterializationPlan, ObjectHandle, Residence};
 use crate::{NumericFormat, Object, Reader, Result, StorageLayout};
@@ -675,7 +682,7 @@ const SH_MLP_HALF: [u64; 2] = [17408, 5120]; // `gate_proj`, `up_proj`
 /// The trellis objects standing for an NVFP4 text-scope plane (its suffix
 /// under `text/layers/{i}/`): a fused plane's split parts under their
 /// exllamav3 names (exllamav3 quantized them separately, each with its own
-/// scales: ADR 0060 §4), a whole one under its own name.
+/// scales: ADR 0060), a whole one under its own name.
 fn trellis_parts(suffix: &str) -> Option<&'static [(&'static str, &'static [u64])]> {
     Some(match suffix {
         "gdn/query_key_value_z" => &[("gdn/in_proj_qkv", &SH_GDN_QKV), ("gdn/in_proj_z", &SH_GDN_Z)],

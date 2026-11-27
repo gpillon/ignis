@@ -559,7 +559,7 @@ pub fn load_shape(config: &crate::config::Config, vision_item_bound: Option<u64>
     shape
 }
 
-/// GitHub #682 (ADR 0103): a 27B load of `shape` says, once, which exception
+/// GitHub #682 (ADR 0065): a 27B load of `shape` says, once, which exception
 /// weights it holds, the setting they resolved from and where the setting
 /// came from (`ignis.runtime.exception_weights`); on a `body` with no BF16
 /// exception tensor, the trellis artifacts', that it holds none, whatever the

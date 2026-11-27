@@ -85,7 +85,7 @@ what ignis does:
   Measured again, those two reads proved a coin in both encodings, and
   FP8 is the default on the RTX 50 and RTX PRO cards, admitted by the
   KLD gate ([`model.exception_weights`](../reference/configuration.md#modelexception_weights);
-  [ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
+  [ADR 0065](../../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md)).
 
 ## Where the kernels come from
 

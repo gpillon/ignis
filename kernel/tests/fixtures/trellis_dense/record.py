@@ -23,7 +23,7 @@ It writes, next to itself:
   provenance.json
       Versions, seeds, and what this script measured about the reference.
 
-ExLlamaV3 is an oracle only (ADR 0060 §5, ADR 0051): this script calls its quantizer, its
+ExLlamaV3 is an oracle only (ADR 0060, ADR 0051): this script calls its quantizer, its
 `reconstruct` and its Python forward, and reads nothing of its CUDA sources. The decoder below
 (`decode_inner`) is the format's definition, the one kernel/tests/fixtures/flash_next/record.py
 states for K <= 4 generalized to every K, asserted bit-exact against `reconstruct` before

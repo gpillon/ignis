@@ -2,7 +2,7 @@
 // matrices take -- OURS (spec 27b-16gb/02 Acceptance 1, GitHub #337).
 //
 // No tolerance: the decoded weight is defined to equal `reconstruct`'s fp16 output exactly
-// (ADR 0060 §5), so any differing bit is a failure.
+// (ADR 0060), so any differing bit is a failure.
 //
 //   fixtures     one 256 x 128 projection per K in {2, 2.5, 3, 4, 5, 6}, encoded by exllamav3's own
 //                quantizer, against its recorded `reconstruct` output; the host restatement of the
