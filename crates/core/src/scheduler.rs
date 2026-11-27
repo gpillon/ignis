@@ -940,8 +940,8 @@ pub trait Compute: Send + Sync {
     /// and the backend's own hold on the KV pages under it.
     ///
     /// Called when the scheduler discards a retained entry — a live request
-    /// taking the pages back (retained state is the first victim, ADR 0023 as
-    /// amended), or, from #187 on, a successor superseding it. The pages come
+    /// taking the pages back (retained state is the first victim, ADR 0023),
+    /// or, from #187 on, a successor superseding it. The pages come
     /// back to the pool when every other holder has released too, so this is a
     /// handle drop and not a free, exactly like
     /// [`Compute::release_prefix`].

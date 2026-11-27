@@ -368,7 +368,7 @@ config_group! {
         /// MMA, and `bf16` on any other card and when no card is read. A
         /// named `bf16` is kept on every card; a named `fp8` is refused below
         /// 12.0. FP8 holds 534.6 MB less, which the KV pool takes, and
-        /// changes greedy text against a BF16 load (ADR 0103). The load's
+        /// changes greedy text against a BF16 load (ADR 0065). The load's
         /// `ignis.runtime.exception_weights` line names the value it runs and
         /// where it came from. A trellis artifact holds no BF16 exception
         /// tensor, so the field changes nothing there; Flash-Next has none.

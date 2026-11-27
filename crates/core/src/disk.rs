@@ -8,7 +8,7 @@
 //! **The order is KV-RAM's, extended — and it is the same code.** The held
 //! entries are a [`HostTier`]: retained state before evicted live sequences,
 //! then class, then probation before protected, then least recently used,
-//! with the Interactive TTL (ADR 0023 as amended by 0045). The spec asks for
+//! with the Interactive TTL (ADR 0023). The spec asks for
 //! the victim order to be shared rather than copied so the two tiers cannot
 //! drift, and the plainest way to share it is to hold the same type twice.
 //!

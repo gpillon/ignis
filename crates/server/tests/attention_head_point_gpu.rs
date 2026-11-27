@@ -179,9 +179,10 @@ fn prefill_chunk() -> u32 {
 const DIGITS: usize = 3;
 const SCALE: f64 = 999.0;
 
-/// `<|image_pad|>` in this artifact's tokenizer (ADR 0034's own correction
-/// names it at 248,056). Checked against every position of the media item's
-/// span, so the span and the token ids are two sources for one fact.
+/// `<|image_pad|>` in this artifact's tokenizer (the doc comment of
+/// `StepLeaf::vocab`, in `crates/runtime/src/lib.rs`, names it at 248,056).
+/// Checked against every position of the media item's span, so the span and
+/// the token ids are two sources for one fact.
 const IMAGE_PAD: u32 = 248_056;
 
 /// The head under test: backbone layer 39 is GQA ordinal 9 (`4 * 9 + 3`).

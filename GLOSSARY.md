@@ -117,7 +117,7 @@ consumer that watches the reasoning for a loop (ADR 0052, config
 `model.loop_guard*`, `rewind` by default).
 
 **Repeat signal**:
-The loop guard's detector beside its compression score (ADR 0053, GitHub #727):
+The loop guard's detector beside its compression score (ADR 0052, GitHub #727):
 the same sentences of the reasoning written twice back to back, compared as
 written, each copy allowed `loop_guard_repeat_varying` sentences the one before
 it lacks and repeating at least `loop_guard_repeat_min` characters of prose
@@ -589,7 +589,7 @@ MMA with an INT8 activation. The default route of the 8.x cards (GitHub #515).
 A GDN layer's pass over a prefill span of 64 tokens or more: the chunked
 delta rule, which carries the sequence's GDN slot from the span's first token
 to its last. The 27B's has two routes: ignis's own (ADR 0080), every card's
-route since ADR 0085, and the vendored chunked kernels, which run only when
+route, and the vendored chunked kernels, which run only when
 the measurement switch names them and stay the oracle of ignis's; Flash-Next's
 GDN layers keep their own vendored kernels whatever the switch says. A shorter
 span, a
@@ -1957,8 +1957,10 @@ logs, and spans (ADR 0012).
 **Hot-path logging constraint**:
 Normal INFO operation must not emit one record per
 token/layer/kernel/allocation on the prefill/decode path; any logging or
-tracing change touching that path must pass the G4 performance gate (ADR
-0007) before merge, not just design review.
+tracing change touching that path must have its cost to decode speed measured
+before merge, ignis against ignis as ADR 0082 states for a speed claim (a
+branch against main, at least two launches per build), not just design
+review.
 
 **Hotpath lint**:
 The grep-based, hand-maintained scan over a fixed list of

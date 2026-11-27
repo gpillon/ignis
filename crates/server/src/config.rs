@@ -242,9 +242,10 @@ pub const DEFAULT_MEDIA_CACHE_MIB: u32 = 1024;
 pub const MEDIA_CACHE_MIB_LIMIT: u32 = 64 * 1024;
 
 /// `--reuse-kv-host-pool-bytes`' default (P4-07, GitHub #125): comfortably
-/// holds several full-context snapshots (each ~528 MB per ADR 0024's
-/// estimate) without an operator having to reason about the format's
-/// per-snapshot cost just to start the server.
+/// holds several full-context snapshots (about half a gigabyte each,
+/// `docs/findings/2026-09-12-sequence-snapshot-transfer-cost.md`) without an
+/// operator having to reason about the format's per-snapshot cost just to
+/// start the server.
 ///
 /// Since GitHub #213 (ADR 0030) it is page-locked whole at start rather than
 /// blob by blob while serving, so it is RAM the process holds even idle.
@@ -621,7 +622,7 @@ impl std::fmt::Debug for Basis {
 }
 
 /// The **solo width** a config names (`--model-prefill-chunk-solo`, GitHub
-/// #489, ADR 0018 as amended): the prefill chunk while no lane is
+/// #489, ADR 0018): the prefill chunk while no lane is
 /// decode-ready. `auto`, the default, is resolved at load, where the VRAM
 /// plan and the card are known ([`crate::config::arch::solo_ladder`]); a
 /// width is a nonzero multiple of 128, and a load never runs it narrower than

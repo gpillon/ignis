@@ -1,4 +1,4 @@
-//! GitHub #489 (ADR 0018 as amended): a load whose prefill scratch is
+//! GitHub #489 (ADR 0018): a load whose prefill scratch is
 //! reserved for the solo width runs the prefill chunk on the same kernels as
 //! one reserved for the chunk alone. The 27B's 16 GB trellis artifact on the
 //! routes an RTX 30 or RTX 40 card runs (the dense prefill and the integer

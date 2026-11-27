@@ -18,7 +18,7 @@
 //! `IGNIS_MODEL_EXCEPTION_WEIGHTS=fp8`, the server's own variable for
 //! `--model-exception-weights`, holds the BF16 exception tensors in FP8
 //! (GitHub #341); unset, they are held as stored, the engine's default (the
-//! server's `auto` is `fp8` on compute capability 12.0, ADR 0103), and a
+//! server's `auto` is `fp8` on compute capability 12.0, ADR 0065), and a
 //! KLD leg names them either way.
 //! `IGNIS_MODEL_PREFILL_ATTENTION=fp16`, the server's own variable for
 //! `--model-prefill-attention`, prefills on the FP16 band (GitHub #335): the

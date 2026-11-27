@@ -12,6 +12,9 @@
 //!    prompt no longer inserts a multi-second gap into every other lane's
 //!    token stream). While no lane is decode-ready the chunk is the wider
 //!    `solo_chunk_tokens` instead (GitHub #489), chosen anew every advance.
+//!    A lane is decode-ready from the end of its request's prefill until the
+//!    request ends, holding a lane or waiting for one; a suspended one is
+//!    not, and restored onto a lane it is again.
 //!    Several **queued** requests may still share that one
 //!    call — up to `max_prefill_batch` of them, `PrefillJob`s batched
 //!    together — but only while each finishes within its own single chunk;
@@ -44,6 +47,22 @@
 //!    entry's pages are charged to the pool once (the charge split), and the
 //!    admission machine runs against the pool minus the cache's pins
 //!    (consistent accounting — the cache never over-allocates).
+//!    **The decode share** (`decode_share`, GitHub #306) paces a prompt's
+//!    chunks: after a chunk that took `t`, the same prompt's next chunk
+//!    waits until the decoding lanes have had `t * s / (1 - s)` of wall
+//!    time. Nothing is held while no lane is decoding, after a prompt's last
+//!    chunk (the next one is a newcomer's, which is not made to wait for
+//!    lanes that already had their turn) or after a chunk at the solo width
+//!    (no lane was decoding while it ran). **Cancel is abort, not suspend**:
+//!    the in-flight chunk finishes, then the sequence is aborted and its KV
+//!    pages, GDN slot and conv taps are released. **The phase ends with a
+//!    hand-off** (GitHub #518, [`crate::scheduler::Scheduler::advance_with`]):
+//!    what it emitted (a prompt's chunks, a decision's answer, the prompt's
+//!    first token, which the prefill drew) reaches the engine before the lane
+//!    deal and the decode round, so a first token waits for the prefill
+//!    alone; the engine answers with the requests it ends on that token,
+//!    which end with `stop` before phase 2 and take no lane, and the first
+//!    round takes the token as its anchor without emitting it again.
 //! 2. **The admission state machine** (core-05) — lane assignment is
 //!    driven by the full fairness machinery (`admission.rs`, ported from
 //!    the reference stack per ADR 0004): *protection* (a blocked head
@@ -226,7 +245,7 @@ pub struct SchedulerConfig {
     /// lane is decode-ready; [`SchedulerConfig::solo_chunk_tokens`] is the
     /// one while none is.
     pub serving_chunk_tokens: u32,
-    /// The **solo width** (GitHub #489, ADR 0018 as amended): the prefill
+    /// The **solo width** (GitHub #489, ADR 0018): the prefill
     /// chunk while no lane is decode-ready, so nobody waits for it. A lane is
     /// decode-ready from the end of its request's prefill until the request
     /// ends, holding a lane or waiting for one; a suspended one is not. The
@@ -990,8 +1009,8 @@ impl ConcreteScheduler {
                 .any(|r| r.state == RequestState::Running && r.remaining_work > 0)
     }
 
-    /// The prefill chunk width of this advance (GitHub #489, ADR 0018 as
-    /// amended): the solo width while no lane is decode-ready, the prefill
+    /// The prefill chunk width of this advance (GitHub #489, ADR
+    /// 0018): the solo width while no lane is decode-ready, the prefill
     /// chunk while one is. Decided once per advance, before the batch is
     /// built, so the cut and the jobs agree even when admission evicts a
     /// lane in between.
@@ -2048,7 +2067,7 @@ impl ConcreteScheduler {
     }
 
     /// Take retained pages back until `idx` can materialize, or until nothing
-    /// is retained (GitHub #186, ADR 0029/0023 as amended).
+    /// is retained (GitHub #186, ADRs 0029 and 0023).
     ///
     /// This is the **first victim** rule, and it runs *before* the eviction
     /// machinery is asked for anything: a bet is given up before any certain
@@ -5072,7 +5091,7 @@ impl Scheduler for ConcreteScheduler {
                     if self.outranked_by_a_moved_sequence(i) {
                         break;
                     }
-                    // GitHub #186 (ADR 0023 as amended by 0029): retained
+                    // GitHub #186 (ADR 0023): retained
                     // state is the first victim, so it goes back *before*
                     // anything else is considered. A live request never waits
                     // for a bet and is never refused because of one.

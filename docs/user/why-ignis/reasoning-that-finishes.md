@@ -69,7 +69,7 @@ sessions" holds on the sessions the thresholds were tuned against. Loops where
 the text varies between repeats, and slow numeric templates, do not compress
 and are missed; so are loops that reword whole passages between their
 copies. A false rewind found later reopens the defaults
-([ADR 0053](../../adr/0053-a-loop-is-acted-on-once-it-persists.md)).
+([ADR 0052](../../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md)).
 :::
 
 ## See it, control it
@@ -110,5 +110,5 @@ copies. A false rewind found later reopens the defaults
 ## Read more
 
 - [Reasoning and the loop guard](../concepts/reasoning.md): detection, action, modes and tuning.
-- [ADR 0052](../../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md) and [ADR 0053](../../adr/0053-a-loop-is-acted-on-once-it-persists.md): why a loop is taken back, and why it must persist first.
+- [ADR 0052](../../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md): why a loop is taken back, and why it must persist first.
 - [System One decisions, without decoding](decisions.md): the route that never reasons at all.

@@ -29,6 +29,15 @@
 //! `Interactive` snapshot in probation outlives an `Agent` snapshot in
 //! protected.
 //!
+//! The tier also holds retained state, the prompt checkpoints and retained
+//! prefixes the device gave up (GitHub #190), and one key leads the three
+//! above: retained entries go before evicted live sequences, whatever their
+//! class or tier ([`KvRamVictim`]). A spill of retained state displaces only
+//! retained entries that rank strictly below it, never a live snapshot
+//! ([`HostTier::plan_retained_room`]), and an `Interactive` retained entry
+//! idle past the TTL ranks as an `Agent`'s probation entry
+//! ([`DEFAULT_RETAINED_INTERACTIVE_TTL`]).
+//!
 //! Two-tier eviction (probation → protected) is still the *second* key: a
 //! freshly captured snapshot starts in **probation** (discarded before any
 //! same-class protected entry, like a fresh page on an LRU "inactive"
@@ -653,7 +662,7 @@ impl HostTier {
     /// Which retained entries to give up so a **live** blob of `bytes` fits,
     /// lowest rank first, or `None` when even all of them would not make the
     /// room (spec vram-budget/03). Every retained entry ranks below live work
-    /// (ADR 0023 as amended by 0029), so any of them may go; no live entry
+    /// (ADR 0023), so any of them may go; no live entry
     /// ever does. Plans only; nothing changes.
     pub fn plan_live_room(&self, bytes: u64, now: Instant) -> Option<Vec<RetainedBlob>> {
         if bytes > self.capacity_bytes {

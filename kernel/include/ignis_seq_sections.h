@@ -235,7 +235,13 @@ struct ignis_seq_progress_image {
    * same prompt-wide value, so a sequence evicted between its chunks
    * already holds the delta its later chunks would set. A clone's capture
    * zeroes it (`ignis_seq_capture_state`): a claimant takes its delta from
-   * its own prefill span. */
+   * its own prefill span. The publisher's delta is its whole prompt's, not
+   * the head's, and a text request may claim a multimodal publisher's
+   * text-only head up to its prompt's end, prefilling nothing that would set
+   * its own, so this is the one progress scalar the clone path leaves
+   * behind; the blob a spilled prefix or checkpoint is written as records 0
+   * too, and a multimodal publisher's own blob differs from its prefix's in
+   * this one word. */
   std::int32_t rope_delta;
   /* The drafter window's frontier (`ignis_seq::dflash2_position`); 0 on a
    * pool without the drafter. */
