@@ -13,7 +13,7 @@ is the reference's file*, and a script proves it.
   and `docs/adr/0037-a-vendored-file-may-carry-a-correctness-patch.md` — a file
   with a *demonstrated* correctness bug may carry a recorded patch, with a test
   that fails without it — and `docs/adr/0077-a-vendored-file-may-carry-a-portability-patch.md`
-  (proposed) — a file may carry a recorded patch that makes it build and run on
+  — a file may carry a recorded patch that makes it build and run on
   an architecture the build targets, changing nothing on `120a`. Read them
   before editing anything here; nothing below changes.
 - Attribution: `kernel/NOTICE` (the subtree is Apache-2.0; `LICENSE` is
