@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0024]
 ---
 
 # The 27B has two drafters, and its MTP head keeps attention state over the whole context and a continuation hidden

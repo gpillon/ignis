@@ -242,9 +242,10 @@ pub const DEFAULT_MEDIA_CACHE_MIB: u32 = 1024;
 pub const MEDIA_CACHE_MIB_LIMIT: u32 = 64 * 1024;
 
 /// `--reuse-kv-host-pool-bytes`' default (P4-07, GitHub #125): comfortably
-/// holds several full-context snapshots (each ~528 MB per ADR 0024's
-/// estimate) without an operator having to reason about the format's
-/// per-snapshot cost just to start the server.
+/// holds several full-context snapshots (about half a gigabyte each,
+/// `docs/findings/2026-09-12-sequence-snapshot-transfer-cost.md`) without an
+/// operator having to reason about the format's per-snapshot cost just to
+/// start the server.
 ///
 /// Since GitHub #213 (ADR 0030) it is page-locked whole at start rather than
 /// blob by blob while serving, so it is RAM the process holds even idle.

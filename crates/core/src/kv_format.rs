@@ -551,10 +551,9 @@ mod tests {
 
     #[test]
     fn hq_is_the_serving_default_now_that_its_routes_are_wired() {
-        // ADR 0022: "hq-e8-2b is the serving default, and the format both
-        // engines run in for the G4 gate. In force since P4-05 (GitHub
-        // #123)." A load that names no format runs the format the reference
-        // serves in and the G4 gate measures; BF16 is retained and is what
+        // ADR 0022: hq-e8-2b is the serving default, since P4-05 (GitHub
+        // #123). A load that names no format runs the format the reference
+        // served in; BF16 is retained and is what
         // every correctness oracle asks for by name.
         assert_eq!(KvFormat::default(), KvFormat::HqE8_2b);
     }
