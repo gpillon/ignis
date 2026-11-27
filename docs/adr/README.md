@@ -40,19 +40,19 @@ edit it by hand.
 | [0028](0028-expose-modes-always-keyed.md) | exposure is a named mode, and an exposed server always has a key | accepted | |
 | [0029](0029-cross-request-state-reuse.md) | cross-request state reuse: content-matched retained state across three residency tiers | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) |
 | [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0035](0035-the-vision-embedding-outlives-its-encode.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md), [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md), [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) |
-| [0031](0031-vendored-kernel-bottleneck-exemption.md) | a vendored kernel that is measured as the bottleneck is not untouchable | accepted | [0093](0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md) |
+| [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
 | [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
-| [0034](0034-the-leaf-answers-without-generating.md) | the leaf answers without generating | accepted | [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) |
+| [0034](0034-the-leaf-answers-without-generating.md) | The leaf answers without generating | accepted | |
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | the vision embedding outlives its encode | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) |
 | [0036](0036-the-v1-surface-documents-itself.md) | the `/v1` surface documents itself, and its reference needs no key | accepted | |
-| [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | a vendored file may carry a patch that fixes a known correctness bug | accepted | |
+| [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | A vendored file may carry a patch that fixes a known correctness bug | accepted | |
 | [0038](0038-the-seam-carries-one-attention-head.md) | the `Compute` seam carries one attention head's scores | accepted | |
 | [0039](0039-the-seam-carries-a-head-set.md) | the attention readout carries a head set | accepted | |
 | [0040](0040-the-readout-carries-the-peak-s-neighbours.md) | the attention readout carries each peak's neighbours | accepted | |
 | [0041](0041-the-readout-reads-a-text-span.md) | the attention readout reads a text span, in whole rows | accepted | |
 | [0042](0042-locate-copies-over-a-folded-state.md) | a locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
-| [0043](0043-a-second-model-without-a-ninfer-reference.md) | a second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) |
+| [0043](0043-a-second-model-without-a-ninfer-reference.md) | a second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | |
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
 | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | the KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) |
 | [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted | |
@@ -60,7 +60,7 @@ edit it by hand.
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | an end of turn drawn inside an open reasoning block closes the block instead | accepted | |
 | [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | an idle model is unloaded, and the next request loads it again | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md), [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) |
 | [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
-| [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | kernel code is ours, adapted from a named source, or vendored | accepted | |
+| [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted | |
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | a reasoning loop is taken back, the model is nudged, and the client is told | accepted | [0053](0053-a-loop-is-acted-on-once-it-persists.md) |
 | [0053](0053-a-loop-is-acted-on-once-it-persists.md) | a loop is acted on once it persists, and a rewind keeps something | accepted | |
 | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | a resident Flash-Next load keeps its experts only in VRAM | accepted | |
@@ -85,7 +85,7 @@ edit it by hand.
 | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) | A catalog entry may state its family, and an alias may be another entry's id | accepted | |
 | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) | The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device | accepted | |
 | [0076](0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md) | The running notes send the notes back to the text model and the recap does not | accepted | |
-| [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md), [0091](0091-on-a-card-smaller-than-the-rtx-5090-the-gdn-gating-planner-takes-the-largest-split-it-holds-and-its-test-caps-the-sm-count.md) |
+| [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | |
 | [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted | |
 | [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | [0085](0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md) |

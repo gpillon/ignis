@@ -866,10 +866,10 @@ pub trait StepLeaf: Send + Sync + 'static {
     /// Columns the loaded model's output head writes — the length a
     /// [`StepLeaf::prefill`] logits buffer must have (GitHub #237).
     ///
-    /// The leaf's own number, and it is **not** the 151,936 ADR 0034
-    /// quotes: that is Qwen2/Qwen3's vocabulary, and this artifact's runs to
+    /// The leaf's own number, and it is **not** 151,936: that is
+    /// Qwen2/Qwen3's vocabulary, and this artifact's runs to
     /// 248,320 (its `<|image_pad|>` alone sits at id 248,056). So a readout
-    /// buffer is nearer 970 KB than the ADR's 607, and one sized from the
+    /// buffer is nearer 970 KB than 607, and one sized from the
     /// wrong number would be a short write into the caller's memory.
     /// Required rather than defaulted for the same reason — every leaf
     /// knows this, and a default would be a wrong answer waiting to be
