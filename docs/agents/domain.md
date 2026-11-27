@@ -17,9 +17,12 @@ set of decisions, `docs/adr/`, listed in its generated index
   `docs/adr/REMOVED.md`, since a removed number is never used again. If `main`
   took that number first, the ADR is renumbered with every line that cites it
   (b61a224f).
-- An ADR opens with a frontmatter that gives its `status`: `proposed`,
-  `accepted`, `deprecated` or `superseded by ADR-NNNN`. `mk/adr-index.py`
-  documents the block and generates the index from it (`make records`).
+- An ADR opens with a frontmatter that gives its `status`, `proposed`,
+  `accepted` or `deprecated`, and nothing else: no relation to another ADR,
+  since a change to a decision is written into its ADR and a superseded ADR is
+  deleted (below), and `make records-check` refuses `amends`, `amended-by`,
+  `supersedes` and `superseded by ADR-NNNN`. `mk/adr-index.py` documents the
+  block and generates the index from it (`make records`).
 - An ADR states what holds today, and why (ADR 0081). It carries no history
   and no description of how the mechanism works, and it does not restate a
   value the code or the config owns: it names the field or the constant.
