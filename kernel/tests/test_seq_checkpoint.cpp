@@ -669,7 +669,7 @@ void check_a_chained_checkpoint_blob_is_the_capturing_sequences_own(bool dflash2
 
 // ---- 6. a capture lends the pages below the opener to a link (GitHub #306) -
 //
-// ADR 0029 as amended 2026-10-07: a sequence whose whole pages below the
+// ADR 0029 (GitHub #306): a sequence whose whole pages below the
 // opener are not yet a prefix -- one standing on nothing, or on a prefix that
 // stops short of the opener's page -- is no longer refused. The capture lends
 // those pages to a **pages-only link** chained over whatever the sequence

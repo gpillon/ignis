@@ -2732,6 +2732,10 @@ async fn serve(
                 }
             },
             _ => {
+                // GitHub #270: a part end costs a render and a tokenization of the
+                // head, so only the first question under each system text asks for
+                // them: the others share the state and claim the fan-out's head,
+                // which covers every end.
                 let first_of_kind = systems.insert(question.prompt_kind().system_text(question.digits));
                 let part_ends = first_of_kind && matches!(evidence, Evidence::Parts(_));
                 main.push((slot, render(server, &evidence, question, model.clone(), part_ends).await?));

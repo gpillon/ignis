@@ -1,4 +1,4 @@
-//! ADR 0029 as amended 2026-10-07 (GitHub #306): on a load whose generation
+//! ADR 0029 (GitHub #306): on a load whose generation
 //! opener's page **rides the capture** -- Flash-Next's -- the whole pages below
 //! a request's opener are handed over by its prompt-checkpoint capture as a
 //! **pages-only link**, so its prefill is cut once, at the opener, instead of

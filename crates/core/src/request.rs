@@ -40,8 +40,8 @@ pub struct PrefixReuse {
 }
 
 /// Whether a request's prompt-checkpoint capture lends the whole pages below
-/// its generation opener to a **pages-only link** (ADR 0029 as amended
-/// 2026-10-07, GitHub #306), and why: [`Request::link_at_capture`].
+/// its generation opener to a **pages-only link** (ADR 0029,
+/// GitHub #306), and why: [`Request::link_at_capture`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CaptureLink {
     /// No loan. The pages below the opener are a prefix the request publishes
@@ -245,8 +245,8 @@ pub struct Request {
     /// publishes at all.
     pub publish_tokens: u32,
     /// Whether, and why, this request's capture hands the whole pages below
-    /// its generation opener over as a **pages-only link** (ADR 0029 as
-    /// amended 2026-10-07, GitHub #306) instead of a chained prefix published
+    /// its generation opener over as a **pages-only link** (ADR 0029,
+    /// GitHub #306) instead of a chained prefix published
     /// at a cut of its own. Set at submit, for a request that can take a
     /// prompt checkpoint at all; see [`CaptureLink`].
     pub link_at_capture: CaptureLink,
@@ -463,7 +463,10 @@ impl Request {
             .max(self.standalone_tokens);
         // A chained publish has to earn its chunk split — and so does a head
         // published over history restored from a materialized blob (GitHub
-        // #190), which is a resumed request's publish too.
+        // #190), which is a resumed request's publish too: it owns every page
+        // it restored, so it publishes, if at all, at its own opener's page,
+        // and without that a conversation that came back from KV-RAM would
+        // never leave another checkpoint.
         let resumed = self.prefix_entry.is_some() || self.standalone_tokens > 0;
         let gated = resumed && self.input.opener_tokens.is_none();
         let structural = [self.retained_prefix_point(page_tokens), self.publish_tokens];
@@ -496,7 +499,7 @@ impl Request {
     }
 
     /// Every **reuse boundary** this request publishes a shared prefix at
-    /// (GitHub #270, ADR 0029 as amended), ascending: the system block's
+    /// (GitHub #270, ADR 0029), ascending: the system block's
     /// ([`Request::retained_prefix_point`], kept until the device needs the
     /// room) and every one the server predicted, each floored as the block
     /// is ([`Request::predicted_boundaries`]). Two that land on one position
@@ -643,7 +646,7 @@ impl Request {
         if opener == 0 || opener as usize >= self.input.tokens.len() {
             return 0;
         }
-        // ADR 0029 as amended 2026-10-07 (GitHub #306): the capture itself
+        // ADR 0029 (GitHub #306): the capture itself
         // hands the pages between what is shared and the opener's page floor to
         // a pages-only link, so they need not already be a prefix. What still
         // refuses is a claim reaching past the opener's own page, and an opener

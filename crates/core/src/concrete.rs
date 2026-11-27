@@ -247,8 +247,8 @@ pub struct SchedulerConfig {
     /// bench measures a cold engine and a correctness oracle prefills every
     /// prompt it is given.
     pub prompt_reuse: bool,
-    /// Whether the generation opener's page **rides the capture** (ADR 0029
-    /// as amended 2026-10-07 and 2026-11-05, and ADR 0100, GitHub #306, #508,
+    /// Whether the generation opener's page **rides the capture** (ADR 0029,
+    /// GitHub #306, #508,
     /// #649; the server decides it at load, by the model's family, the card's
     /// GPU generation and a measurement switch). On, a request that can
     /// capture a prompt checkpoint publishes nothing at its opener's page
@@ -1903,7 +1903,7 @@ impl ConcreteScheduler {
     }
 
     /// Record the **pages-only link** request `idx`'s capture at `opener`
-    /// handed over, if it handed one over (ADR 0029 as amended 2026-10-07,
+    /// handed over, if it handed one over (ADR 0029,
     /// GitHub #306), and answer whether the checkpoint has something to stand
     /// on.
     ///
@@ -2048,7 +2048,7 @@ impl ConcreteScheduler {
     }
 
     /// Take retained pages back until `idx` can materialize, or until nothing
-    /// is retained (GitHub #186, ADR 0029/0023 as amended).
+    /// is retained (GitHub #186, ADRs 0029 and 0023).
     ///
     /// This is the **first victim** rule, and it runs *before* the eviction
     /// machinery is asked for anything: a bet is given up before any certain
@@ -4704,7 +4704,7 @@ impl Scheduler for ConcreteScheduler {
         // (`Request::publish_point` walks both in prompt order). This stays
         // the opener's page floor, and the block joins it there.
         request.publish_tokens = publish_tokens;
-        // ADR 0029 as amended 2026-10-07 (GitHub #306): where the opener's
+        // ADR 0029 (GitHub #306): where the opener's
         // page rides the capture, a request that can capture publishes nothing
         // at its floor -- that prefix's image would serve only a prompt parting
         // from this one in the last page before its opener, and the cut it

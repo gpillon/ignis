@@ -1,5 +1,5 @@
-//! GitHub #270 (ADR 0029 as
-//! amended 2026-09-26) — a request carries an ordered **list of reuse
+//! GitHub #270 (ADR 0029)
+//! — a request carries an ordered **list of reuse
 //! boundaries**, not one.
 //!
 //! #188 published a retained prefix at one place, the end of the system block.

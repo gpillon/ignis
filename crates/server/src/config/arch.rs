@@ -545,8 +545,8 @@ pub fn prefill_linear_refusal(
 
 /// Whether a load of `family` on a card of `generation` publishes its
 /// generation opener's page by the prompt checkpoint's capture, as a
-/// pages-only link (ADR 0029 as amended 2026-10-07, 2026-11-05 and
-/// 2026-11-17, GitHub #306, #508, #649): the one decision, which
+/// pages-only link (ADR 0029,
+/// GitHub #306, #508, #649): the one decision, which
 /// [`crate::runtime::EngineShape`] asks for the load's family and the card the
 /// start read.
 ///

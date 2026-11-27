@@ -801,7 +801,7 @@ fn a_live_request_takes_a_retained_prefix_back_rather_than_waiting_for_it() {
 
 #[test]
 fn the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds() {
-    // ADR 0029's amendment (2026-09-16, #188): retained checkpoints go before
+    // ADR 0029 (#188): retained checkpoints go before
     // retained prefixes, LRU within each. A checkpoint serves one
     // conversation's next turn; a retained prefix serves every future request
     // that opens with that block. Between two bets the narrower one goes

@@ -1,4 +1,4 @@
-//! GitHub #508 (spec #503, ADR 0029 as amended 2026-11-05): prompt
+//! GitHub #508 (spec #503, ADR 0029): prompt
 //! checkpoints with the generation opener's page **riding the capture**, the
 //! 27B's policy on Ampere and Ada, against the real model.
 //!

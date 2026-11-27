@@ -127,7 +127,7 @@ pub struct RequestInput {
     /// tokenizer disagrees about.
     pub system_block_tokens: Option<u32>,
     /// The **reuse boundaries** this request carries beside the system block
-    /// (GitHub #270, ADR 0029 as amended): more prompt positions where its
+    /// (GitHub #270, ADR 0029): more prompt positions where its
     /// prefill is cut and the shared prefix ending there is published, each
     /// with how long it is kept.
     ///

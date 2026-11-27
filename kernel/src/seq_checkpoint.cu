@@ -249,8 +249,8 @@ extern "C" int32_t ignis_seq_checkpoint_capture(struct ignis_seq_pool *pool, str
   // claimant at them (the defect GitHub #186 fixed in 565d634).
   //
   // GitHub #187 made it true by publishing a chained prefix at the opener's
-  // page floor first, at a chunk cut of its own. GitHub #306 (ADR 0029 as
-  // amended 2026-10-07) makes it true here, at the opener: the `handed` pages
+  // page floor first, at a chunk cut of its own. GitHub #306 (ADR 0029)
+  // makes it true here, at the opener: the `handed` pages
   // between what the sequence shares and the opener's floor are **lent** to a
   // **pages-only link** chained over its head -- no image, since no sequence
   // stands at its end, and no handle, since nothing claims it on its own. They
