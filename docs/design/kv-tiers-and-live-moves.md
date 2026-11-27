@@ -38,8 +38,11 @@ met in this order, each step only as far as the one before fell short:
 5. Nothing left: the admission waits in the queue, held as `make_room` already
    holds a head, and is admitted when room frees.
 
-Steps 2 to 4 must cover the need together, or nothing is given up and nothing
-moves: what moved would only come back into the room it left. A claim that
+On an admission step 2 goes first and unconditionally, until the entry fits
+or nothing is retained (`reclaim_retained`). Steps 3 and 4 go only when, with
+what retained state gives, they cover the need together: otherwise no claim is
+given up and nothing moves, since what moved would only come back into the
+room it left. A claim that
 makes the room alone goes before anything moves. A shortage of lanes is a
 different path with its own order (`evict_one_victim`): there a lane holder
 goes before a lane-less request, since moving a lane-less request frees no
