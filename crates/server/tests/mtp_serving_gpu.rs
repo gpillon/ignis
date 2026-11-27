@@ -95,7 +95,7 @@ const MODEL: &str = "qwen3.8-27b";
 /// The MTP head's 12 objects (ADR 0095): what an MTP load's weights line
 /// holds beyond a load without the head.
 const HEAD_BYTES: u64 = 451_267_584;
-/// The provisional default window (GitHub #628 sets it).
+/// The default window (GitHub #628 measured it).
 const WINDOW: u32 = 7;
 /// Tokens each greedy prompt may generate.
 const TOTAL: u32 = 128;

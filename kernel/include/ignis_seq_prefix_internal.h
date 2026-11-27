@@ -75,7 +75,11 @@ struct ignis_seq_prefix {
    * image -- a claim copies it, and nothing can claim the prefix once its
    * handle is released (ignis_seq_prefix_release lets it go then) -- and
    * empty (`valid()` false) on every other pool, and in a pages-only link,
-   * whose pages hold only positions every head entry of which is written. */
+   * whose pages hold only positions every head entry of which is written. A
+   * chained prefix's first page is its publisher's copy of its parent's last
+   * page, which holds that publisher's entry, part of the chain's history; a
+   * spilled prefix's blob ends with this copy, as a checkpoint's ends with its
+   * tail. */
   ninfer::PagedKVAllocation last;
   /* The prefix this one extends (GitHub #187), or null for one that owns
    * every page of the head it covers.

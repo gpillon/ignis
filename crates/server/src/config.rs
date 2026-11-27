@@ -1774,8 +1774,8 @@ fn derive_speculation(
         Some(SpecChoice::Backend(backend)) => backend,
     };
     // GitHub #623: the 27B's MTP window is the operator's, or a profile's that
-    // chose MTP too; the window a profile gives beside its own DFlash2 (every
-    // built-in profile's 7) is that drafter's, not the head's.
+    // chose MTP too; the window a profile gives beside its own DFlash2
+    // is that drafter's, not the head's.
     let the_27bs_mtp = the_27bs_mtp(family, Some(backend));
     let window = s.draft_tokens.filter(|_| !the_27bs_mtp || mtp_takes_window(resolution));
     let tokens = match window {
