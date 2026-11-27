@@ -25,9 +25,10 @@ DFlash2, and each round's shape is chosen per round.
   window was taken up to a threshold, and keeps asking while its extended rounds take enough. It reads only what the
   host holds before the next round launches, never the drafter's confidence. The policy (`spec.shape_policy`) turns
   the lanes' asks into the round's shape: `all` extends a round only when every lane in it asks, so no lane pays for
-  another; `aggregate`, the default, which the served gate kept over `all`, when the drafts the asking lanes are
-  expected to take past position 7 exceed what the wider round costs every lane in it; `mixed` grants lane by lane
-  and alone runs a mixed round (ADR 0106, which says where it is the default).
+  another; `aggregate`, the default, which the served gate kept over `all`, at one lane when the lane asks, and at
+  2 to 4 lanes when the drafts the asking lanes are expected to take past position 7 exceed what the wider round
+  costs every lane in it; `mixed` grants lane by lane and alone runs a mixed round (ADR 0106, which says where it is
+  the default).
 - **Rules are judged on served arms.** Two offline replays of round records ranked rules wrongly against the served
   arms: a shape change is a text change, and acceptance depends on the shape history. A rule changes on a served A/B,
   never on a replay alone.
