@@ -24,15 +24,16 @@ read and checked the same way, before anything stops.
   alone. The lists report the entry `available: false` with its `reason`, as for the class.
 - **What a built-in entry states.** `blackwell` on an artifact that runs only there, an NVFP4 artifact, Flash-Next
   and the image model, and on a trellis build not yet verified below Blackwell; none on the models that run on the
-  CPU. Two facts admit a trellis build below Blackwell, and neither is a run of that build on an sm_86 card. Its
-  layout is that of a build that has loaded, prefilled and decoded on one, as the 16 GB 27B has: the engine picks
-  its routes by family and body format, never by weights id. And its quality on the 8.x routes, read on the RTX
-  5090, is within ADR 0082's limit for a route's numerics. A run of it on an sm_86 card would move its numbers, not
-  decide whether it loads: the 16 GB 27B's run there read the RTX 5090's quality. Swift 1.5's 16 GB build states
-  none on those two facts: its conversion sidecar matches the 16 GB 27B's field for field once hashes,
-  quantization errors and provenance are set aside, and its KLD ratio against V0 read 1.0148 [0.9892, 1.0340], and
-  1.0143 [1.0022, 1.0264] with ignis's own GDN prefill, against a limit of 1.05. The 12 GB 27B states none on both
-  grounds, as that build did (ADR 0098).
+  CPU. Two facts admitted Swift 1.5's 16 GB build below Blackwell, and neither is a run of Swift on an sm_86 card.
+  Its layout is that of a build that has loaded, prefilled and decoded on one, as the 16 GB 27B has: the engine
+  picks its routes by family and body format, never by weights id. And its quality on the 8.x routes, read on the
+  RTX 5090, is within ADR 0082's limit for a route's numerics. A run of it on an sm_86 card would move its numbers,
+  not decide whether it loads: the 16 GB 27B's run there read the RTX 5090's quality. So it states none: its
+  conversion sidecar matches the 16 GB 27B's field for field once hashes, quantization errors and provenance are
+  set aside (the same trellis matrices and formats, the same copied objects, the same locally quantized NVFP4
+  drafter, the same byte count), and its KLD ratio against V0, read in #513 on the dense prefill and the integer
+  band, was 1.0148 [0.9892, 1.0340], and 1.0143 [1.0022, 1.0264] with ignis's own GDN prefill, against a limit of
+  1.05. The 12 GB 27B states none and stands on the same two (ADR 0098).
 - **The route checks stay** as the backstop, as the VRAM plan's refusal stays beside the class.
 
 ## Considered Options
