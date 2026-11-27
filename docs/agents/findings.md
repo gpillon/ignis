@@ -39,6 +39,8 @@ and include the other evidence in the document.
 | Work status and work to be done | GitHub issue |
 | Spec, and its tickets' acceptance criteria | the spec's GitHub issue and its sub-issues (before 2026-10-25, a file under `docs/specs/`) |
 | Architectural decision | `docs/adr/` |
+| The rule a module implements | that module's opening documentation comment |
+| A mechanism that spans several modules, with no module as its home | `docs/design/` |
 | Byte-level, ABI or wire-format contract that code cites as normative | `docs/formats/` |
 | Domain term or concept | root `GLOSSARY.md` |
 | Temporary material, raw logs, and experiment output | `.scratch/` |
