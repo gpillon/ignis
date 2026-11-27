@@ -355,7 +355,9 @@ struct ignis_prefill_options {
   /* GitHub #624: the three axes the position before a multimodal span
    * rotated at -- the prompt's `mrope_positions` column at the span's start
    * less one, temporal, height, width -- or NULL. On a 27B load built for the
-   * MTP head, a multimodal span that continues a sequence (start past 0)
+   * MTP head, a multimodal span that continues a sequence (start past 0: a
+   * scheduler chunk after the first, a claimant of a prefix that ends inside
+   * an image, a later turn)
    * needs it: the head's row at that position is built from the span's first
    * token and rotates where the target's hidden there did, which no later
    * span's own positions say. Refused NULL there; unread on a span starting

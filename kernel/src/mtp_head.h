@@ -163,7 +163,9 @@ int32_t frontier_row(ignis_model &model, ignis_seq_pool &pool, ignis_seq &seq, s
 //              sequence consumed -- the continuation hidden and the anchor,
 //              then the target's post-final-norm hidden of each committed
 //              column and the token after it -- so no row the chain built
-//              from the head's own hidden stays below the frontier;
+//              from the head's own hidden stays below the frontier. Eager,
+//              beside the GDN fold and DFlash2's append: it reads the cut,
+//              which the host decides;
 //   the continuation hidden (`commit_continuation`, the round's last device
 //              step): the target's post-final-norm hidden of column c - 1.
 //

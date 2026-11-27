@@ -183,8 +183,9 @@ struct ignis_seq_pool_spec {
    * the last of `kv_num_layers`, and every slot owns the continuation
    * hidden (one BF16 vector of the model's hidden width), zeroed at
    * ignis_seq_alloc; under hq-e8-2b the head's layer keeps ring words of its
-   * own. Such a pool takes no snapshot, restore, retained slot, prefix or
-   * checkpoint yet. Flash-Next's MTP pool names no backend (0): its head's
+   * own. Snapshot, restore, a retained slot, a prefix and a checkpoint carry
+   * that state (GitHub #622, the section table,
+   * ignis_seq_sections.h). Flash-Next's MTP pool names no backend (0): its head's
    * layer is one more of `kv_num_layers` and nothing else. Must match the
    * speculative backend of the model the pool's sequences are stepped with. */
   int32_t speculative_backend;

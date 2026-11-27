@@ -104,8 +104,11 @@ int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uint32_t lanes
  * same inputs as the chain inside the sequence's next width-1 round at that
  * extent, so the same drafts, each the argmax of its step's scores (the
  * lowest id on a tie). Only where each step's scores land differs: its own
- * block of the readout's scratch, not the round's logits, which it leaves
- * as the last round left them. It copies out
+ * block of the readout's scratch, not the round's logits, which a host cut's
+ * repair may still read and which it leaves as the last round left them. The
+ * first-draft readout above (`ignis_mtp_readout`) stays for the
+ * double-precision checks: its row is built on the prefill's attention route,
+ * not the round's. It copies out
  *
  *   out_drafts  I32 [extent]          the chain's drafts, in order
  *   out_scores  BF16 [extent][vocab]  each step's scores, the target's output
@@ -123,8 +126,10 @@ int32_t ignis_mtp_readout_round_hidden(struct ignis_model *model, uint32_t lanes
  * window and set their ring bits, which older keys inside the window still
  * name, so the leaf saves the slot's head residual planes and head ring
  * words before the chain and puts them back after it: the next step reads
- * the window it would have read with no readout. The target's state is read
- * only.
+ * the window it would have read with no readout. Clearing the bits instead,
+ * as a failed round's guard does, would be safe but leave the next round
+ * reading the codec where a sequence never read reads exact rows. The
+ * target's state is read only.
  *
  * Refused (-1, see ignis_mtp_readout_last_error) without the MTP head, on a
  * pool of another drafter, for a sequence of another pool or with no

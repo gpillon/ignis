@@ -276,7 +276,8 @@ struct ignis_seq_pool {
   // buffer as one more layer's planes, but its ring words are its own
   // (`hq_head_ring`, right after the target's): the target's words say which
   // ring rows hold exact keys of the positions the target appended, and the
-  // head appends each position one step later. Null without the head.
+  // head appends each position one step later, a verify round's chain past
+  // the head's frontier besides (kernel/src/mtp_head.h). Null without the head.
   std::unique_ptr<ninfer::DeviceBuffer> mtp_continuation;
   std::uint32_t *hq_head_ring = nullptr;
 

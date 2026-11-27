@@ -1,7 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0016]
-amended-by: [ADR-0029, ADR-0045, ADR-0095]
+amended-by: [ADR-0029, ADR-0045]
 ---
 
 # ADR 0024 — sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse

@@ -12,6 +12,14 @@
 //! hq-e8-2b beside its residual planes (the `hq_residual_window` line), and
 //! the head's buffers in a prefill chunk (`workspace`) and a round
 //! (`decode_graph`). Nothing of DFlash2.
+//!
+//! A verify round adds no line: its chain runs in the round's scratch in a
+//! scope of its own, released before the pass bumps its buffers, its scores
+//! in the round's own logits, which the pass writes whole after it, and its
+//! commit is the one head call over the widest round's columns the
+//! `decode_graph` line already holds. Vision adds its rows' rotation
+//! ([`prefill_scratch_bytes`], [`round_scratch_bytes`]), and a text-only
+//! head load's lines are what they were, to the byte.
 
 use crate::arena::{bf16, words as i32};
 // The target's hidden width, which the head's stem and continuation hidden
