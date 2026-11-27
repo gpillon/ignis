@@ -62,7 +62,7 @@ edit it by hand.
 | [0046](0046-one-declaration-per-config-field.md) | one declaration per config field: flag, env, file key, default, validator | accepted | [0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md) |
 | [0047](0047-a-catalog-the-operator-can-extend.md) | a model catalog the operator can extend, and a `model` command to fetch from it | accepted | [0064](0064-a-catalog-entry-states-its-card-class.md), [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) |
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | an end of turn drawn inside an open reasoning block closes the block instead | accepted | |
-| [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | an idle model is unloaded, and the next request loads it again | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md), [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) |
+| [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | An idle model is unloaded, and the next request loads it again | accepted | |
 | [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
 | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | kernel code is ours, adapted from a named source, or vendored | accepted | |
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | a reasoning loop is taken back, the model is nudged, and the client is told | accepted | [0053](0053-a-loop-is-acted-on-once-it-persists.md) |
