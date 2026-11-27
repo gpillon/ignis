@@ -2,7 +2,7 @@
 
 ## The vision canary fixture (GitHub #178)
 
-`crates/server/tests/fixtures/vision_canary/` is ADR 0014's floor applied to
+`crates/server/tests/fixtures/vision_canary/` is ADR 0082's canary floor applied to
 multimodal prompts: four generated images (a rendered number, a coloured
 square, three circles, a line of screenshot text), one unambiguous question
 each, and the reference's greedy answers.
@@ -10,7 +10,7 @@ each, and the reference's greedy answers.
 teacher-forced agreement over the first 32 answer positions, each prompt
 prefilled twice — whole, and in 48-token spans so the placeholder run crosses
 span boundaries — and **each way clears the 95% floor on its own**, pooled
-over the four canaries the way ADR 0014 pools its own suite.
+over the four canaries the way the text canary pools its own suite.
 
 The questions ask for a sentence, not a word, so the score has resolution:
 the four answers are ~50 scored positions per prefill mode, and one near-tie
