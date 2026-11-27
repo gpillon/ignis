@@ -1,9 +1,9 @@
 # DFlash2 teacher-forced replay of recorded agent turns
 
 The tools behind `docs/findings/2026-09-24-dflash2-sampled-acceptance.md` (spec
-`docs/specs/runtime/08-dflash2-sampled-acceptance.md`, GitHub #267), kept as they
+of GitHub #267), kept as they
 were run so that a drafter or verify change can be paired against the same rounds.
-GitHub #340 (spec `docs/specs/27b-16gb/05-gates-and-simulation.md`, gate 3) runs the
+GitHub #340 (its spec's gate 3) runs the
 same turns on the 16 GB artifact's trellis body and on the served NVFP4 one.
 
 A recorded turn is walked through **real verify rounds** on a DFlash2-7 hq-e8-2b

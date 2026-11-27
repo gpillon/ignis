@@ -1,6 +1,6 @@
 # Image converter
 
-Spec 01 (`docs/specs/image-model/01-the-image-artifact.md`, GitHub #318): the offline tool that
+Spec 01 (GitHub #318): the offline tool that
 turns `Qwen/Qwen-Image-2.1-Turbo` at revision `fc13ba1986fcb905854dc8de2f52eee395f49b5b` into the
 ignis image artifact, a `.ninfer` v2 container of family `Qwen-Image-2.1` (`model_id`
 `ignis-image-2.1-turbo`). CPU only. Python writes **work files**; the Rust packer

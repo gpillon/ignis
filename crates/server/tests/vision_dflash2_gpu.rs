@@ -1,5 +1,5 @@
 //! DFlash2 on a multimodal prefill span (GitHub #195, spec
-//! `docs/specs/vision/01-image-input.md` §Compute seam, ADR 0014).
+//! of GitHub #174, §Compute seam, ADR 0014).
 //!
 //! GitHub #178 fenced `--vision-enabled` and `--spec-backend dflash2` apart at load. What
 //! stood in the way was one thing: the verify round staged each lane's raw KV

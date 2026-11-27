@@ -1,5 +1,5 @@
 //! Vision as a load option (GitHub #177, spec
-//! `docs/specs/vision/01-image-input.md`).
+//! of GitHub #174).
 //!
 //! Like speculation, vision is engine residency, chosen at load and frozen for
 //! the life of that load: with a [`Vision`], the `vision/*` objects are bound

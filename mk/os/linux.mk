@@ -1,5 +1,5 @@
 # Linux hooks. Same contract as mk/os/windows.mk (documented at the top of
-# that file). GitHub #167, spec docs/specs/make/01-linux-hooks.md.
+# that file). GitHub #167.
 #
 # Implemented here: the kernel leaf build and its op tests (kernel/build.sh),
 # the GPU status/guard pair and the run under the GPU lock (mk/linux/gpu.sh,

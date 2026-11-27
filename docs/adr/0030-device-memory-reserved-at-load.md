@@ -69,7 +69,7 @@ retained-state families by `kind`. The series are on
 
 ### Status
 
-Accepted (2026-09-17). Spec: `docs/specs/vram-budget/01-vram-budget.md`.
+Accepted (2026-09-17). Spec: GitHub #207.
 Clarifies ADR 0029 (its device pool of retained images is physical: retained
 slots) and absorbs GitHub #204. Measurement and code analysis:
 `.scratch/vram-analysis/REPORT.md`. Amended 2026-09-18 (owner request):
@@ -428,7 +428,7 @@ unexported.
 
 ### Amendment (2026-09-29) — retained slots on the host (GitHub #281)
 
-Spec: `docs/specs/vram-budget/02-retained-host.md`.
+Spec: GitHub #281.
 
 Measured with an 8-agent swarm, the device slots did little of the reuse:
 eight agents need about seventeen slots, so a conversation's image was
@@ -472,7 +472,7 @@ checkpoint hits). Meanwhile the eight slots and their residual window held
 
 ### Amendment (2026-10-07) — the KV pool policy (ADR 0045)
 
-Spec: `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
+Spec: GitHub #309.
 
 - **Layout item 7, "the KV pool, which takes the rest", holds for a resident
   load only**: the 27B, and Flash-Next on a card that holds every expert.

@@ -40,7 +40,7 @@ Changed since, by ADR 0029, ADR 0045 and GitHub issues:
 ### Status
 
 Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
-`docs/specs/runtime/04-reference-feature-floor.md`. Applies ADR 0009
+linked from the tickets of #65. Applies ADR 0009
 (step-level device-resident ABI) to the two features that move sequence state.
 Amended 2026-10-07 by ADR 0045: a transfer may move a blob a window at a time,
 through the options struct this ADR reserved for "a partial extent". KV-disk
@@ -60,7 +60,7 @@ conv taps, a position and last token, and since #99 a penalty-count row. The
 G3 session established that all of these are consistent together at a completed
 chunk boundary, and recorded a caveat with it: a *new* state section does not
 inherit that snapshot-point permission and must re-earn it
-(`docs/archive/DEFERRED-DECISIONS.md` item 5).
+(`records-2026-11-27:docs/archive/DEFERRED-DECISIONS.md` item 5).
 
 Two questions followed. First, how much of that structure crosses the C ABI.
 Exposing a section table to Rust would let the host tier compute layouts, and

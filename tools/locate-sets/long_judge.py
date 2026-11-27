@@ -1,5 +1,5 @@
 """EXPERIMENT (branch locate-long-context): spec 20's judge, registered
-before sets L2 and R were asked (`docs/specs/decide/20-locate-at-length.md`).
+before sets L2 and R were asked (`records-2026-11-27:docs/specs/decide/20-locate-at-length.md`).
 
 Reads `long.py ask`'s rows and the server's dumps (both prefills' rows of
 the 32 served heads) and scores, per length tier:

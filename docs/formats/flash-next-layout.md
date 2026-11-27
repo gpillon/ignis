@@ -3,7 +3,7 @@
 GitHub: #299 (spec 01). Owner of this document: the converter (`tools/flash-next-converter/`).
 Readers: the Rust packer and reader (`crates/artifact`), the MoE kernels (spec 02),
 residency (spec 03), the forward and its gates (spec 04). A spec named by its number here
-is the Flash-Next spec of that number under `docs/specs/flash-next/`. Why the format is what
+is the Flash-Next spec of that number: GitHub #299 to #304 for specs 01 to 06, #307 for spec 07. Why the format is what
 it is: ADR 0044 (the trellis experts) and ADR 0002 (the `.ninfer` container). Three more
 converters write by it: the 16 GB 27B's (`tools/27b-16gb-converter/`) §2's work tree and §3's
 records, the image model's (`tools/image-converter/`) §2's work tree and §6's encodings, and the

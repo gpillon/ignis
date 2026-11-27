@@ -1,5 +1,5 @@
-//! Where a `/v1/decide` state will be resumed (GitHub #270, spec
-//! `docs/specs/decide/16-reuse-boundaries.md`, ADR 0029 as amended).
+//! Where a `/v1/decide` state will be resumed (GitHub #270,
+//! ADR 0029 as amended).
 //!
 //! A hybrid resumes only where its prefill captured state, so the positions a
 //! later request will resume from have to be predicted before the prefill.

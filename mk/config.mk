@@ -169,7 +169,7 @@ LOOP_GUARD ?=
 # 0063 §3; a context named here is explicit and never adapts) -- then
 # hq-e8-2b KV, DFlash2 speculation with a 7-token draft window. MAX_CONTEXT=n
 # names a context (524288 was make's own until #336). The G5 gate legs
-# (docs/specs/runtime/05) ran at MAX_CONTEXT=262144 ROPE_SCALING=none.
+# (GitHub #66) ran at MAX_CONTEXT=262144 ROPE_SCALING=none.
 # Empty = leave the flag off (the server's default); SPEC=off turns speculation
 # off (SPEC= leaves it to the server, and the card class's profile speculates).
 # PREFILL_CHUNK is left to the server too: the card class's profile (`auto`):

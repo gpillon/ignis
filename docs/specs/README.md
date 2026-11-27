@@ -1,15 +1,15 @@
-# Specs (frozen)
+# Specs
 
-The specs written before 2026-10-25, one folder per feature. Since then a spec
-is a GitHub issue and its tickets are its sub-issues (ADR 0070), and these
-files are frozen: an issue opened before that date links its spec here, and
-the file is the record of what its tickets were asked to build. A file here is
-not updated, apart from a path when a file it cites moves: a new spec, or a
-change to an old one, is an issue.
+The specs written before 2026-10-25, one folder per feature, were here. They
+left the main branch on 2026-11-27 and are whole under the tag
+`records-2026-11-27`. Each is linked from its issue: an issue opened before
+2026-10-25 has a short body that links its spec at the tag. Since that date a
+spec is a GitHub issue and its tickets are its sub-issues
+(`docs/agents/issue-tracker.md`).
 
-Two specs were still in flight at the freeze and stayed files until their
-tickets closed: `speech/08-diarization.md` (#361, closed on 2026-10-26) and
-`speech/07-transcribe.md` (#362, closed on 2026-10-28). The second was edited
-once more after that, on 2026-10-31: its As built gained a section for #442,
-a pause written as the context with a word or two changed (88eaf360,
-73c0ffcb).
+To open one, and to list them:
+
+```sh
+git show records-2026-11-27:docs/specs/<feature>/<file>.md
+git ls-tree -r --name-only records-2026-11-27 docs/specs
+```

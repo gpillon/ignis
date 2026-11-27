@@ -1,4 +1,4 @@
-"""The 16 GB artifact's converter (spec docs/specs/27b-16gb/01-the-16gb-artifact.md, GitHub #338).
+"""The 16 GB artifact's converter (GitHub #338).
 
 `run` writes the packer's work tree (docs/formats/flash-next-layout.md §2: per unit a
 `tensors.json`, one payload file per tensor and a `DONE` written last; `frontend/` holds the

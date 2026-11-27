@@ -5,7 +5,7 @@
 //! MP4/M4A) are decoded by symphonia; the Ogg and Matroska/WebM containers
 //! are demuxed, and what they carry is decoded when it is FLAC. Opus is
 //! not decoded: libopus is a native build the owner accepts only if a
-//! verification build passes (`docs/specs/speech/spec.md`, "Native code
+//! verification build passes (spec of GitHub #350, "Native code
 //! outside `cuda`"), and until then an Opus clip is refused naming what is
 //! accepted. Resampling to 16 kHz is a windowed-sinc filter of our own.
 

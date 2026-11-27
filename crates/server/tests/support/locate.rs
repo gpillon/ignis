@@ -1,5 +1,5 @@
 //! The `locate` prompt and its segment-to-key map, as spec 18 phase A
-//! measures them (`docs/specs/decide/18-locate-by-attention.md`, GitHub #274).
+//! measures them (GitHub #274).
 //!
 //! Shared by the calibration harnesses (`attention_head_locate_gpu.rs`,
 //! `attention_span_locate_gpu.rs`) and their table-driven tests

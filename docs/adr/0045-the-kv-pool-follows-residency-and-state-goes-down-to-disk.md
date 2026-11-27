@@ -110,7 +110,7 @@ Accepted (2026-10-07). The owner decided the pool policy and its 524,288-token
 default, kept the expert cache floor as a refusal with an opt-in to start below
 it, and asked for Tier 2 to be built. Items marked *(agent proposal)* are
 defaults the owner confirms or changes; the others are the owner's. Spec:
-`docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
+GitHub #309.
 **Amends ADR 0030** (the KV pool line, the expert cache floor), **ADR 0029**
 (Tier 2 is built), **ADR 0024** (a transfer may move a window at a time),
 **ADR 0023** (the eviction priority reaches one tier further down; a page
@@ -495,7 +495,7 @@ Not built, since P0 chose the fixed branch below
 design, a reservation of the prompt plus a 32-page step that grows as the lane
 decodes, a lane that parks, an entry room of four steps, a last resort and
 `ignis_seq_grow` in the leaf, is in this file as of commit 606b5335 and in
-spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`.
+the spec of GitHub #309.
 
 ##### The fixed branch: P0 fails
 
@@ -876,5 +876,5 @@ When KV-RAM cannot take a device victim, the victim goes straight to disk
   KV-RAM live victim goes to disk instead. Only the last resort, when every
   tier refuses, counts there.
 - **v1's disk tier cannot outlive a restart or a model switch.** Phase 2's
-  idea (`docs/specs/flash-next/phase2-model-switch-notes.md`) starts from the
+  idea (`records-2026-11-27:docs/specs/flash-next/phase2-model-switch-notes.md`) starts from the
   header this ADR already writes.

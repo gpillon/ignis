@@ -36,10 +36,10 @@ set of decisions, `docs/adr/`, listed in its generated index
 - When a decision changes, the live places that cite its ADR are reread in the
   same change: the number stays valid, a comment that paraphrases the old
   decision may not. Live is everything but the historical set:
-  `docs/findings/`, the release notes, `docs/specs/` and `docs/archive/`, with
-  commit messages and issues. A folder nobody lists there is live
-  (`HISTORICAL` in `mk/adr-index.py`). `make records-check` names each ADR
-  whose text changed.
+  `docs/findings/`, the release notes, and `docs/specs/` and `docs/archive/`,
+  which each keep one page saying where their files went, with commit
+  messages and issues. A folder nobody lists there is live (`HISTORICAL` in
+  `mk/adr-index.py`). `make records-check` names each ADR whose text changed.
 - When an ADR is written:
   - a new decision is a new ADR, `proposed` while it waits for the owner;
   - a change to a decision that the owner has confirmed, in a grilling for

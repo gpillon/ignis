@@ -1,4 +1,4 @@
-"""GitHub #270 live acceptance (spec docs/specs/decide/16-reuse-boundaries.md,
+"""GitHub #270 live acceptance (its spec's
 acceptance 7): does /v1/decide reuse a `state` given as content parts?
 
 The issue's repro, kept in the repository and extended with a reuse-marker

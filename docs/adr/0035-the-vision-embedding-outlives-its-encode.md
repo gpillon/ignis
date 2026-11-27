@@ -22,7 +22,7 @@ page and the prefill's scatter reads it in place.
 
 Sources: owner decision 2026-09-20 on GitHub #243; the split measured in
 `docs/findings/2026-09-20-number-width-and-decide-e2e.md`; spec
-`docs/specs/vision-fanout/01-share-the-vision-embedding.md`.
+of GitHub #243.
 
 ## Context
 

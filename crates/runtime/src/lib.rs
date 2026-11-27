@@ -36,7 +36,7 @@ pub use flash_next_leaf::{FlashNextCheckpoint, FlashNextLeaf, FlashNextModel, Fl
 pub use ignis_core::KV_PAGE_TOKENS;
 
 /// The default prefill chunk width, in tokens (spec
-/// `docs/specs/runtime/02-real-prefill.md`): the reference's own
+/// of GitHub #63): the reference's own
 /// default, left alone — the chunk width is a knob this phase exposes,
 /// not a number it tunes. Unconditional on the `cuda` feature: it is a
 /// plain number, and both `ignis_server::config` (always compiled) and

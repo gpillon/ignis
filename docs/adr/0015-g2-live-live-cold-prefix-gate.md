@@ -19,8 +19,8 @@ launch of the exact same binary, on the exact same GPU, moments apart. Every
 decision below still holds; ADR 0021 adds the launch-pooling requirement on
 top of it.
 
-Sources: `docs/specs/runtime/02-real-prefill.md` (GitHub #63, the spec
-this ADR serves), `docs/archive/REVIEW-2026-09-05.md` §6 (Phase 2), the
+Sources: the phase 2 spec (GitHub #63, the spec
+this ADR serves), `records-2026-11-27:docs/archive/REVIEW-2026-09-05.md` §6 (Phase 2), the
 reference's published context-length tables.
 
 ## Context

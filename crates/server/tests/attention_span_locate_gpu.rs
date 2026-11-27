@@ -1,6 +1,6 @@
 //! Where in a text does the attention point, to the token? The instrument
-//! of spec 19 phase 1 (`docs/specs/decide/19-a-span-read-from-attention.md`,
-//! GitHub #276), over the span sets `tools/locate-sets/spans.py` writes.
+//! of spec 19 phase 1
+//! (GitHub #276), over the span sets `tools/locate-sets/spans.py` writes.
 //!
 //! Spec 18's harness (`attention_head_locate_gpu.rs`) dumped every head at
 //! one position over the state's keys, for two scaffolds. Phase 0 read those

@@ -1,5 +1,5 @@
 /* ignis kernel leaf: the DFlash2 proposal readout -- a test-only measurement
- * seam (GitHub #267, docs/specs/runtime/08-dflash2-sampled-acceptance.md).
+ * seam (GitHub #267).
  *
  * NOT part of the serving path, and no serving code calls it. It exists so a
  * replay of recorded agent turns can read, at any sequence state, what the
