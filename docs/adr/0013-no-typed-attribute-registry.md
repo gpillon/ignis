@@ -6,7 +6,7 @@ status: accepted
 
 ## Status
 
-Accepted (2026-09-07, grilling session on `docs/specs/logging/spec.md`).
+Accepted (2026-09-07, grilling session on `records-2026-11-27:docs/specs/logging/spec.md`).
 
 ## Context
 

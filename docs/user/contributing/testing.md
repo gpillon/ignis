@@ -568,7 +568,7 @@ cargo test --release -p ignis-speech --test oracle -- --ignored --test-threads=1
 ```
 
 The fixtures and their bounds are recorded by `tools/speech-oracle/record.py`
-([spec speech/01](../../specs/speech/01-cpu-executor.md)).
+([spec speech/01, issue #351](https://github.com/gpillon/ignis/issues/351)).
 
 `server_vad`'s voice activity detection has its own: the default suite checks
 the port against Silero's recorded probabilities on the fixture clip, and the
@@ -577,7 +577,7 @@ the port against Silero's recorded probabilities on the fixture clip, and the
 (`IGNIS_SPEECH_LEAD_MS=0,500,1000,1500` adds arms of other leading silences, each
 reported).
 Its records come from `tools/speech-vad/record.py`
-([spec speech/05](../../specs/speech/05-server-vad.md)):
+([spec speech/05, issue #355](https://github.com/gpillon/ignis/issues/355)):
 
 ```sh
 cargo test --release -p ignis-speech --test vad -- --ignored --test-threads=1

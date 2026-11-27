@@ -1,6 +1,6 @@
 """Spec 22's set R3 (GitHub #278): real logs for the acceptance of `locate`'s
 defaults, registered before any route is asked on it
-(`docs/specs/decide/22-locate-by-copy-over-a-folded-state.md` § Set R3).
+(the spec GitHub #278 links, § Set R3).
 
 Two sources, neither ever committed (`.scratch/`):
 

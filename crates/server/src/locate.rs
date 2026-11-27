@@ -1,5 +1,5 @@
 //! `locate`'s prompt and its segments (spec
-//! `docs/specs/decide/18-locate-by-attention.md`, GitHub #275, ADR 0041):
+//! 18, GitHub #275, ADR 0041):
 //! the pure host functions that turn a caller's `state` into the prompt the
 //! vote was calibrated on, and each **segment** of it into the keys its
 //! heads are read over.

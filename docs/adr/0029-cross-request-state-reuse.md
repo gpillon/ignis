@@ -79,7 +79,7 @@ headings one level down.
 ### Status
 
 Accepted (2026-09-16) — GitHub #183 (absorbs #168). Spec:
-`docs/specs/kv-reuse/01-cross-request-reuse.md`. Builds on ADR 0024
+linked from #183. Builds on ADR 0024
 (sequence state transfer) and ADR 0023 (eviction priority), and amends both.
 Clarified by ADR 0030 (2026-09-17): the device pool of retained images below
 is physical — **retained slots** reserved at load, holding every shared
@@ -340,7 +340,7 @@ submitted), an **observed fork** (the end of the longest run of leading
 content parts a recent request also began with — the second occurrence
 publishes, the third claims), and a **reuse marker** (`cache_control:
 {"type": "ephemeral"}` on a content part; a request carrying one gets no
-observed-fork boundary). Spec: `docs/specs/decide/16-reuse-boundaries.md`.
+observed-fork boundary). Spec: GitHub #270.
 
 What does not change, and why it is consistent with the Decision:
 
@@ -478,7 +478,7 @@ Considered and rejected:
 ### Amendment (2026-10-07) — Tier 2 is built (ADR 0045)
 
 The Decision's "Three residency tiers, Tier 2 prepared" is superseded: KV-disk
-is built (ADR 0045, spec `docs/specs/vram-budget/03-kv-pool-policy-and-kv-disk.md`).
+is built (ADR 0045, spec of GitHub #309).
 
 - **What KV-RAM gives up goes to the disk** instead of nowhere, and a device
   victim KV-RAM cannot take goes straight there. A blob comes back from the

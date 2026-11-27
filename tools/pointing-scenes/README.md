@@ -1,8 +1,8 @@
 # Pointing scenes, the pointing head and the head set
 
 The tools behind `/v1/decide`'s one-pass `point` (spec
-`docs/specs/decide/13-point-by-attention-head.md`, GitHub #260, ADR 0038) and
-its anchored head set (spec `docs/specs/decide/14-point-and-box-from-the-head-set.md`),
+13, GitHub #260, ADR 0038) and
+its anchored head set (spec 14, GitHub #263),
 kept as they were run so that recalibrating for a new artifact is a repeat
 and not a new study.
 

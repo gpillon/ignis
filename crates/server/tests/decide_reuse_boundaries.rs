@@ -1,4 +1,4 @@
-//! GitHub #270 (spec `docs/specs/decide/16-reuse-boundaries.md`) — where a
+//! GitHub #270 — where a
 //! decision's `state` can be resumed, over the HTTP surface and a real
 //! `ConcreteScheduler` on the deterministic `MockCompute` (ADR 0006).
 //!

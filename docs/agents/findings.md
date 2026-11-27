@@ -37,7 +37,7 @@ and include the other evidence in the document.
 | Content | Authoritative location |
 |---|---|
 | Work status and work to be done | GitHub issue |
-| Spec, and its tickets' acceptance criteria | the spec's GitHub issue and its sub-issues (before 2026-10-25, a file under `docs/specs/`) |
+| Spec, and its tickets' acceptance criteria | the spec's GitHub issue and its sub-issues (before 2026-10-25, a file its issue links at the tag `records-2026-11-27`) |
 | Architectural decision | `docs/adr/` |
 | The rule a module implements | that module's opening documentation comment |
 | A mechanism that spans several modules, with no module as its home | `docs/design/` |
@@ -127,7 +127,8 @@ capture and the report derived from it, and leave the capture on disk;
 - `Related`, `Superseded by` and `Corrected by` use repository-relative links
   when the target is in the repository, and full links for GitHub issues or
   external sources. A relative link in `Superseded by` or `Corrected by` must
-  resolve to a file that exists.
+  resolve to a file that exists, or lead into `docs/specs/` or `docs/archive/`,
+  whose files are under the tag `records-2026-11-27`.
 
 | Topic | What it holds |
 |---|---|

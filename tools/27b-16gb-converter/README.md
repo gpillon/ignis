@@ -1,6 +1,6 @@
 # 27B 16 GB converter
 
-Spec 01 of the 27B on 16 GB cards (`docs/specs/27b-16gb/01-the-16gb-artifact.md`, GitHub #338): the
+Spec 01 of the 27B on 16 GB cards (GitHub #338): the
 offline tool that turns the public EXL3 quant `turboderp/Qwen3.8-27B-exl3`, branch `SC_3.00bpw_H4`, and
 the served artifact `qwen3_8_27b_nvfp4full-v2.ninfer` into the packer's **work tree** for the 16 GB
 artifact `qwen3_8_27b_trellis_sc30-v2.ninfer` (identity `qwen3.8-27b` / `trellis-sc30`). The Rust packer

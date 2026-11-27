@@ -1,4 +1,4 @@
-//! GitHub #270 (spec `docs/specs/decide/16-reuse-boundaries.md`, ADR 0029 as
+//! GitHub #270 (ADR 0029 as
 //! amended 2026-09-26) — a request carries an ordered **list of reuse
 //! boundaries**, not one.
 //!

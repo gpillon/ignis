@@ -1,6 +1,6 @@
 # Flash-Next converter
 
-Spec 01 (`docs/specs/flash-next/01-the-flash-next-artifact.md`, GitHub #299): the offline
+Spec 01 (GitHub #299): the offline
 tool that turns `Qwen/Qwen3.8-Flash-Next` at revision
 `de4b8e4d43b917e7706784d8bb445c9af86a3540` into ignis **work files** (trellis experts with a K
 per expert, FP8 non-experts, the INT4 n-gram table), the **reference recordings** and the

@@ -1,4 +1,4 @@
-//! The **shortlist** (spec `docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`,
+//! The **shortlist** (spec 22,
 //! GitHub #278, ADR 0042): a `locate` whose heads narrow a very long text to
 //! a few candidates and whose labelled `choice` decides among them, with no
 //! token generated.

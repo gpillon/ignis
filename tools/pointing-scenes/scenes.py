@@ -1,6 +1,6 @@
 """N pointing scenes with the blue button somewhere different every time.
 
-E-P1 of `docs/specs/decide/12-the-coordinate-in-the-latent.md` fits a probe,
+E-P1 of `records-2026-11-27:docs/specs/decide/12-the-coordinate-in-the-latent.md` fits a probe,
 and a fit needs samples that move. The committed fixture is three scenes
 chosen to vary the button's *size*; this varies its **position**, which is
 the quantity the probe has to recover, and keeps the rest of the scene the

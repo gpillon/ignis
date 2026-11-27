@@ -6,7 +6,7 @@ status: accepted
 
 ## Status
 
-Accepted (2026-09-23, owner — spec `docs/specs/decide/15-the-head-box-reads-inside-the-cell.md`,
+Accepted (2026-09-23, owner — spec 15 of `/v1/decide`,
 GitHub #264). **Extends ADR 0039**, which extends ADR 0038. Everything both
 decided holds: the job names exactly what to read, exactly that comes back,
 the keys are the ones attention read, and a read the leaf cannot make is a

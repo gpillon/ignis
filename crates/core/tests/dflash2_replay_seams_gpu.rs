@@ -1,5 +1,5 @@
 //! GPU coverage for the acceptance replay's two measurement seams (GitHub
-//! #267, docs/specs/runtime/08-dflash2-sampled-acceptance.md), on both 27B
+//! #267), on both 27B
 //! bodies: the served NVFP4 one and the 16 GB artifact's trellis one (GitHub
 //! #339, #340). Neither seam is a serving path; the replay of recorded agent
 //! turns (`crates/runtime/examples/dflash2_replay.rs`) stands on both.

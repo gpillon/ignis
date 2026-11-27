@@ -7,7 +7,7 @@ status: accepted
 ## Status
 
 Proposed (2026-09-28, revised twice the same day — spec
-`docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`, GitHub #278).
+22, GitHub #278).
 Accepted when spec 22's acceptance holds, with its numbers written here.
 **Extends ADR 0041**, whose head vote becomes one of two methods, unchanged.
 **Partial acceptance, 2026-09-28**

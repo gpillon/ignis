@@ -10,8 +10,8 @@ amends: [ADR-0049, ADR-0050]
 Accepted (2026-10-24, owner): the grilling session on speech recognition of
 2026-10-23/24, decisions Q1-Q52 and the validated Playground mockup (Q17);
 this ADR records Q8-Q9, Q14, Q26, Q28-Q35, Q39-Q40, Q44, Q46, Q53 and
-Q56. Specs
-`docs/specs/speech/`.
+Q56. Specs:
+GitHub #350 and its tickets.
 - **Amends** ADR 0050's "one model at a time", for the speech model only: it
   is loaded beside the text or image model. The image model is still never
   loaded beside a text model.

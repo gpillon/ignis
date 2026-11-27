@@ -18,7 +18,7 @@ is the reference's file*, and a script proves it.
   before editing anything here; nothing below changes.
 - Attribution: `kernel/NOTICE` (the subtree is Apache-2.0; `LICENSE` is
   vendored alongside the code)
-- Spec: `docs/specs/runtime/01-device-resident-forward.md` (GitHub #36)
+- Spec: GitHub #36
 
 ## The manifest
 
