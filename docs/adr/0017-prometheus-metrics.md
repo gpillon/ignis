@@ -251,7 +251,7 @@ a memory gauge's zero is a reading -- which is why its name stays outside the
 lays an image load out by its condition budget, and *In use now* reads the
 prefixes against it.
 Amended 2026-10-18 (#330, spec server/14): five families for the **loop
-guard** (ADR 0052, 0053), rendered after the forced-close counter. No fact of
+guard** (ADR 0052), rendered after the forced-close counter. No fact of
 the guard reaches the telemetry consumer: the guard's own task records them,
 off the model thread, into the same atomics. `ignis_loop_guard_loops_total`'s
 `outcome` is the guard's log line it counts, one increment beside each
