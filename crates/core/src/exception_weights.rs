@@ -14,7 +14,7 @@ use std::fmt;
 /// default is `bf16`, so a load bound directly keeps the stored numerics
 /// unless it names FP8; the server's `model.exception_weights` is an
 /// [`ExceptionWeightsSetting`], `auto` by default, which its config
-/// resolution decides by the card (ADR 0103).
+/// resolution decides by the card (ADR 0065).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ExceptionWeights {
     /// As the artifact stores them.
@@ -56,7 +56,7 @@ impl fmt::Display for ExceptionWeights {
     }
 }
 
-/// `--model-exception-weights` as configured (GitHub #682, ADR 0103):
+/// `--model-exception-weights` as configured (GitHub #682, ADR 0065):
 /// `auto`, the default, or the weights spelled out. The server's config
 /// resolution decides `auto` beside the card it reads: `fp8` on a card that
 /// runs the block-scaled FP8 MMA (compute capability 12.0), `bf16` on any

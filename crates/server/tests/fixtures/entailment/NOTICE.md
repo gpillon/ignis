@@ -143,7 +143,7 @@ named as a flag, resolved with no file and no environment and loaded
 through the server's own load path. `s-bf16-yarn3` and `s-fp8-yarn3.5` are
 each exception weights' served shape on the RTX 5090; every other served
 arm moves one value from its weights' served shape. Which context a start
-keeps follows the VRAM free on the card at start (ADR 0103): under the
+keeps follows the VRAM free on the card at start (ADR 0065): under the
 profile's 1,200 MiB headroom, FP8 keeps the profile's 917,504 tokens with at
 least 28,483 MiB free and BF16 with at least 28,993 MiB, and each adapts
 below that; a 1,500 MiB headroom raises both by 300 MiB. With 28,549 MiB

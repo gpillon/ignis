@@ -741,7 +741,7 @@ async fn count_use(State(server): State<Arc<Server>>, req: Request, next: Next) 
     next.run(req).await.map(|body| axum::body::Body::new(crate::idle::Counted::new(body, in_use)))
 }
 
-/// The routes whose `POST` uses the model (ADR 0049 §2: what the serving
+/// The routes whose `POST` uses the model (ADR 0049, `crate::idle`: what the serving
 /// gate holds, apart from the routes that only report state or drive a
 /// switch): the completions, the decision and its alias, the counting
 /// routes, which read the model's tokenizer, and the image routes. The
