@@ -4,155 +4,67 @@ status: accepted
 
 # Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves
 
-Qwen3.8-Flash-Next is multimodal upstream: at the pinned revision its config
-says `language_model_only: false` and its shard 1 holds 333 `model.visual.*`
-tensors. The artifact was converted text-only (spec `flash-next/04` left vision
-out of scope), so ignis refuses an image to it. Its tower has the 27B's shape
-but its own weights: the same origin (the block norms agree within 0.3-0.7%)
-retrained with the model (an attention projection 16% apart, the merger's norm
-correlating at 0.84), and a merger that writes 2,560 columns, Flash-Next's
-hidden width, not 5,120. The owner decided on 2026-11-09 (#555) that Flash-Next
-takes images with the 27B's feature set, and how:
+Qwen3.8-Flash-Next is multimodal upstream, but its artifact was converted text-only, so ignis refused an image to it.
+Its tower has the 27B's shape but its own weights: the same origin (the block norms agree within 0.3-0.7%) retrained
+with the model (an attention projection 16% apart, the merger's norm correlating at 0.84), and a merger that writes
+Flash-Next's hidden width, half the 27B's. Flash-Next takes images with the 27B's feature set, and this is how:
 
-- **The tower and its merger ship in a companion container of their own**,
-  beside the main one, as the MTP head does (flash-next-layout.md §13): their
-  own identity, a pair pin to the main container, bound only when vision is
-  on. They are encoded from the pinned revision's BF16 tensors, every matrix
-  in W8 (the 27B tower's recipe until #560's alarm, see As built). The 72 GB
-  main container and its content hash stay as they are; the download grows by
-  about 0.5 GB, which the catalog always fetches,
-  as it fetches the MTP companion. A later packaging of ignis's own may fold
-  the companions back into one file.
-- **The encoder works in memory the prefill already reserves**: Flash-Next's
-  prefill scratch and its expert staging ring (1,574,895,616 bytes on the RTX
-  5090 at the 2026-11-09 start), both idle while an item encodes, since the
-  encode runs before the chunk's forward. A vision load plans the same expert
-  cache as a text-only load at the same settings. Where the two areas cannot
-  hold an item of the item bound, the bound shrinks to what fits and the VRAM
-  plan says so: vision never takes the expert cache. The tower and the
-  embedding pool follow ADR 0075's residency, `host` on the RTX 5090's
-  profile, so a vision load with no image in flight costs no VRAM.
-- **Vision stays a load option, off by default.** A start or a switch that
-  asks for it without the companion is refused naming the file, before
-  anything is torn down.
-- **Its quality is checked without the 335 GiB BF16 checkpoint.** ADR 0082's
-  gate scores text, and the text path does not change. The image path adds
-  three checks: the encoded tower against the BF16 tower, run from shard 1
-  alone, with the 27B tower's error under the same recipe as its bar; the
-  three-axis positions in the attention and the indexer, exact against the
-  reference implementation on synthetic tensors; and accuracy on images
-  with known answers, reported beside the 27B's. A KLD against BF16 on image
-  prompts runs only if those raise an alarm.
+- **The tower and its merger ship in a companion container of their own**, beside the main one, as the MTP head
+  does: their own identity, a pair pin to the main container, bound only when vision is on
+  ([the layout](../formats/flash-next-layout.md), "The vision companion container"). The main container and its
+  content hash stay as they are; the download grows by about 0.5 GB, which the catalog always fetches, as it fetches
+  the MTP companion. A later packaging of ignis's own may fold the companions back into one file.
+- **Every matrix of the tower is W8**, encoded from the pinned revision's BF16 tensors, not the 27B tower's grouped
+  recipe: under that recipe the tower check raised its alarm, the error growing at Flash-Next's retrained merger,
+  and W8 answers it for about 0.2 GB more of tower, the same staging slot and no new kernel route: every matrix
+  takes a W8 route the dispatch already serves, the merger's second linear through the recorded patch that gave its
+  width one (ADR 0088). The 27B's tower and recipe do not change. A companion of the grouped encoding is refused when
+  it opens, naming both weights ids, so a start or a switch refuses it before anything loads.
+- **The encoder works in memory the prefill already reserves**: Flash-Next's prefill scratch and its expert staging
+  ring, both idle while an item encodes, since the encode runs before the chunk's forward. A vision load plans the
+  same expert cache as a text-only load at the same settings: the forward's vision inputs ride in memory a text load
+  reserves too, and a vision prefill refuses while the decode graphs' scratch is in use, a verify round while the
+  prefill scratch is. Where the two areas cannot hold an item of the item bound, the bound shrinks to what fits and
+  the VRAM plan says so: vision never takes the expert cache. The tower and the embedding pool follow ADR 0075's
+  residency, `host` on the RTX 5090's profile, so a vision load with no image in flight costs no VRAM.
+- **Vision stays a load option, off by default**: the vision and media fields apply to both text families, each
+  family its own, and the built-in profiles turn vision on for the 27B only. A start or a switch that asks for it
+  without the companion is refused naming the file, before anything is torn down.
+- **A switch carries the vision of the model it replaces**, to the target's own vision settings, unless vision is
+  named off for the target itself, which wins; naming it off for every model does not stop the carry. A model
+  serving without vision carries nothing, and a start is unchanged. The carried value is decided again at every
+  switch and never written to the config file.
+- **Its quality is checked without the 335 GiB BF16 checkpoint.** ADR 0082's gate scores text, and the text path does
+  not change. The image path adds three checks: the encoded tower against the BF16 tower, run from the checkpoint's
+  first shard alone, with the 27B tower's error under the same recipe as its bar; the three-axis positions in the
+  attention and the indexer, exact against the reference implementation on synthetic tensors; and accuracy on images
+  with known answers, reported beside the 27B's. A KLD against BF16 on image prompts runs only if those raise an
+  alarm ([the results](../findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md)).
 
 ## Considered Options
 
-- **A new revision of the main container with the visual tensors**: 72 GB
-  uploaded and downloaded again for 0.5 GB of tower, a new content hash, and
-  the MTP companion's pair pin cut again.
-- **The 27B's encoder rule, its own share sized for the item bound** (the
-  larger of the prefill's share and the encoder's, ADR 0030): up to ~0.9 GiB
-  beyond the prefill's, which on Flash-Next comes out of the expert cache.
-  About 1.1 GB of cache is worth 4% of one-lane decode and 9% of three-lane
-  decode (finding 2026-10-08, the KV pool following residency), paid while no
-  image is in flight.
-- **Borrowing free KV pages** (ADR 0067's loan, #356; the option ADR 0075
-  parked on #409): it would free the pool too, but needs the loan, an
-  admission for an image that arrives with the pool full, and encoder kernels
-  over scattered pages. It stays on #409, for both families.
-- **The 27B's tower objects reused as they are**: the weights differ, and the
-  merger's width with them.
+- **A new revision of the main container with the visual tensors**: 72 GB uploaded and downloaded again for 0.5 GB
+  of tower, a new content hash, and the MTP companion's pair pin cut again.
+- **The 27B's encoder rule, its own share sized for the item bound** (the larger of the prefill's share and the
+  encoder's, ADR 0030): up to ~0.9 GiB beyond the prefill's, which on Flash-Next comes out of the expert cache. About
+  1.1 GB of cache is worth 4% of one-lane decode and 9% of three-lane decode
+  ([finding](../findings/2026-10-08-flash-next-kv-pool-follows-residency.md)), paid while no image is in flight.
+- **Borrowing free KV pages** (ADR 0067's loan; the option ADR 0075 parked on #409): it would free the pool too, but
+  needs the loan, an admission for an image that arrives with the pool full, and encoder kernels over scattered
+  pages. It stays on #409, for both families.
+- **The 27B's tower objects reused as they are**: the weights differ, and the merger's width with them.
 
 ## Consequences
 
-- On a card that holds every expert (ADR 0054) there is no staging ring, and
-  the prefill scratch alone bounds the item.
-- A Flash-Next sequence keeps the three-axis position its indexer still needs,
-  its incomplete compressed block's first token's, in its snapshots and
-  checkpoints too: the indexer rotates a compressed block's key at its first
-  token's position when the block completes.
-- With the main container unchanged, a text-only user downloads 0.5 GB more
-  and loads exactly what loads today.
-
-**As built** (2026-11-09 and 2026-11-10, GitHub #556-#560 and #562-#565), where the decision left a choice.
-
-- **The companion** (#556): `qwen3_8_flash_next_vision-v2.ninfer`, 482,499,840 bytes, its own identity
-  (`qwen3.8-flash-next-vision`, weights `vision-w8-bf16-de4b8e4`) and a pair pin to the main container,
-  built by `tools/flash-next-vision/convert.py` from the first shard's visual range alone (897,862,112 bytes), every
-  matrix W8 (groups of 32, binary16 scales), the norms, biases and position embedding BF16. It is published beside the
-  main container in Flash-Next's model repository, and the catalog, pinned at the hub commit that added it, fetches it
-  with the model.
-- **Every matrix W8, not the 27B tower's recipe** (#560, the owner's decision of 2026-11-10). The companion first
-  shipped (284,229,120 bytes, weights `vision-w8q4q5q6-bf16-de4b8e4`) held the 27B's formats: the patch embedding Q6,
-  the blocks' projections Q4 and Q5, the merger W8. #560's tower check put its served rows 0.305 in relative L2 from
-  the BF16 tower's against the 27B's 0.183; the diagnosis found the encode computing what the stored words say, the
-  weights quantizing alike in both towers, and the error growing at Flash-Next's retrained merger, where 31% of it was
-  one vector every row shares. With every matrix W8 the CPU simulation gave 0.029, for 198,272,448 bytes more of
-  tower (481,445,216 in place of 283,172,768), the same staging slot (22,608,384 bytes) and no new kernel route:
-  every matrix takes a W8 route the dispatch already serves, the merger's second linear the one below (ADR 0088).
-  The served tower then measured 0.0586 (Measured). The 27B's tower and recipe do not change. A companion of the
-  grouped encoding is refused when it opens, naming both weights ids, so a start or a switch refuses it before
-  anything loads.
-- **Vision and media settings per family** (#557): the vision and media fields apply to both text families, each
-  family its own; the four built-in profiles turn vision on for the 27B only, so a Flash-Next start loads no tower
-  unless it asks (`--vision-enabled`, `VISION=1`). Each field, the residency and the envelope among them, has a
-  value for both models (`--vision-residency`, a profile's `vision.residency`) and one for a model alone
-  (`--qwen38flashnext-vision-residency`); a profile sets the residency and the envelope for both. A knob an operator
-  names for one model whose vision is off is refused; one named for both is refused only when vision is off for
-  both, and otherwise applies to the models with vision on, which the start logs (`ignis.config.vision_options`).
-  The host plan shows the tower (482,705,408 bytes of host spans) and the pool as their own lines.
-- **The item bound** is computed when the tower is bound: the largest item whose encode fits the prefill scratch
-  first, then the `host` residency's staging slots in the expert staging ring, then the encode's workspace there,
-  then both, at most 16,384 merged tokens (#557, #558). The ring was shown first to hold nothing live while an item
-  encodes: only a prefill stages into it, a decode miss takes an LRU victim, and the encode joins the residency
-  before it writes there. A card that holds every expert has no ring, and the prefill scratch alone bounds the item,
-  as on the 27B. The VRAM plan logs the bound, and the server lowers the processor's pixel bound to its area.
-- **The same expert cache** (#558): the forward's per-chunk vision inputs, the chunk's three axes and its media
-  rows, are carved from the decode graphs' scratch, idle in a prefill; the rope deltas sit in the positions buffer's
-  alignment; a verify round's axis records sit at the prefill scratch's base, idle in a round. A vision prefill
-  refuses while the decode graphs' scratch is in use, and a verify round while the prefill scratch is. At the RTX
-  5090's settings every reservation line equals the text-only load's, MTP on and off.
-- **A sequence keeps the three axes its indexer still needs, not every token's** (#558): a compressed block's key is
-  computed when its block completes, so the one position a sequence must
-  carry is its incomplete block's first token's. It is kept in that block's own key slot, an axis record (a magic, the
-  first token's KV position, its three axes), written when a call begins a block and leaves it incomplete, read and
-  overwritten by the key when a later call completes the block. It travels with its page through snapshots,
-  checkpoints and spills, at no VRAM and with no change of the blob layout; a verify round saves and restores each
-  lane's. The rope delta rides the progress image; a checkpoint's capture zeroes it, and its claimant takes its own
-  from the span it prefills (#559).
-- **The MTP head** (#564): its prefill entry before an image placeholder takes the vision column the trunk took, and
-  a span ending inside its image the image's next column; decode, verify and the chain embed generated tokens by id,
-  unchanged. The entry before an image that starts a new span takes the placeholder's id, the image not being encoded
-  yet: it costs acceptance, never the output. Greedy MTP on equals MTP off on image prompts up to ADR 0056's near tie:
-  the image test holds a split to a pick gap within 16 BF16 ulps, teacher-forced, as the text path's wide verify
-  rounds are held (the owner's call of 2026-11-10, once #565 had traced the drift), and a verify round after an image
-  leaves the state a plain round leaves, bit for bit.
-- **The routes drift twice as far on an image prompt** (#565): plain decode, a verify round and the prefill compute a
-  token's logits a few BF16 ulps apart on text, about twice as far on a multimodal span. The experiment traced it to
-  the vision start and end tokens, which carry it on a text prompt with no image, not to the image's path, which
-  agrees with the reference implementation's: a property of the model's inputs, not a defect. Routes that agree bit
-  for bit, so that speculation never changes an answer, are #567, parked.
-- **The merger's width needed a route** (#557): the vendored W8 dispatch had none for the merger's second linear at
-  [2560, 4608]. It takes the routes the image model's [4096, 4608] takes, a recorded patch of the vendored dispatch
-  with its op test, on the standing reason ADR 0088 gives a vendored registry that lacks a case ignis needs.
-- **A switch keeps vision** (#563): the vision settings carry across families. `POST /v1/models/switch` to a family
-  whose companion is missing answers 409 `vision_companion_missing`, naming the file, before the active model is torn
-  down; an implicit switch meets the same check when it prepares, before teardown. The request size cap follows the
-  active model's media. A switch carries the vision of the model it replaces (the owner's call of 2026-11-10): with
-  the model serving on vision, a built-in profile's on the 27B alone among it, the target loads with vision on at its
-  own vision settings, unless vision is named off for the target itself (its own flag, env var, config file section
-  or live value), which wins; `--vision-enabled false`, naming it off for every model, does not stop the carry. A
-  model serving without vision carries nothing, and a start is unchanged: Flash-Next's vision stays off unless named
-  on. The carried value is the target's own live value, decided again at every switch and never written to the
-  config file. So a 27B on its profile's vision switching to a Flash-Next without its companion is refused 409, and
-  Flash-Next's host plan then counts the tower and the pool. A switch that leaves vision named off logs it
-  (`ignis.model.switch_vision_off`, `by: named`, the value that names it).
-- **Measured** ([finding](../findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md)): with
-  every matrix W8 the tower's served rows are 0.0586 in relative L2 from the BF16 tower's, the 27B's 0.183, lower on
-  32 of 32 images (the grouped encoding's 0.305 was the alarm); the known answers 66 of 66, the 27B's 66 of 66, no
-  alarm, so the KLD against BF16 on image prompts does not run. At the RTX 5090's settings a vision load plans every
-  VRAM line the text-only load plans, and the item bound is 16,384 at an 8,192-token chunk, from the prefill scratch
-  alone, and at a 1,024-token chunk, with the ring. MTP-3 on image prompts splits from MTP off only at one-ulp near
-  ties and accepts 66.0% of its drafts, against 54.2% on text. The decode gate, vision on with no image in flight
-  against vision off: at C=1 99.87% and 100.02% (pooled 99.95%), at C=3 100.04% and 99.99% (pooled 100.01%), the
-  expert cache equal in every leg (16,531,515,984 bytes at a pinned 27 GiB budget) and the texts identical, so the
-  99% gate passes.
+- On a card that holds every expert (ADR 0054) there is no staging ring, and the prefill scratch alone bounds the
+  item.
+- A Flash-Next sequence keeps the three-axis position its indexer still needs, its incomplete compressed block's
+  first token's, not every token's, in its snapshots, checkpoints and spills too, with no change of the blob layout:
+  the indexer rotates a compressed block's key at its first token's position when the block completes.
+- With the main container unchanged, a text-only user downloads 0.5 GB more and loads exactly what loads today.
+- The MTP head's prefill entry before an image that starts a new span takes the placeholder's id, the image not
+  being encoded yet: that costs acceptance, never the output. Greedy MTP on equals MTP off on image prompts up to
+  ADR 0056's near tie, as the text path's wide verify rounds are held, and a verify round after an image leaves the
+  state a plain round leaves, bit for bit.
+  The routes drift about twice as far on an image prompt as on text, a property of the vision start and end tokens,
+  not a defect of the image's path; routes that agree bit for bit are #567, parked.

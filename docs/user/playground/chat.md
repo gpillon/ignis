@@ -62,7 +62,8 @@ inline, and the line says the model sees it in that prompt only. A picture
 ## The chat's workspace
 
 A chat can have a **workspace**: files you and the model work on together,
-kept in this browser and never on the server. It is born with the chat's
+kept in this browser and never on the server, so clearing the site's data
+deletes it with [the sessions](sessions.md). It is born with the chat's
 first file, a file you attach, make in the [panel](#the-workspace-panel) or
 one the model writes, and takes the chat's title as its name; a chat that
 makes no file has none, unless you pick an existing workspace for it

@@ -79,7 +79,8 @@ int main() {
     check(placed(100, 0, 100, 0, false, false), "device: the scratch");
     check(placed(99, 100, 100, 0, true, false), "device: the ring when the scratch is short");
     check(refused(99, 99, 100, 0), "device: neither");
-    // ADR 0087's figure: the RTX 5090's ring at the 2026-11-09 start holds a
+    // The finding docs/findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md:
+    // the RTX 5090's ring at the 2026-11-09 start holds a
     // 16,384-token item's workspace -- the processor's largest -- on its own.
     constexpr std::size_t kRtx5090Ring = 1'574'895'616;
     const std::size_t largest = ignis_vision_workspace_bytes(16384, kVisionMaxSegments);

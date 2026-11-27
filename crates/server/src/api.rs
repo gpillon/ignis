@@ -174,7 +174,7 @@ pub fn router(state: Arc<Server>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), limit_request_body))
         .layer(axum::extract::DefaultBodyLimit::disable());
     // The Playground (GitHub #163): present unless `--server-ui false` withheld the
-    // assets -- served by default since ADR 0026's 2026-09-19 amendment.
+    // assets -- it is served by default (ADR 0026).
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
     }
@@ -194,7 +194,8 @@ pub fn router(state: Arc<Server>) -> Router {
     // `/v1/openapi.json`. Merged *after* the key layer above, so a browser
     // pointed at `/v1` on a keyed server reaches the page rather than a
     // bare 401 it has no way to answer. Always served: the reference is
-    // part of the `/v1` surface, not of the opt-in Playground.
+    // part of the `/v1` surface, not of the Playground, which
+    // `--server-ui false` withholds.
     router = router.merge(crate::openapi::router(document));
     // The liveness and readiness probes (GitHub #327), past every `/v1`
     // layer above: no key, no use counted, none of the gate's per-model

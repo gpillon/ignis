@@ -545,7 +545,8 @@ int main() {
     }
     check(bounds[IGNIS_VISION_RESIDENCY_HOST] <= bounds[IGNIS_VISION_RESIDENCY_DEVICE],
           "a staged tower's slots leave the item no larger");
-    // ADR 0087's RTX 5090 ring (1,574,895,616 bytes at the 2026-11-09 start)
+    // The RTX 5090's ring (1,574,895,616 bytes at the 2026-11-09 start, the finding
+    // docs/findings/2026-11-10-flash-next-images-checked-without-the-bf16-checkpoint.md)
     // holds the processor's largest item under either residency, where a
     // 1,024-token chunk's scratch alone holds no larger one.
     constexpr uint64_t kRtx5090Ring = 1574895616;

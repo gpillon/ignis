@@ -37,7 +37,8 @@ fn model_dir() -> Option<PathBuf> {
 /// under `device` all on the device, a weights line and no host line. Every
 /// matrix is W8 (GitHub #556), and the plan the leaf's descriptors read
 /// carries the companion's formats: the tower is larger than the 27B's
-/// grouped one, 297,000,960 bytes of spans (ADR 0075), though its merger
+/// grouped one, 297,000,960 bytes of spans (`TOWER_SPAN_BYTES` in
+/// `qwen27b_host_plan.rs`), though its merger
 /// writes half the rows.
 #[test]
 fn the_shipped_companion_binds_under_either_residency() {
