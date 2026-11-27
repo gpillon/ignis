@@ -164,7 +164,7 @@ pub fn router(state: Arc<Server>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), limit_request_body))
         .layer(axum::extract::DefaultBodyLimit::disable());
     // The Playground (GitHub #163): present unless `--server-ui false` withheld the
-    // assets -- served by default since ADR 0026's 2026-09-19 amendment.
+    // assets -- it is served by default (ADR 0026).
     if let Some(assets) = state.playground {
         router = router.merge(crate::playground::router(assets));
     }
