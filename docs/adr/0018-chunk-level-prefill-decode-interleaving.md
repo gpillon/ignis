@@ -53,6 +53,10 @@ hand-off carries are the scheduler's rules, in the opening comment of `crates/co
 - **A count of decode rounds per chunk, K, as the dial.** Per cycle a lane sees `K-1` short gaps and exactly one
   long one, so the long gaps stay the top `1/K` of the distribution and the p95 inter-token latency does not move
   until `K >= 20`, a 240% inflation of the time to first token.
+- **A 2,048-token chunk for Flash-Next, to shorten the gap.** It halves the longest gap (1.7 s) but leaves the lanes
+  at about 1 tok/s and costs 28.3 to 28.7 s of time to first token on a 34K prompt even with nobody decoding,
+  against about 15 s at 8,192 tokens
+  ([finding](../findings/2026-10-07-flash-next-prefill-chunk-and-decode-share.md)).
 
 ## Consequences
 
