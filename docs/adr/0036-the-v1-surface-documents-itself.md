@@ -20,8 +20,8 @@ of all for `POST /v1/decide` (ADR 0034), the endpoint that is ignis's own and th
   answer without one. A browser pointed at `/v1` cannot set an `Authorization` header, so a gated reference would be
   a reference nobody could read. It publishes the API's shape (no prompt, no completion, no load figure), and the
   document declares the `bearerAuth` scheme, so the page's *Authorize* button drives the gated routes from
-  the page. ADR 0028 keys every exposed server, and a keyed server must not publish its load; the open reference is
-  a deliberate carve-out: shape is not load.
+  the page. An exposed server (ADR 0028) must not publish its load; the open reference is a deliberate carve-out
+  from that rule: shape is not load.
 - **Monitoring is not API.** The Prometheus exposition (ADR 0017: `/metrics` on its own listener, `/ui/metrics`
   behind the key) is outside the document, and a test fails if a path carrying `metrics`, or any `/ui` path, ever
   appears in it.
