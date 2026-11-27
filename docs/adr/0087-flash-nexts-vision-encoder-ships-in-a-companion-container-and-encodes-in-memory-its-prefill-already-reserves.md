@@ -19,7 +19,7 @@ Flash-Next's hidden width, half the 27B's. Flash-Next takes images with the 27B'
   and W8 answers it for about 0.2 GB more of tower, the same staging slot and no new kernel route: every matrix
   takes a W8 route the dispatch already serves, the merger's second linear through the recorded patch that gave its
   width one (ADR 0088). The 27B's tower and recipe do not change. A companion of the grouped encoding is refused when
-  it opens, naming both weights ids.
+  it opens, naming both weights ids, so a start or a switch refuses it before anything loads.
 - **The encoder works in memory the prefill already reserves**: Flash-Next's prefill scratch and its expert staging
   ring, both idle while an item encodes, since the encode runs before the chunk's forward. A vision load plans the
   same expert cache as a text-only load at the same settings: the forward's vision inputs ride in memory a text load
