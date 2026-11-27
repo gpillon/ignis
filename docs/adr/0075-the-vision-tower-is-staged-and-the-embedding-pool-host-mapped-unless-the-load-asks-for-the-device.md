@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0035, ADR-0063]
+amends: [ADR-0035]
 ---
 
 # The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device

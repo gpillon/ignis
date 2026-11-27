@@ -72,7 +72,7 @@ pub struct ActiveModel {
     /// away from one that then fails to load its target has nothing to
     /// reload, and says so instead of serving nothing silently.
     pub source: Option<ModelSource>,
-    /// Every adaptation the load took to fit its VRAM plan (ADR 0063 §3), as
+    /// Every adaptation the load took to fit its VRAM plan (ADR 0063), as
     /// `ignis.runtime.vram_plan`'s `adapted` spells them: empty when it took
     /// none, as on every load but the 27B's. `GET /v1/models` reports it
     /// beside the context the load runs (#340).

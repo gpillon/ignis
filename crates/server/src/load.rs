@@ -10,6 +10,15 @@
 //! loaded (spec image-model/05). Start-up code, not the
 //! per-token path: its logging is the once-per-load kind (`hotpath_lint`
 //! watches `runtime.rs`, the scheduler construction it calls into).
+//!
+//! A 27B load may run at other values than the configured ones: its
+//! adaptation lowers what the VRAM plan refuses ([`crate::adaptation`], ADR
+//! 0063). What the load kept is what it serves from then on: the vision
+//! processor is built before the load at the configured context, to check
+//! the model contract, and served at the context the load runs
+//! (`serve_vision`); `ignis.model.loaded` names the kept values; and a VRAM
+//! plan refused after every adaptation reads as the plan's deficit and the
+//! adaptations tried.
 
 use std::sync::Arc;
 
@@ -116,7 +125,7 @@ impl From<crate::runtime::Qwen27bLoadError> for LoadError {
         match error {
             crate::runtime::Qwen27bLoadError::HostPlan(refusal) => Self::HostPlan(refusal),
             // The VRAM plan's refusal reads as it always did: its deficit and
-            // the adaptations tried (ADR 0063 §3).
+            // the adaptations tried (ADR 0063).
             crate::runtime::Qwen27bLoadError::VramPlan(refusal) => Self::LoadFailed(refusal.to_string()),
             crate::runtime::Qwen27bLoadError::Other(message) => Self::LoadFailed(message),
         }
@@ -370,7 +379,7 @@ pub fn prepare_model(config: &crate::config::Config, artifact: &std::path::Path)
     // processor and acquires them before admission. A tokenizer whose
     // placeholder ids are not the model contract's is refused. Built before
     // the load, which sizes the encoder for the processor's item bound; the
-    // load serves it at the context it runs (`serve_vision`, ADR 0063 §3).
+    // load serves it at the context it runs (`serve_vision`, ADR 0063).
     let processor = config
         .vision
         .map(|v| crate::media::load_processor(&frontend, v, config.max_context))
@@ -505,7 +514,7 @@ pub fn load_model(prepared: PreparedModel) -> Result<LoadedModel, LoadError> {
 /// `provider` with the vision processor a `--vision-enabled` load serves,
 /// and the acquirer that prepares images with it, both at `max_context`:
 /// the context the load runs, which its adaptation may have lowered from
-/// the configured one (ADR 0063 §3). So the processor's request budget and
+/// the configured one (ADR 0063). So the processor's request budget and
 /// item bound are the envelope the leaf planned, never the configured
 /// context's; `vision` is the load's, its item bound what the encoder holds
 /// (GitHub #557: Flash-Next's, in its prefill scratch, may be below the
@@ -651,7 +660,7 @@ fn cuda_image_runner(
 
 /// The GPU-backed scheduler for `artifact` (GitHub #61 / P1-25), logged as
 /// `ignis.model.loaded` with the shape it runs: the 27B's at the values its
-/// adaptation kept (ADR 0063 §3), Flash-Next's at the item bound its encoder
+/// adaptation kept (ADR 0063), Flash-Next's at the item bound its encoder
 /// holds (GitHub #557). Beside it, what the load reserved, that shape and
 /// the adaptations it took, as `ignis.runtime.vram_plan` spells them (empty
 /// on Flash-Next, which adapts nothing). GitHub #649: the measurement switch

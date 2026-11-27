@@ -17,6 +17,11 @@
 //! host [`MediaCache`] keyed by content digest with single-flight for
 //! concurrent identical misses. Dropping the acquisition future — a client
 //! disconnect — stops the work at its next checkpoint.
+//!
+//! The processor's envelope is the load's, not the config's: a 27B load
+//! whose adaptation lowered its context ([`crate::adaptation`], ADR 0063)
+//! serves the processor at the context it runs ([`processor_at`]), so the
+//! request budget and the item bound follow what the leaf planned.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -238,7 +243,7 @@ pub fn load_processor(
 
 /// `processor` at a load's context `max_context` rather than the one it was
 /// built at: the context a 27B load runs, which its adaptation may have
-/// lowered (ADR 0063 §3). Its request budget, and so its item bound, follow
+/// lowered (ADR 0063). Its request budget, and so its item bound, follow
 /// the envelope the leaf planned; and an item bound the load holds below the
 /// artifact's (`vision`'s, GitHub #557: Flash-Next's encode in its prefill
 /// scratch, ADR 0087) lowers the pixel bound to its area, so a larger image
@@ -1205,7 +1210,7 @@ mod tests {
         VisionProcessor::new(&tokenizer, options).expect("the contract's placeholders")
     }
 
-    /// ADR 0063 §3 (review of #336 part D): a processor built at the
+    /// ADR 0063 (review of #336 part D): a processor built at the
     /// configured context and served at the one a 27B load adapted to takes
     /// that context's envelope -- its request budget, its item bound, the
     /// raw patches they imply -- and keeps the artifact's pixel bounds.

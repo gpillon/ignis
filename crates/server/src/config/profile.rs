@@ -7,6 +7,14 @@
 //! file's section is, so a profile an operator defines for a card the
 //! maintainers do not own resolves exactly as a built-in one does: there is
 //! one code path, and a built-in profile is only the default contents of it.
+//!
+//! With no profile named, `auto` picks the built-in profile of the card's
+//! [`CardClass`], which is the card's total memory alone (ADR 0063): a total
+//! of no class is refused, naming `--profile`, and a named profile always
+//! wins, `none` included. Every value a profile gives is a default twice
+//! over: the operator overrides it, and a 27B load whose VRAM plan refuses it
+//! lowers it ([`crate::adaptation`]), where a value the operator named is
+//! refused instead.
 
 use std::collections::BTreeMap;
 
@@ -258,7 +266,7 @@ pub const NONE_PROFILE: &str = "none";
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
 /// DFlash2 at 7 tokens, as every other profile but `rtx5090`, and vision on, explicit
-/// (ADR 0063 as amended by ADR 0075): at a 4,096-token envelope, an item bound
+/// (ADR 0063, ADR 0075): at a 4,096-token envelope, an item bound
 /// of about 2,048 x 2,048 pixels, and residency `host`, written out so the
 /// profile table shows it. The tower sits in pinned host RAM and the pool is
 /// host-mapped, so a load with no image in flight keeps the text-only KV pool
@@ -272,7 +280,7 @@ pub const NONE_PROFILE: &str = "none";
 /// context, and leaves the drafter's head to `auto`, the full head (ADR 0063).
 /// Every one of these is a default the load adapts when the free memory it
 /// finds cannot hold it: the head, then the context down to 65,536, then one
-/// lane (ADR 0063 §3). On a 16 GB RTX 40 card the routes it runs unset since
+/// lane (ADR 0063). On a 16 GB RTX 40 card the routes it runs unset since
 /// spec #503 add the dense prefill's 89 MB buffer and take less prefill
 /// scratch: on the 5090 at a 16 GB budget less 1 GiB (2026-11-05) they left the
 /// KV pool 6,656 tokens smaller, 386,048 against 392,704, and the context
@@ -304,7 +312,7 @@ pub const NONE_PROFILE: &str = "none";
 /// `vram.qwen38.headroom_bytes`, a choice, since 1200M would leave no context;
 /// a 512-token prefill chunk with the solo width pinned to it, the scratch
 /// before the context; and vision on as `rtx-16gb` has it, in host memory at
-/// a 4,096-token envelope. Each is a default the load adapts (ADR 0063 §3)
+/// a 4,096-token envelope. Each is a default the load adapts (ADR 0063)
 /// and the operator overrides: two lanes, a 256-token chunk (with the solo
 /// width named too) and DFlash2 stay selectable. It names no model, and no
 /// Flash-Next value: Flash-Next on a small card is not this class's.
@@ -332,7 +340,7 @@ pub const NONE_PROFILE: &str = "none";
 /// 27B's table YaRN at 4 over its 262,144 trained positions (ADR 0057). The
 /// pool's 150,464 tokens past the context (~1.39 GB) are what a real card's
 /// desktop may take before the load adapts, as it adapts every value here
-/// that the free memory it finds cannot hold (ADR 0063 §3); the closing runs
+/// that the free memory it finds cannot hold (ADR 0063); the closing runs
 /// on an RTX 3090 and an RTX 4090 confirm the context (spec #474). The 27B
 /// also keeps [`RTX_24GB_RETAINED_DEVICE_SLOTS`] retained slots on the device
 /// (GitHub #508), written in the text below by that constant's name, with

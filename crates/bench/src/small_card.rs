@@ -461,7 +461,7 @@ fn as_u64(value: &Value) -> Option<u64> {
 }
 
 /// What the load ran with beside what the config asked for, and every
-/// adaptation it took to fit its VRAM plan (ADR 0063 §3), as
+/// adaptation it took to fit its VRAM plan (ADR 0063), as
 /// `GET /v1/models` reports them on the loaded model.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Adaptation {

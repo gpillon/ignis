@@ -7,6 +7,13 @@
 //! the build tells them. Asking the loader instead (`cudaFuncGetAttributes`
 //! on a leaf kernel) would create the context, and the VRAM plan reads the
 //! free memory before the context exists (GitHub #210).
+//!
+//! What a card's generation decides for a load left to `auto` is decided here
+//! too. One of those is the solo ladder ([`solo_ladder`]; ADR 0018, ADR
+//! 0063): the widths a 27B load on an RTX 30 or RTX 40 card tries above its
+//! prefill chunk, widest first, before it adapts anything, keeping one only
+//! where the plan holds it with nothing else adapted and room for a second
+//! request.
 
 use std::fmt;
 
@@ -593,7 +600,7 @@ pub fn second_tail_cut_for_load() -> Result<bool, String> {
 }
 
 /// The solo widths an `auto` load of `family` on a card of `generation`
-/// tries, widest first (GitHub #489, ADR 0018 and ADR 0063 §3 as amended):
+/// tries, widest first (GitHub #489, ADR 0018 and ADR 0063):
 /// the one decision, which [`crate::runtime::EngineShape::solo_widths`] asks.
 /// The load keeps the first its VRAM plan holds with nothing else adapted and,
 /// at more than one lane, the spare reservation left beside the context,

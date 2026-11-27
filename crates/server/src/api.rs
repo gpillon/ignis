@@ -3401,7 +3401,7 @@ struct ModelInfo {
     /// after any adaptation (#340). The active text model's only.
     #[serde(skip_serializing_if = "Option::is_none")]
     decode_lanes: Option<u32>,
-    /// Every adaptation the load took to fit its VRAM plan (ADR 0063 §3), in
+    /// Every adaptation the load took to fit its VRAM plan (ADR 0063), in
     /// order, as `ignis.runtime.vram_plan`'s `adapted` spells them; `""`
     /// when it took none. The active text model's only.
     #[serde(skip_serializing_if = "Option::is_none")]

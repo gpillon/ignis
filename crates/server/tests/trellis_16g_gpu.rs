@@ -117,7 +117,7 @@ const DECODE_GRAPH_BYTES: u64 = 20_621_336;
 const BUDGET_LESS_1_GIB: u64 = 17_179_869_184 - (1 << 30);
 const BUDGET_LESS_3_GIB: u64 = 17_179_869_184 - (3 << 30);
 /// The spare reservation the ladder keeps beside one full sequence at two
-/// lanes: `vram.adapt_spare_tokens`' default (ADR 0063 §3).
+/// lanes: `vram.adapt_spare_tokens`' default (ADR 0063).
 const SPARE_TOKENS: u64 = 65_536;
 
 /// The 16 GB card's start inside `budget` bytes (#339 A1's flags).
@@ -394,7 +394,7 @@ async fn less_1_gib_of_desktop_keeps_262144_tokens_on_two_lanes_and_adapts_nothi
 }
 
 /// The card less 3 GiB of simulated desktop: 262,144 tokens no longer fit,
-/// and the ladder (ADR 0063 §3) keeps 65,536 at two lanes. 196,608 is refused
+/// and the ladder (ADR 0063) keeps 65,536 at two lanes. 196,608 is refused
 /// by the plan's own floor (one sequence and a page per retained slot);
 /// 131,072 holds one sequence but not the spare reservation of
 /// `vram.adapt_spare_tokens` beside it; 65,536 holds both. Each is the plan

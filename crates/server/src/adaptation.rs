@@ -1,4 +1,4 @@
-//! **Adaptation** (ADR 0063 §3, spec 27b-16gb/04 solution 4, `GLOSSARY.md`):
+//! **Adaptation** (ADR 0063, spec 27b-16gb/04 solution 4, `GLOSSARY.md`):
 //! a 27B load whose VRAM plan refuses its profile's values lowers the ones
 //! the operator left to the profile or the hardcoded default, in a fixed
 //! order, until the plan fits -- and says which it lowered.
@@ -11,8 +11,8 @@
 //! leaf's lines at each attempt's context, lanes and head. So every rule
 //! below is a CPU test with injected budgets.
 //!
-//! Before any of them, the **solo width** (GitHub #489, ADR 0063 §3 as
-//! amended; [`adapt_solo`]): at `auto`, each width of the card's ladder is
+//! Before any of them, the **solo width** (GitHub #489, ADR 0063;
+//! [`adapt_solo`]): at `auto`, each width of the card's ladder is
 //! planned at the start's values, and the first the plan fits is kept, with
 //! nothing else adapted for it and, at more than one lane, the KV pool still
 //! holding one full sequence and the spare reservation (the criterion an
@@ -35,18 +35,33 @@
 //! 3. `decode_lanes` to 1, after which the context ladder runs again from the
 //!    value it started from. Lanes that cannot drop leave the largest context
 //!    the plan itself holds, the spare reservation unmet, and the log says
-//!    so.
+//!    so; a context that keeps the spare reservation still wins first. With
+//!    the two fields at their defaults that context is the floor whenever it
+//!    happens (above 262,144 tokens the pool is the same at every step, below
+//!    it the pool grows as the context falls); a spare reservation larger
+//!    than the step can leave it higher.
 //!
 //! A start the plan fits as configured adapts nothing, whatever room its
-//! pool leaves. A plan refused for any other reason than its minimum (a
+//! pool leaves: the criterion is an adapted context's, not the configured
+//! one's, so a budget one byte smaller may run a smaller context that has the
+//! room. A plan refused for any other reason than its minimum (a
 //! budget above free memory, a named KV pool below its floor) is not adapted
-//! either: no adaptation lowers what that refusal names. When not even one
+//! either: no adaptation lowers what that refusal names. A budget with
+//! oversubscription allowed never refuses, so it never adapts. When not even one
 //! step's context fits, the start is refused with the last attempt's deficit
 //! and every adaptation tried, in order.
+//!
+//! What no step moves: a value the operator named, whatever its source
+//! ([`Adaptable`], which the resolution fills by source alone), but for a
+//! named solo width, which only ever narrows a chunk, never a context or a
+//! lane; DFlash2, which adaptation never switches off; and Flash-Next's load,
+//! which adapts nothing, its solo width included. At the two fields'
+//! defaults no start is refused that was accepted before adaptation existed:
+//! each such start was refused already.
 
 use ignis_core::{ProposalHead, VramPlanError};
 
-/// The ladder's two config fields (ADR 0063 §3), both 65,536 tokens unless
+/// The ladder's two config fields (ADR 0063), both 65,536 tokens unless
 /// named: the context step, which is also the floor
 /// (`model.adapt_context_step`, a whole number of KV pages), and the spare
 /// reservation a context keeps room for beside one full sequence at more
@@ -230,7 +245,7 @@ pub enum AdaptError<E> {
 }
 
 /// The contexts the ladder plans from `from` at `context_step` tokens a step
-/// (ADR 0063 §3): `from` itself, then every multiple of the step below it,
+/// (ADR 0063): `from` itself, then every multiple of the step below it,
 /// down to one step -- 262,144, 196,608, 131,072, 65,536 on the 16 GB
 /// profile at the default step; 917,504 down 65,536 at a time on the
 /// 5090's. A context at or below one step is its own only candidate. The
@@ -255,8 +270,8 @@ pub enum SoloCandidates {
     Named(u32),
 }
 
-/// [`adapt`] with the solo width first (GitHub #489, ADR 0063 §3 as
-/// amended): `start` is at the prefill chunk (its `prefill_chunk_solo`), and
+/// [`adapt`] with the solo width first (GitHub #489, ADR 0063):
+/// `start` is at the prefill chunk (its `prefill_chunk_solo`), and
 /// `solo` says what is tried above it. An `auto` width is kept where the plan
 /// fits it and, at more than one lane, its KV pool holds the start's context
 /// and `ladder`'s spare reservation; one that does not is no step and leaves
@@ -721,7 +736,7 @@ mod tests {
     }
 
     /// A width the plan fits whose pool keeps one sequence but not the spare
-    /// reservation beside it is passed over, as a context is (ADR 0063 §3):
+    /// reservation beside it is passed over, as a context is (ADR 0063):
     /// the room for a second request comes before a wider chunk. At one
     /// lane, where the reservation has no lane to serve, the plan's own
     /// floor is enough.

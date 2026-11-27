@@ -1,7 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0063, ADR-0064]
-amended-by: [ADR-0098]
+amends: [ADR-0064]
 ---
 
 # A catalog entry states the oldest GPU generation it loads on

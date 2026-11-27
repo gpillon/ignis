@@ -21,6 +21,16 @@
 //! [`resolve`] is the seam: pure (no `std::env`, no filesystem, no process
 //! exit), so precedence and validation are covered by fast unit tests
 //! instead of only end-to-end runs.
+//!
+//! The card is an input like the environment (ADR 0063): with no profile
+//! named, `auto` takes the built-in profile of the class of the card the
+//! start read ([`profile::auto`]), and [`resolve_on`] is where a caller says
+//! which card that is. A [`Config`] also says what a 27B load may do with it
+//! when its VRAM plan refuses its values ([`crate::adaptation`]): which of
+//! them may adapt, those the profile or the hardcoded default gave and none
+//! the operator named ([`Config::adaptable`]), and the ladder's step and
+//! spare reservation, two fields of their own ([`Config::adapt_ladder`]),
+//! since a threshold that decides whether or how a load starts is a field.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -268,13 +278,13 @@ pub const DEFAULT_GRAMMAR_MAX_DEPTH: u32 = ignis_grammar::DEFAULT_MAX_DEPTH as u
 pub const DEFAULT_GRAMMAR_MAX_REF_CHAIN: u32 = ignis_grammar::DEFAULT_MAX_REF_CHAIN as u32;
 pub const DEFAULT_GRAMMAR_MAX_WHITESPACE: u32 = ignis_grammar::DEFAULT_MAX_WS_RUN as u32;
 
-/// `--model-adapt-context-step`'s default (ADR 0063 §3): a 27B context the
+/// `--model-adapt-context-step`'s default (ADR 0063): a 27B context the
 /// load adapts goes down 65,536 tokens at a time, and never below 65,536 --
 /// spec 27b-16gb/04's 262,144 -> 196,608 -> 131,072 -> 65,536 on the 16 GB
 /// card, generalized to any profile's value.
 pub const DEFAULT_ADAPT_CONTEXT_STEP: u32 = 65_536;
 
-/// `--vram-adapt-spare-tokens`' default (ADR 0063 §3): at more than one
+/// `--vram-adapt-spare-tokens`' default (ADR 0063): at more than one
 /// decode lane, a context the 27B's load adapts is kept when its KV pool
 /// holds it and one more 65,536-token reservation, room for a second
 /// request beside a full one.
@@ -1025,7 +1035,7 @@ impl Config {
         self.card_total_bytes().and_then(profile::CardClass::of_total)
     }
 
-    /// The 27B's adaptation ladder (ADR 0063 §3): its context step
+    /// The 27B's adaptation ladder (ADR 0063): its context step
     /// (`--model-adapt-context-step`) and its spare reservation
     /// (`--vram-adapt-spare-tokens`). The load's shape carries it
     /// ([`crate::runtime::EngineShape::adapt_ladder`]).
@@ -1037,8 +1047,8 @@ impl Config {
         }
     }
 
-    /// Which of the 27B's load values its **adaptation** may lower (ADR 0063
-    /// §3): the context, the decode lanes and the drafter's head, each when
+    /// Which of the 27B's load values its **adaptation** may lower (ADR
+    /// 0063): the context, the decode lanes and the drafter's head, each when
     /// the profile or the hardcoded default gave it. The load's shape carries
     /// it ([`crate::runtime::EngineShape::adaptable`]).
     pub fn adaptable(&self) -> crate::adaptation::Adaptable {
