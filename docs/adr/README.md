@@ -68,7 +68,7 @@ edit it by hand.
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | a reasoning loop is taken back, the model is nudged, and the client is told | accepted | [0053](0053-a-loop-is-acted-on-once-it-persists.md) |
 | [0053](0053-a-loop-is-acted-on-once-it-persists.md) | a loop is acted on once it persists, and a rewind keeps something | accepted | |
 | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | a resident Flash-Next load keeps its experts only in VRAM | accepted | |
-| [0055](0055-a-pinned-hot-set-is-opt-in.md) | a pinned hot set of experts: a field off by default, 2 GiB in the rtx5090 profile | accepted | |
+| [0055](0055-a-pinned-hot-set-is-opt-in.md) | A pinned hot set of experts: a field off by default, which the rtx5090 profile sets | accepted | |
 | [0056](0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md) | speculation past 8 verify rows is numerically equivalent, not bit-exact | accepted | [0104](0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md) |
 | [0057](0057-rope-scaling-is-auto-by-default.md) | rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
 | [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | every route has a deadline, and a passed one answers what was generated | accepted | [0096](0096-a-cut-tool-call-reaches-the-client-as-generated-its-name-its-arguments-so-far-and-finish-reason-length.md) |
