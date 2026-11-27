@@ -52,7 +52,7 @@ inline constexpr std::int32_t kMinTokens = 64;
 // the 27B's prefill, its time to first token at 8K and 64K 3-4% shorter on the 16 GB trellis entry
 // and 4.2-5.7% on the NVFP4 one, within each regime of alternated legs, and its KLD against BF16
 // unmoved within the noise on both 27B bodies (GitHub #514's rule; Blackwell's default since
-// GitHub #536, spec #531; ADRs 0080 and 0085).
+// GitHub #536, spec #531; ADR 0080).
 constexpr bool runs_by_default(int compute_capability_major) {
   return compute_capability_major == 8 || compute_capability_major == 12;
 }

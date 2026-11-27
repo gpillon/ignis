@@ -593,7 +593,7 @@ pub fn second_tail_cut_for_load() -> Result<bool, String> {
 }
 
 /// The solo widths an `auto` load of `family` on a card of `generation`
-/// tries, widest first (GitHub #489, ADR 0018 and ADR 0063 §3 as amended):
+/// tries, widest first (GitHub #489, ADR 0018, and ADR 0063 §3 as amended):
 /// the one decision, which [`crate::runtime::EngineShape::solo_widths`] asks.
 /// The load keeps the first its VRAM plan holds with nothing else adapted and,
 /// at more than one lane, the spare reservation left beside the context,

@@ -614,7 +614,7 @@ fn a_decode_share_holds_nothing_while_no_lane_decodes() {
 
 #[test]
 fn without_a_decode_share_a_chunk_still_gets_exactly_one_round() {
-    // The default (ADR 0018's K = 1) is unchanged: one round per chunk.
+    // The default (a decode share of 0, ADR 0018) is unchanged: one round per chunk.
     let (mut sched, compute) = timed_sched(0.0);
     sched.submit(input(&[1], 1000), RequestClass::Agent).unwrap();
     sched.advance();
