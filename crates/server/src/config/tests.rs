@@ -3407,7 +3407,7 @@ fn the_vision_residency_defaults_to_the_host() {
     assert_eq!(device.vision.map(|v| v.residency()), Some(VisionResidency::Device));
 }
 
-/// ADR 0063 and ADR 0075 (GitHub #416): the 5090 takes `host`; the
+/// ADR 0075 (GitHub #416): the 5090 takes `host`; the
 /// 96 GB card, where tower and pool are ~0.8% of the KV pool and the host may
 /// be short of RAM, takes `device`.
 #[test]

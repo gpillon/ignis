@@ -271,6 +271,9 @@ pub const NONE_PROFILE: &str = "none";
 /// profile table shows it. The tower sits in pinned host RAM and the pool is
 /// host-mapped, so a load with no image in flight keeps the text-only KV pool
 /// (7,956 pages at 1,024 and at 4,096, measured on the 5090 on a 16 GB budget).
+/// A reporter's RTX 5060 Ti under Linux (GitHub #407, #360), with the tower
+/// still in VRAM, read what the envelope costs: vision at the 32,768-token
+/// default adapted the context to 65,536, and at 1,024 kept all 262,144.
 /// `vram.qwen38.headroom_bytes` is the 5090's 1200M
 /// until a real card says otherwise, and `prefill_chunk` stays at its 1,024: the
 /// prefill scratch is sized by the chunk, and 2,048 would cost ~0.4 GB of
