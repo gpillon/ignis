@@ -17,7 +17,7 @@ with a family's default id, whose entry on a small card is an artifact that does
    refused by class, and the VRAM plan's refusal still guards it, so an operator catalog written before card
    classes still starts. Every built-in text and image model states one; the built-in speech models (ADR 0067) and
    the diarizer (ADR 0069) run on the CPU and state none, so no card refuses them. A number that is no card class
-   refuses the catalog. A class may be a policy, not a hardware limit: Flash-Next states the 32 GB class though,
+   refuses the catalog. A class may be a policy, not a hardware limit: Flash-Next's class is one, since,
    with `vram.allow_expert_cache_below_floor`, it starts below its expert-cache floor, with a warning.
 2. **The artifact built for a smaller class has its own served id, and may answer to another id as an alias**: its
    family's default id, or another entry's served id of the same family. On a card that cannot load an id's own
@@ -81,6 +81,7 @@ that an alias resolves serves the entry under that entry's own id, as a switch t
 
 - Flash-Next's entry states the 16 GB class once it runs there, and the image model's after it. The way in is the
   16 GB class's profile (ADR 0063) lowering the expert-cache floor: under the rule that a refusal threshold is a
-  config field, the floor becomes one, the profile's own value estimated first and tuned on hardware. A first
+  config field, the floor becomes one, its default today's floor, the profile's own value estimated first and
+  tuned on hardware. A first
   estimate from the plan's lines is about 5 GiB: Flash-Next's fixed lines at one lane and a 262K pool are about
   9.65 GB, which leaves 5.4 to 7.1 GB on a 16 GB card, depending on what else holds it.
