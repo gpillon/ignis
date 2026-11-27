@@ -79,7 +79,8 @@
 //!    the fixed branch: an admission is the only trigger) moves only what
 //!    ranks below the requester ([`crate::admission::choose_page_shortage_victim`]),
 //!    and moved sequences come back in rank order, ahead of any newcomer
-//!    they outrank; a restore never moves anything.
+//!    they outrank; a restore never moves anything. The path across the
+//!    modules, KV-disk included, is `docs/design/kv-tiers-and-live-moves.md`.
 //!
 //! Lane capacity: the scheduler holds the load's decode lanes resident --
 //! at most [`N_DECODE_LANES`] (8); the 27B's 8 unless named and Flash-Next's
@@ -646,7 +647,7 @@ enum GiveUp {
     /// Retained state, and nothing else.
     RetainedState,
     /// Retained state, then the claims of the requests waiting below an
-    /// entry of this rank (ADR 0045 as amended 2026-10-31).
+    /// entry of this rank (ADR 0045).
     ClaimsBelow(Rank),
 }
 
@@ -1224,8 +1225,8 @@ impl ConcreteScheduler {
     }
 
     /// The requests waiting for their admission that hold a device claim and
-    /// rank below `rank`, lowest-ranked first (GitHub #445, ADR 0045 as
-    /// amended 2026-10-31). Each holds a reference on the shared prefix it
+    /// rank below `rank`, lowest-ranked first (GitHub #445, ADR 0045).
+    /// Each holds a reference on the shared prefix it
     /// claimed, a sibling's or retained state's, and with it any device
     /// checkpoint it chose for its first chunk. A claim on KV-RAM or the disk
     /// holds nothing on the device, and one already on the device is live.
@@ -2061,7 +2062,7 @@ impl ConcreteScheduler {
     /// [`Self::reclaim_retained`] until `fits` holds (GitHub #190: a prefix
     /// coming back from KV-RAM needs pages without being a request).
     ///
-    /// GitHub #445 (ADR 0045 as amended 2026-10-31): with
+    /// GitHub #445 (ADR 0045): with
     /// [`GiveUp::ClaimsBelow`] an entry's rank, and once retained state alone
     /// has given up all it can, the waiting claims below it go, lowest-ranked
     /// first: a bet its request has not cashed yet is still a bet. The caller
@@ -3471,7 +3472,7 @@ impl ConcreteScheduler {
     /// takes: a restore never comes here, and neither does the head's lane
     /// deal ([`Self::try_evict_for_head`]), which keeps its own order.
     ///
-    /// GitHub #444 (ADR 0045 as amended 2026-10-31): a victim frees its own
+    /// GitHub #444 (ADR 0045): a victim frees its own
     /// reservation and the pages of its prefix chain that only retained state
     /// holds beside it ([`PrefixCache::pages_a_holder_frees`]): those it
     /// published or lent, and those it claimed from a finished request. The
@@ -3482,7 +3483,7 @@ impl ConcreteScheduler {
     /// followed by that pass at once, so the need is met in the advance that
     /// moved.
     ///
-    /// GitHub #445 (ADR 0045 as amended 2026-10-31): the claims of the
+    /// GitHub #445 (ADR 0045): the claims of the
     /// requests waiting below the requester go before anything moves, after
     /// retained state, once the two make the whole room. Nothing moves for
     /// room a bet holds.
@@ -3694,7 +3695,7 @@ impl ConcreteScheduler {
     /// pages count as reclaimable: they are given up when that is what makes
     /// the room, and not otherwise. Nothing live moves.
     ///
-    /// GitHub #445 (ADR 0045 as amended 2026-10-31): so do the claims of the
+    /// GitHub #445 (ADR 0045): so do the claims of the
     /// requests waiting below the sequence, `rank`, after retained state.
     fn make_entry_room(&mut self, pages: u32, above: EntryRoom, rank: Rank, events: &mut Vec<SchedEvent>) -> bool {
         if self.resident_slots_used + above.slots + 1 > self.capacity.resident_slots {

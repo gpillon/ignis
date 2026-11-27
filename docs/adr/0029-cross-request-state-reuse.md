@@ -1,7 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0023, ADR-0024]
-amended-by: [ADR-0045, ADR-0100]
+amended-by: [ADR-0100]
 ---
 
 # ADR 0029 — cross-request state reuse: content-matched retained state across three residency tiers

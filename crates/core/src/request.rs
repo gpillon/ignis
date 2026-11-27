@@ -868,7 +868,7 @@ impl Request {
     }
 
     /// Give up the device claim of a request still waiting for its admission
-    /// (GitHub #445, ADR 0045 as amended 2026-10-31): back to claiming
+    /// (GitHub #445, ADR 0045): back to claiming
     /// nothing, with its whole bound to reserve and its prefill to start at
     /// the first token, so it looks again for state to resume from when it
     /// next comes up. The caller released its reference on the prefix it

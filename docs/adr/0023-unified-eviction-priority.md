@@ -1,6 +1,6 @@
 ---
 status: accepted
-amended-by: [ADR-0029, ADR-0045]
+amended-by: [ADR-0029]
 ---
 
 # ADR 0023 — one eviction priority across GPU residency and the host tier

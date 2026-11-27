@@ -15,7 +15,8 @@
 //!   reads only files it made, by the names it gave them.
 //! - **One file a blob**: a 4 KiB header page, written last as the commit,
 //!   then the blob, its last window padded to the unbuffered-IO alignment
-//!   ([`FileHeader`]). The header names the load (#205: the served model, the
+//!   ([`FileHeader`]; the layout, byte by byte, is
+//!   `docs/formats/kv-disk-file.md`). The header names the load (#205: the served model, the
 //!   blob identity, the sidecar's payload hash when there is one, the RoPE
 //!   scaling) and the blob (its kind, match key, tokens and length), with a
 //!   CRC32 per window and one of its own. A file with no header (a torn
@@ -93,7 +94,9 @@ pub fn default_bytes(family: ModelFamily) -> u64 {
 
 /// The fewest tokens a disk restore must save over the tier above it to be
 /// taken (spec vram-budget/03): a read of a short prefix costs more than its
-/// prefill. Flash-Next's prefill is the slower, so its floor is the lower.
+/// prefill. Flash-Next's prefill is the slower, so its floor is the lower:
+/// one prefill chunk there, the break-even at the default context on the 27B
+/// (`docs/findings/2026-10-07-kv-disk-arithmetic-on-the-rtx-5090-host.md`).
 /// The image model has no tier: no restore is ever worth it.
 pub fn restore_floor_tokens(family: ModelFamily) -> u32 {
     match family {
