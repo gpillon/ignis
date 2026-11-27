@@ -2,40 +2,23 @@
 status: accepted
 ---
 
-# ADR 0002 — The engine loads `.ninfer` artifacts directly
+# The engine loads `.ninfer` artifacts directly
 
-## Status
+The model's weights and its frontend and tokenizer objects live in NInfer's native `.ninfer` container, a format
+defined by its reader's code, with no external spec. The engine loads `.ninfer` files directly: the reference's
+artifact reader is ported to Rust as the engine's model-loading layer, and the artifact stays the source of truth.
 
-Accepted (2026-09-02, grilling session).
+## Considered Options
 
-## Context
-
-The model weights (and the frontend/tokenizer objects) live in the native NInfer
-`.ninfer` container (1,325 objects: 1,259 base + 66 grafted DFlash2; 281 NVFP4
-tensors, 9 BF16 exception tensors, ~19.4 GB). The container format is
-code-defined (no external spec); the reference reader is a self-contained C++
-module (`reader`, `binder`, `materializer`, `storage_layouts`).
-
-Options:
-- (a) port the artifact reader to Rust; the engine loads `.ninfer` files directly
-- (b) offline converter `.ninfer` → safetensors; the engine reads the standard format
-
-Both require writing the container reader once; (b) additionally moves it into a
-one-off tool and adds a 19 GB conversion step.
-
-## Decision
-
-(a). The artifact stays the source of truth. The reader is ported as the engine's
-model-loading layer.
+- **An offline converter from `.ninfer` to safetensors, the engine reading the standard format**: rejected. Either
+  way the container reader is written once; the converter moves it into a one-off tool and adds a conversion step of
+  the whole artifact, 19 GB for the 27B.
 
 ## Consequences
 
-- No conversion step; the existing `qwen3_8_27b_nvfp4full-v2.ninfer` file is the
-  deployment artifact from v1 onward.
-- The binder's "every object must be consumed at bind time" check becomes a
-  first-class correctness gate (a future artifact with missing/extra objects fails
-  loudly instead of loading silently).
-- Coupling to the NInfer family's container format; format changes upstream are a
-  supported input, not a surprise.
-- Sidecars (`conversion.json`, `graft.json`) document object provenance and are
-  consumed by the loader.
+- There is no conversion step: the `.ninfer` file is the deployment artifact.
+- The binder's check that every object is consumed at bind time is a first-class correctness gate: an artifact with
+  missing or extra objects fails loudly instead of loading silently.
+- ignis is coupled to the NInfer family's container format: a format change upstream is a supported input, not a
+  surprise.
+- The sidecars (`conversion.json`, `graft.json`) document object provenance and are consumed by the loader.
