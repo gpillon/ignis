@@ -3855,7 +3855,7 @@ fn metrics_bind_moves_the_metrics_listener_in_either_order_or_alone() {
 
 /// A default address another process holds (a second server on the host)
 /// costs a start its listener, never the start; one the operator named is
-/// theirs, and refuses it (ADR 0017's 2026-10-15 amendment). Named means an
+/// theirs, and refuses it (ADR 0017). Named means an
 /// address other than the default, from any of the three spellings.
 #[test]
 fn only_a_metrics_address_other_than_the_default_counts_as_named() {

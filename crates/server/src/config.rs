@@ -59,7 +59,7 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8000";
 pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9464";
 
 /// Whether Prometheus metrics are served without anyone saying so (ADR 0017,
-/// amended 2026-10-15, the owner's call): on. #90 showed they cost the
+/// the owner's call): on. #90 showed they cost the
 /// inference path nothing; the listener stays on loopback, keyless and never
 /// exposed, and a start that finds its default address taken goes on without
 /// it.
@@ -560,7 +560,7 @@ pub struct Config {
     /// metrics listener (flag, env or file). One they named that cannot be
     /// bound refuses the start; the default, which a second server on the
     /// host already holds, only warns, and the start goes on without the
-    /// listener (ADR 0017, amended 2026-10-15).
+    /// listener (ADR 0017).
     pub metrics_bind_named: bool,
     /// The key every `/v1` request must present as `Authorization: Bearer
     /// <key>` (`--server-api-key`). `None` (the default) keeps the API open,

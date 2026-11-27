@@ -23,11 +23,11 @@ edit it by hand.
 | [0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md) | Correctness is self-checked, not matched against a reference engine | accepted | |
 | [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted | |
 | [0010](0010-vendored-reference-kernels.md) | Kernel policy: vendor the reference ops verbatim, under a manifest | accepted | |
-| [0011](0011-tracing-for-structured-logging.md) | `tracing` + `tracing-subscriber` as the structured logging foundation | accepted | [0025](0025-scheduler-interval-as-a-log-event.md) |
+| [0011](0011-tracing-for-structured-logging.md) | `tracing` + `tracing-subscriber` as the structured logging foundation | accepted | |
 | [0012](0012-request-id-as-trace-id.md) | Internal tracing spans reuse `request.id` as the OTel `trace_id` | accepted | |
 | [0013](0013-no-typed-attribute-registry.md) | No typed attribute registry; discipline + regression tests only | accepted | |
 | [0016](0016-step-abi-extensible-options.md) | Step-ABI calls take extensible options structs | accepted | |
-| [0017](0017-prometheus-metrics.md) | Opt-in Prometheus metrics with zero inference-path work | accepted | [0025](0025-scheduler-interval-as-a-log-event.md), [0030](0030-device-memory-reserved-at-load.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md), [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md), [0094](0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md), [0097](0097-a-normalized-tool-leaves-its-length-bounds-out-and-the-call-check-counts-the-parameters-held-would-close.md) |
+| [0017](0017-prometheus-metrics.md) | Prometheus metrics with zero inference-path work, on by default | accepted | |
 | [0018](0018-chunk-level-prefill-decode-interleaving.md) | Prefill and decode interleave at chunk granularity, driven by the Rust scheduler | accepted | |
 | [0019](0019-decode-cuda-graph-slot-indirection.md) | decode CUDA graph replay via device-resident slot indirection | accepted | |
 | [0020](0020-batch-wide-decode-round.md) | the decode round is one batch-wide model traversal | accepted | |

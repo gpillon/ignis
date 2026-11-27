@@ -276,7 +276,7 @@ fn a_bind_conflict_emits_a_server_failed_event() {
     drop(held);
 }
 
-// ── the metrics listener, on by default (ADR 0017, amended 2026-10-15) ────
+// ── the metrics listener, on by default (ADR 0017) ────────────────────────
 
 /// No `--server-metrics` and the listener binds; the start line names where
 /// — the port a `:0` bind was given, not the `:0`.

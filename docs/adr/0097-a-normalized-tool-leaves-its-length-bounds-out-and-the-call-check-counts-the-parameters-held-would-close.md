@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0017, ADR-0094]
+amends: [ADR-0094]
 ---
 
 # A normalized tool leaves its length bounds out, and the call check counts the parameters held would close

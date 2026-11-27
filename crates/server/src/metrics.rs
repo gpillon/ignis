@@ -4,10 +4,20 @@
 //!
 //! [`Metrics`] is an aggregate projection of facts the model thread already
 //! sends to the asynchronous telemetry consumer (`engine.rs`'s
-//! `telemetry_task`). That consumer is its only writer; the HTTP task only
-//! reads it, and all text encoding happens there, at scrape time. Nothing in
-//! the scheduler, the model thread, the runtime or the kernel leaf knows it
-//! exists, and with `--server-metrics false` it is never built.
+//! `telemetry_task`). That consumer writes it from those facts; a value no
+//! fact carries is written, off the model thread, by whatever already holds
+//! it (an HTTP handler, the Responses socket queue, an image or speech job,
+//! the loop guard's task), and each `record_*` and `set_*` below says who
+//! calls it. The HTTP task that serves a scrape only reads it, and all text
+//! encoding happens there, at scrape time. Nothing in the scheduler, the
+//! model thread, the runtime or the kernel leaf knows it exists, and with
+//! `--server-metrics false` it is never built.
+//!
+//! ADR 0017 holds the rules common to every family: no work on the inference
+//! path, only authoritative values under bounded labels, when a family
+//! appears. What one family counts, its labels and its finer rules are here,
+//! in its help text and in the doc comments of what records and renders it;
+//! the guide's metrics page is generated from them (`user_docs.rs`).
 //!
 //! Fixed atomics rather than a lock: a scrape can never make the consumer
 //! wait, and the consumer can never make a scrape wait. A scrape therefore
@@ -157,8 +167,9 @@ pub enum Rejection {
 
 impl Rejection {
     /// The reason a submit error counts under. A request longer than the
-    /// per-sequence context (GitHub #166, after ADR 0017's table) is a
-    /// request that can never fit, like one larger than the KV pool.
+    /// per-sequence context (GitHub #166) is a
+    /// request that can never fit, like one larger than the KV pool, so the
+    /// reason set stays these three.
     pub fn of(err: &SubmitError) -> Self {
         match err {
             SubmitError::Full => Self::Full,
@@ -179,7 +190,7 @@ impl Rejection {
 }
 
 /// How an image job ended: `ignis_image_jobs_total`'s fixed `outcome` label
-/// (GitHub #324, ADR 0017's amendment of 2026-10-15; `timed_out` since ADR
+/// (GitHub #324, ADR 0017; `timed_out` since ADR
 /// 0058).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageOutcome {
@@ -193,7 +204,9 @@ pub enum ImageOutcome {
     Refused,
     /// The runner failed a call, or panicked.
     Failed,
-    /// Its deadline passed (ADR 0058).
+    /// Its deadline passed, between two calls (ADR 0058): one more outcome
+    /// of this family, recorded by the job like the other five, and no
+    /// family of its own.
     TimedOut,
 }
 
@@ -232,7 +245,7 @@ pub struct ImageJobEnd {
 }
 
 /// How a transcription ended: `ignis_speech_transcriptions_total`'s fixed
-/// `outcome` label (spec speech/02, ADR 0017's amendment of 2026-10-24).
+/// `outcome` label (spec speech/02, ADR 0017).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeechOutcome {
     /// The transcript was made and sent.
@@ -475,7 +488,7 @@ const LOCATE_SERIES: [(Kind, Method, Compression, LocateFound); 11] = {
     ]
 };
 
-/// `ignis_decision_answer_mass`' bucket boundaries (ADR 0017 as amended by
+/// `ignis_decision_answer_mass`' bucket boundaries (ADR 0017, GitHub
 /// #241), in millionths.
 ///
 /// Not a latency scale reused for a ratio. The measured baseline is a median
@@ -598,7 +611,7 @@ fn decimal(value: u64, scale: u64) -> String {
     format!("{whole}.{}", frac.trim_end_matches('0'))
 }
 
-/// `ignis_structured_repair_seconds`' bucket boundaries (ADR 0017 as amended by ADR 0089,
+/// `ignis_structured_repair_seconds`' bucket boundaries (ADR 0089,
 /// #593), in microseconds: a repair samples one position again from the
 /// round's own scores, tens of microseconds to a few milliseconds, which the
 /// latency scales above (from 50 ms) would put in one bucket.
@@ -1018,6 +1031,14 @@ impl Metrics {
     /// answer. Counted beside `ignis_decisions_total{type="locate"}`, which
     /// still counts it once as a decision. A combination the endpoint never
     /// serves is not counted — it has no series.
+    ///
+    /// Once per question, and for nothing else of it: a shortlist's labelled
+    /// `choice`s and its yes/no are steps of its one `locate`, not decisions,
+    /// so they move neither `ignis_decisions_total{type="choice"}` nor the
+    /// answer-mass histogram, and its content-free baseline prefill is not a
+    /// decision and is not counted. A `locate` is read off attention, not an
+    /// answer position, so like a `point` or a `box` it observes no answer
+    /// mass (GitHub #275).
     pub fn record_locate(&self, kind: Kind, method: Method, compression: Compression, found: LocateFound) {
         let at = LOCATE_SERIES
             .iter()
@@ -1046,9 +1067,10 @@ impl Metrics {
     /// mass, because it has none to observe
     /// ([`Primitive::has_answer_mass`]). The histogram is therefore
     /// deliberately **readout-only**, and its `_count` sits below the
-    /// counter's sum by exactly the number of constrained decodes served — stated in
-    /// ADR 0017's row rather than left for a reader to infer from a graph
-    /// that does not add up.
+    /// counter's sum by exactly the number of constrained decodes served — stated
+    /// here rather than left for a reader to infer from a graph that does
+    /// not add up. A `scalar` is a generated answer too (GitHub #255) and a
+    /// `locate` is read off attention (GitHub #275): neither observes a mass.
     pub fn record_decision(&self, primitive: Primitive, answer_mass: Option<f64>) {
         // Two atomics, so a scrape can land between them. The mass goes
         // first on purpose: the histogram may then be one ahead of the
@@ -1087,13 +1109,20 @@ impl Metrics {
     }
 
     /// A completed request's thinking budget forced the model's close (spec
-    /// server/08).
+    /// server/08). The telemetry consumer projects it from the finish event
+    /// the scheduler already emits, so the model thread does no new work for
+    /// it. A loop guard's close is prefilled, not forced, so it is never one
+    /// of these.
     pub(crate) fn record_thinking_forced_close(&self) {
         self.thinking_forced_closes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A completed request held to a grammar (#593): counted by its type,
+    /// A completed request held to a grammar (#593, ADR 0089): counted by its type,
     /// with the sampled tokens the grammar rejected and the time of each repair.
+    /// The scheduler times a repair where it happens and reports each miss
+    /// with its repair time as a fact of its own; the telemetry consumer
+    /// sums them per request and calls this as the request completes, so a
+    /// request that did not complete moves none of the family.
     pub(crate) fn record_structured(&self, summary: &crate::telemetry::StructuredSummary) {
         let slot = STRUCTURED_KINDS.iter().position(|&kind| kind == summary.kind).unwrap_or(0);
         for &us in &summary.repair_micros {
@@ -1136,14 +1165,19 @@ impl Metrics {
     /// A call to a tool that is not held, just counted by
     /// [`Metrics::record_tool_call`], had `values` string values from which
     /// the first-occurrence cuts dropped text after a tag inside them, text
-    /// the confirmed close would have kept in the value (GitHub #610).
+    /// the confirmed close would have kept in the value (GitHub #610, ADR
+    /// 0094): a lower bound, which weighs extending the rule to every tool.
     pub(crate) fn record_tool_call_values_split(&self, values: u64) {
         self.tool_call_values_split.fetch_add(values, Ordering::Relaxed);
     }
 
     /// A call just counted by [`Metrics::record_tool_call`], valid or not,
     /// held a parameter that an object the operator's switch at `held` would
-    /// close does not declare (GitHub #641).
+    /// close does not declare (GitHub #641, ADR 0097). A family of its own,
+    /// not a kind of `ignis_tool_call_violations_total`: that one counts
+    /// invalid calls, and these may be valid. Never counted on a model that
+    /// holds no tool, for a key an object admits by name, or in a tool that
+    /// `held` leaves free.
     pub(crate) fn record_tool_call_undeclared_parameters(&self) {
         self.tool_call_undeclared_parameters.fetch_add(1, Ordering::Relaxed);
     }
@@ -1202,7 +1236,9 @@ impl Metrics {
     }
 
     /// The image queue as it stands: jobs waiting for their turn, and the
-    /// one running (GitHub #324).
+    /// one running (GitHub #324). Set by the queue itself, under its lock, at
+    /// each admission, turn and departure, so the last change to land is the
+    /// last one shown.
     pub fn set_image_queue(&self, waiting: u32, running: u32) {
         self.image_seen.store(1, Ordering::Relaxed);
         self.image_waiting.store(u64::from(waiting), Ordering::Relaxed);
@@ -1232,7 +1268,13 @@ impl Metrics {
 
     /// The bytes of the condition prefixes the image model holds now
     /// (GitHub #324): set by the job as it encodes its prefix and releases
-    /// it, with the runner held.
+    /// it, with the runner held, not projected from a telemetry fact; every
+    /// load's reservations reset it. Read against the `condition_budget`
+    /// line, as `ignis_kv_pool_used_pages` is against `ignis_kv_pool_pages`.
+    /// Unlike the image job families it renders from the first scrape, 0 on
+    /// a text load, since a memory gauge's zero is a reading: which is why
+    /// its name stays outside the `ignis_image_` families, absent until a
+    /// job.
     pub fn set_condition_budget_used(&self, bytes: u64) {
         self.condition_budget_used_bytes.store(bytes, Ordering::Relaxed);
     }
@@ -1258,6 +1300,13 @@ impl Metrics {
 
     /// A live snapshot was written to KV-disk from `from` (spec
     /// vram-budget/03): straight from the device, or demoted from KV-RAM.
+    /// A live move is counted where it lands (ADR 0045): one into KV-RAM is
+    /// `ignis_kv_cache_evictions_total`, which stays device to KV-RAM only,
+    /// and one straight to disk is this family's `from="device"`. A demotion
+    /// from KV-RAM to disk is `from="kv_ram"` and no
+    /// `ignis_kv_ram_evictions_total`, which stays a snapshot dropped and
+    /// lost: with the tier on, only the last resort, when every tier
+    /// refuses, counts there.
     pub(crate) fn record_kv_disk_spill(&self, from: DiskSource) {
         let at = match from {
             DiskSource::Device => 0,
@@ -1370,17 +1419,25 @@ impl Metrics {
         self.set_flash_next(None);
     }
 
-    /// A request's first token came `ms` after its submission.
+    /// A request's first token came `ms` after its submission. For both
+    /// latency histograms the submission is the scheduler's acceptance as the
+    /// telemetry consumer observes it, the anchor of the
+    /// `ignis.request.ttft` and `done` log events: measuring from HTTP
+    /// ingress would take a fact the consumer does not already receive.
     pub(crate) fn observe_ttft_ms(&self, ms: u64) {
         self.ttft.observe(ms);
     }
 
-    /// A request completed `ms` after its submission.
+    /// A request completed `ms` after its submission. A request cancelled
+    /// after its first token has a TTFT observation and no duration one.
     pub(crate) fn observe_duration_ms(&self, ms: u64) {
         self.duration.observe(ms);
     }
 
-    /// A submission was accepted by the scheduler.
+    /// A submission was accepted by the scheduler. This and the cancels
+    /// count engine requests: a loop-guard rewind is two, so its cancel
+    /// counts once in `ignis_requests_cancelled_total` and its continuation
+    /// once here (GitHub #330).
     pub(crate) fn record_accepted(&self) {
         self.accepted.fetch_add(1, Ordering::Relaxed);
     }
@@ -1409,6 +1466,9 @@ impl Metrics {
     }
 
     /// The socket requests waiting in the admission queue now (GitHub #282).
+    /// A socket request the engine finds full is queued, not rejected, so it
+    /// does not move `ignis_requests_rejected_total`; one refused for good
+    /// (unknown model, context, size) does, as on HTTP.
     pub(crate) fn set_responses_queued(&self, queued: u64) {
         self.responses_queued.store(queued, Ordering::Relaxed);
     }
@@ -1466,10 +1526,13 @@ impl Metrics {
                 "Live host-tier snapshots dropped from KV-RAM to make room; the request re-prefills from the start.",
                 &self.kv_ram_evictions,
             ),
-            // Sibling-prefix reuse only, as ADR 0017's table row says. A
+            // Sibling-prefix reuse only. A
             // retained prefix is claimed through the same path (#188), and
             // `SchedEvent::PrefixReused::retained` is what keeps its tokens
             // out of here and in `ignis_retained_reused_tokens_total` (#190).
+            // Reading this series as all prefix reuse, sibling and retained
+            // together, was proposed and declined: the counter stayed narrow
+            // and the routing changed instead.
             (
                 "ignis_prefix_reused_tokens_total",
                 "Cumulative tokens skipped through sibling-prefix reuse.",
@@ -1496,7 +1559,9 @@ impl Metrics {
             // misses a tier no *retained* prefix matched in (a live sibling's
             // head is no hit, so it stops no miss) and looks only on the
             // device and in KV-RAM, so `tier="disk",kind="prefix"` stays at
-            // zero. ADR 0017 records the rule under its metric table.
+            // zero. Each kind misses only where it can be hit on the load: no
+            // checkpoint miss with `--reuse-prompt off`, no prefix miss
+            // without a retained slot.
             (
                 "ignis_retained_state_misses_total",
                 "Prefill runs whose first chunk landed with no retained checkpoint, or no retained prefix, matching in the tier (a re-queued request counts again).",
@@ -1686,10 +1751,13 @@ impl Metrics {
         self.ttft.render(&mut out, "ignis_request_ttft_seconds", "Submission-to-first-token latency.");
         self.duration.render(&mut out, "ignis_request_duration_seconds", "Submission-to-completion latency.");
         // The decision family, **only once there has been a decision**
-        // (GitHub #241). ADR 0017 exports zeros for everything else; this
-        // follows its other rule instead — "only authoritative values are
-        // exported" — because a load that serves no decisions is the normal
-        // one, and three permanently-zero series plus an eleven-bucket
+        // (GitHub #241). ADR 0017 exports a family from the first scrape,
+        // zeros included, unless most servers never use its route or its
+        // feature; this was the first such family, absent until its first
+        // event: it follows the ADR's other rule instead, that only
+        // authoritative values are exported, because a load that serves no
+        // decisions is the normal one, and three permanently-zero series
+        // plus an eleven-bucket
         // histogram on every scrape of every server would be clutter that
         // says nothing. A `rate()` over a series that appears mid-window is
         // handled by Prometheus the same way a new target is.
@@ -1884,7 +1952,12 @@ impl Metrics {
             // 7 drafts or fewer), whose extended series stays at 0. GitHub
             // #719: each lane of a mixed round counts once as mixed, at neither
             // shape, as each lane's rounds count at the others; the series stays
-            // at 0 where no load runs one.
+            // at 0 where no load runs one. So the three series sum to
+            // `ignis_speculative_rounds_total` and a share of them is a share
+            // of lane-rounds (ADR 0106): counting a mixed round's lanes at
+            // their own shapes would show no round as mixed. The per-position
+            // families keep counting each lane's own drafts, an extended
+            // lane's up to its window and a base lane's up to its own.
             let name = "ignis_speculative_shape_rounds_total";
             declare(
                 &mut out,
@@ -3141,8 +3214,8 @@ mod tests {
     /// histogram's `_count` is deliberately below the counter's sum.
     ///
     /// The owner's call, and an asymmetry a reader would otherwise have to
-    /// infer from a graph that does not add up — ADR 0017's row says it in
-    /// words and this says it in numbers.
+    /// infer from a graph that does not add up — `Metrics::record_decision`
+    /// says it in words and this says it in numbers.
     #[test]
     fn a_program_is_counted_and_observes_no_answer_mass() {
         let metrics = Metrics::new();
