@@ -58,7 +58,10 @@ file is the spec and the ticket's brief: read it after the issue body. The
 files left the main branch and are whole under the tag `records-2026-11-27`:
 the issue's link opens the spec there, and in a clone
 `git show records-2026-11-27:docs/specs/<feature>/<file>.md` does
-(`docs/specs/README.md`). A new spec is an issue.
+(`docs/specs/README.md`). A new spec is an issue. The old specs are not
+turned into issues: GitHub cannot backdate an issue, four of the 158 files
+exceed the 65,536-character body limit, about 275 citations would move, and
+about half the specs were edited after their tickets closed.
 
 ## Closing work
 
