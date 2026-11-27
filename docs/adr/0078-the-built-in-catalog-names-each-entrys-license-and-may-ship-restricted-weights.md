@@ -4,7 +4,7 @@ status: accepted
 
 # The built-in catalog names each entry's license and may ship weights whose license restricts commercial use
 
-Swift 1.5 (GitHub #449) is a fine-tune of the 27B under the Swift Open License
+Swift 1.5 is a fine-tune of the 27B under the Swift Open License
 v1.0, which leaves commercial use by an organization above US$1M of revenue
 unlicensed. Until then the built-in catalog had held weights under open licenses
 and Qwen's own (Flash-Next's community license, the image model's research

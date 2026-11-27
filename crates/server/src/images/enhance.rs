@@ -5,6 +5,10 @@
 //! ideograph, an edit's with its condition images when the text model can
 //! see them. Reasoning is off. The switches that bring the text model in are
 //! the routes' ([`super::routes`]); this is the rewrite on it.
+//!
+//! The enhancer's id is first the id this card serves it under (ADR 0064),
+//! through the step a request's `model` takes: on a card that cannot load its
+//! own entry, the entry of its family that answers to it.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -158,7 +162,7 @@ pub fn unknown_enhancer(server: &Server, enhancer: &str, listing: &BTreeMap<Stri
 
 /// The text model `enhancer` (`image.prompt_enhancer`) names, as this card
 /// serves it — through the same step a request's `model` takes
-/// ([`crate::api::model_on_this_card`], ADR 0064 §2): on a card below the
+/// ([`crate::api::model_on_this_card`], ADR 0064): on a card below the
 /// 27B's default entry, the default enhancer `qwen3.8-27b` is the entry that
 /// answers to it, so the rewrite runs on that one, loaded or visited, and is
 /// never a visit to the model already loaded. As configured when no entry

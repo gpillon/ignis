@@ -101,7 +101,7 @@ family of every entry an alias involves: the entry that lists it, and the
 entry whose id it is. An id or an alias that is a family's default id says it:
 `qwen3.8-27b-16g`'s alias `qwen3.8-27b` makes it a Qwen3.8-27B. For any other,
 the entry states `family`, the family's default id
-([ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md)).
+([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)).
 That is how an alias can name another entry's id: your own fine-tune and its
 16 GB build answer to one id on every card, as `qwen3.8-27b-16g` answers to
 `qwen3.8-27b`.

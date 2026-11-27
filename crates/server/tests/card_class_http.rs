@@ -10,7 +10,7 @@
 //! nothing changes. The catalog is the built-in one, which holds the 16 GB
 //! 27B (GitHub #338); every artifact is a file under `download.path`, and the
 //! models are `support/switch.rs`'s mocks, loaded by id. An alias may also be
-//! another entry's id of the same family (ADR 0074): the uncensored variant's
+//! another entry's id of the same family (ADR 0064): the uncensored variant's
 //! 16 GB build, also built in (GitHub #423), answers to
 //! `qwen3.8-27b-abliterated` on a 16 GB card, and Swift 1.5's (GitHub #473)
 //! to `swift-1.5-27b`. A 24 GB card (GitHub #480) is below every 32 GB entry
@@ -63,7 +63,7 @@ const DEFAULT_27B: &str = "qwen3.8-27b";
 const FLASH_NEXT: &str = "qwen3.8-flash-next";
 const IMAGE: &str = "ignis-image-2.1-turbo";
 /// The uncensored variant's served id, its 32 GB entry's, and the id of its
-/// 16 GB build (ADR 0074, GitHub #423).
+/// 16 GB build (ADR 0064, GitHub #423).
 const ABLITERATED: &str = "qwen3.8-27b-abliterated";
 const ABLITERATED_16G: &str = "qwen3.8-27b-abliterated-16g";
 /// Swift 1.5's served id, its NVFP4 entry's, and the id of its 16 GB build
@@ -264,7 +264,7 @@ async fn still_serving(app: &axum::Router, server: &Server, loader: &MockLoader,
     assert_eq!(completion["model"], loaded);
 }
 
-/// ADR 0064 §3: `POST /v1/models/switch` by id to an entry above the card's
+/// ADR 0064: `POST /v1/models/switch` by id to an entry above the card's
 /// class is refused before anything stops — not even prepared, so the
 /// status never leaves `serving` — and the loaded model serves on. A switch
 /// naming its own artifact is the operator's word (ADR 0047), which only the
@@ -285,7 +285,7 @@ async fn an_explicit_switch_to_an_entry_above_the_card_class_is_refused_before_a
     assert_eq!(until_serving(&app).await["data"][0]["id"], FLASH_NEXT);
 }
 
-/// ADR 0064 §3: a request naming an entry above the card's class is refused
+/// ADR 0064: a request naming an entry above the card's class is refused
 /// before its implicit switch begins, on every route that switches — chat,
 /// Responses over HTTP and over its WebSocket, image generations and edits,
 /// decisions (`422`, its own refusal shape) — and on the counting route; the
@@ -318,7 +318,7 @@ async fn a_request_naming_an_entry_above_the_card_class_is_refused_before_anythi
     still_serving(&app, &server, &loader, SIXTEEN).await;
 }
 
-/// ADR 0064 §2: on a 16 GB card with the 16 GB 27B loaded, a request naming
+/// ADR 0064: on a 16 GB card with the 16 GB 27B loaded, a request naming
 /// the 27B's default id is served by it — no switch, no refusal — on every
 /// route, lane tag and all; the answer names the model that served it. On
 /// the image routes the id the kind check reads is the loaded 16 GB 27B's,
@@ -357,7 +357,7 @@ async fn on_a_16gb_card_the_default_id_is_served_by_the_entry_that_answers_to_it
     assert_eq!(server.active().model_id(), SIXTEEN);
 }
 
-/// ADR 0064 §2: from another model, the default id switches to the entry
+/// ADR 0064: from another model, the default id switches to the entry
 /// that answers to it on this card, never to its own 32 GB one — and the
 /// model loaded stays served by its own id whatever its class.
 #[tokio::test]
@@ -386,7 +386,7 @@ async fn on_a_16gb_card_the_default_id_switches_to_the_entry_that_answers_to_it(
     assert_eq!(until_serving(&app).await["data"][0]["id"], SIXTEEN);
 }
 
-/// ADR 0064 §2: an alias only ever resolves within one model family, and the
+/// ADR 0064: an alias only ever resolves within one model family, and the
 /// family is the artifact's header's (ADR 0047), not the alias's. The entry
 /// that answers to the 27B's default id, holding a Flash-Next artifact — on
 /// disk, so its header is read before anything stops — does not answer to
@@ -445,9 +445,9 @@ async fn on_a_32gb_card_or_an_unknown_one_nothing_changes() {
     }
 }
 
-/// ADR 0064 §3: `GET /v1/models` lists an entry on disk the card cannot
+/// ADR 0064: `GET /v1/models` lists an entry on disk the card cannot
 /// load as unavailable, with the reason — the default id's own entry, and
-/// the uncensored variant's (ADR 0074), saying which entry serves a request
+/// the uncensored variant's (ADR 0064), saying which entry serves a request
 /// naming it — and `GET /v1/models/catalog` says the same of every row, none
 /// of them switchable.
 #[tokio::test]
@@ -498,8 +498,8 @@ async fn the_model_lists_mark_entries_above_the_card_class_unavailable_with_the_
     }
 }
 
-/// ADR 0064 §3: "A switch, explicit or implicit, and a download check the
-/// card class first" — the class is the catalog entry's, so a catalog id the
+/// ADR 0064: "A switch, explicit or implicit, a start and a download check
+/// the card first" — the class is the catalog entry's, so a catalog id the
 /// operator also listed by path (`switch.known_models`) is fitted all the
 /// same: unavailable on both lists, never switchable, and a request or a
 /// switch naming it is refused before anything stops. An id that is no
@@ -533,11 +533,11 @@ async fn a_catalog_id_the_operator_listed_is_fitted_to_the_card_all_the_same() {
     assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some("acme-own")), "the operator's own model: {completion}");
 }
 
-/// ADR 0064 §2 for `image.prompt_enhancer`, `qwen3.8-27b` by default: it
+/// ADR 0064 for `image.prompt_enhancer`, `qwen3.8-27b` by default: it
 /// takes the step a request's `model` takes, so on a 16 GB card the rewrite
 /// runs on the entry that answers to the default id — the loaded one in
 /// place, never a visit to itself, or the one a visit loads — and to the
-/// uncensored variant's (ADR 0074). With no such entry it is an enhancer no
+/// uncensored variant's (ADR 0064). With no such entry it is an enhancer no
 /// visit reaches, which the start and a `PATCH` say; on a 32 GB card it is
 /// its own entry's.
 #[tokio::test]
@@ -568,7 +568,7 @@ async fn the_prompt_enhancer_is_served_by_the_entry_that_answers_to_it() {
     assert_eq!(unknown_enhancer(&thirty_two, DEFAULT_27B, &none), None);
 }
 
-/// ADR 0074: on a 16 GB card a request naming the uncensored variant's id
+/// ADR 0064: on a 16 GB card a request naming the uncensored variant's id
 /// switches to its 16 GB build, whose artifact is on disk — never to the
 /// 32 GB entry's — and is served under the build's own id; once it is
 /// loaded, a request naming the id is served by it, lane tag and all, with
@@ -596,7 +596,7 @@ async fn on_a_16gb_card_the_uncensored_variants_id_is_served_by_its_16gb_build()
     assert_eq!(loader.loads(), [ABLITERATED_16G, SIXTEEN, ABLITERATED_16G]);
 }
 
-/// ADR 0074: the implicit switch to the 16 GB build happens only when its
+/// ADR 0064: the implicit switch to the 16 GB build happens only when its
 /// artifact is on disk. Without it, a request or a switch naming the
 /// uncensored variant's id is refused before anything stops, naming the
 /// build — never served by the 32 GB entry, which this card cannot load.
@@ -614,7 +614,7 @@ async fn the_switch_to_the_uncensored_variants_16gb_build_needs_its_artifact_on_
     still_serving(&app, &server, &loader, SIXTEEN).await;
 }
 
-/// ADR 0074: the header stays the authority. The 16 GB build states the
+/// ADR 0064: the header stays the authority. The 16 GB build states the
 /// 27B's family; holding an artifact whose header names Flash-Next, it does
 /// not answer to the uncensored variant's id: a request and a switch naming
 /// it are refused before anything stops, naming both families, and the
@@ -642,7 +642,7 @@ async fn an_uncensored_variants_16gb_build_whose_header_names_another_family_doe
     assert_eq!((status, completion["model"].as_str()), (StatusCode::OK, Some(ABLITERATED_16G)), "{completion}");
 }
 
-/// ADR 0074: on a 32 GB card, a 96 GB one or one of no known class nothing
+/// ADR 0064: on a 32 GB card, a 96 GB one or one of no known class nothing
 /// changes for the uncensored variant: its id is its own entry's, for a
 /// request's switch and an explicit one, whatever the 16 GB build's header.
 #[tokio::test]
@@ -667,7 +667,7 @@ async fn on_other_cards_the_uncensored_variants_id_is_its_own_entrys() {
     }
 }
 
-/// ADR 0074, ADR 0064 §3: on a 16 GB card `GET /v1/models` lists the
+/// ADR 0064: on a 16 GB card `GET /v1/models` lists the
 /// uncensored variant's 16 GB build, and marks its 32 GB entry unavailable
 /// with the reason, naming the build that serves a request for its id here;
 /// `GET /v1/models/catalog` says the same of their rows.
@@ -694,7 +694,7 @@ async fn on_a_16gb_card_the_model_lists_name_the_build_that_serves_the_uncensore
     assert!(row(ABLITERATED)["reason"].as_str().unwrap().contains(&format!("served by {ABLITERATED_16G}")), "{catalog}");
 }
 
-/// GitHub #473 (ADR 0074): on a 16 GB card a request naming Swift 1.5's id
+/// GitHub #473 (ADR 0064): on a 16 GB card a request naming Swift 1.5's id
 /// switches to its 16 GB build, whose artifact is on disk, never to the NVFP4
 /// entry's, and is served under the build's own id; once it is loaded a
 /// request naming the id is served by it, lane tag and all, with no switch,
@@ -735,7 +735,7 @@ async fn on_a_16gb_card_swifts_id_is_served_by_its_16gb_build_which_can_be_named
     assert_eq!(loader.loads(), [SWIFT_16G, SIXTEEN, SWIFT_16G, SIXTEEN, SWIFT_16G, SIXTEEN, SWIFT_16G]);
 }
 
-/// GitHub #473 (ADR 0074): the switch to Swift 1.5's 16 GB build needs its
+/// GitHub #473 (ADR 0064): the switch to Swift 1.5's 16 GB build needs its
 /// artifact on disk, and its header to name the 27B's family. Without the
 /// artifact, a request and a switch naming `swift-1.5-27b` are refused before
 /// anything stops, naming the build, never served by the NVFP4 entry, which
@@ -798,7 +798,7 @@ async fn on_other_cards_swifts_id_is_its_nvfp4_entrys() {
     }
 }
 
-/// GitHub #473, ADR 0064 §3: on a 16 GB card `GET /v1/models` lists Swift
+/// GitHub #473, ADR 0064: on a 16 GB card `GET /v1/models` lists Swift
 /// 1.5's 16 GB build, and marks its NVFP4 entry unavailable with the reason,
 /// naming the build that serves a request for its id here;
 /// `GET /v1/models/catalog` says the same of their rows.
@@ -1039,7 +1039,7 @@ async fn on_an_ada_card_of_no_class_the_alias_serves_the_16gb_entry() {
     still_serving(&app, &server, &loader, SIXTEEN).await;
 }
 
-/// Spec #474, ADR 0064's As built: the generation is the catalog entry's,
+/// Spec #474, ADR 0064: the generation is the catalog entry's,
 /// whoever names its id, so on an RTX 3090 a catalog id the operator also
 /// listed by path (`switch.known_models`) is fitted all the same: unavailable
 /// on the list with the reason, and a switch or a request naming it refused
@@ -1163,7 +1163,7 @@ async fn on_a_larger_card_the_12gb_entry_loads_by_its_own_id_and_the_default_id_
     }
 }
 
-/// Spec #701 (GitHub #706, ADR 0074, ADR 0098): on a 12 GB card of each
+/// Spec #701 (GitHub #706, ADR 0064, ADR 0098): on a 12 GB card of each
 /// generation, an RTX 50, an RTX 30 and an RTX 40, a request naming the
 /// uncensored variant's id switches to its 12 GB build, whose artifact is on
 /// disk, never to the 32 GB entry's or the 16 GB build's, and is served
@@ -1262,7 +1262,7 @@ async fn on_a_larger_card_the_uncensored_variants_12gb_build_loads_by_its_own_id
     }
 }
 
-/// Spec #701 (GitHub #706), ADR 0064 §3: on a 12 GB card of each generation
+/// Spec #701 (GitHub #706), ADR 0064: on a 12 GB card of each generation
 /// `GET /v1/models` lists the uncensored variant's 12 GB build as available,
 /// and marks its 32 GB entry unavailable with the reason, naming the build
 /// that serves a request for its id here, and its 16 GB build unavailable,

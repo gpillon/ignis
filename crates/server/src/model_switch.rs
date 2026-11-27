@@ -46,6 +46,25 @@
 //! is then served on the model it named. Both run [`begin`]: one mechanism,
 //! two callers.
 //!
+//! **The card comes first** (ADR 0064, ADR 0079). A switch by id, explicit
+//! or implicit, is fitted to the card the start read before it begins. An id
+//! another catalog entry of its family answers to on this card is that
+//! entry's (`Switcher::on_this_card`), once its artifact's header names the
+//! id's family: an alias resolves only within one model family, and only to
+//! an entry the card can load. A catalog entry the card cannot load, by its
+//! class or its GPU generation, with no entry answering to it, is refused
+//! before step 1, `409 model_above_card_class` or `409
+//! model_above_gpu_generation`: nothing is prepared, the status never leaves
+//! `serving` and no `last_switch` is written. The class and the generation
+//! are the catalog entry's, whoever names its id: a catalog id the operator
+//! also listed in `switch.known_models`, or started on by path, is fitted all
+//! the same, unavailable on the lists, never switched to, and the way back to
+//! it after a switch is refused. Only a switch naming its `artifact` is the
+//! operator's word, which the VRAM plan alone guards, and an id that is no
+//! catalog entry has no class. The lists keep an entry the card cannot load,
+//! as unavailable with the reason, which names the entry that answers to its
+//! id here when one does (`Switcher::unavailable_reason`).
+//!
 //! **Idle unload** (spec model-switch/02, ADR 0049). The idle clock
 //! (`crate::idle`) tears a model nobody uses down through this module's own
 //! slot and teardown (`claim_unload_if`, `unload`), and so does `POST
@@ -116,7 +135,7 @@ pub trait ModelLoader: Send + Sync {
     /// The model family `target`'s artifact is of, when that can be told
     /// without loading it — its header's (ADR 0047): what an alias is
     /// checked against before a switch to the entry that answers to it (ADR
-    /// 0064 §2: an alias resolves only within one model family). By default
+    /// 0064: an alias resolves only within one model family). By default
     /// the family whose own id `target` is served under; `None` when that
     /// says nothing.
     fn family_of(&self, target: &ModelSource) -> Option<ModelFamily> {
@@ -500,7 +519,7 @@ pub enum Unswitchable {
     /// be fetched first (`model download`), a switch never starts a download.
     NotDownloaded,
     /// A catalog entry the card cannot load, by class or by generation, with
-    /// no entry answering to it that fits (ADR 0064 §3, ADR 0079): `409
+    /// no entry answering to it that fits (ADR 0064, ADR 0079): `409
     /// model_above_card_class` or `409 model_above_gpu_generation`
     /// ([`CardRefusal::code`]), before anything is prepared or torn down.
     RefusedOnCard(CardRefusal),
@@ -518,8 +537,8 @@ pub enum Unswitchable {
 pub struct Servable {
     /// Its id.
     pub id: String,
-    /// Why a request naming it is not served by it on this card (ADR 0064
-    /// §3, ADR 0079): a catalog id on disk the card cannot load, by class or
+    /// Why a request naming it is not served by it on this card (ADR 0064,
+    /// ADR 0079): a catalog id on disk the card cannot load, by class or
     /// by generation. `None` for a model
     /// a request naming it switches to.
     pub unavailable: Option<String>,
@@ -730,7 +749,7 @@ impl Switcher {
     /// directory needs no restart.
     ///
     /// A catalog id the card cannot load is refused first, before a switch
-    /// begins (ADR 0064 §3, ADR 0079) — listed or not: the class and the
+    /// begins (ADR 0064, ADR 0079) — listed or not: the class and the
     /// generation are the catalog entry's, whatever path the operator gave its
     /// id; an id another entry
     /// answers to on this card is the caller's to rewrite first
@@ -755,7 +774,7 @@ impl Switcher {
     }
 
     /// The catalog's card-aware step ([`crate::download::Catalog::answering`],
-    /// ADR 0064 §2-3, ADR 0079) for a request's `model` or a switch by id,
+    /// ADR 0064, ADR 0079) for a request's `model` or a switch by id,
     /// lane tag stripped: `Ok(None)` when `model` stands as it is — the
     /// catalog does not hold it (an operator's own model, which has no class),
     /// or its own entry fits the card; `Ok(Some(id))` when another entry of
@@ -790,7 +809,7 @@ impl Switcher {
     }
 
     /// Why the catalog entry `model` itself cannot be loaded on this card,
-    /// for `GET /v1/models` and `GET /v1/models/catalog` (ADR 0064 §3, ADR
+    /// for `GET /v1/models` and `GET /v1/models/catalog` (ADR 0064, ADR
     /// 0079): its class or its generation is above the card's, and when
     /// another entry serves a request naming it here, which one. `None` for
     /// an entry that fits, a model the catalog does not hold, or with no card
@@ -910,7 +929,7 @@ impl Switcher {
     /// `switch.allow_implicit` in: off, nothing is servable but `active`.
     ///
     /// A catalog id whose artifact is on disk — the catalog's, or the path
-    /// the operator listed it with — that the card cannot load (ADR 0064 §3)
+    /// the operator listed it with — that the card cannot load (ADR 0064)
     /// is listed where it always was, with why it is not available
     /// ([`Switcher::unavailable_reason`]).
     pub fn servable_models(&self, active: &str) -> Vec<Servable> {
@@ -940,7 +959,7 @@ impl Switcher {
     /// model down for a load that cannot begin. Looked up at each call, so a
     /// file put back is switchable at once. Its id still wins over a catalog
     /// entry's. A catalog id above the card's class is not one, listed or
-    /// not (ADR 0064 §3): a request naming it never switches.
+    /// not (ADR 0064): a request naming it never switches.
     pub fn known(&self, model: &str) -> Option<PathBuf> {
         // A speech model is no model to switch to (ADR 0067).
         if self.is_speech(model) || self.is_diarizer(model) {

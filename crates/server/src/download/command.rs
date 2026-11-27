@@ -9,6 +9,13 @@
 //! `download.enabled`, which gates only the implicit start-time fetch. And
 //! nothing here needs `cuda`: any machine can fetch the files an air-gapped
 //! one is carried.
+//!
+//! Both are fitted to the card the start would read (ADR 0064, ADR 0079): a
+//! download of an id another entry answers to on this card fetches that
+//! entry; one of an entry the card cannot load, by its class or its GPU
+//! generation, refuses the whole command before anything is fetched, `--all`
+//! too, naming each such entry; and the list says which entries the card
+//! loads. With no card read, nothing is refused.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -262,7 +269,8 @@ pub struct ListRow {
     /// read with `on_disk`, from the same sizes.
     pub bytes_on_disk: u64,
     /// The family the artifact's own header names, when the artifact is on
-    /// disk and names one — never declared in the catalog (ADR 0047).
+    /// disk and names one: the header's, never the one the catalog states
+    /// (ADR 0047).
     pub family: Option<ModelFamily>,
 }
 
@@ -296,8 +304,8 @@ pub fn list_rows(
         .collect()
 }
 
-/// The entries `model download` fetches (spec model-download/02, ADR 0064
-/// §3, ADR 0079): each of `ids`, matched case-insensitively as a command
+/// The entries `model download` fetches (spec model-download/02, ADR 0064,
+/// ADR 0079): each of `ids`, matched case-insensitively as a command
 /// line's ids are; every entry with `all`; the configured model,
 /// `configured`, with neither. Each is fitted to `card`, the card the start
 /// would read, first ([`Catalog::answering`]): an id another entry answers to
@@ -669,7 +677,7 @@ mod tests {
         entries_to_fetch(catalog, &ids, all, crate::config::DEFAULT_MODEL, card).map(|entries| entries.into_iter().map(|entry| entry.id).collect())
     }
 
-    /// ADR 0064 §2-3: on a 16 GB card the default id — named, or the
+    /// ADR 0064: on a 16 GB card the default id — named, or the
     /// configured model with none — fetches the entry that answers to it,
     /// each entry once.
     #[test]
@@ -685,7 +693,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074: an alias that is another entry's id resolves for a download
+    /// ADR 0064: an alias that is another entry's id resolves for a download
     /// as for a request — `model download qwen3.8-27b-abliterated` on a 16 GB
     /// card fetches the built-in abliterated 16 GB build (GitHub #423), and
     /// on a larger card the id's own entry.
@@ -726,7 +734,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074, GitHub #473: `model download swift-1.5-27b` on a 16 GB card
+    /// ADR 0064, GitHub #473: `model download swift-1.5-27b` on a 16 GB card
     /// fetches Swift 1.5's 16 GB build, which can be named too, and on a
     /// larger card, or one of no known class, the NVFP4 entry.
     #[test]
@@ -741,7 +749,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §3: a download of an entry above the card's class is
+    /// ADR 0064: a download of an entry above the card's class is
     /// refused whole, before anything is fetched — each such entry named
     /// with both classes, `--all` too — and the default model on a 16 GB
     /// card is, in a catalog without the 16 GB 27B.

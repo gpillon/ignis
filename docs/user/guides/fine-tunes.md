@@ -14,7 +14,7 @@ list`, `model download`, the Server view and `GET /v1/models/catalog` show it
 ([the catalog](models.md#the-catalog)). An entry of a fine-tune whose id names
 no family states the family it is of, `family: qwen3.8-27b`, which is how its
 16 GB build answers to its id on a 16 GB card
-([ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md)).
+([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)).
 
 The built-in catalog has two fine-tunes of the 27B: the
 [uncensored variant](uncensored.md), whose post-training is an abliteration,

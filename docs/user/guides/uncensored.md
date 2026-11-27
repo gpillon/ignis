@@ -28,7 +28,7 @@ On a 32 GB card or larger it is served as `qwen3.8-27b-abliterated`, so a
 client can tell it from the 27B. On a 16 GB card the same commands fetch and
 start `qwen3.8-27b-abliterated-16g`, which answers to `qwen3.8-27b-abliterated`
 there, as `qwen3.8-27b-16g` answers to `qwen3.8-27b`
-([ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md)).
+([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md)).
 On a 12 GB card, an RTX 50, RTX 40 or RTX 30 card alike, they
 fetch and start `qwen3.8-27b-abliterated-12g`, which answers to it there, as
 `qwen3.8-27b-12g` answers to `qwen3.8-27b`; the 16 GB build is refused there by

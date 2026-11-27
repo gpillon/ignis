@@ -620,7 +620,7 @@ runs against. A model-load option, fixed for the life of the load.
 **Model family**:
 The architecture an artifact runs as (`Qwen3.8-27B`, `Qwen3.8-Flash-Next`,
 `Qwen-Image-2.1`), read from the artifact's own header: a catalog entry may
-state it, and the header must agree (ADR 0074). It decides the forward
+state it, and the header must agree (ADR 0064). It decides the forward
 program, the drafter and the family scope.
 _Avoid_: model (for the architecture)
 
@@ -643,7 +643,7 @@ _Avoid_: model name
 A served id one catalog entry also answers to on a card that cannot load that
 id's own entry, its **card class** below the entry's or its **GPU generation**
 older: its family's default id, or another entry's served id of the same
-family (ADR 0064, ADR 0074, ADR 0079). It resolves only within
+family (ADR 0064, ADR 0079). It resolves only within
 one model family — the entry that answers to it holds an artifact whose header
 names that family — and only to an entry the card can load. Entries of
 different card classes may answer to one id, and where several fit the card
@@ -681,7 +681,7 @@ speech models and the diarizer, which run on the CPU, state none), the oldest
 **GPU generation** it loads on (`generation`, optional: an entry stating none
 loads on every generation the build runs on), the
 **aliases** it may answer to (ADR 0064), its **model family** when
-neither its id nor its aliases name one (`family`, ADR 0074), and the license
+neither its id nor its aliases name one (`family`, ADR 0064), and the license
 its weights are published under (`license`: the license's identifier and a link
 to its text; every built-in entry states it, an operator entry may; ADR 0078). An
 operator entry never reuses a built-in id.

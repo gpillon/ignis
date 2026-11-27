@@ -4,7 +4,7 @@ status: accepted
 
 # The server downloads and removes models after start, from the Server view
 
-Until 2026-10-25 the server fetched a model only at start, when the model it
+The server fetched a model only at start, when the model it
 was told to serve was missing (ADR 0033, ADR 0047), and the Server view could
 only copy the `model download` command for the operator to run. The Server
 view now downloads a catalog entry, cancels that download and removes a

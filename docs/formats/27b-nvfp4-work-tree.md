@@ -5,7 +5,7 @@ GitHub: #467 (spec #449). Owner of this document: the packer family `qwen3.8-27b
 family). Writer of the work tree: the NVFP4 converter (#468). Readers of the sidecar: the loader's
 checksum verification (`ignis_artifact::checksum`) and the 16 GB converter (`tools/27b-16gb-converter`,
 #465). Why the container is what it is: ADR 0002; why a fine-tune keeps `model_id` `qwen3.8-27b`:
-ADR 0074 and spec #449's "Identity".
+ADR 0064 and spec #449's "Identity".
 
 An NVFP4 container of the 27B, the base's or a fine-tune's, has the served artifact's layout
 (`qwen3_8_27b_nvfp4full-v2.ninfer`): the same 1,325 objects, names, formats, layouts and shapes, in

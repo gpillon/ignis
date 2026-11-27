@@ -24,7 +24,7 @@
 # classes may answer to one id, and where several fit the card the one of the
 # largest class answers (ADR 0098): the 12 GB 27B answers to `qwen3.8-27b`
 # on a 12 GB card only. `family` (optional) is
-# the model family an entry is of, by the family's own id (ADR 0074): stated
+# the model family an entry is of, by the family's own id (ADR 0064): stated
 # where an alias involves an entry and neither its id nor its aliases is a
 # family's own id.
 # `license` (required here, ADR 0078) is the license the entry's weights are
@@ -45,7 +45,7 @@ models:
 
   # The 27B with the huihui-ai abliteration: the same family, told apart by
   # its served id, which names no family, so the entry states it: an alias
-  # may then name it (ADR 0074).
+  # may then name it (ADR 0064).
   - id: qwen3.8-27b-abliterated
     repo: gpillon/Qwen3.8-27B-nvfp4full-dflash2-abliterated-NInfer
     revision: "ef3216949e42c42fc713feffb2e05849d57f0f3b"
@@ -110,7 +110,7 @@ models:
   # The uncensored variant for the 16 GB card class (spec #386, GitHub #423):
   # the 16 GB 27B's artifact with the 70 matrices the huihui-ai abliteration
   # changed re-quantized at the quant's own K, every other object the same.
-  # Its id and its alias name no family, so it states its own (ADR 0074); it
+  # Its id and its alias name no family, so it states its own (ADR 0064); it
   # answers to the 32 GB entry's served id on a 16 GB card. Pinned to the
   # upload's hub commit (2026-10-30).
   - id: qwen3.8-27b-abliterated-16g
@@ -130,7 +130,7 @@ models:
   # leaves commercial use above its revenue threshold unlicensed (ADR 0078).
   # The NVFP4 artifact the 27B NVFP4 converter built from Swift's BF16, every
   # matrix encoded and every divisor calibrated locally, under its own weights
-  # id (GitHub #470). Its id names no family, so it states it (ADR 0074).
+  # id (GitHub #470). Its id names no family, so it states it (ADR 0064).
   # Pinned to the upload's hub commit.
   - id: swift-1.5-27b
     repo: gpillon/Swift-1.5-Qwen3.8-27B-nvfp4-ignis
@@ -148,9 +148,9 @@ models:
   # body and head of a local exllamav3 conversion of Swift's BF16 at the
   # 16 GB 27B's per-matrix bit widths, every other object the Swift NVFP4
   # artifact's (GitHub #472). Its id and its alias name no family, so it
-  # states its own (ADR 0074); it answers to the 32 GB entry's served id on a
+  # states its own (ADR 0064); it answers to the 32 GB entry's served id on a
   # 16 or 24 GB card, and on an RTX 3090. It states no generation, as the 16 GB
-  # 27B (GitHub #529, ADR 0079 as amended): its layout is that build's, and its
+  # 27B (GitHub #529, ADR 0079): its layout is that build's, and its
   # quality on the 8.x routes passed #513.
   # Pinned to the upload's hub commit.
   - id: swift-1.5-27b-16g
@@ -193,7 +193,7 @@ models:
   # abliteration changed re-quantized at the K `ig28a` gives each, every
   # other object the same (weights id `trellis-ig28-abliterated`, admitted
   # 2026-11-21). Its id and its alias name no family, so it states its own
-  # (ADR 0074); it answers to the 32 GB entry's served id on a 12 GB card; on
+  # (ADR 0064); it answers to the 32 GB entry's served id on a 12 GB card; on
   # a larger one the 16 GB build, of the larger class, does, and this one
   # loads by its own id (ADR 0098). It states no generation, as the 12 GB
   # 27B. Pinned to the upload's hub commit.

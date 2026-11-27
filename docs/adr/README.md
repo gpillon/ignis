@@ -42,7 +42,7 @@ edit it by hand.
 | [0030](0030-device-memory-reserved-at-load.md) | Device memory reserved at load, within a VRAM budget | accepted | |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
 | [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
-| [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
+| [0033](0033-the-server-fetches-its-own-model.md) | The server fetches its own model, and asks first only when somebody is there | accepted | |
 | [0034](0034-the-leaf-answers-without-generating.md) | The leaf answers without generating | accepted | |
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | The vision embedding outlives its encode | accepted | |
 | [0036](0036-the-v1-surface-documents-itself.md) | The `/v1` surface documents itself, and its reference needs no key | accepted | |
@@ -56,7 +56,7 @@ edit it by hand.
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
 | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | The KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | |
 | [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted | |
-| [0047](0047-a-catalog-the-operator-can-extend.md) | a model catalog the operator can extend, and a `model` command to fetch from it | accepted | [0064](0064-a-catalog-entry-states-its-card-class.md), [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) |
+| [0047](0047-a-catalog-the-operator-can-extend.md) | A model catalog the operator can extend, and a `model` command to fetch from it | accepted | |
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | An end of turn drawn inside an open reasoning block closes the block instead | accepted | |
 | [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | An idle model is unloaded, and the next request loads it again | accepted | |
 | [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
@@ -71,8 +71,8 @@ edit it by hand.
 | [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | The 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
 | [0061](0061-prefill-attention-reads-the-hq-codec.md) | Prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
 | [0062](0062-the-token-embedding-lives-in-host-memory.md) | The 27B's token embedding lives in pinned host memory, on every card | accepted | |
-| [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
-| [0064](0064-a-catalog-entry-states-its-card-class.md) | a catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
+| [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
+| [0064](0064-a-catalog-entry-states-its-card-class.md) | A catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | |
 | [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | The 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | |
 | [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
@@ -81,12 +81,11 @@ edit it by hand.
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
 | [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |
-| [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) | A catalog entry may state its family, and an alias may be another entry's id | accepted | |
 | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) | The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device | accepted | |
 | [0076](0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md) | The running notes send the notes back to the text model and the recap does not | accepted | |
 | [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | |
 | [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted | |
-| [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
+| [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | |
 | [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | |
 | [0081](0081-an-adr-states-what-holds-today-and-a-changed-decision-rewrites-it-in-place.md) | An ADR states what holds today, and a decision that changes rewrites it in place | accepted | |
 | [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) | The gate is KLD against BF16, DFlash2 on against off and the loop rate | accepted | |

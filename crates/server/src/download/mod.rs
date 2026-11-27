@@ -1,5 +1,5 @@
 //! Fetching a model (GitHub #234 and #313, each with its spec;
-//! ADR 0033, amended by ADR 0047).
+//! ADR 0033, ADR 0047).
 //!
 //! A server started with no `.ninfer` artifact used to fall back to the
 //! placeholder template and `MockCompute` without a word about where the real
@@ -17,6 +17,13 @@
 //! - [`artifact_source`] — the start-time **decision**: pure, given the
 //!   catalog, an `exists` probe and whatever the operator answered; every
 //!   cell of spec 01's table is a unit test below;
+//! - [`start_model`] and [`served_start_options`] — the start fitted to the
+//!   card (ADR 0064, ADR 0079): with no artifact named, an id another entry
+//!   of its family answers to on this card starts that entry, under that
+//!   entry's own id, its artifact and id over the start options as a switch
+//!   to it would serve it, once its artifact's header names the id's family;
+//!   an id no entry loads on this card refuses the start before anything is
+//!   fetched;
 //! - [`bearer_token`] — which token a request carries: pure;
 //! - `transfer.rs` — the [`Downloader`], and the [`Download`] it runs in the
 //!   background, driven against loopback `axum` servers
@@ -172,7 +179,7 @@ pub fn start_model(catalog: &Catalog, model: &str, card: Option<&crate::config::
 }
 
 /// The start options a start runs with once [`start_model`] has said which
-/// id it serves and [`artifact_source`] where its artifact is (ADR 0064 §2):
+/// id it serves and [`artifact_source`] where its artifact is (ADR 0064):
 /// `options` as they are when it serves the id they were resolved with — a
 /// named artifact, or an id whose own entry fits the card — or loads no
 /// artifact (the placeholder); else `served`, the entry that answers to
@@ -181,7 +188,7 @@ pub fn start_model(catalog: &Catalog, model: &str, card: Option<&crate::config::
 /// ([`crate::config::target_patch`]), so `GET /v1/config`, the switcher and
 /// the load all name the model that runs.
 ///
-/// An alias resolves only within one model family (ADR 0064 §2), and the
+/// An alias resolves only within one model family (ADR 0064), and the
 /// family is the artifact's header's (ADR 0047), which is known only once the
 /// artifact is on disk — after the fetch when the start fetched it: `header`
 /// reads it (`loader::artifact_family`), and an artifact of another family
@@ -234,7 +241,7 @@ pub fn sidecar_fetch_command(catalog: &Catalog, artifact: &Path, catalog_file: O
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartRefusal {
     /// The entry that answers to the configured id holds an artifact of
-    /// another family (ADR 0064 §2): the alias does not resolve.
+    /// another family (ADR 0064): the alias does not resolve.
     RefusedOnCard(CardRefusal),
     /// Its artifact and id over the start options do not resolve.
     Config(crate::config::ConfigError),
@@ -487,7 +494,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §2, `main`'s start path end to end: a start with no artifact
+    /// ADR 0064, `main`'s start path end to end: a start with no artifact
     /// named on a 16 GB card — the class `Config::card_class` reads from the
     /// probe's total — finds the entry that answers to the default id on
     /// disk and serves it under that entry's own id, its artifact and id over
@@ -618,7 +625,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §2: an alias resolves only within one model family, by the
+    /// ADR 0064: an alias resolves only within one model family, by the
     /// artifact's header (ADR 0047). A start that has to fetch the entry
     /// answering to the default id knows the header only once the fetch has
     /// landed: an artifact of another family — or of none — then refuses the
@@ -642,7 +649,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074, `main`'s start path end to end with the built-in catalog
+    /// ADR 0064, `main`'s start path end to end with the built-in catalog
     /// (GitHub #423): `--model-id qwen3.8-27b-abliterated` on a 16 GB card
     /// starts the abliterated 16 GB build, which answers to it, under its own
     /// id — its artifact and id over the start options — when its artifact's
@@ -684,7 +691,7 @@ mod tests {
         assert_eq!(served_start_options(options.clone(), &served, Some(&own), &catalog, options.card(), &|_| panic!("its own entry")).unwrap(), options);
     }
 
-    /// ADR 0074, `main`'s start path end to end with the built-in catalog
+    /// ADR 0064, `main`'s start path end to end with the built-in catalog
     /// (GitHub #473): `--model-id swift-1.5-27b` on a 16 GB card starts Swift
     /// 1.5's 16 GB build, which answers to it, under its own id, when its
     /// artifact's header names the 27B's family; one of another family
@@ -756,7 +763,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §3: a start whose model no entry loads on this card is
+    /// ADR 0064: a start whose model no entry loads on this card is
     /// refused naming both classes — the default model on a 16 GB card in a
     /// catalog without the 16 GB 27B.
     #[test]
