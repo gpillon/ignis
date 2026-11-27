@@ -40,5 +40,6 @@ The offloaded load, whose cache is below the catalog, is untouched.
 - A machine with a 96 GB card serves Flash-Next with far less RAM, and the whole n-gram table fits beside it on
   64 GB; decode, TTFT and greedy text are unchanged or better, with no miss left.
 - Whether the residency phase of a load is shorter (no second copy, pool to VRAM) or longer (one synchronous copy
-  per record from pageable buffers) was not settled. A cold load is disk-bound; admitting a layer in fewer, larger
+  per record from pageable buffers) was not settled. Inferred from the admission bench, a cold load is disk-bound;
+  admitting a layer in fewer, larger
   copies is the follow-up if the warm case matters.
