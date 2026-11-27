@@ -62,15 +62,17 @@ response cancels whichever of them is running.
   before the prompt is rendered, if and only if the struck text hashes to the hash its tag carries; otherwise the
   text is left as it is. Only assistant reasoning is repaired (chat `reasoning_content`, Responses `reasoning`
   input items): never a user, system, developer or tool message, never assistant `content`. It has no field: a
-  history written while the guard was on reaches a server where it is off.
-- **The repaired reasoning is the model's view token for token**, which is why a nudge after a kept line break goes
-  in without its own leading line breaks. A rewind then costs the next turn no reuse that an ordinary turn would
-  have: reuse stops at the previous turn's generation opener, as for any turn (ADR 0029).
+  history written while the guard was on reaches a server where it is off, and a reprise of the conversation goes
+  through the same repair.
+- **The repaired reasoning is the model's view token for token**, which is why a nudge or the close after a kept
+  line break goes in without its own leading line breaks. A rewind then costs the next turn no reuse that an
+  ordinary turn would have: reuse stops at the previous turn's generation opener, as for any turn (ADR 0029).
 - **A holdback can hide a rewind**: `loop_guard_holdback` characters of reasoning are held back from the client,
   none by default, and a rewind whose cut falls in them reaches it with no tag and none of the loop. Everything
-  held back goes out before the stream ends, however it ends, a passed deadline included (ADR 0058). It delays the
-  reasoning by its size, and under about 2,000 characters it hides almost nothing: the shortest rewind measured
-  struck 1,577, and on the confirm run 3,000 would have hidden 19 of 25 rewinds, 6,000 would have hidden 24.
+  held back goes out at the reasoning's close, and before the stream ends, however it ends, a passed deadline
+  included (ADR 0058). It delays the reasoning by its size, and under about 2,000 characters it hides almost
+  nothing: the shortest rewind measured struck 1,577, and on the confirm run 3,000 would have hidden 19 of 25
+  rewinds, 6,000 would have hidden 24.
 - **The Responses state stores the model's view**, not what was streamed, so the next turn that chains on it
   needs no repair. With `include: ["reasoning.encrypted_content"]`, which Codex asks for, a reasoning item carries
   that view as an opaque string, and one ignis can read is used on input in place of the item's visible text. It is
@@ -83,10 +85,11 @@ response cancels whichever of them is running.
 
 **How it is set.** Every threshold, and each nudge, is a live config field of the model group (ADR 0046), visible
 and patchable with no reload. `loop_guard` is `rewind` by default, which the held-out runs favour, with `log` for
-diagnosis. The margins between the thresholds are thin and in-sample: a false rewind or a missed harmful loop found
-later reopens the defaults. A server built without a config (the in-process tests, the output-comparing GPU tests)
-runs the guard `off`, so no test meets a rewind it did not ask for. Output differs from the reference whenever the
-guard acts, so benches and gates set `loop_guard=off` explicitly.
+diagnosis; a false rewind found later reopens that default. The margins between the thresholds are thin and
+in-sample: a false rewind or a missed harmful loop found later reopens the defaults. A server built without a
+config (the in-process tests, the output-comparing GPU tests) runs the guard `off`, so no test meets a rewind it
+did not ask for. Output differs from the reference whenever the guard acts, so benches and gates set
+`loop_guard=off` explicitly.
 
 ## Considered Options
 
