@@ -286,6 +286,11 @@ adr_status() { # <rev> <path>: the frontmatter's status, else the Status section
 # own resolution: when the text differs from every parent's and from what git
 # merges of the two sides' texts with no conflict, since what a merge only
 # brings in was changed, and judged, in the commits of the branch.
+# Two limits: an octopus merge (three parents or more) whose text differs from
+# every parent's counts as its own change, with no merge of the sides tried;
+# with more than one merge base the first is taken, so a criss-cross merge may
+# see a conflict that is not its own and count it. Either one makes the ADR
+# amended where a mark on the merge would be needed.
 changes_text() { # <sha> <number>
     local mine parent parents texts=() base merged
     parents="$(git log -1 --format=%P "$1")"
