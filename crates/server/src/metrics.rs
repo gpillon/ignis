@@ -1754,8 +1754,10 @@ impl Metrics {
         // (GitHub #241). ADR 0017 exports a family from the first scrape,
         // zeros included, unless most servers never use its route or its
         // feature; this was the first such family, absent until its first
-        // event, because a load that serves no decisions is the normal
-        // one, and three permanently-zero series plus an eleven-bucket
+        // event: it follows the ADR's other rule instead, that only
+        // authoritative values are exported, because a load that serves no
+        // decisions is the normal one, and three permanently-zero series
+        // plus an eleven-bucket
         // histogram on every scrape of every server would be clutter that
         // says nothing. A `rate()` over a series that appears mid-window is
         // handled by Prometheus the same way a new target is.
