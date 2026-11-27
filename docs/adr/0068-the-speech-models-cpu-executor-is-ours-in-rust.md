@@ -38,8 +38,9 @@ every one with no C ([finding](../findings/2026-10-24-rust-quantized-matmul-matc
 - **Two dependencies are not copied code.** `symphonia` (MPL-2.0) is an unmodified crate dependency for audio
   formats, recorded in `NOTICE`: its copyleft is per file and binds only its own files, which we do not change. A
   bundled libopus (BSD-3) would build through the `cmake` crate, a new build dependency and the only CMake in a
-  build without `cuda`, whose C goes through the `cc` crate: the owner accepts it only if it does not complicate the
-  build or cost too much, so it comes in only once a verification build passes on both targets.
+  build without `cuda`: the C the build already compiles goes through the `cc` crate, with no CMake. The owner
+  accepts libopus only if it does not complicate the build or cost too much, so it comes in only once a
+  verification build passes on both targets.
 
 ## Considered Options
 
@@ -48,7 +49,8 @@ every one with no C ([finding](../findings/2026-10-24-rust-quantized-matmul-matc
   Haswell baseline that needed a CPUID check before the first call, or the process died on an older CPU; a CMake
   build in every `make` and in CI's CPU leg; a cargo feature `speech`, off in a bare `cargo build`; and a second
   upstream in ADR 0010's manifest. The spike showed the kernels it was wanted for can be ours, at parity.
-- **Adapt only ggml's dot products, in C**, as adapted ops under ADR 0051: the fallback, C only if truly necessary.
+- **Adapt only ggml's dot products, in C**, as adapted ops under ADR 0051, each a function of raw pointers and block
+  structs: the fallback, C only if truly necessary.
   Not needed: the Rust kernels met every criterion with no C.
 - **GPU only, no CPU executor.** Rejected: the loan takes only free KV pages and falls back to the CPU when they
   are not enough, and on a 16 GB card the CPU is the only way.
@@ -63,5 +65,5 @@ every one with no C ([finding](../findings/2026-10-24-rust-quantized-matmul-matc
 - Parity on CPUs newer than the one measured (AVX-VNNI, AVX-512) needs kernels of ours that were neither written
   nor measured. Nothing in the design is x86-only: NEON kernels take their place beside the AVX2 ones by the same
   runtime selection.
-- The spike timed the matmuls alone, on one microarchitecture: it does not show that the whole executor holds its
-  speed.
+- The spike timed the matmuls alone, on one microarchitecture. The whole executor's batch speed is measured in the
+  [finding](../findings/2026-10-25-nemotron-on-the-cpu.md) on Nemotron, in its comparison with Qwen3-ASR.
