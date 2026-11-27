@@ -1,13 +1,13 @@
 # Hold the ADRs and the findings to their frontmatter and their generated
-# indexes (ADR 0081): docs/adr/README.md and docs/findings/README.md are written
+# indexes: docs/adr/README.md and docs/findings/README.md are written
 # by mk/adr-index.py and mk/findings-index.py, never by hand. This runs what
 # `make records-check` runs, each script's selftest and then its check, on a
 # push that touches either folder or either script. Python's standard library
 # alone: nothing to install.
 #
-# The ADR check also refuses a change to the text of an ADR that existed
-# before the push (--since): a decision that changes is a new ADR, and the old
-# one changes only in its frontmatter. Its base is the push's previous tip, a
+# The ADR check also compares the ADRs with what they were before the push
+# (--since): an ADR rewritten in place passes (ADR 0081), and one that was
+# accepted and is proposed now is refused. Its base is the push's previous tip, a
 # new branch's merge base with main, or a pull request's base, so the checkout
 # takes the history (commits and trees, no blobs until one is read). No
 # concurrency group: a run cancelled by the next push would leave its push's
@@ -60,7 +60,7 @@ jobs:
         run: python3 mk/findings-index.py --selftest
       - name: The board status's selftest
         run: python3 mk/board-status.py --selftest
-      - name: The ADRs' frontmatter and their index, and no earlier ADR's text changed
+      - name: The ADRs' frontmatter and their index, and no accepted ADR proposed again
         env:
           BEFORE: ${{ github.event.before }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}

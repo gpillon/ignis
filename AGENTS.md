@@ -43,7 +43,7 @@ experiment: the index `docs/findings/README.md`, and `docs/agents/findings.md`.
 
 ### ADRs
 
-Recording, amending, numbering or citing a decision: the index
+Recording, changing, numbering or citing a decision: the index
 `docs/adr/README.md`, and `docs/agents/domain.md`.
 
 ### Testing

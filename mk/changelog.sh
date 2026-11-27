@@ -232,23 +232,33 @@ if [ -n "$held" ]; then
     echo "(Check each one: this repo closes issues on branches that are not merged yet.)"
 fi
 
-# Decisions. A file added in the range is a new ADR, a file modified is one
-# amended -- ADR 0026 was amended in v0.1.2 and that is the shape it takes.
-# Every line is "ADR NNNN — title": the older ADRs carry the number in their
-# heading, the short format's heading is the bare title and the number is in
-# the file name only, and the site's changelog links the literal "ADR NNNN".
+# Decisions. An ADR new in the range is a decision recorded, one whose text
+# changed is one amended -- ADR 0026 was amended in v0.1.2 and that is the
+# shape it takes. Every line is "ADR NNNN — title": the older ADRs carry the
+# number in their heading, the short format's heading is the bare title and
+# the number is in the file name only, and the site's changelog links the
+# literal "ADR NNNN".
 #
-# Since ADR 0081 an ADR whose decision changed is amended by a new one and
-# changes only in its frontmatter, so a modified ADR is "(amended)" only when
-# its text changed: the frontmatter is dropped, and every link target and
-# every path in backticks blanked, on both sides first, so a status, a
-# back-link or a moved file's path is not an amendment; nor is a typo fix that
-# a commit in the range names, `[typo ADR-0032]`, the one change to an earlier
-# ADR's text `mk/adr-index.py --since` lets through. A status that changed is
-# said, "(now superseded by ADR 0082)", against the long form's `## Status`
-# section when the older side has no frontmatter yet. docs/adr/README.md is
-# the generated index, not a decision.
+# An ADR is its number: a decision that changes rewrites its ADR in place (ADR
+# 0081), and the file is renamed when its title changes, so the two ends of the
+# range are compared by number, whatever the file is called at each. An ADR is
+# "(amended)" when its text changed: the frontmatter is dropped, and every link
+# target and every path in backticks blanked, on both sides first, so a status,
+# a back-link or a moved file's path is not an amendment. Nor is a change every
+# commit of which carries a mark for it: `[adr-cleanup]`, the mark of a commit
+# that brings ADRs to the short format and changes no decision, which covers
+# every ADR the commit touches, or `[typo ADR-0032]` (or a list), which covers
+# the ADRs it names. A mark covers its own commit only: a decision changed by
+# another commit of the range is amended. A status that changed is said, "(now
+# superseded by ADR 0082)", against the long form's `## Status` section when
+# the older side has no frontmatter yet. docs/adr/README.md is the generated
+# index, not a decision.
+adr_at() { # <rev> <number>: the path of that ADR's file at <rev>, nothing when it has none
+    git ls-tree --name-only "$1" docs/adr/ 2>/dev/null |
+        grep -E "^docs/adr/$2-[^/]*\.md\$" | head -1
+}
 adr_text() { # <rev> <path>
+    [ -n "$2" ] || return 0
     git show "$1:$2" 2>/dev/null |
         awk 'NR == 1 && $0 == "---" { front = 1; next }
              front { if ($0 == "---") { front = 0; gap = 1 }; next }
@@ -265,42 +275,59 @@ adr_status() { # <rev> <path>: the frontmatter's status, else the Status section
              section && /^## / { exit }
              section && NF { word = tolower($1); gsub(/[^a-z]/, "", word); print word; exit }'
 }
-adrs="$(git diff --name-status "$from..$to" -- docs/adr/ 2>/dev/null | grep -E '^[AM]')"
-typos="$(git log --format=%B "$from..$to" |
-    grep -oE '\[typo ADR-[0-9]{4}(, ADR-[0-9]{4})*\]' | grep -oE '[0-9]{4}' | sort -u)"
+# Is ADR <number>, whose text differs between the two ends, amended? Yes when a
+# commit of the range changes its text and carries no mark for it, and when no
+# commit that touches it carries one at all (a merge's own edit shows in none).
+amended() { # <number>
+    local sha message covered=0
+    while read -r sha; do
+        [ -n "$sha" ] || continue
+        message="$(git log -1 --format=%B "$sha")"
+        case "$message" in
+            *"[adr-cleanup]"*) covered=1; continue ;;
+        esac
+        if printf '%s\n' "$message" | grep -oE '\[typo ADR-[0-9]{4}(, ADR-[0-9]{4})*\]' |
+            grep -oE '[0-9]{4}' | grep -qx "$1"; then
+            covered=1
+            continue
+        fi
+        [ "$(adr_text "$sha^" "$(adr_at "$sha^" "$1")")" = \
+          "$(adr_text "$sha" "$(adr_at "$sha" "$1")")" ] || return 0
+    done < <(git log --format=%H "$from..$to" -- "docs/adr/$1-*")
+    [ "$covered" -eq 0 ]
+}
+numbers="$(git diff --no-renames --name-only "$from..$to" -- docs/adr/ 2>/dev/null |
+    sed -n 's|^docs/adr/\([0-9]\{4\}\)-[^/]*\.md$|\1|p' | sort -u)"
 decisions=""
-while IFS=$'\t' read -r status path; do
+for number in $numbers; do
+    old="$(adr_at "$from" "$number")"
+    path="$(adr_at "$to" "$number")"
     [ -n "$path" ] || continue
-    file="${path##*/}"
-    case "$file" in
-        [0-9][0-9][0-9][0-9]-*.md) ;;
-        *) continue ;;
-    esac
     heading="$(git show "$to:$path" 2>/dev/null | sed -n 's/^# *//p' | head -1)"
     [ -n "$heading" ] || heading="$path"
     case "$heading" in
         "ADR "[0-9][0-9][0-9][0-9]*) ;;
-        *) heading="ADR ${file%%-*} — $heading" ;;
+        *) heading="ADR $number — $heading" ;;
     esac
-    case "$status" in
-        A*) decisions="$decisions- $heading"$'\n' ;;
-        M*)
-            note=""
-            [ "$(adr_text "$from" "$path")" = "$(adr_text "$to" "$path")" ] ||
-                printf '%s\n' "$typos" | grep -qx "${file%%-*}" || note="amended"
-            was="$(adr_status "$from" "$path")"
-            now="$(adr_status "$to" "$path")"
-            # "superseded" in a Status section is the same as the frontmatter's
-            # "superseded by ADR-0007"; an unknown side says nothing.
-            if [ -n "$was" ] && [ -n "$now" ]; then
-                case "$now" in
-                    "$was"|"$was "*) ;;
-                    *) note="${note:+$note, }now ${now//ADR-/ADR }" ;;
-                esac
-            fi
-            [ -n "$note" ] && decisions="$decisions- $heading ($note)"$'\n' ;;
-    esac
-done <<< "$adrs"
+    if [ -z "$old" ]; then
+        decisions="$decisions- $heading"$'\n'
+        continue
+    fi
+    note=""
+    [ "$(adr_text "$from" "$old")" = "$(adr_text "$to" "$path")" ] ||
+        ! amended "$number" || note="amended"
+    was="$(adr_status "$from" "$old")"
+    now="$(adr_status "$to" "$path")"
+    # "superseded" in a Status section is the same as the frontmatter's
+    # "superseded by ADR-0007"; an unknown side says nothing.
+    if [ -n "$was" ] && [ -n "$now" ]; then
+        case "$now" in
+            "$was"|"$was "*) ;;
+            *) note="${note:+$note, }now ${now//ADR-/ADR }" ;;
+        esac
+    fi
+    [ -n "$note" ] && decisions="$decisions- $heading ($note)"$'\n'
+done
 if [ -n "$decisions" ]; then
     echo
     echo "### Decisions"

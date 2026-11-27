@@ -25,9 +25,11 @@
 # a NOT_PLANNED issue is not a release note at all, a commit naming no issue
 # is listed rather than dropped, and every ADR is named "ADR NNNN — title"
 # whether its heading carries the number or is the bare title of the short
-# format. Since ADR 0081 it also pins when a modified ADR is a decision: when
-# its text changed, not its frontmatter or a link's target, and when its
-# status changed, said as "(now ...)"; the generated index never is.
+# format. It also pins when an ADR the range changes is a decision: when its
+# text changed, not its frontmatter or a link's target, by a commit that
+# carries no mark for it (`[adr-cleanup]`, `[typo ADR-NNNN]`), under whatever
+# name its file has, and when its status changed, said as "(now ...)"; the
+# generated index never is.
 
 set -uo pipefail
 
@@ -93,7 +95,7 @@ commit() {
 }
 
 printf '# ADR 0001 — a decision taken before the range\n' > docs/adr/0001-early.md
-# The ADRs whose frontmatter the range changes (ADR 0081): the long form's
+# The ADRs whose frontmatter the range changes: the long form's
 # Status section, a link, a short one's frontmatter status.
 printf '# ADR 0004 — a long-form decision\n\n## Status\n\nAccepted (2026-01-01).\n' \
     > docs/adr/0004-long.md
@@ -108,6 +110,16 @@ printf '# ADR 0009 — a decision superseded already\n\n## Status\n\nSuperseded 
     > docs/adr/0009-superseded.md
 printf '%s\n' '---' 'status: accepted' '---' '' '# A decision with a typo' '' 'Its reasno.' \
     > docs/adr/0010-typo.md
+# The ADRs the range rewrites in place (ADR 0081), each long before it.
+adr() { # <file> <title> <text>
+    printf '%s\n' '---' 'status: accepted' '---' '' "# $2" '' "$3" > "docs/adr/$1"
+}
+adr 0011-cleaned.md 'A decision the cleanup shortens' 'Its decision, with its history.'
+adr 0012-cleaned-too.md 'A second decision the cleanup shortens' 'Its decision, with its history.'
+adr 0013-cleaned-then-changed.md 'A decision cleaned, then changed' 'Its decision, with its history.'
+adr 0014-old-title.md 'A decision under its old title' 'Its old decision.'
+adr 0015-old-name.md 'A decision the cleanup retitles' 'Its decision, with its history.'
+adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Its reasno.'
 commit "Groundwork, and the earlier half of #20"
 git tag -a v9.9.8 -m v9.9.8
 export GIT_AUTHOR_DATE='2026-01-03T00:00:00Z' GIT_COMMITTER_DATE='2026-01-03T00:00:00Z'
@@ -128,7 +140,7 @@ printf '# A decision in the short format\n\nIts context, the decision and why.\n
 commit "A decision in the short format, recorded (#10)"
 printf '# ADR 0001 — a decision taken before the range\n\nAmended.\n' > docs/adr/0001-early.md
 commit "The earlier decision, amended (#10)"
-# Frontmatter only, as ADR 0081 changes an ADR a later one amends or replaces:
+# Frontmatter only, as an ADR changes when a later one amends or replaces it:
 # a status the Status section already said, a link's target, a back-link.
 printf '%s\n' '---' 'status: accepted' 'amended-by: [ADR-0002]' '---' '' \
     '# ADR 0004 — a long-form decision' '' '## Status' '' 'Accepted (2026-01-01).' \
@@ -151,6 +163,24 @@ commit "The frontmatter, and the index (#10)"
 printf '%s\n' '---' 'status: accepted' '---' '' '# A decision with a typo' '' 'Its reason.' \
     > docs/adr/0010-typo.md
 commit "A typo in a decision, fixed [typo ADR-0010] (#10)"
+# A cleanup commit changes no decision: its mark keeps every ADR it rewrites
+# out of the amended list, and a file it renames with its title too.
+adr 0011-cleaned.md 'A decision the cleanup shortens' 'Its decision.'
+adr 0012-cleaned-too.md 'A second decision the cleanup shortens' 'Its decision.'
+adr 0013-cleaned-then-changed.md 'A decision cleaned, then changed' 'Its decision.'
+git rm -q docs/adr/0015-old-name.md
+adr 0015-new-name.md 'A decision the cleanup retitled' 'Its decision.'
+commit "Four decisions, shortened to what holds today [adr-cleanup] (#10)"
+# A decision that changes rewrites its ADR in place, with no mark: amended,
+# whether a marked commit touched the ADR before it, and under its new name.
+adr 0013-cleaned-then-changed.md 'A decision cleaned, then changed' 'Another decision.'
+git rm -q docs/adr/0014-old-title.md
+adr 0014-new-title.md 'A decision under its new title' 'A new decision, and why.'
+commit "Two decisions, changed (#10)"
+adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Its reason.'
+commit "A typo in a decision, fixed [typo ADR-0016] (#10)"
+adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Another reason.'
+commit "The decision's reason, changed (#10)"
 commit "The duplicate, mentioned anyway (#40)"
 commit "Merge: a branch"
 commit "ignis 9.9.9"
@@ -243,6 +273,26 @@ has "ADR 0009" "$decisions" \
 has "ADR 0010" "$decisions" \
     && fail "a typo fix its commit names made an ADR amended: $decisions" \
     || note "a typo fix its commit names is not an amendment"
+
+has "ADR 0011" "$decisions" || has "ADR 0012" "$decisions" \
+    && fail "a commit with the cleanup mark made its ADRs amended: $decisions" \
+    || note "a commit with the cleanup mark keeps its ADRs out of the amended list"
+
+has "ADR 0015" "$decisions" \
+    && fail "an ADR the cleanup renamed with its title reached the Decisions: $decisions" \
+    || note "an ADR a cleanup commit renames with its title is not listed"
+
+has "ADR 0013 — A decision cleaned, then changed (amended)" "$decisions" \
+    && note "a decision changed without the mark is amended, a cleanup commit before it or not" \
+    || fail "the ADR changed after its cleanup is not marked amended: $decisions"
+
+has "ADR 0014 — A decision under its new title (amended)" "$decisions" \
+    && note "a decision rewritten under the file name of its new title is amended, not new" \
+    || fail "the ADR rewritten under a new file name is not marked amended: $decisions"
+
+has "ADR 0016 — A decision with a typo, then changed (amended)" "$decisions" \
+    && note "a typo mark covers its own commit, not a later change of the decision" \
+    || fail "the ADR changed after its typo fix is not marked amended: $decisions"
 
 has "Architecture decision records" "$decisions" \
     && fail "the generated index reached the Decisions: $decisions" \

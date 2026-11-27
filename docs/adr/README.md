@@ -1,24 +1,15 @@
 # Architecture decision records
 
-An ADR records a decision that is hard to reverse, surprising without its
-context and the result of a real trade-off, and why it was taken: the project's
-memory of why ignis is built the way it is.
+Each ADR states what holds today, and why: a decision that changes rewrites its
+ADR in place, and the earlier versions are the history of its file,
+`git log -p -- "docs/adr/NNNN-*"`.
 
-- **Writing one.** A new ADR is in the `/domain-modeling` skill's short format,
-  its heading the bare title, with the frontmatter
-  [ADR 0081](0081-an-adrs-status-is-in-its-frontmatter-and-a-changed-decision-is-a-new-adr.md)
-  describes. [ADR 0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md)
-  lists where the repo differs from the skill, and
-  [docs/agents/domain.md](../agents/domain.md) gives the numbering rule.
-- **A decision that changes** is recorded by a new ADR that amends or
-  supersedes the old one, whose text then stays as it was: only its
-  frontmatter changes (`amended-by`, or a status of `superseded by`).
-  `make records-check` refuses any other change to an ADR that is no longer
-  `proposed`, a typo fix aside when its commit message says `[typo ADR-NNNN]`,
-  and an edit in place the owner decided when it says `[edit ADR-NNNN]`.
-- **This file is generated** from the frontmatter by `mk/adr-index.py`
-  (`make records`), and `make records-check` fails when it is out of date:
-  never edit it by hand.
+How an ADR is written, numbered and changed is in
+[docs/agents/domain.md](../agents/domain.md), and
+[ADR 0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md)
+lists where the repo differs from the `/domain-modeling` skill. This file is
+generated from the ADRs' frontmatter by `mk/adr-index.py` (`make records`), and
+`make records-check` fails when it is out of date: never edit it by hand.
 
 | ADR | Title | Status | Amended by |
 |---|---|---|---|
@@ -91,7 +82,7 @@ memory of why ignis is built the way it is.
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
 | [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
 | [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
-| [0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md) | A spec is a GitHub issue and its tickets are sub-issues | accepted | [0081](0081-an-adrs-status-is-in-its-frontmatter-and-a-changed-decision-is-a-new-adr.md), [0084](0084-ignis-stands-on-its-own.md) |
+| [0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md) | A spec is a GitHub issue and its tickets are sub-issues | accepted | [0081](0081-an-adr-states-what-holds-today-and-a-changed-decision-rewrites-it-in-place.md), [0084](0084-ignis-stands-on-its-own.md) |
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
 | [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |
@@ -102,7 +93,7 @@ memory of why ignis is built the way it is.
 | [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted | |
 | [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | [0085](0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md) |
-| [0081](0081-an-adrs-status-is-in-its-frontmatter-and-a-changed-decision-is-a-new-adr.md) | An ADR's status is in its frontmatter, and a decision that changes is recorded by a new ADR | accepted | |
+| [0081](0081-an-adr-states-what-holds-today-and-a-changed-decision-rewrites-it-in-place.md) | An ADR states what holds today, and a decision that changes rewrites it in place | accepted | |
 | [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) | The gate is KLD against BF16, DFlash2 on against off and the loop rate | accepted | |
 | [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md) | The north-star is the best local engine for coding, for agentic work and as a companion | accepted | |
 | [0084](0084-ignis-stands-on-its-own.md) | ignis stands on its own | accepted | |
