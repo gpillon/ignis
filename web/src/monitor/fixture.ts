@@ -1,5 +1,5 @@
 // A scrape of `GET /ui/metrics` in the shape `crates/server/src/metrics.rs`
-// renders (GitHub #89/#90, ADR 0017 and ADR 0030 §Observability): every
+// renders (GitHub #89/#90, ADR 0017 and ADR 0030): every
 // contract series, in the order and with the labels `Metrics::render` writes
 // them, on a load that has served traffic and retained state.
 // Test data only — nothing in the page imports it.

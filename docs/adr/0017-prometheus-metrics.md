@@ -1,6 +1,6 @@
 ---
 status: accepted
-amended-by: [ADR-0025, ADR-0030, ADR-0045, ADR-0046, ADR-0058, ADR-0089, ADR-0094, ADR-0097, ADR-0106]
+amended-by: [ADR-0025, ADR-0045, ADR-0046, ADR-0058, ADR-0089, ADR-0094, ADR-0097, ADR-0106]
 ---
 
 # ADR 0017 — Opt-in Prometheus metrics with zero inference-path work

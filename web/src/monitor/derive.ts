@@ -95,8 +95,8 @@ export type Latency = {
 
 
 /**
- * A live figure against the constant that bounds it (ADR 0030
- * §Observability). The share is computed here, from two terms that are both
+ * A live figure against the constant that bounds it (ADR 0030).
+ * The share is computed here, from two terms that are both
  * on the page, because no percentage is exported: a reader can always see
  * which of the two moved.
  */
@@ -784,7 +784,7 @@ export function deriveSpeculation(points: Point[], since: number): Speculation {
 }
 
 /**
- * The memory panel's figures (GitHub #217, ADR 0030 §Observability): the
+ * The memory panel's figures (GitHub #217, ADR 0030): the
  * plan the load reserved, and what is occupied of each shape it bounds.
  *
  * The retained-state counters are read as plain totals and window gains

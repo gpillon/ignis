@@ -54,7 +54,7 @@ import { setMonitorInterval, setMonitorPaused, useNow } from "./useMonitor.ts";
 // verdict in words, then throughput and load, admission, latency, the memory
 // this load reserved and what is occupied of it, cache pressure and the
 // scraper itself; every series is also in the table at the foot. Only ADR
-// 0017's contract, as ADR 0030 §Observability widened it, is drawn — no
+// 0017's contract, with ADR 0030's memory series, is drawn — no
 // invented metrics, and every ratio is computed here from two series that are
 // both on the page.
 

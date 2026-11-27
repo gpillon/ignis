@@ -13,6 +13,56 @@
 //! wait, and the consumer can never make a scrape wait. A scrape therefore
 //! reads each series on its own, not one consistent cut across all of them —
 //! which Prometheus does not assume either.
+//!
+//! **The memory series** (ADR 0030) are gauges in bytes, pages or slots,
+//! never a percentage: a ratio hides which of its two terms moved, and both
+//! terms are series here. They have three sources, none of which adds serving
+//! work, and nothing polls the leaf or the driver while serving:
+//!
+//! - **Load-time constants** ([`LoadReservations`]), computed once by the
+//!   load that builds the plan: the plan's lines as
+//!   `ignis_vram_reserved_bytes{line}` in the plan's own spellings, then
+//!   Flash-Next's two and the image model's `condition_budget`; the budget;
+//!   the KV pool's pages and page bytes; the capacities of the KV-RAM arena,
+//!   of KV-disk and of the retained slots, with the host slots and their
+//!   block. The KV pool is no line, so the budget less every line is the pool
+//!   plus its page rounding. The slots' capacity is the scheduler's effective
+//!   count, not the flags': with prompt reuse off and no slot named it hands
+//!   out none, and the flags' value would bound `in_use` by a capacity
+//!   nothing can fill. A load that refuses to start exports nothing.
+//! - **Projections of facts the model thread sends anyway**, metrics on or
+//!   off: `ignis_retained_slots{state="in_use"}` and
+//!   `ignis_retained_slot_skips_total{reason}`, in the log's own spellings.
+//!   The skip counter is the series that says a load has run out of room to
+//!   leave reuse behind. It already tells the two kinds of retained state
+//!   apart, a publish that found no slot being a prefix and a capture that
+//!   found no slot or no page a checkpoint, which is one reason the
+//!   retained-state families name the `kind` that moved beside its `tier`.
+//!   `tier="device"` is the slot tier, whichever kind of slot, device or
+//!   host, holds the image: the label is not split by slot kind.
+//! - **The occupancy the tick carries** ([`ignis_core::Occupancy`]): the KV
+//!   pool's pages and the bytes of the KV-RAM arena and of KV-disk in use.
+//!   The model thread sends the tick after every step, with the same payload
+//!   whether metrics are on or off. Each figure counts everything its pool
+//!   holds, not one kind of claimant: the pool's charge is one counter for
+//!   the whole load and the host tier's one budget, a retained checkpoint's
+//!   tail page is as much a KV page as a running request's, and a second
+//!   count of the same memory could disagree with the first. So
+//!   `ignis_kv_pool_used_pages` falls to zero after the last request only
+//!   when nothing was retained: with reuse on it settles at what the
+//!   retained images hold, which `ignis_retained_slots{state="in_use"}`
+//!   names.
+//!
+//! The series carry no `lane` label (ADR 0017 forbids sequence and lane
+//! ids), no KV pages per request class (legal cardinality, but new accounting
+//! on the admission path, not a free read) and no count of prefix or
+//! checkpoint entries (on the device every retained image holds a slot, so
+//! the slots in use are that count). The image model's load reports its plan
+//! in the same families ([`LoadReservations::image`]): its condition budget
+//! is set aside, not allocated, so `ignis_condition_budget_used_bytes` reads
+//! what its jobs hold against the `condition_budget` line, and at a full
+//! budget reads below the line by the encode's transient K and V, which the
+//! line includes and the prefixes' bytes do not.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -31,7 +81,7 @@ use ignis_core::{RetainedSkip, SubmitError};
 use crate::toolcall::{CallVerdict, CallViolation};
 
 /// What one load reserved, and the shapes the reservations bound (GitHub
-/// #216, ADR 0030 §Observability). Computed once, during the load that
+/// #216, ADR 0030). Computed once, during the load that
 /// already builds the plan, and never read again — so exporting it adds no
 /// serving work of any kind.
 ///
@@ -115,7 +165,7 @@ impl LoadReservations {
     /// arena its calls share as `workspace`, and the condition budget --
     /// inside the plan's budget. It has no KV pool, and no `cuda_context` or
     /// `residual` line: its plan reads the free memory with its context
-    /// already held and charges neither (ADR 0030's #324 amendment).
+    /// already held and charges neither (ADR 0092).
     pub fn image(plan: &ignis_core::image_leaf::ImagePlan) -> Self {
         Self {
             lines: ignis_core::VramLines {
@@ -1552,7 +1602,7 @@ impl Metrics {
             );
         }
         // What the load reserved, and what is occupied of it (GitHub #216,
-        // ADR 0030 §Observability). Bytes, pages and slots — never a
+        // ADR 0030). Bytes, pages and slots — never a
         // percentage, which would hide which of its two terms moved.
         declare(
             &mut out,
@@ -1622,7 +1672,7 @@ impl Metrics {
         }
         // Two states of one family: what bounds it, and what is in it. The
         // arena is bytes and says `used`; the slots are counted and say
-        // `in_use` (ADR 0030 §Observability spells each).
+        // `in_use` (ADR 0030's memory series, each in its own spelling).
         for (name, help, used_state, capacity, used) in [
             (
                 "ignis_kv_ram_arena_bytes",

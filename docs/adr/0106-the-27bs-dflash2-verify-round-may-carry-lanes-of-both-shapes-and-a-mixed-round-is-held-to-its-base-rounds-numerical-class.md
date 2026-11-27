@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0017, ADR-0030, ADR-0104]
+amends: [ADR-0017, ADR-0104]
 ---
 
 # The 27B's DFlash2 verify round may carry lanes of both shapes, and a mixed round is held to its base round's numerical class
@@ -91,7 +91,7 @@ round ADR 0104 left out; the owner narrowed it on 2026-11-22 (#711, two decision
   and 5 MiB less a mix fewer (one mix's capture took 4 to 10 MiB), in whole 2 MiB pages; 0 on a load that captures none.
   The driver keeps the graphs' pages after a teardown, so a reload adds the line back. This amends
   [ADR 0030](0030-device-memory-reserved-at-load.md) as
-  [ADR 0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)
+  an earlier ADR
   did for the fifteenth line, by a new ADR rather than an edit in place, which only the owner decides.
 - **The shape counts, a label of a family ADR 0017 has** (#719). `shape="mixed"` joins
   `ignis_speculative_shape_rounds_total`'s label set beside `base` and `extended`, with no new family: like the other

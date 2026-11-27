@@ -1,7 +1,7 @@
 import type { Exposition, Sample } from "./exposition.ts";
 
-// One scrape read against ADR 0017's contract table, widened by ADR 0030
-// §Observability: the series the panel knows how to draw, by name. Anything
+// One scrape read against ADR 0017's contract table, with ADR 0030's
+// memory series: the series the panel knows how to draw, by name. Anything
 // else ignis serves is kept in `unknown` and listed raw, never dropped
 // silently.
 //
@@ -79,7 +79,7 @@ export const RETAINED_FAMILIES = {
 export type RetainedFamily = keyof typeof RETAINED_FAMILIES;
 export const RETAINED_FAMILY_KEYS = Object.keys(RETAINED_FAMILIES) as RetainedFamily[];
 
-/** Why a publish or a capture left no reuse behind (ADR 0030 §Observability). */
+/** Why a publish or a capture left no reuse behind (ADR 0030). */
 export const SLOT_SKIP_REASONS = ["publish_skipped_no_slot", "capture_skipped_no_slot", "capture_skipped_no_page"] as const;
 export type SlotSkipReason = (typeof SLOT_SKIP_REASONS)[number];
 

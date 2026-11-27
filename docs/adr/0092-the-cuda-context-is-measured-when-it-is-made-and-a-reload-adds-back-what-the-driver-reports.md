@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0030]
 ---
 
 # The CUDA context is measured when it is made, and a reload adds back what the driver reports

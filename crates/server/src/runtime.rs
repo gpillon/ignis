@@ -1517,7 +1517,7 @@ pub fn qwen27b_load(
         eos,
         kv_disk,
     )?;
-    // GitHub #216 (ADR 0030 §Observability): the plan was a value this
+    // GitHub #216 (ADR 0030): the plan was a value this
     // function built, read once and dropped. What it reserved outlives it
     // now, so an operator can read it off `/metrics` instead of off the one
     // log line the load wrote. The retained slot count is the scheduler's

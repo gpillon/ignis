@@ -786,8 +786,8 @@ impl Server {
         self
     }
 
-    /// Record what this load reserved (GitHub #216, ADR 0030
-    /// §Observability): the plan's lines and the shapes they bound, written
+    /// Record what this load reserved (GitHub #216, ADR
+    /// 0030): the plan's lines and the shapes they bound, written
     /// once, before the first request. Without `--server-metrics` there is nothing
     /// to write them into and the call does nothing; a load that built no
     /// plan (the placeholder path) never makes it.

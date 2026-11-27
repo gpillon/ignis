@@ -2,7 +2,7 @@
 // in waves and bursts (an agent fan-out), queue for six lanes, prefill,
 // decode, get cancelled or turned away, and the counters and histograms move
 // the way the real exposition's do (crates/server/src/metrics.rs, ADR 0017
-// and ADR 0030 §Observability, which the memory panel of GitHub #217 reads).
+// and ADR 0030, whose memory series the memory panel of GitHub #217 reads).
 // The simulation advances on each scrape to the scrape's clock, so the
 // Monitor has live data without the shared GPU. Development only.
 
