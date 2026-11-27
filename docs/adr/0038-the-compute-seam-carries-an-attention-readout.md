@@ -16,9 +16,9 @@ to read, and exactly that comes back.
   of one span, at the job's last position. Of each head of a head set read beside it: the one key it peaks on over
   the span less the excluded positions (the calibration's fallback cells), its score there, and the scores of that
   key's left, right, up and down neighbours in the image grid, which is what reading the peak's position inside its
-  cell needs (a 3x3 neighbourhood read no better). No logits row crosses, and of an image no head's whole row beside
-  the pointing head's (a text span's rows are ADR 0041's). A job that asks for no readout allocates and launches
-  nothing new, and one that names no set costs what the pointing head alone costs.
+  cell needs (a 3x3 neighbourhood read no better). No full attention row and no logits row crosses, and of a head
+  set over an image no head's row (a text span's rows are ADR 0041's). A job that asks for no readout allocates and
+  launches nothing new, and one that names no set costs what the pointing head alone costs.
 - **The leaf scores the keys where attention read them, as it read them**: inside each armed GQA layer, right after
   its attention and inside its scope, under hq-e8-2b from the prompt route's materialized keys and under BF16 from
   the cache's pages. The accuracy was measured on exactly those keys
@@ -31,24 +31,26 @@ to read, and exactly that comes back.
   the prefill itself stands, and the scheduler ends that request with an error. The readout is read only when every
   armed layer read. The scheduler keeps a readout's last chunk long enough to take the prompt route: the chunk cut,
   the reuse trim and the retained prefix's reach all hold back that tail.
-- **The heads are calibrated constants keyed to the artifact's content hash.** They were chosen on labelled scenes,
-  so they cannot be computed at load, and they are never read on an artifact they were not chosen for. The head set
-  is calibrated beside its pointing head, with its fallback cells per grid: the first and the last image cell on any
-  grid, and the cells measured on a grid. A load with a head set answers a `point` by the anchored reading and a
-  `box` with `"method": "head"` by the extent; a load with a pointing head only answers a `point` from that head and
-  refuses a head `box`; a load with neither answers both by the digit chain and says so at startup.
+- **The heads are calibrated constants keyed to the artifact's content hash.** They were chosen on labelled scenes
+  by cross-validation, so they cannot be computed at load, and they are never read on an artifact they were not
+  chosen for. The head set is calibrated beside its pointing head, with its fallback cells per grid: the first and
+  the last image cell on any grid, and the cells measured on a grid. A load with a head set answers a `point` by the
+  anchored reading and a `box` with `"method": "head"` by the extent; a load with a pointing head only answers a
+  `point` from that head and refuses a head `box`; a load with neither answers both by the digit chain and says so
+  at startup.
 - **A head point or a head box is a decision.** It reads at its last prefill position and generates nothing, so
   every rule that makes a readout a request kind (no decode lane, no residency, no checkpoint, a zero generation
   budget) holds for it unchanged. A head `box` is read in a point's pass, the point's system text and forced
   `{"x":`, because that is the prompt the set was chosen and measured on; so a fan-out's head boxes share the
   image's prefix with its head points.
-- **The arithmetic is the host's.** The leaf ships scores and key indices, and the anchored reading and the
-  sub-cell position are pure host functions held to the Python reference every number was measured with, by golden
-  cases the reference writes: the rule can change without a kernel change. A neighbour off the grid is absent, not a
-  sentinel: a score of minus infinity or zero would be a number the rule could interpolate, and would move a box off
-  the object at the image's border. A set named without its neighbours' room or its grid's columns is refused before
-  any GPU time. A head may not peak on a fallback cell, where a head parks when it finds nothing, but as a neighbour
-  that cell is an ordinary one, its score still the attention's: every number behind the rule was measured so.
+- **The arithmetic is the host's.** The leaf ships scores and key indices, and the anchored reading and the sub-cell
+  position are pure host functions held to the Python reference every number was measured with, by golden cases the
+  reference writes: the rule can change without a kernel change. A neighbour off the grid is absent, not a sentinel:
+  a score of minus infinity or zero would be a number the rule could interpolate, and would move a box off the
+  object at the image's border. A set named without its neighbours' room or its grid's columns is refused before any
+  GPU time: the caller meant a set, and would silently get no way to read inside a cell. A head may not peak on a
+  fallback cell, where a head parks when it finds nothing, but as a neighbour that cell is an ordinary one, its
+  score still the attention's: every number behind the rule was measured so.
 
 ## Considered Options
 

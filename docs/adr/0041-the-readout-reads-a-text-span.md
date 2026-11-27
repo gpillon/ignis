@@ -55,8 +55,8 @@ sized for.
 - The load options gained the text span's key count in what was the struct's tail padding, so their size did not
   move: the append ADR 0016 allows under a layout pin, accepted because the ABI has one consumer, built with the
   leaf from the same header (a caller compiled against the older header would hand over its padding as the count).
-- The calibration table holds the heads and the ceiling only: the copy scaffold and the baseline are the served
-  reading's, not calibrated values. A recalibration whose procedure chose another scaffold or no baseline would be a
+- The copy scaffold and the baseline are the served reading's, not calibrated values: the calibration table holds
+  none of them. A recalibration whose procedure chose another scaffold or no baseline would be a
   new reading, and a new spec, not a new table row.
 - A new artifact needs its vote recalibrated on fresh development sets (`tools/locate-sets/README.md`), then accepted
   on a fresh set through `/v1/decide`.
