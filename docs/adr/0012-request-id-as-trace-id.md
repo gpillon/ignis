@@ -16,9 +16,10 @@ system already assigns.
 Spans open at request and round granularity only, outside the per-token hot loop, so that entering and leaving one
 adds no measurable cost to the decode inner loop: a span per token would itself be the hot-path logging overhead
 that normal operation must not have. A span inside the per-token path, as opposed to per round, is a hot-path
-performance decision, not only a tracing-API one: it must be validated again against the gate before merge (ADR
-0082's today, where the 99% performance gate against the reference stood when this was decided), the rule ADR 0011
-sets for a log event on the same path.
+performance decision, not only a tracing-API one: its cost to decode speed must be measured before merge, ignis
+against ignis as ADR 0082 states for a speed claim (a branch against main, at least two launches per build), where
+the 99% performance gate against the reference stood when this was decided, the rule ADR 0011 sets for a log event
+on the same path.
 
 ## Considered Options
 
