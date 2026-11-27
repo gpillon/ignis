@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0031]
 ---
 
 # On Blackwell the 27B's decode and verify rounds attend over hq-e8-2b on ignis's own route, and the vendored kernel stays its oracle
