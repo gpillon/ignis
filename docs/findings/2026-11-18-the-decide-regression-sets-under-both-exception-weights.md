@@ -8,7 +8,7 @@
 - Topic: decide-options
 - Related: [GitHub #675](https://github.com/gpillon/ignis/issues/675), [spec #672](https://github.com/gpillon/ignis/issues/672), [GitHub #667](https://github.com/gpillon/ignis/issues/667) (the fixture study), [GitHub #537](https://github.com/gpillon/ignis/issues/537), [GitHub #670](https://github.com/gpillon/ignis/issues/670), [GitHub #671](https://github.com/gpillon/ignis/issues/671), [ADR 0065](../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md), [the BF16 exception tensors in FP8](2026-10-21-the-bf16-exception-tensors-in-fp8.md), [Blackwell's GDN prefill on ignis's kernels](2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md) (the 2026-11-08 tiers)
 - Superseded by: none
-- Corrected by: [ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)
+- Corrected by: [ADR 0065](../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md), [FP8 exception weights at their served shape](2026-11-18-the-27bs-fp8-exception-weights-at-their-served-shape-on-the-rtx-5090.md)
 - Summary: RTX 5090, 27B: FP8 exceptions move the 20-case entailment set by an RMS of 1.68-1.89 logits, inside a harmless switch's 1.42-2.10; over 14 named arms no contributed "yes" case stays a gate, two ignis-written ones do.
 
 ## Question

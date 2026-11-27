@@ -669,7 +669,7 @@ pub fn log_draft_head_auto(head: ignis_core::ProposalHead) {
     );
 }
 
-/// A 27B load's exception weights (GitHub #682, ADR 0103): the ones it holds,
+/// A 27B load's exception weights (GitHub #682, ADR 0065): the ones it holds,
 /// the setting they resolved from (`auto`, `bf16`, `fp8`) and where that
 /// setting came from (`default`, `profile`, `file`, `env`, `flag`, `patch`).
 /// Without `exception_tensors`, a body that has none (the trellis artifacts),
@@ -2000,7 +2000,7 @@ mod tests {
         // `auto`'s; a shape built by hand adapts nothing (ADR 0063 §3). It also
         // knows the generation of the card it read, the 5090 `resolve`
         // injects, where a shape built by hand read none (GitHub #508). On that
-        // card `auto`'s exception weights resolve to fp8 (ADR 0103), where a
+        // card `auto`'s exception weights resolve to fp8 (ADR 0065), where a
         // shape built by hand keeps the engine's bf16.
         let resolved = EngineShape {
             adaptable: crate::adaptation::Adaptable::ALL,
