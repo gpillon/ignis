@@ -10,8 +10,8 @@ back its transcript, never converses, and is loaded beside whichever text or ima
 switch and never resident in VRAM. The feature is public, so its placement must hold on every card class ignis ships
 and on Linux, and on a 16 GB card the text model takes the whole card. The CPU was
 measured before anything was decided ([finding](../findings/2026-10-24-qwen3-asr-on-cpu.md)): every variant ran
-between 2 and 10 times real time, the band fixed beforehand as go only through incremental Realtime transcription
-(at least 10 times is go, below 2 is no-go).
+between 2 and 10 times real time, go only through incremental Realtime transcription by the bands proposed beforehand
+and confirmed by the owner after the numbers (at least 10 times is go, below 2 is no-go).
 
 **Loaded beside the other model.** The speech model keeps serving during a switch, beside the image model and while
 the text model is idle-unloaded. ignis then holds a second loaded model: the text or image model on the device, the
@@ -66,7 +66,8 @@ unavailable too, with its own reason.
 
 - ignis serves audio in. Audio out is still not served.
 - Host RAM: 1.4-3.1 GB resident while the model is in use, its KV at a 4,096-token context included, as measured on
-  llama.cpp. Unloading frees it all, and the first dictation after an unload waits for the load.
+  llama.cpp. Unloading frees it all, and the first dictation after an unload waits for the load, 1.4-1.8 s for the
+  larger model, also measured on llama.cpp.
 - A CPU transcription uses all but one physical core by default (`speech.threads`). The larger model's decode is
   bound by memory bandwidth, so it competes with whatever else uses host memory. That default is accepted only if
   text decode slows by less than 10% during a CPU transcription, measured on the GPU.
