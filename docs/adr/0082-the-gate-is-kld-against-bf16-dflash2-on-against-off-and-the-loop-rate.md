@@ -22,7 +22,9 @@ instead.
   RTX 5090: that figure is a lower bound of the full KLD, so its limit comes from a top-64 figure of the RTX 5090,
   never from a full-vocabulary one.
 - **DFlash2 on against off.** With the drafter on, decode tok/s beats off in each of nine decode cells: 8,192, 65,536
-  and 253,440 tokens of context, at one lane cold, two lanes, and one lane with reuse.
+  and 253,440 tokens of context, at one lane cold, two lanes, and one lane with reuse. Reported beside it, not
+  binding: #267's teacher-forced replay of recorded agent turns, tokens per round against the counterpart's, with the
+  0.90 floor that earlier admissions held as binding.
 - **Loop rate.** On the loop set, one build, the same prompts and seeds, the artifact does not loop more than its
   counterpart at a one-sided Fisher exact p below 0.05. It is the one leg that runs with the loop guard at its
   default, since a rewind is one of its calls.
