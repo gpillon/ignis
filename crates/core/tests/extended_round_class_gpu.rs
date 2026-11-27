@@ -83,8 +83,9 @@
 //!   not tell a right row from a wrong one.
 //!
 //! Each shape's distance from speculation off prints per lane, per lane count
-//! and per kind: a reading, not a bound. The margins are proposed, the
-//! owner's to confirm or replace (ADR 0104).
+//! and per kind: a reading, not a bound. The margins are the owner's, and so
+//! are the class's near tie in place of ADR 0056's alone and its reading over
+//! a kind's lane counts together (ADR 0104).
 //!
 //! # Mixed rounds (#717, spec #711; ADR 0106)
 //!
@@ -269,7 +270,8 @@ const CLASS_MOVED_PICKS_ALLOWANCE: usize = 2;
 /// none over none, 26 over 42, 37 over 22 (1.68), 6.0 over 11.0; this test,
 /// over each kind's lane counts together (the bound's reading), forced rounds
 /// 12.0 over 12.0 and graph rounds 22.0 over 12.0 (1.83); at one lane count
-/// the graph rounds' 4 lanes read 22.0 over 9.0 (2.44), past this margin there.
+/// the forced rounds' furthest is 12.0 over 11.0 (one lane) and the graph
+/// rounds' 4 lanes read 22.0 over 9.0 (2.44), past this margin there.
 /// The widest gap between the shapes: prototype 0 to 8 on texts of this
 /// test's length, 82.5 on the long answers; this test, forced rounds 8.0,
 /// graph rounds 17.0 (one lane, over a base widest of 12.0 there), where ADR

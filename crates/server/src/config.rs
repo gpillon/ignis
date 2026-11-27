@@ -621,7 +621,7 @@ impl std::fmt::Debug for Basis {
 }
 
 /// The **solo width** a config names (`--model-prefill-chunk-solo`, GitHub
-/// #489, ADR 0018 as amended): the prefill chunk while no lane is
+/// #489, ADR 0018): the prefill chunk while no lane is
 /// decode-ready. `auto`, the default, is resolved at load, where the VRAM
 /// plan and the card are known ([`crate::config::arch::solo_ladder`]); a
 /// width is a nonzero multiple of 128, and a load never runs it narrower than

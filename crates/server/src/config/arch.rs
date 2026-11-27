@@ -593,7 +593,7 @@ pub fn second_tail_cut_for_load() -> Result<bool, String> {
 }
 
 /// The solo widths an `auto` load of `family` on a card of `generation`
-/// tries, widest first (GitHub #489, ADR 0018 and ADR 0063 §3 as amended):
+/// tries, widest first (GitHub #489, ADR 0018, and ADR 0063 §3 as amended):
 /// the one decision, which [`crate::runtime::EngineShape::solo_widths`] asks.
 /// The load keeps the first its VRAM plan holds with nothing else adapted and,
 /// at more than one lane, the spare reservation left beside the context,
@@ -621,7 +621,7 @@ pub fn solo_ladder(family: ModelFamily, generation: Option<GpuGeneration>) -> &'
 }
 
 /// The 27B's BF16 exception tensors on `card` (`--model-exception-weights`,
-/// GitHub #456, #682, ADR 0103): held in FP8, they prefill on the W8A8 GEMM,
+/// GitHub #456, #682, ADR 0065): held in FP8, they prefill on the W8A8 GEMM,
 /// the sm_120a set's block-scaled FP8 MMA. `auto`, the default, is `fp8` on
 /// a card read that runs it and `bf16` on any other card and when no card is
 /// read; a named `bf16` runs everywhere; a named `fp8` on a card that does
@@ -816,7 +816,7 @@ mod tests {
         }
     }
 
-    /// GitHub #682 (ADR 0103): `auto` holds the exception tensors in FP8 on
+    /// GitHub #682 (ADR 0065): `auto` holds the exception tensors in FP8 on
     /// compute capability 12.0, the RTX 50 and RTX PRO cards, and as stored
     /// on an Ampere or an Ada card and when no card is read.
     #[test]
