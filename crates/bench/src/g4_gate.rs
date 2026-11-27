@@ -1,20 +1,22 @@
 //! The **G4 gate check** (P4-01, GitHub #117): at least two launches per
 //! engine in, one pooled verdict out.
 //!
-//! Spec: GitHub #65, linked from its tickets ("Gate G4");
-//! ADR 0015 (live/live), ADR 0021 (launch pooling). Mirrors
+//! Spec: GitHub #65, linked from its tickets ("Gate G4"). Mirrors
 //! [`crate::g2`] / [`crate::g3_gate`]'s refusal discipline exactly — a
 //! verdict is only computed when every launch of both engines agrees on the
 //! session id and the trace hash, and every needle cell is present on both
-//! sides — but adds what ADR 0021 asks and G2/G3 have not needed yet: the
+//! sides — but adds the third item of the crate's measuring rule (the
+//! crate's opening documentation), which G2/G3 leave to their caller: the
 //! *pooled* cell statistic across two or more independent process launches
 //! per engine, with each launch's own value carried as a diagnostic rather
 //! than decisive.
 //!
 //! ## Pooling, kept to the smallest thing that works
 //!
-//! ADR 0021: "report every launch's cells, and require the cell statistic
-//! taken across all launches ... to meet the threshold." Concretely: the
+//! The rule: report every launch's cells, and require the cell statistic
+//! taken across all launches (not the best one, not one chosen) to meet the
+//! threshold; one process launch picks its own throughput band, so one launch
+//! a side compares two launches, not two engines. Concretely: the
 //! per-class (and aggregate) tok/s cell pools an engine's launches by
 //! concatenating every launch's per-request metrics and reducing them with
 //! the same throughput-weighted aggregation [`crate::metrics::class_stats`]
@@ -23,8 +25,8 @@
 //! aggregate is reported too (diagnostic only), and a cell whose
 //! across-launch spread (the coefficient of variation of the launches' own
 //! aggregates) exceeds the largest within-launch spread (the coefficient of
-//! variation of that launch's own per-request tok/s) is flagged — ADR
-//! 0021's own finding, not silently averaged away.
+//! variation of that launch's own per-request tok/s) is flagged — a
+//! finding to record, not silently averaged away.
 //!
 //! The needle-retrieval cell is never pooled as a ratio (spec 04: "reported
 //! as a pass/fail floor and never folded into a ratio") — every launch must
@@ -65,7 +67,7 @@ pub struct CellVerdict {
     pub ratio: f64,
     /// `ratio >= `[`RATIO_THRESHOLD`].
     pub passed: bool,
-    /// Diagnostic only (ADR 0021): each of ours' launches' own aggregate.
+    /// Diagnostic only: each of ours' launches' own aggregate.
     pub ours_launch_tok_s: Vec<f64>,
     /// Diagnostic only: each of the reference's launches' own aggregate.
     pub reference_launch_tok_s: Vec<f64>,
@@ -75,8 +77,8 @@ pub struct CellVerdict {
     /// Diagnostic: the same, for the reference.
     pub reference_across_launch_spread_pct: f64,
     /// Diagnostic: the largest per-launch coefficient of variation (%) of
-    /// per-request tok/s, over ours' own launches — the baseline ADR
-    /// 0021's flag compares *ours'* across-launch spread against ("its own
+    /// per-request tok/s, over ours' own launches — the baseline the
+    /// spread flag compares *ours'* across-launch spread against ("its own
     /// launches' internal spread").
     pub ours_within_launch_spread_pct: f64,
     /// Diagnostic: the same, over the reference's own launches.
@@ -84,8 +86,8 @@ pub struct CellVerdict {
     /// Set when either engine's across-launch spread exceeds *that same
     /// engine's own* within-launch spread: "a cell whose across-launch
     /// spread looks larger than its own launches' internal spread is
-    /// itself a finding worth recording, not silently averaged away" (ADR
-    /// 0021) — compared per engine, not against the other engine's own
+    /// itself a finding worth recording, not silently averaged away"
+    /// — compared per engine, not against the other engine's own
     /// spread, so a quiet reference launch cannot mask a real flag on the
     /// engine under test, or vice versa.
     pub spread_flagged: bool,
@@ -116,7 +118,7 @@ pub struct Verdict {
     pub trace_sha256: String,
     pub ours_label: String,
     pub reference_label: String,
-    /// How many independent launches were pooled per side (>= 2, ADR 0021).
+    /// How many independent launches were pooled per side (>= 2).
     pub ours_launches: usize,
     pub reference_launches: usize,
     pub threshold: f64,
@@ -176,7 +178,7 @@ impl Verdict {
                 out.push_str(&format!(
                     "    WARNING: across-launch spread exceeds that engine's own within-launch \
                      spread (ours: {:.1}% across vs {:.1}% within; reference: {:.1}% across vs \
-                     {:.1}% within) — ADR 0021\n",
+                     {:.1}% within): record it, do not average it away\n",
                     cell.ours_across_launch_spread_pct,
                     cell.ours_within_launch_spread_pct,
                     cell.reference_across_launch_spread_pct,
@@ -225,7 +227,7 @@ fn class_metrics(record: &Record, class: Option<RequestClass>) -> Vec<RequestMet
 
 /// The pooled `ClassStats` over every launch's metrics for `class`
 /// concatenated together — the "cell statistic taken across all launches"
-/// ADR 0021 asks for, built from the aggregation `class_stats` already
+/// the pooling rule asks for, built from the aggregation `class_stats` already
 /// performs within one run.
 fn pooled_stats(records: &[Record], class: Option<RequestClass>) -> Option<ClassStats> {
     let items: Vec<RequestMetrics> = records.iter().flat_map(|r| class_metrics(r, class)).collect();
@@ -348,8 +350,8 @@ fn pooled_cell(
     let reference_launch_tok_s = per_launch_tok_s(reference, class);
     let ours_across = coefficient_of_variation(&ours_launch_tok_s);
     let reference_across = coefficient_of_variation(&reference_launch_tok_s);
-    // ADR 0021: "a cell whose across-launch spread looks larger than its
-    // own launches' internal spread" — each engine's across-launch number
+    // A cell whose across-launch spread looks larger than its
+    // own launches' internal spread is flagged — each engine's across-launch number
     // is compared against *that engine's own* within-launch baseline, not
     // the other engine's, so a quiet reference launch cannot mask a real
     // flag on the engine under test (or vice versa).
@@ -378,7 +380,7 @@ fn pooled_cell(
 
 /// Compare pooled launches of two engines and report the G4 verdict, or
 /// refuse. `ours` is the engine under test (>= 2 launches), `reference`
-/// the live reference (>= 2 launches) — ADR 0021's launch-pooling floor.
+/// the live reference (>= 2 launches) — the launch-pooling floor.
 pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> {
     if ours.is_empty() {
         return Err(Refusal("no launches were recorded for the engine under test".to_string()));
@@ -389,7 +391,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     if ours.len() < 2 {
         return Err(Refusal(format!(
             "{} has {} launch(es) recorded; G4 is a live/live gate and pools at least two \
-             independent process launches per engine within the session (ADR 0021)",
+             independent process launches per engine within the session",
             ours[0].label,
             ours.len()
         )));
@@ -397,7 +399,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     if reference.len() < 2 {
         return Err(Refusal(format!(
             "{} has {} launch(es) recorded; G4 is a live/live gate and pools at least two \
-             independent process launches per engine within the session (ADR 0021)",
+             independent process launches per engine within the session",
             reference[0].label,
             reference.len()
         )));
@@ -408,7 +410,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     if let Some(bad) = all.iter().find(|r| &r.session != session) {
         return Err(Refusal(format!(
             "{} (session {}) and {} (session {}) are not from the same session: G4 is judged \
-             live/live (ADR 0015), so every launch of both engines must share one session",
+             live/live, so every launch of both engines must share one session",
             all[0].label, session, bad.label, bad.session
         )));
     }
@@ -582,7 +584,7 @@ mod tests {
         ];
         let refusal = check(&ours, &reference).expect_err("must refuse");
         assert!(refusal.0.contains("ignis"), "{refusal}");
-        assert!(refusal.0.contains("ADR 0021"), "{refusal}");
+        assert!(refusal.0.contains("at least two independent process launches"), "{refusal}");
     }
 
     #[test]
@@ -594,7 +596,7 @@ mod tests {
         let reference = vec![record("reference", "S1", "abc", 100.0, true)];
         let refusal = check(&ours, &reference).expect_err("must refuse");
         assert!(refusal.0.contains("reference"), "{refusal}");
-        assert!(refusal.0.contains("ADR 0021"), "{refusal}");
+        assert!(refusal.0.contains("at least two independent process launches"), "{refusal}");
     }
 
     #[test]
@@ -925,7 +927,7 @@ mod tests {
         // Two `ignis` launches with wildly different sub-class tok/s (a
         // large across-launch spread) but each launch's own single request
         // has no internal spread to compare against (0%) — the flag must
-        // fire (ADR 0021's own finding: not silently averaged away).
+        // fire (a finding to record, not silently averaged away).
         let ours = vec![
             record("ignis", "S1", "abc", 80.0, true),
             record("ignis", "S1", "abc", 120.0, true),

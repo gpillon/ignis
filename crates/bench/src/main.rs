@@ -62,11 +62,18 @@
 //!             [--image <screenshot.png> [--image-question <text>]]
 //!             [--samples 5] [--max-tokens 8] [--label L] [--profile P]
 //!             [--session S] [--corpus <bank.ids>] [--out <record.json>]`
-//!       The G2 measurement instrument (P2-05, ADR 0015): time to first
+//!       The G2 measurement instrument (P2-05): time to first
 //!       token at an exact prompt length, on cold prefixes, against any
 //!       OpenAI-compatible endpoint. Writes one engine's record. `--image`
 //!       adds the multimodal cell (GitHub #181): the PNG plus a short
 //!       question, after the text cells; with it `--cells` may be omitted.
+//!   `ttft-pool --launch <launch1.json> --launch <launch2.json> [--launch ...]
+//!             --out <pooled.json>`
+//!       One engine's `ttft` records from at least two independent launches
+//!       of one session, pooled into one record: every sample of every
+//!       launch, the median over all of them. `g2` then compares pooled
+//!       records. Refuses launches of different sessions, engines or cells,
+//!       and a launch with a failed cell.
 //!   `g2      --ours <ignis-record.json> --ref <reference-record.json>
 //!             [--note <text>] [--out <verdict.json>]`
 //!       The G2 verdict over two such records: the ratio of medians per
@@ -98,7 +105,7 @@
 //!       /v1/session/end` finalizes the trace and stops the proxy.
 //!   `g3      --endpoint <url> --artifact <artifact.ninfer> [--label L]
 //!             [--profile P] [--session S] [--corpus <bank.ids>] [--out <record.json>]`
-//!       The G3 measurement instrument (P3-07, ADR 0015): the C=1 / C=4 /
+//!       The G3 measurement instrument (P3-07): the C=1 / C=4 /
 //!       ITL cells (spec 03) over HTTP/SSE against any OpenAI-compatible
 //!       endpoint. Writes one engine's record.
 //!   `g3-gate --ours <ignis-record.json> --ref <reference-record.json>
@@ -110,15 +117,15 @@
 //!   `g4      --endpoint <url> --artifact <artifact.ninfer> --trace <trace.jsonl>
 //!             [--label L] [--profile P] [--session S] [--conc N] [--corpus <bank.ids>]
 //!             [--out <record.json>]`
-//!       The G4 measurement instrument (P4-01, ADR 0015/0021): replays the
+//!       The G4 measurement instrument (P4-01): replays the
 //!       load trace and measures the needle-retrieval cells (64K / 128K).
 //!       Writes one *launch* of one engine's record — the trace's SHA-256
 //!       and the session id ride along, so `g4-gate` can enforce live/live.
 //!   `g4-gate --ours <launch1.json> --ours <launch2.json> [...]
 //!             --ref <launch1.json> --ref <launch2.json> [...]
 //!             [--note <text>] [--out <verdict.json>]`
-//!       The pooled G4 verdict over at least two launches per engine
-//!       (ADR 0021): the per-class / aggregate pooled throughput ratio
+//!       The pooled G4 verdict over at least two launches per engine:
+//!       the per-class / aggregate pooled throughput ratio
 //!       against 99%, and the needle-retrieval floor. Refuses a verdict
 //!       when the launches are not live/live (different sessions, different
 //!       trace hashes, a missing cell) or fewer than two launches are given
@@ -128,7 +135,7 @@
 //!             [--corpus <bank.ids>] [--out <record.json>]
 //!             [--depths 24,98,196] [--lanes N]
 //!             [--temperature T --top-p P --top-k K [--sample-seed S]]`
-//!       The G5 measurement instrument (P5-07, ADR 0015/0021): g3's C=1
+//!       The G5 measurement instrument (P5-07): g3's C=1
 //!       throughput cell (and its committed-token counter) at three prompt
 //!       depths (24K/98K/196K). Writes one *launch* of one engine's record.
 //!       `--depths` (K tokens, comma-separated) and `--lanes` (sequences per
@@ -140,8 +147,8 @@
 //!   `g5-gate --ours <launch1.json> --ours <launch2.json> [...]
 //!             --ref <launch1.json> --ref <launch2.json> [...]
 //!             [--note <text>] [--out <verdict.json>]`
-//!       The pooled G5 verdict over at least two launches per engine
-//!       (ADR 0021): one committed-tok/s ratio per depth against 99%,
+//!       The pooled G5 verdict over at least two launches per engine:
+//!       one committed-tok/s ratio per depth against 99%,
 //!       reusing `g4-gate`'s pooling rule. Refuses a verdict when the
 //!       launches are not live/live or fewer than two launches are given
 //!       per side.
@@ -164,6 +171,12 @@
 //! (the `ignis-server`'s OpenAI-compatible API); `report`/`gate` are fully
 //! functional on their own (they compare recorded runs and canary results);
 //! `record` captures a live session (the gate-run's capture piece, spec 03).
+//!
+//! `ttft`, `g3`, `g4` and `g5` each write one engine's record, and `g2`,
+//! `g3-gate`, `g4-gate` and `g5-gate` compare two engines' records by the
+//! measuring rule the library's opening documentation states: one session,
+//! cold prefixes, at least two independent launches a side. The thresholds
+//! they print are those of the phase gates and decide no gate (ADR 0082).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -196,6 +209,7 @@ fn main() -> ExitCode {
         Some("record") => cmd_record(&args[1..]),
         Some("oracle") => cmd_oracle(&args[1..]),
         Some("ttft") => cmd_ttft(&args[1..]),
+        Some("ttft-pool") => cmd_ttft_pool(&args[1..]),
         Some("small-card") => cmd_small_card(&args[1..]),
         Some("g2") => cmd_g2(&args[1..]),
         Some("g3") => cmd_g3(&args[1..]),
@@ -228,6 +242,7 @@ fn print_usage() {
   ignis-bench ttft --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768 [--samples 5] [--max-tokens 8]
                    [--image <screenshot.png> [--image-question <text>]]
                    [--label ignis] [--profile <text>] [--session <id>] [--corpus <bank.ids>] [--out <record.json>]
+  ignis-bench ttft-pool --launch <launch1.json> --launch <launch2.json> [--launch ...] --out <pooled.json>
   ignis-bench small-card --endpoint <url> [--metrics <url>|off] [--cells 8192,65536] [--samples 3]
                          [--decode-tokens 256] [--out <small-card.json>]
   ignis-bench g2 --ours <ignis-record.json> --ref <reference-record.json> [--note <text>] [--out <verdict.json>]
@@ -811,7 +826,7 @@ fn cmd_ttft(args: &[String]) -> ExitCode {
         .unwrap_or(ttft::DEFAULT_MAX_TOKENS);
     let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
     let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
-    // Live/live (ADR 0015): the *same* session id must be passed to both
+    // One session: the *same* session id must be passed to both
     // engines' runs, so a generated one is announced loudly enough to be
     // reused by the second run.
     let session = opt(args, "session").unwrap_or_else(new_session_id);
@@ -996,9 +1011,46 @@ fn cmd_small_card(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `ttft-pool`: one engine's TTFT records from independent launches, pooled
+/// into the one record `g2` compares ([`ttft::pool_launches`]).
+fn cmd_ttft_pool(args: &[String]) -> ExitCode {
+    let out = match require(args, "out") {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("{e}");
+            print_usage();
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut launches = Vec::new();
+    for path in repeated_opt(args, "launch") {
+        match ttft::Record::read(Path::new(&path)) {
+            Ok(record) => launches.push(record),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let pooled = match ttft::pool_launches(&launches) {
+        Ok(pooled) => pooled,
+        Err(refusal) => {
+            eprintln!("ttft-pool REFUSED: {refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", pooled.render());
+    if let Err(e) = pooled.write(Path::new(&out)) {
+        eprintln!("error: {e}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("wrote {out}");
+    ExitCode::SUCCESS
+}
+
 /// `g2` (P2-05, GitHub #87): the G2 verdict over two TTFT records. Refuses
 /// outright — rather than reporting a failure — when the two records do not
-/// support a live/live comparison (ADR 0015).
+/// support a comparison: one session, the same cells, every sample cold.
 fn cmd_g2(args: &[String]) -> ExitCode {
     let (ours_path, ref_path) = match (require(args, "ours"), require(args, "ref")) {
         (Ok(o), Ok(r)) => (o, r),
@@ -1043,7 +1095,7 @@ fn cmd_g2(args: &[String]) -> ExitCode {
     if verdict.passed {
         ExitCode::SUCCESS
     } else {
-        eprintln!("G2 gate FAILED (ADR 0015: ratio <= {} per cell)", verdict.threshold);
+        eprintln!("G2 gate FAILED (ratio <= {} per cell)", verdict.threshold);
         ExitCode::FAILURE
     }
 }
@@ -1064,7 +1116,7 @@ fn cmd_g3(args: &[String]) -> ExitCode {
     };
     let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
     let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
-    // Live/live (ADR 0015): the *same* session id must be passed to both
+    // One session: the *same* session id must be passed to both
     // engines' runs.
     let session = opt(args, "session").unwrap_or_else(new_session_id);
     let out = opt(args, "out");
@@ -1152,7 +1204,7 @@ fn cmd_g3(args: &[String]) -> ExitCode {
 
 /// `g3-gate` (P3-07, GitHub #100): the G3 verdict over two records. Refuses
 /// outright — rather than reporting a failure — when the two records do not
-/// support a live/live comparison (ADR 0015).
+/// support a comparison in one session.
 fn cmd_g3_gate(args: &[String]) -> ExitCode {
     let (ours_path, ref_path) = match (require(args, "ours"), require(args, "ref")) {
         (Ok(o), Ok(r)) => (o, r),
@@ -1201,7 +1253,7 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G3 gate FAILED (ADR 0015: tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / \
+            "G3 gate FAILED (tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / \
              <= {} tolerated-with-warning)",
             verdict.throughput_threshold, verdict.itl_pass_threshold, verdict.itl_fail_threshold
         );
@@ -1212,7 +1264,7 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
 /// `g4` (P4-01, GitHub #117): replay the load trace and measure the
 /// needle-retrieval cells against one OpenAI-compatible endpoint. The
 /// record it writes is one *launch* of one engine; `g4-gate` pools at
-/// least two of them per engine (ADR 0021) into a verdict.
+/// least two of them per engine into a verdict.
 fn cmd_g4(args: &[String]) -> ExitCode {
     let (endpoint, artifact, trace_path) = match (
         require(args, "endpoint"),
@@ -1230,7 +1282,7 @@ fn cmd_g4(args: &[String]) -> ExitCode {
     };
     let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
     let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
-    // Live/live (ADR 0015): the *same* session id must be passed to every
+    // One session: the *same* session id must be passed to every
     // launch of both engines.
     let session = opt(args, "session").unwrap_or_else(new_session_id);
     let out = opt(args, "out");
@@ -1335,7 +1387,7 @@ fn cmd_g4(args: &[String]) -> ExitCode {
 }
 
 /// `g4-gate` (P4-01, GitHub #117): the pooled G4 verdict over at least two
-/// launches per engine (ADR 0021). Refuses outright — rather than
+/// launches per engine. Refuses outright — rather than
 /// reporting a failure — when the launches do not support a live/live
 /// comparison (different sessions, different trace hashes, a missing
 /// cell).
@@ -1384,7 +1436,7 @@ fn cmd_g4_gate(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G4 gate FAILED (ADR 0021: pooled tok/s ratio >= {} per class and aggregate, every \
+            "G4 gate FAILED (pooled tok/s ratio >= {} per class and aggregate, every \
              needle cell retrieved)",
             verdict.threshold
         );
@@ -1397,7 +1449,7 @@ fn cmd_g4_gate(args: &[String]) -> ExitCode {
 /// against one OpenAI-compatible endpoint, or at `--depths` with `--lanes`
 /// sequences each (GitHub #578). The record it writes is one
 /// *launch* of one engine; `g5-gate` pools at least two of them per engine
-/// (ADR 0021) into a per-depth verdict.
+/// into a per-depth verdict.
 fn cmd_g5(args: &[String]) -> ExitCode {
     let (endpoint, artifact) = match (require(args, "endpoint"), require(args, "artifact")) {
         (Ok(e), Ok(a)) => (e, a),
@@ -1411,7 +1463,7 @@ fn cmd_g5(args: &[String]) -> ExitCode {
     };
     let label = opt(args, "label").unwrap_or_else(|| "ignis".into());
     let profile = opt(args, "profile").unwrap_or_else(|| "unrecorded".into());
-    // Live/live (ADR 0015): the *same* session id must be passed to every
+    // One session: the *same* session id must be passed to every
     // launch of both engines.
     let session = opt(args, "session").unwrap_or_else(new_session_id);
     let committed_tokens =
@@ -1492,7 +1544,7 @@ fn cmd_g5(args: &[String]) -> ExitCode {
 }
 
 /// `g5-gate` (P5-07, GitHub #151): the pooled G5 verdict over at least two
-/// launches per engine (ADR 0021), one ratio per depth. Refuses outright —
+/// launches per engine, one ratio per depth. Refuses outright —
 /// rather than reporting a failure — when the launches do not support a
 /// live/live comparison (different sessions, a missing depth cell) or fewer
 /// than two launches are given per side.
@@ -1541,7 +1593,7 @@ fn cmd_g5_gate(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G5 gate FAILED (ADR 0021: pooled committed tok/s ratio >= {} at every depth)",
+            "G5 gate FAILED (pooled committed tok/s ratio >= {} at every depth)",
             verdict.threshold
         );
         ExitCode::FAILURE
@@ -1897,7 +1949,7 @@ fn cmd_oracle_compare(args: &[String]) -> ExitCode {
     }
     let overall = oracle::overall_agreement(&results);
     println!("overall free-running agreement: {:.1}%", overall * 100.0);
-    // ADR 0014: free-running comparison is a DIAGNOSTIC, not the G1 gate. A
+    // Free-running comparison is a DIAGNOSTIC, not the G1 floor (ADR 0082). A
     // single divergence changes the candidate's own prefix and decorrelates
     // every later position, so a low figure here means "the continuations
     // parted ways", not "the forward pass is broken". The G1 correctness
@@ -1906,7 +1958,7 @@ fn cmd_oracle_compare(args: &[String]) -> ExitCode {
     // `crates/server/tests/oracle_teacher_forced_gpu.rs`. So this command
     // reports and never fails the process on the agreement figure.
     println!(
-        "note: free-running agreement is informational only (ADR 0014). The G1 \
+        "note: free-running agreement is informational only. The G1 \
          correctness floor is teacher-forced next-token agreement >= {:.0}%, \
          measured by the GPU profile.",
         oracle::G1_AGREEMENT_FLOOR * 100.0

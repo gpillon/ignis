@@ -2,30 +2,38 @@
 //! at an **exact prompt length**, on **cold prefixes**, against any
 //! OpenAI-compatible endpoint.
 //!
-//! Spec: GitHub #63; ADR 0015 (G2 is
-//! judged live/live on cold-prefix samples). The verdict half lives in
-//! [`crate::g2`].
+//! Spec: GitHub #63. The verdict half lives in [`crate::g2`], and
+//! [`pool_launches`] pools one engine's launches for it. This module holds
+//! the cold-prefix item of the crate's measuring rule (the crate's opening
+//! documentation); its [`Record`] carries the session the other items are
+//! checked by.
 //!
 //! ## Why "cold prefix" is the whole design
 //!
-//! The quantity G2 gates is **prefill**. With the reference in its
-//! production profile, repeating one prompt across samples turns samples
-//! 2..N into prefix-cache hits, and what the stopwatch then measures is a
-//! cache lookup. So every sample here — the warmup included — gets its
+//! The quantity measured is **prefill**. With an engine in the profile it
+//! is served in, prefix reuse on, repeating one prompt across samples turns
+//! samples 2..N into prefix-cache hits, and what the stopwatch then measures
+//! is a cache lookup. A cache is a real property of an engine and worth a
+//! cell of its own; in a prefill cell it flatters whichever engine has one.
+//! Turning prefix reuse off for the run would measure a profile nobody
+//! serves, and leave the engine's other caches (a host KV tier, drafter
+//! checkpoints). So every sample here — the warmup included — gets its
 //! **own** prompt, differing from the *first content token*, and every
 //! sample **verifies** its coldness against the engine's own reported
 //! computed-prefill-token count ([`crate::client::Outcome::computed_prefill_tokens`]).
 //! A sample whose computed prefill is not the prompt's own length is
 //! **void** and fails its cell. Coldness is evidence here, never an
-//! assumption.
+//! assumption. A run's prompts share the chat template's own tokens and
+//! nothing an engine could reuse, which the run proves before its first
+//! request.
 //!
 //! ## The instrument is one instrument
 //!
-//! ignis and the reference are driven through the same
+//! Both engines of a comparison are driven through the same
 //! [`crate::client::Endpoint`], with the same request shape (streaming,
 //! greedy, thinking disabled, a small output budget) and the same prompt
 //! generator. A cell's statistic is the **median of five samples after one
-//! warmup**, so a single scheduling hiccup does not decide a gate.
+//! warmup**, so a single scheduling hiccup does not decide a cell.
 //!
 //! ## Prompts of an exact length
 //!
@@ -1065,8 +1073,8 @@ impl Cell {
 /// A TTFT record: what one engine measured, on which cells, in which
 /// session.
 ///
-/// The session identifier is what makes a **live/live** verdict possible
-/// (ADR 0015): two records carrying the same session were produced in the
+/// The session identifier is what makes a comparison of two records
+/// checkable: two records carrying the same session were produced in the
 /// same measurement session, on the same machine, by the same operator
 /// run. The gate check refuses to compare records that do not.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1187,6 +1195,78 @@ pub fn median(values: &[f64]) -> Option<f64> {
     } else {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     })
+}
+
+/// One engine's records from independent launches, pooled into one record
+/// of the same shape: every cell's samples from every launch, numbered
+/// across them, and the median taken over all of them, so [`crate::g2`]
+/// compares the pooled result and not one launch against another (the
+/// crate's measuring rule: a launch picks its own throughput band).
+///
+/// Refused: fewer than two launches; launches that differ in session, label,
+/// engine or artifact, or that did not measure the same cells in the same
+/// order; a launch with a failed cell. A void sample is carried as it is, so
+/// the comparison still refuses it.
+pub fn pool_launches(launches: &[Record]) -> Result<Record, String> {
+    if launches.len() < 2 {
+        return Err(format!(
+            "{} launch given: a pooled record takes at least two independent launches of the \
+             engine, the server stopped and started again between them",
+            launches.len()
+        ));
+    }
+    let first = &launches[0];
+    for (number, launch) in launches.iter().enumerate().skip(1) {
+        for (field, theirs, ours) in [
+            ("session", &launch.session, &first.session),
+            ("label", &launch.label, &first.label),
+            ("engine", &launch.engine, &first.engine),
+            ("artifact", &launch.artifact, &first.artifact),
+        ] {
+            if theirs != ours {
+                return Err(format!(
+                    "launch {}: its {field} is {theirs:?} and the first launch's is {ours:?}: a \
+                     pooled record is one engine's launches in one session",
+                    number + 1
+                ));
+            }
+        }
+        // A cell is named by its length and, for an image cell, its image.
+        let names = |record: &Record| -> Vec<(u32, Option<ImageIdentity>)> {
+            record.cells.iter().map(|cell| (cell.prompt_tokens, cell.image.clone())).collect()
+        };
+        if names(launch) != names(first) {
+            return Err(format!(
+                "launch {}: its cells are not the first launch's: every launch measures the same \
+                 cells, in the same order",
+                number + 1
+            ));
+        }
+    }
+    for (number, launch) in launches.iter().enumerate() {
+        for cell in &launch.cells {
+            if let Some(error) = &cell.error {
+                return Err(format!(
+                    "launch {}: cell {} failed and was never measured: {error}",
+                    number + 1,
+                    cell.prompt_tokens
+                ));
+            }
+        }
+    }
+    let mut pooled = first.clone();
+    for (index, cell) in pooled.cells.iter_mut().enumerate() {
+        cell.samples = launches
+            .iter()
+            .flat_map(|launch| launch.cells[index].samples.iter().cloned())
+            .enumerate()
+            .map(|(index, sample)| Sample { index, ..sample })
+            .collect();
+        let ttfts: Vec<f64> = cell.samples.iter().map(|s| s.ttft_ms).collect();
+        cell.median_ttft_ms = median(&ttfts);
+    }
+    pooled.profile = format!("{} (pooled over {} launches)", first.profile, launches.len());
+    Ok(pooled)
 }
 
 // ── measuring ────────────────────────────────────────────────────────────
@@ -1396,8 +1476,8 @@ fn measure_prompts(
 /// Short means part of the prompt came from a cache — the contamination
 /// this instrument exists to catch. Long means our post-template count and
 /// the engine's disagree, which makes the cell's claimed length a fiction;
-/// either way the sample is not evidence, so it is void (ADR 0015: the
-/// tool enforces live/live, not the operator's discipline).
+/// either way the sample is not evidence, so it is void (the tool holds
+/// the cold-prefix rule, not the operator's discipline).
 pub(crate) fn coldness_failure(computed: Option<u32>, prompt_tokens: u32) -> Option<String> {
     match computed {
         None => Some(
