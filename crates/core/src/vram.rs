@@ -165,7 +165,8 @@ pub struct VramLines {
     /// tensor maps on the device. 0 on Linux, the trellis body, Flash-Next, an
     /// RTX 30 or RTX 40 card and a chunk below 1,024 tokens.
     pub tma_descriptors: u64,
-    /// One media item's encoder output (0 without `--vision-enabled`).
+    /// The media embedding pool, in whole pages (0 without `--vision-enabled`
+    /// and under `--vision-residency host`, whose pool is host-mapped).
     pub media_embedding: u64,
     /// Device sampling's staging buffers and workspace.
     pub sampling: u64,
