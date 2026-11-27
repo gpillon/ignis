@@ -1068,7 +1068,7 @@ struct ArmedAttentionReadout {
   int64_t key_count = 0;
   float *host_scores = nullptr; // [key_count]
   int32_t *host_read = nullptr; // 1 read, 0 not
-  // GitHub #263 (ADR 0039): the head set, parallel arrays of `set_count`
+  // GitHub #263 (ADR 0038): the head set, parallel arrays of `set_count`
   // heads, the keys their argmax skips, and where each head's key goes.
   uint32_t set_count = 0;
   const int32_t *set_gqa_ordinals = nullptr;
@@ -1076,7 +1076,7 @@ struct ArmedAttentionReadout {
   uint32_t excluded_count = 0;
   const int32_t *excluded = nullptr;
   int32_t *host_set_argmax = nullptr; // [set_count]
-  // GitHub #264 (ADR 0040): each head's score at its own argmax, and the four
+  // GitHub #264 (ADR 0038): each head's score at its own argmax, and the four
   // around it -- the image grid's columns say which of those exist.
   uint32_t grid_cols = 0;
   float *host_set_peak = nullptr;       // [set_count]

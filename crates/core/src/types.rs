@@ -837,7 +837,7 @@ pub enum SchedEvent {
         /// The **attention readout** a head-point decision finished with
         /// (GitHub #260, ADR 0038): one pre-softmax score per key of the span
         /// it named, in order, and one key index per head of its head set
-        /// when it named one (GitHub #263, ADR 0039) — `None` for every other
+        /// when it named one (GitHub #263, ADR 0038) — `None` for every other
         /// request, and for a head point whose leaf could not read the keys,
         /// which then finishes with [`FinishReason::Error`].
         attention: Option<crate::pointing::AttentionScores>,

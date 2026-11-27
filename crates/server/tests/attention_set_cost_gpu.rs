@@ -1,4 +1,4 @@
-//! Spec 14 acceptance 5 (GitHub #263, ADR 0039): **what reading the head set
+//! Spec 14 acceptance 5 (GitHub #263, ADR 0038): **what reading the head set
 //! costs, inside the prefill.**
 //!
 //! One prompt — the served render of a head point, forced `{"x":` and all —
@@ -12,7 +12,7 @@
 //! from the leaf's own chunk profile (`IGNIS_CHUNK_PROFILE`, GitHub #92), with
 //! prompt reuse off so every run prefills the same chunks.
 //!
-//! Since spec 15 (GitHub #264, ADR 0040) the set's shape is two launches a
+//! Since spec 15 (GitHub #264, ADR 0038) the set's shape is two launches a
 //! layer: the fused reduction, and the gather that scores the four keys
 //! around each of that layer's argmaxes. What this measures is both together
 //! — there is no build with one and not the other — so the bound is spec

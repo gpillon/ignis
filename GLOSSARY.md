@@ -1647,7 +1647,7 @@ whether a restricted softmax is reading the model or renormalizing noise: a
 Reading attention heads' pre-softmax scores (`q · k / sqrt(head_dim)`) at a
 prefill's last position over one span of its keys — an image's placeholders, or
 a text state's tokens — instead of the logits of answer tokens
-(GitHub #260, #263, #264 and #275; ADR 0038, ADR 0039, ADR 0040 and ADR 0041).
+(GitHub #260, #263, #264 and #275; ADR 0038 and ADR 0041).
 A `point`, a head `box` or a **locate** answered this way is a **decision**:
 one prefill, no decode round, no lane.
 
@@ -1662,7 +1662,7 @@ a load answers `point` with the digit chain.
 **Head set**:
 The attention heads read together beside the **pointing head**, one image cell
 each: where that head looks hardest, the **fallback cells** skipped
-(GitHub #263, ADR 0039). Each reads a different part of the object the question asked
+(GitHub #263, ADR 0038). Each reads a different part of the object the question asked
 for — its boundary, mostly — so the cells near the pointing head's point
 outline the object.
 
@@ -1676,7 +1676,7 @@ keeps them, and a map flat enough to fall back to one (`region.share` about
 
 **Sub-cell peak**:
 Where a **head set**'s head looks hardest *inside* its image cell, not just
-which cell (GitHub #264, ADR 0040): parabolic interpolation over its score at
+which cell (GitHub #264, ADR 0038): parabolic interpolation over its score at
 its peak and the two in-line neighbours on each axis, in cells, zero when a
 neighbour is off the grid or the triple is not a strict peak. It is what lets a
 box frame an object smaller than the cell grid can express — a 1024 px button

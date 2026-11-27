@@ -47,11 +47,9 @@ edit it by hand.
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | The vision embedding outlives its encode | accepted | |
 | [0036](0036-the-v1-surface-documents-itself.md) | The `/v1` surface documents itself, and its reference needs no key | accepted | |
 | [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | A vendored file may carry a patch that fixes a known correctness bug | accepted | |
-| [0038](0038-the-seam-carries-one-attention-head.md) | the `Compute` seam carries one attention head's scores | accepted | |
-| [0039](0039-the-seam-carries-a-head-set.md) | the attention readout carries a head set | accepted | |
-| [0040](0040-the-readout-carries-the-peak-s-neighbours.md) | the attention readout carries each peak's neighbours | accepted | |
-| [0041](0041-the-readout-reads-a-text-span.md) | the attention readout reads a text span, in whole rows | accepted | |
-| [0042](0042-locate-copies-over-a-folded-state.md) | a locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
+| [0038](0038-the-compute-seam-carries-an-attention-readout.md) | The `Compute` seam carries an attention readout | accepted | |
+| [0041](0041-the-readout-reads-a-text-span.md) | The attention readout reads a text span, in whole rows | accepted | |
+| [0042](0042-locate-copies-over-a-folded-state.md) | A locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
 | [0043](0043-a-second-model-without-a-ninfer-reference.md) | A second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | |
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
 | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | The KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | |

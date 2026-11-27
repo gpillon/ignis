@@ -44,6 +44,15 @@ its `digits` is a maximum. The first token of a run is drawn by its prefill,
 not by its first decode round, because a round returns the token the previous
 call made ready.
 
+A `point` or `box` read off the heads says `"method": "head"` in its answer. Its
+`uncertainty` is the reading's resolution, not a spread: half an image token per
+axis on a load with a head set, one token for a `point` on a load with the
+pointing head alone. `region.share` is the confidence to act on, and not a
+calibrated probability. With a head set the `point` is the centre of the
+object's `extent`, which the answer carries in the image's pixels; without one
+there is no `extent`, the point sits on the part of the object the pointing head
+reads, and a head `box` is refused.
+
 The body is one `state` and a map of `questions`:
 
 ```bash

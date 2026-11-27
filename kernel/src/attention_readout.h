@@ -1,7 +1,7 @@
 // The attention readout (GitHub #260, ADR 0038): one query head of one GQA
 // layer, at a prefill chunk's last position, dotted with the keys of one span
 // exactly as that layer's attention read them -- and, with a head set
-// (GitHub #263, ADR 0039), every head of the set that layer holds, each
+// (GitHub #263, ADR 0038), every head of the set that layer holds, each
 // reduced on the device to the one key it peaks on.
 //
 // Internal, not part of the flat C ABI: the ABI half is

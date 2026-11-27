@@ -234,7 +234,7 @@ struct ignis_prefill_options {
   int64_t attention_key_count;
   float *out_attention_scores;
   int32_t *out_attention_read;
-  /* GitHub #263 (ADR 0039): the head set read beside the attention readout,
+  /* GitHub #263 (ADR 0038): the head set read beside the attention readout,
    * or none when `attention_set_count` is 0 -- and then the readout arms its
    * one layer and launches what it launched before. Head `i` is query head
    * `attention_set_query_heads[i]` of GQA layer
@@ -252,7 +252,7 @@ struct ignis_prefill_options {
   uint32_t attention_excluded_count;
   const int32_t *attention_excluded;
   int32_t *out_attention_set_argmax;
-  /* GitHub #264 (ADR 0040): with the set, head `i`'s score at its own argmax
+  /* GitHub #264 (ADR 0038): with the set, head `i`'s score at its own argmax
    * lands in `out_attention_set_peak[i]`, and the four scores around it in
    * `out_attention_set_neighbours[4 * i + 0..4]` -- the argmax's left, right,
    * up and down neighbours in the image grid, in that order, enough for the

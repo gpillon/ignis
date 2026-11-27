@@ -2378,7 +2378,7 @@ pub struct MultimodalPrefill<'a> {
 
 /// One **attention readout** a span asks for (GitHub #260, ADR 0038): what
 /// to read, and where the scores go — one slot per key of the query's span,
-/// and one per head of its head set (GitHub #263, ADR 0039), with the four
+/// and one per head of its head set (GitHub #263, ADR 0038), with the four
 /// neighbours of an image's set (GitHub #264) or the rows of a set read in
 /// rows (GitHub #275, ADR 0041).
 pub struct AttentionReadout<'a> {

@@ -1,5 +1,5 @@
 //! Spec 13 acceptance 1 (GitHub #260, ADR 0038) and spec 14 acceptance 1
-//! (GitHub #263, ADR 0039): **the leaf's reads are the attention's.**
+//! (GitHub #263, ADR 0038): **the leaf's reads are the attention's.**
 //!
 //! Each head point here names the served calibration's **head set** too, as
 //! `/v1/decide` does: 96 heads over nine armed GQA layers, the tap armed on
@@ -283,7 +283,7 @@ fn the_leaf_reads_what_the_tap_sees(kv_format: KvFormat) {
 
         // ── the peaks and their neighbours against the tap's ─────────────
         //
-        // Spec 15 (GitHub #264, ADR 0040): the gather launch scores the four
+        // Spec 15 (GitHub #264, ADR 0038): the gather launch scores the four
         // keys around each argmax in the image grid, and says so with NaN
         // where the grid has none. The tap is the oracle for both.
         let peak = leaf.set_peak.as_deref().unwrap_or_else(|| panic!("{label}: no peak scores"));
