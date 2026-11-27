@@ -5,7 +5,7 @@ matrices.
 - A fused NVFP4 plane of the served artifact becomes the split matrices the quant carries, under
   their exllamav3 names (`gdn/in_proj_qkv` + `gdn/in_proj_z`, `attention/q_proj` / `k_proj` /
   `v_proj`, `mlp/gate_proj` + `mlp/up_proj`): exllamav3 quantized them separately, each with its
-  own scales, so they cannot be fused by concatenation (ADR 0060 §4).
+  own scales, so they cannot be fused by concatenation (ADR 0060).
 - A plane the quant also holds whole keeps the served name (`gdn/output`, `attention/output`,
   `mlp/down`, `text/output_head`): the layer code picks the op by the tensor's format.
 - The NVFP4 planes' `*_input_scale_divisor` scalars belong to their W4A4 activations and are

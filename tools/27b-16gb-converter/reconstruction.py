@@ -2,7 +2,7 @@
 work, and the only exllamav3 user).
 
 The weight a record stands for is exllamav3's own reconstruction (`LinearEXL3.get_weight_tensor`,
-the oracle of ADR 0060 §5 and of M1's harness), `[in, out]` fp16; the error is
+the oracle of ADR 0060 and of M1's harness), `[in, out]` fp16; the error is
 `‖W − W_bf16‖_F / ‖W_bf16‖_F` with `W_bf16` the checkpoint's `<key>.weight`, summed in fp64 over
 row blocks so the 248,320-row head never needs a second full-size copy. A matrix above the bound
 (0.6, M1's) is a layout error, never a quantization one: SC_3.00bpw_H4's worst is 0.34.

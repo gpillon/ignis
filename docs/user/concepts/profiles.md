@@ -113,7 +113,7 @@ Why each:
   which leaves the KV pool 534.6 MB more: the 917,504 tokens hold unadapted
   with at least 28,483 MiB free at start, against 28,993 MiB with BF16, and on
   2026-11-18, with 28,549 MiB free, BF16 adapted to 786,432 tokens and yarn:3
-  while FP8 kept them ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
+  while FP8 kept them ([the finding](../../findings/2026-11-18-the-27bs-fp8-exception-weights-at-their-served-shape-on-the-rtx-5090.md)).
 - **DFlash2 at 15 drafts.** Each verify round
   takes the base shape, or the extended one while a request's text is
   predictable ([past seven drafts](speculative-decoding.md#past-seven-drafts-two-round-shapes)).

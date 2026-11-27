@@ -119,7 +119,7 @@ tensors in FP8 on the RTX 50 and RTX PRO cards
 1,200 MiB headroom the context fits unadapted with at least 28,483 MiB free at
 start, where BF16 needs 28,993 MiB. On 2026-11-18, with 28,549 MiB free at
 start, the FP8 load kept 917,504 tokens
-and a BF16 one adapted to 786,432 ([ADR 0103](../../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md)).
+and a BF16 one adapted to 786,432 ([the finding](../../findings/2026-11-18-the-27bs-fp8-exception-weights-at-their-served-shape-on-the-rtx-5090.md)).
 That is the plan working as intended: the context is sized to the card, not
 guessed.
 

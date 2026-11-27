@@ -58,7 +58,9 @@
 //! drain and no teardown (nothing is resident), and a load that fails leaves
 //! [`ModelStatus::Failed`], since there is no previous model to reload. An
 //! unload and a switch, a reload or a load never overlap: they share
-//! [`Switcher::running`].
+//! [`Switcher::running`]. Neither the unload nor the load after it is a
+//! switch: both are logged, and `last_switch`, which tells an operator what
+//! the last switch did, is left as it was.
 //!
 //! **Visits** (spec image-model/05 §Prompt enhancement). An image request
 //! whose prompt a text model rewrites while the image model is loaded
@@ -68,7 +70,7 @@
 //! request is answered `503 model_switching` throughout. A visit back to the
 //! model it left never writes `last_switch`: it is not a switch. One that
 //! ends on another model is the request's switch, and each of its two
-//! switches is written there as a switch is (ADR 0049 §5).
+//! switches is written there as a switch is (ADR 0049).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -1248,7 +1250,7 @@ struct Begun {
     landed: ModelStatus,
     /// What how it ends is written to `last_switch` as: a switch's or a
     /// reload's own ends; a visit's leg's own, when the visit ends on another
-    /// model than the one it left — the request's switch (ADR 0049 §5);
+    /// model than the one it left — the request's switch (ADR 0049);
     /// nothing for a request's load, or a visit back.
     recorded: Option<SwitchStarted>,
 }
@@ -1424,8 +1426,8 @@ impl Visit {
 /// the switch to `then` follows. Every other request is answered `503
 /// model_switching` from the first step to the last; `last_switch` is left
 /// as it was when `then` is the model it leaves, and is written by each
-/// switch as a switch writes it otherwise (the request's switch, ADR 0049
-/// §5). `steps` is told each switch's steps. Refused as a switch is
+/// switch as a switch writes it otherwise (the request's switch, ADR 0049).
+/// `steps` is told each switch's steps. Refused as a switch is
 /// ([`SwitchRefusal`]), and when no model serves ([`SwitchRefusal::NotServing`]).
 pub fn visit(server: &Server, via: ModelSource, then: ModelSource, steps: Option<Steps>) -> Result<Visit, SwitchRefusal> {
     let (arrived_tx, arrived) = tokio::sync::oneshot::channel();
