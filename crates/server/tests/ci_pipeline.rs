@@ -1,5 +1,5 @@
-//! The release workflow's shape since GitHub #552 (ADR 0086, which amends
-//! ADR 0032): the builds run beside the tests, and nothing is published
+//! The release workflow's shape since GitHub #552 (ADR 0032): the builds
+//! run beside the tests, and nothing is published
 //! before the tests pass; the CPU-only suite runs as shards whose count the
 //! matrix and the shard script agree on; the Linux build compiles the kernel
 //! leaf in a layer of its own.

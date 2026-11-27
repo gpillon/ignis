@@ -20,7 +20,7 @@ cut (spec #646, ticket #649).
   last 63 tokens before the generation opener: it resumes at the reuse point before it, the previous turn's checkpoint
   or the system block. An identical retry, a conversation's next turn and a subagent burst resume as before.
 - **The 27B's split points move on Blackwell**, so its greedy text can change where two tokens are nearly tied
-  ([ADR 0007](0007-performance-gate-not-parity.md), ADR 0029's reuse boundaries).
+  ([ADR 0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md), ADR 0029's reuse boundaries).
 - **A measurement switch restores the second cut**, for comparisons: `IGNIS_SECOND_TAIL_CUT=1`, a contributor's,
   read at each model load as the leaf's measurement switches are (unset or empty is the single cut, any other value
   refuses the load by name), reported on the load's `ignis.model.loaded` line (`second_tail_cut`), and documented with

@@ -114,8 +114,8 @@ NUMBERED = re.compile(r"ADR[ -]?\d{4}\b")
 # "ADR 0001 — title" in the long form; the index shows the title alone.
 NUMBER_PREFIX = re.compile(r"ADR[ -]?\d{4}\s*(?:—|–|-|:)\s*")
 # The soft limit on an ADR's length: the words of its text as `wc -w` counts
-# them, the frontmatter aside. Provisional: the cleanup's pilot lot sets it (#749).
-WORD_LIMIT = 300
+# them, the frontmatter aside. Set by the cleanup's pilot lot (#749).
+WORD_LIMIT = 600
 # --since: a frontmatter's status at the base.
 FRONT_STATUS = re.compile(r"^status: (\S+)", re.MULTILINE)
 

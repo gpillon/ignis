@@ -25,7 +25,7 @@ cargo test          # workspace-wide; make test is the same
 It is CPU-only and never touches the GPU, which is what lets CI run it on
 Linux and on Windows runners with no card; the release builds run beside it,
 and nothing is published until both legs are green
-([ADR 0086](../../adr/0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md)).
+([ADR 0032](../../adr/0032-release-through-the-container-build.md)).
 A machine-local smoke test whose fixture is absent skips, and a skip counts as
 green — except for compute work: a test on the forward pass that skips on a
 busy GPU or a kernel error proves nothing, so those tests live in the GPU

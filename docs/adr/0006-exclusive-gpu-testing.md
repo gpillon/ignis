@@ -1,59 +1,33 @@
 ---
 status: accepted
-amended-by: [ADR-0084]
 ---
 
-# ADR 0006 — Exclusive GPU testing (no concurrent engines)
+# Exclusive GPU testing (no concurrent engines)
 
-## Status
+One process holds the development card at a time: one run fills the RTX 5090, the weights of two full-size engines
+alone exceed its memory, so two cannot coexist on it, and the run that loses the card dies with no diagnostic.
+Exclusivity is a test-harness concern, not a runtime feature of the engine: the engine has no multi-tenant story and
+does not refuse to start because another process uses the GPU, and `ignis-server` run by hand takes no lock.
 
-Accepted (2026-09-02, grilling session). Edited 2026-11-20 (#707).
+- **A preflight.** The guard is a preflight check in the `bench`/test harness, run before every GPU run
+  (`make gpu-status`, the preflight): it detects that another process holds the GPU and refuses or waits, so
+  running two engines by accident is explicit and never silent.
+- **A GPU lock**, one per card, records who holds it, and every way onto the card through `make` takes it: the GPU
+  profile for its whole run (or for the few tests it is given), a server started through `make`, the kernel leaf's
+  op tests, and any command run through `make gpu-run`. A server start and the guard refuse at once while someone
+  else holds it, naming the holder; a test, `make gpu-run` and the profile wait for it up to a limit
+  (`GPU_LOCK_WAIT`), then fail naming it. A holder that has exited, or whose pid now names another process, holds
+  nothing, so a run killed before it could clean up leaves no lock standing. Two runs therefore no longer race
+  between the check and the start, and an agent can run its own GPU tests while others share the card.
+- **The lock is added to the preflight, not put in its place**: the profile's pass marker and the process check
+  stay, since the engine's test helper reads the marker and a worktree on an older commit knows only those two.
+- **Who stops what** depends on where the agent that runs the test is served, on the card or elsewhere. If its own
+  model is served from the card, the process holding the card is the agent itself, as for a fork's contributor with
+  one consumer card, and the GPU step goes to the user: stop the serving engine, run, restart it. If the agent runs
+  elsewhere, a process holding the card is someone else's, another session's, an experiment's or another tool's (the
+  shared card of ADR 0049): the agent waits or asks, and never stops a process it did not start. The recipe is in
+  `docs/agents/testing.md`.
 
-## Context
+## Considered Options
 
-ignis is developed (and tested) with the same model runner (ninfer, running
-Qwen 3.8-27B) that the developer uses for coding — a **self-bootstrapping**
-loop. When we run ignis to test it, the RTX 5090 may already be holding ninfer
-(both engines need the GPU). The 5090 has 32 GB; a *single* engine's full
-footprint (weights ≈16.03 GiB + KV pool ~12–13 GB + graph ~1.9 GB) leaves only
-~3.5–4.4 GB free, and two engines' *weights alone* (2 × 16.03 GiB = 32.06 GiB)
-exceed 32 GB **before** any KV/graphs. Two full-size engines therefore cannot
-coexist on the 5090.
-
-## Decision
-
-Testing is **exclusive**: before running ignis against the GPU, the developer
-stops/pauses ninfer so that only one engine holds the GPU. The guard is a
-**preflight check in the `bench`/test harness** (detect "another process holds
-the GPU → refuse or wait") plus a **runbook step** ("stop ninfer before
-testing"). It is a **test-harness concern, not a runtime feature** of the
-engine: v1 has no multi-tenant story, and the engine itself does not refuse to
-start because another process uses the GPU.
-
-Beside the preflight, a **GPU lock**, one per card, records who holds it: the
-holder's pid and process start time, its worktree, its command and when the
-hold began. A holder that has exited, or whose pid now names another process,
-holds nothing, so a run killed before it could clean up leaves no lock
-standing. Every way onto the card takes it: the GPU profile for its whole run
-(or for the few tests it is given), a server started through `make`, which
-hands the lock to the server until it stops, the kernel leaf's op tests, and
-any command run through `make gpu-run`. A server start and the guard refuse at
-once while someone else holds it, naming the holder; a test, `make gpu-run`
-and the profile wait for it up to a limit, 15 minutes by default, then fail
-naming it. The lock is added to the preflight, not put in its place: the
-profile's pass marker and the process check stay, since the engine's test
-helper reads the marker and a worktree on an older commit knows only those
-two. It is still the harness's: the lock lives in the scripts behind `make`,
-and `ignis-server` run by hand takes none.
-
-## Consequences
-
-- No simultaneous engines on the 5090 → no VRAM starvation of either engine.
-- The preflight makes the foot-gun (accidentally running both) explicit and
-  non-silent.
-- With the lock, two runs no longer race between the check and the start: the
-  one that finds the card taken waits or refuses with the holder's name
-  instead of dying with no diagnostic, so an agent can run its own GPU tests
-  while others share the card.
-- Coexistence would only be possible with *reduced* (partial) engine sizes,
-  which is not a v1 goal.
+- **Two engines side by side**: possible only with reduced engine sizes, which is not a goal.

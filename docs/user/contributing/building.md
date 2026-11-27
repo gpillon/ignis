@@ -186,7 +186,7 @@ reference test at real 27B geometry. The card fits one run at a time: check
 `ignis-bench canary` runs the fixed high-signal prompt suite against a live
 server and checks each output is *sane* and *deterministic* — greedy plus a
 fixed seed means an identical output on a repeat run
-([ADR 0007](../../adr/0007-performance-gate-not-parity.md)):
+([ADR 0007](../../adr/0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md)):
 
 ```bash
 cargo run -p ignis-bench -- canary --endpoint http://127.0.0.1:8000

@@ -28,7 +28,7 @@ it.
   the network: the speech catalog's smallest entry downloaded from Hugging
   Face and checked against its pins (`crates/server/tests/speech_catalog_hf.rs`,
   #709). Nothing is published until both legs and that job are green; the
-  release builds run beside them (`.github/workflows/release.yml`, ADR 0086). That is
+  release builds run beside them (`.github/workflows/release.yml`, ADR 0032). That is
   possible only because the default suite is CPU-only; everything below about
   the GPU profile stays on the machine with the 5090.
 - Machine-local smoke tests skip gracefully when their fixture is

@@ -17,11 +17,10 @@ edit it by hand.
 |---|---|---|---|
 | [0001](0001-cpp-kernel-leaf-c-abi.md) | C++ kernel leaf behind a C ABI | accepted | [0009](0009-step-level-device-resident-abi.md) |
 | [0002](0002-load-ninfer-artifact.md) | The engine loads `.ninfer` artifacts directly | accepted | |
-| [0003](0003-parity-gate-99pct.md) | 99% token-agreement parity gate | superseded by [0007](0007-performance-gate-not-parity.md) | |
 | [0004](0004-full-admission-in-v1.md) | Full admission state machine in v1 | accepted | |
-| [0005](0005-performance-first-principle.md) | Performance-first as the organizing principle | accepted | [0050](0050-ignis-serves-an-image-model.md), [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md), [0084](0084-ignis-stands-on-its-own.md) |
-| [0006](0006-exclusive-gpu-testing.md) | Exclusive GPU testing (no concurrent engines) | accepted | [0084](0084-ignis-stands-on-its-own.md) |
-| [0007](0007-performance-gate-not-parity.md) | The 99% gate is a performance gate, not a parity gate | accepted | [0050](0050-ignis-serves-an-image-model.md) |
+| [0005](0005-performance-first-principle.md) | Performance-first as the organizing principle | accepted | |
+| [0006](0006-exclusive-gpu-testing.md) | Exclusive GPU testing (no concurrent engines) | accepted | |
+| [0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md) | Correctness is self-checked, not matched against a reference engine | accepted | |
 | [0008](0008-cuda-graph-staging-buffers.md) | CUDA-graph decode replay: persistent device staging buffers | superseded by [0009](0009-step-level-device-resident-abi.md) | [0019](0019-decode-cuda-graph-slot-indirection.md) |
 | [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted | [0016](0016-step-abi-extensible-options.md) |
 | [0010](0010-vendored-reference-kernels.md) | Kernel policy: vendor the reference ops verbatim, under a manifest | accepted | |
@@ -43,7 +42,7 @@ edit it by hand.
 | [0029](0029-cross-request-state-reuse.md) | cross-request state reuse: content-matched retained state across three residency tiers | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) |
 | [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0035](0035-the-vision-embedding-outlives-its-encode.md), [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md), [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md), [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | a vendored kernel that is measured as the bottleneck is not untouchable | accepted | [0093](0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md) |
-| [0032](0032-release-through-the-container-build.md) | the Linux release is the container build, and it is one pipeline | accepted | [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) |
+| [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
 | [0034](0034-the-leaf-answers-without-generating.md) | the leaf answers without generating | accepted | [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) |
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | the vision embedding outlives its encode | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) |
@@ -75,13 +74,12 @@ edit it by hand.
 | [0061](0061-prefill-attention-reads-the-hq-codec.md) | prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
 | [0062](0062-the-token-embedding-lives-in-host-memory.md) | the 27B's token embedding lives in pinned host memory, on every card | accepted | |
 | [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
-| [0064](0064-a-catalog-entry-states-its-card-class.md) | a catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0084](0084-ignis-stands-on-its-own.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
+| [0064](0064-a-catalog-entry-states-its-card-class.md) | a catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | the 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | [0103](0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
-| [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | the user guide is a Starlight site built from `docs/user/` alone, published on a release tag | accepted | |
+| [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
 | [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
 | [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
-| [0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md) | A spec is a GitHub issue and its tickets are sub-issues | accepted | |
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
 | [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |
@@ -97,7 +95,6 @@ edit it by hand.
 | [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md) | The north-star is the best local engine for coding, for agentic work and as a companion | accepted | |
 | [0084](0084-ignis-stands-on-its-own.md) | ignis stands on its own | accepted | |
 | [0085](0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md) | On Blackwell too, the 27B's GDN prefill runs ignis's own kernels | accepted | |
-| [0086](0086-the-builds-run-beside-the-tests-and-nothing-is-published-before-they-pass.md) | The builds run beside the tests, and nothing is published before they pass | accepted | |
 | [0087](0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md) | Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves | accepted | |
 | [0088](0088-a-vendored-registry-that-lacks-a-case-ignis-needs-may-be-extended-or-rewritten-when-small.md) | A vendored registry that lacks a case ignis needs may be extended, or rewritten when it is small | accepted | |
 | [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) | A grammar checks each sampled token and repairs a miss, and the model is told the schema | accepted | [0094](0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md) |

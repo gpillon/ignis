@@ -71,7 +71,7 @@ lives in those buffers; the hot path never updates graph nodes.
   `ignis_graph_launch` → D2H the logits → `ignis_greedy_sample`. The graph
   itself is invariant after construction-time capture.
 - The graph is captured for the **representative geometry** (the
-  `GraphGeometry` dims, ADR 0003 eager fallback): a decode step of a
+  `GraphGeometry` dims, eager fallback): a decode step of a
   different batch size falls back to the eager sequence — no per-size
   recapture in v1.
 - **Non-goals (v1):** per-batch-size graph variants, per-step node updates,
