@@ -1,4 +1,4 @@
-//! The vision canary (GitHub #178, ADR 0014's floor applied to multimodal
+//! The vision canary (GitHub #178, ADR 0082's canary floor applied to multimodal
 //! prompts): a handful of fixed images with short, unambiguous questions,
 //! scored by **teacher-forced next-token agreement** against the reference's
 //! greedy answers (`tests/fixtures/vision_canary`, recorded by
@@ -9,7 +9,7 @@
 //! spans so every image's placeholder run crosses span boundaries -- the
 //! embedding is encoded once and its columns placed chunk by chunk. Each way
 //! of prefilling clears the floor on its own, pooled over the canaries the
-//! way ADR 0014 pools its own suite. The answers are sentences rather than
+//! way the text canary pools its own suite. The answers are sentences rather than
 //! single words precisely so the score has resolution: at one token per
 //! answer a single near-tie flip moves the suite by a seventh. A wrong merge
 //! order, patch layout, MRoPE axis or scatter offset is a gross error and
@@ -283,8 +283,8 @@ fn the_vision_canary_meets_the_teacher_forced_floor_whole_and_across_chunks() {
     assert!(compared > 0, "the fixture must contribute scored positions");
     // Each way of prefilling clears the floor on its own -- the issue's "an
     // image whose placeholder run spans more than one prefill chunk scores
-    // the same canary floor" -- pooled over the canaries the way ADR 0014
-    // pools its own suite.
+    // the same canary floor" -- pooled over the canaries the way the text
+    // canary pools its own suite.
     for label in ["whole", "spanning"] {
         let mode: Vec<TeacherForcedResult> =
             results.iter().filter(|r| r.id.ends_with(label)).cloned().collect();
