@@ -1,12 +1,11 @@
 //! The G3 measurement instrument (P3-07, GitHub #100): C=1 / C=4 / ITL,
 //! measured over HTTP/SSE against any OpenAI-compatible endpoint.
 //!
-//! Spec: `docs/specs/runtime/03-serving-loop.md`; ADR 0015 (live/live
-//! gate, cold samples). The verdict half lives in [`crate::g3_gate`].
+//! Spec: GitHub #64. The verdict half lives in [`crate::g3_gate`].
 //!
-//! Reuses [`crate::ttft`]'s prompt generator and cold-prefix rule verbatim
-//! (ADR 0015: "later gates should follow this method... unless a specific
-//! gate has a reason not to" — G3 has none) and [`crate::metrics`]'s
+//! Follows the crate's measuring rule (the crate's opening documentation):
+//! it reuses [`crate::ttft`]'s prompt generator and cold-prefix rule verbatim,
+//! its [`Record`] carries the measurement session, and [`crate::metrics`]'s
 //! throughput-weighted aggregation and percentile math, so a G3 cell is
 //! built from the same audited pieces G2's cell was.
 //!
@@ -21,7 +20,7 @@
 //! - **ITL**: four decode lanes (prompt 4,096 / safety cap 4,032) sampled
 //!   *continuously* while ten 32,768-token prefillers run **sequentially**
 //!   against the pool — each allocated, prefilled and released before the
-//!   next is allocated (ADR 0015: every prefiller prompt is its own, cold,
+//!   next is allocated (every prefiller prompt is its own, cold,
 //!   verified). p50/p95/p99/max are all recorded; p95 decides.
 //!
 //! Every cell's prompts are the artifact's own tokenizer, exact post-
@@ -893,7 +892,7 @@ fn measure_itl_with(
 
 /// A G3 record: what one engine measured, on which cells, in which
 /// session. Mirrors [`ttft::Record`]'s identity fields, so a G3 gate check
-/// enforces the same live/live discipline (ADR 0015).
+/// enforces the same live/live discipline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// The measurement session both engines' records must share.

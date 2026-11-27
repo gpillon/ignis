@@ -1,12 +1,15 @@
 //! The **G3 gate check** (P3-07, GitHub #100): two G3 records in, one
 //! verdict out.
 //!
-//! Spec: `docs/specs/runtime/03-serving-loop.md`; ADR 0015. Mirrors
+//! Spec: GitHub #64. Mirrors
 //! [`crate::g2`]'s shape and its live/live discipline exactly: a verdict is
 //! only computed from two records sharing a session, with every cold-prefix
 //! obligation satisfied on both sides — otherwise [`check`] returns a
 //! [`Refusal`], never a failing verdict, because the tool enforces
-//! live/live rather than trusting the operator's discipline.
+//! live/live rather than trusting the operator's discipline. Of the crate's
+//! measuring rule (the crate's opening documentation) it holds one session
+//! and cold samples; it takes one record a side, so a comparison over two
+//! launches a side is two checks, read together.
 //!
 //! Three per-cell checks, all thresholds a *floor*:
 //!
@@ -199,12 +202,12 @@ impl Verdict {
 /// Compare two G3 records and report the verdict, or refuse.
 ///
 /// `ours` is the numerator (ignis), `reference` the denominator. See the
-/// module docs for the live/live contract (ADR 0015) this enforces.
+/// module docs for the live/live contract this enforces.
 pub fn check(ours: &Record, reference: &Record) -> Result<Verdict, Refusal> {
     if ours.session != reference.session {
         return Err(Refusal(format!(
-            "the records are not from the same session ({} vs {}): G3 is judged live/live \
-             (ADR 0015), so both engines must be measured in one session on one machine",
+            "the records are not from the same session ({} vs {}): G3 is judged live/live, \
+             so both engines must be measured in one session on one machine",
             ours.session, reference.session
         )));
     }

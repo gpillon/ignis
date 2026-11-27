@@ -6,8 +6,9 @@
 //! Spec: `docs/specs/runtime/05-speculative-decoding.md` — not written
 //! yet (#66: "to write when G4 lands"); this module is built from #66's and
 //! #151's own acceptance criteria plus `docs/archive/REVIEW-2026-09-05.md` §6
-//! Phase 5's depth table. ADR 0007 (performance gate, not parity), ADR 0015
-//! (live/live, cold samples), ADR 0021 (pooled launches).
+//! Phase 5's depth table. ADR 0007 (performance gate, not parity); the
+//! crate's measuring rule (the crate's opening documentation): one session,
+//! cold samples, pooled launches.
 //!
 //! ## The counter
 //!

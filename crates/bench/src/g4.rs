@@ -4,12 +4,12 @@
 //! the needle-retrieval correctness floor. The verdict half lives in
 //! [`crate::g4_gate`].
 //!
-//! Spec: `docs/specs/runtime/04-reference-feature-floor.md` ("Gate G4");
-//! ADR 0015 (live/live), ADR 0021 (launch pooling). Before this ticket,
+//! Spec: GitHub #65, linked from its tickets ("Gate G4"). It follows the
+//! crate's measuring rule (the crate's opening documentation). Before this ticket,
 //! `crates/bench/src/gate.rs` / `report.rs` compared two in-memory [`Run`]s
 //! with no session or trace identity at all — exactly the "record one
-//! reference run, commit it, compare later" shape ADR 0015 and ADR 0021 now
-//! refuse for every other gate. [`Record`] is the trace-replay run's
+//! reference run, commit it, compare later" shape that rule
+//! refuses for every other check. [`Record`] is the trace-replay run's
 //! counterpart to [`crate::g3::Record`] / [`crate::ttft::Record`]: same
 //! identity fields, so [`crate::g4_gate::check`] can enforce the same
 //! live/live discipline.
@@ -375,7 +375,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// `endpoint`, `engine`, `artifact`, `profile`, `date`); `trace_sha256` is
 /// new (spec 04's first acceptance criterion): the gate refuses a verdict
 /// when two records do not share it, exactly as it already refuses one
-/// when they do not share a session (ADR 0015).
+/// when they do not share a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Record {
     /// The measurement session every launch of both engines must share.

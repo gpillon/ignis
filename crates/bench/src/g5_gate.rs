@@ -2,8 +2,9 @@
 //! engine in, one pooled ratio out — per depth.
 //!
 //! Spec: `docs/specs/runtime/05-speculative-decoding.md` (not written
-//! yet; see [`crate::g5`]'s doc comment). ADR 0015 (live/live), ADR 0021
-//! (launch pooling). #151: "a `g5-gate` reuses `g4-gate`'s per-cell pooling
+//! yet; see [`crate::g5`]'s doc comment). The crate's measuring rule (the
+//! crate's opening documentation): one session, pooled launches.
+//! #151: "a `g5-gate` reuses `g4-gate`'s per-cell pooling
 //! rule across launches and reports one ratio per depth against 0.99" — this
 //! module is [`crate::g4_gate`]'s pooling rule (concatenate every launch's
 //! per-request metrics, reduce with [`crate::metrics::class_stats`]'s
@@ -44,7 +45,7 @@ pub struct CellVerdict {
     pub ratio: f64,
     /// `ratio >= `[`RATIO_THRESHOLD`].
     pub passed: bool,
-    /// Diagnostic only (ADR 0021): each of ours' launches' own aggregate.
+    /// Diagnostic only: each of ours' launches' own aggregate.
     pub ours_launch_tok_s: Vec<f64>,
     /// Diagnostic only: each of the reference's launches' own aggregate.
     pub reference_launch_tok_s: Vec<f64>,
@@ -59,7 +60,7 @@ pub struct CellVerdict {
     /// Diagnostic: the same, over the reference's own launches.
     pub reference_within_launch_spread_pct: f64,
     /// Set when either engine's across-launch spread exceeds *that same
-    /// engine's own* within-launch spread (ADR 0021's own finding — see
+    /// engine's own* within-launch spread (a finding to record — see
     /// `crate::g4_gate::CellVerdict::spread_flagged`'s doc comment, which
     /// this mirrors exactly).
     pub spread_flagged: bool,
@@ -73,7 +74,7 @@ pub struct Verdict {
     pub session: String,
     pub ours_label: String,
     pub reference_label: String,
-    /// How many independent launches were pooled per side (>= 2, ADR 0021).
+    /// How many independent launches were pooled per side (>= 2).
     pub ours_launches: usize,
     pub reference_launches: usize,
     pub threshold: f64,
@@ -124,7 +125,7 @@ impl Verdict {
                 out.push_str(&format!(
                     "    WARNING: across-launch spread exceeds that engine's own within-launch \
                      spread (ours: {:.1}% across vs {:.1}% within; reference: {:.1}% across vs \
-                     {:.1}% within) — ADR 0021\n",
+                     {:.1}% within): record it, do not average it away\n",
                     cell.ours_across_launch_spread_pct,
                     cell.ours_within_launch_spread_pct,
                     cell.reference_across_launch_spread_pct,
@@ -313,7 +314,7 @@ fn pooled_cell(depth_tokens: u32, ours: &[Record], reference: &[Record]) -> Resu
 
 /// Compare pooled launches of two engines and report the G5 verdict, or
 /// refuse. `ours` is the engine under test (>= 2 launches), `reference` the
-/// live reference (>= 2 launches) — ADR 0021's launch-pooling floor.
+/// live reference (>= 2 launches) — the launch-pooling floor.
 pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> {
     if ours.is_empty() {
         return Err(Refusal("no launches were recorded for the engine under test".to_string()));
@@ -324,7 +325,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     if ours.len() < 2 {
         return Err(Refusal(format!(
             "{} has {} launch(es) recorded; G5 is a live/live gate and pools at least two \
-             independent process launches per engine within the session (ADR 0021)",
+             independent process launches per engine within the session",
             ours[0].label,
             ours.len()
         )));
@@ -332,7 +333,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     if reference.len() < 2 {
         return Err(Refusal(format!(
             "{} has {} launch(es) recorded; G5 is a live/live gate and pools at least two \
-             independent process launches per engine within the session (ADR 0021)",
+             independent process launches per engine within the session",
             reference[0].label,
             reference.len()
         )));
@@ -343,7 +344,7 @@ pub fn check(ours: &[Record], reference: &[Record]) -> Result<Verdict, Refusal> 
     if let Some(bad) = all.iter().find(|r| &r.session != session) {
         return Err(Refusal(format!(
             "{} (session {}) and {} (session {}) are not from the same session: G5 is judged \
-             live/live (ADR 0015), so every launch of both engines must share one session",
+             live/live, so every launch of both engines must share one session",
             all[0].label, session, bad.label, bad.session
         )));
     }
@@ -460,7 +461,7 @@ mod tests {
         let reference = vec![full("reference", "S1", 140.0), full("reference", "S1", 140.0)];
         let refusal = check(&ours, &reference).expect_err("must refuse");
         assert!(refusal.0.contains("ignis"), "{refusal}");
-        assert!(refusal.0.contains("ADR 0021"), "{refusal}");
+        assert!(refusal.0.contains("at least two independent process launches"), "{refusal}");
     }
 
     #[test]

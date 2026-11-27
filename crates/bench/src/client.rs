@@ -148,7 +148,7 @@ impl Outcome {
     /// The prompt tokens the engine actually *computed* this request: the
     /// reported prompt tokens minus whatever it served from a prefix cache.
     ///
-    /// This is the one reading the cold-prefix rule is judged on (ADR 0015),
+    /// This is the one reading the cold-prefix rule is judged on,
     /// and both engines are read the same way — the OpenAI usage shape both
     /// speak. `None` means the engine reported no usage at all, which the
     /// TTFT instrument treats as an unverifiable (void) sample rather than
