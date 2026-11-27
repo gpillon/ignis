@@ -4,8 +4,8 @@
 #
 #   v*.*.* tag   the release: image tagged <version> + <major>.<minor> +
 #                latest, and a GitHub release with the archives.
-#   main         a development build, NOT a release (ADR 0032, amended
-#                2026-10-07): the image tagged `develop` only, and a rolling
+#   main         a development build, NOT a release (ADR 0032): the image
+#                tagged `develop` only, and a rolling
 #                GitHub prerelease whose tag `develop` is moved to the run's
 #                commit on every run. Never `latest`, never a version tag. A
 #                workflow_dispatch run on main publishes the same way.
@@ -22,10 +22,10 @@
 #
 # A push to main or ci/** that changes only files no build, image or test
 # reads (paths-ignore below: Markdown, docs, bench data, scripts) starts no
-# run at all (ADR 0032, amended 2026-10-12). Tags are never path-filtered.
+# run at all (ADR 0032). Tags are never path-filtered.
 #
-# Nothing is published before the tests pass (ADR 0086, which amends ADR
-# 0032; GitHub #552). The `test` job runs the CPU-only suite on both hosts --
+# Nothing is published before the tests pass (ADR 0032; GitHub #552). The
+# `test` job runs the CPU-only suite on both hosts --
 # `cargo test` never touches the GPU on its own (docs/agents/testing.md),
 # which is exactly what makes it runnable on a runner with no card in it --
 # and the `network` job runs the one `#[ignore]`d test that needs only the
@@ -34,7 +34,7 @@
 # profile stays on the machine with the 5090.
 #
 # The Linux tarball and the container image are one job and one compile (ADR
-# 0032, revised): the Containerfile's `artifacts` stage holds exactly the
+# 0032): the Containerfile's `artifacts` stage holds exactly the
 # binaries its `runtime` stage runs, and a second build step in the same job
 # hits the builder's own cache rather than compiling the kernel twice. The
 # `image` job only pushes the image that job built, after the tests.
@@ -401,7 +401,7 @@ jobs:
         run: cargo check --workspace --all-targets --locked --target aarch64-apple-darwin
 
   # Linux binaries and the container image, from one Containerfile and one
-  # compile (ADR 0032, revised 2026-09-21). The `artifacts` stage holds
+  # compile (ADR 0032). The `artifacts` stage holds
   # exactly the binaries the `runtime` image runs, so the tarball and the
   # published image can never carry different builds, and the CUDA toolkit
   # comes from the base image rather than an install step.
@@ -410,8 +410,8 @@ jobs:
   # is layer hits: the kernel is compiled once per push, which is what the
   # separate image workflow needed a shared remote cache scope to approximate.
   #
-  # It runs beside the tests and publishes nothing (ADR 0086, which amends
-  # ADR 0032; #552): when the run will publish, the image step writes the
+  # It runs beside the tests and publishes nothing (ADR 0032; #552): when
+  # the run will publish, the image step writes the
   # image it built to an OCI archive, and the `image` job pushes that archive
   # once the tests have passed. The pushed image is this compile's, as the
   # tarball is.
@@ -560,7 +560,7 @@ jobs:
           if-no-files-found: error
 
   # Beside the tests, like `linux`: it publishes nothing, and what does
-  # publish its zip needs `test` (ADR 0086, #552).
+  # publish its zip needs `test` (ADR 0032, #552).
   windows:
     needs: [version]
     runs-on: windows-2022
@@ -773,7 +773,7 @@ jobs:
           if-no-files-found: error
 
   # The image the `linux` job built, pushed once the tests have passed (ADR
-  # 0032, amended 2026-11-08, #552): the OCI archive that job wrote, copied to
+  # 0032, #552): the OCI archive that job wrote, copied to
   # each tag docker/metadata-action gave it there, index and provenance
   # attestation included (`--all`), with its digests unchanged. A `v*` tag
   # pushes <version>, <major>.<minor> and latest, main pushes `develop`.
@@ -822,7 +822,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Both hosts, or no release; and the tests (ADR 0086).
+  # Both hosts, or no release; and the tests (ADR 0032).
   release:
     needs: [version, test, network, linux, windows]
     if: github.repository == 'gpillon/ignis' && startsWith(github.ref, 'refs/tags/v')
