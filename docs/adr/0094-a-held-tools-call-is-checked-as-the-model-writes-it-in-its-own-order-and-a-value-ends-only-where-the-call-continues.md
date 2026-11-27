@@ -44,7 +44,8 @@ declared tools. The behaviour, case by case, is in the guide (`docs/user/api/str
 - **The model's order, not the schema's.** The template renders tools with sorted keys, so the client's order is
   one the model never saw, and a repair of a parameter's name leaves its value free, so a fixed order would put the
   value meant for one parameter under another. Each parameter is written at most once, the function closes only
-  once every required parameter is written, and the delivered JSON follows the schema's key order as sent.
+  once every required parameter is written, and the delivered JSON follows the schema's key order as sent, which `tools` is
+  read in once beside its sorted value.
 - **A value ends only where the call continues.** For a held tool, a line ends a string value only when it is a
   valid next step of the call under the schema: the opener of a declared parameter the call has not written, or
   `</function>` then `</tool_call>` once every required parameter is written, each after an optional forgotten

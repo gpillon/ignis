@@ -16,7 +16,7 @@ against a fat-fingered value: whoever wants no deadline says `0`. What each rout
 - **Counted from when the request starts to use the engine**: its admission, never a WebSocket's queue; an image
   job's turn, never its queue; a decision's question from its submission. A request waiting for a lane or in a queue
   has used none of the engine. A chat request's media acquisition is held to the whole-answer deadline from its own
-  start, and with none only each fetch's own timeout bounds it.
+  start, an error either way past it, and with none only each fetch's own timeout bounds it.
 - **A passed deadline cancels the engine request**, on every route, which frees its lane, and the request log says
   the cause was a timeout whatever answered the client. A wedged engine is still bounded: the answer is what reached
   the client, and the lane is freed once the model thread runs again.
