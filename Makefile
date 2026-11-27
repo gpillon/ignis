@@ -13,9 +13,8 @@
 #   Makefile             the platform-neutral target graph (this file)
 #   mk/config.mk         the knobs and their defaults (CUDA, PROFILE, UI, ...)
 #   mk/os/<os>.mk        the per-OS hooks: target triple, kernel build, GPU
-#                        checks, background server control. Windows is
-#                        implemented; Linux is scaffolded and every hook it
-#                        cannot run yet fails with a "not implemented" message.
+#                        checks, background server control. Windows and
+#                        Linux implement every hook.
 #   mk/windows/*.ps1     the PowerShell helpers behind the Windows hooks
 #   local.mk             untracked per-machine overrides (see local.mk.example)
 #
