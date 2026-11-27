@@ -9,7 +9,7 @@ general knowledge, languages, mathematics, long technical documents. One of the 
 start or by a switch at runtime. ninfer has no implementation of this model (no MoE router, no grouped expert GEMM,
 no sparse attention indexer, no hyper-connections, no n-gram embedding), so there is nothing to vendor and no engine
 to record an oracle from or to race, and rules that assume one would make the model unservable: its oracle is the
-checkpoint, its speed is gated against our own measured model, and its ops are our own.
+checkpoint, its speed is gated against our own measured model, and the ops ninfer lacks are our own.
 
 - **The oracle is the checkpoint, not another engine.** The references are the checkpoint's own modeling code under
   transformers, run layer by layer and teacher-forced in the converter's single pass. A greedy BF16 generation is
@@ -30,7 +30,7 @@ checkpoint, its speed is gated against our own measured model, and its ops are o
   hyper-connection ops numerically. They never define what the model should answer.
 - **Speed is gated against our own measured model, not against an engine.** No race against a reference engine
   gates this model: its spec (#301) states the speed floor and the simulation it is measured against.
-- **Flash-Next's ops have no ninfer provenance and are our own implementation** (ADR 0010's label, the first of
+- **Flash-Next's ops without ninfer provenance are our own implementation** (ADR 0010's label, the first of
   ADR 0051's three kinds of kernel code): the MoE router and expert kernels, the QSA indexer and sparse attention,
   the hyper-connection mix, the n-gram embedding and the FP8 row-scale linear. They carry no port claim. Each brings
   a kernel-leaf reference test at Flash-Next's real geometry with an fp64 or recorded reference, as vendored ops do.
