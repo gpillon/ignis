@@ -21,8 +21,9 @@ thinking budget's forced close, a permitted set on the next draw, cannot catch i
 - The scheduler's view lags by the round it cannot see, so the leaf decides "open at that position" over the
   round's own tokens: a model that closes its own block and then ends an empty answer is never given a second
   `</think>`.
-- In a verify round, whose cut is decided on the host before the state uses it, an accepted draft that is a stop id
-  cuts the run before it and the `</think>` is the next pending token. Nothing else is cut or committed differently.
+- In a verify round, whose cut is decided in the leaf's own host code, before the state uses it, an accepted draft
+  that is a stop id cuts the run before it and the `</think>` is the next pending token. Nothing else is cut or
+  committed differently.
 - The leaf says when it redirected, and the request log records it beside `thinking_closed`, so a turn closed this
   way can be told from one the model closed itself.
 - There is no server flag: a turn that would end inside its reasoning is a turn with no answer, and there is no
