@@ -21,7 +21,8 @@ only.
   diff that changes them and the workflow needs no Rust build.
 - **The site deploys once the tag's release is published, and again when that release is edited**, not when the tag
   is pushed: at the push the release does not exist yet, so its notes would be missing from the Changelog section.
-  Only the newest release is deployed: a re-run or an edit of an older one builds and stops.
+  Only the newest release is deployed: a re-run or an edit of an older one builds and stops. A manual run
+  (`workflow_dispatch`) still deploys the ref it is given.
 - **The Changelog section is read from the GitHub releases at build time and never committed.** The notes live on
   GitHub only and are written by hand into the release after it is published, so a committed page would be stale the
   moment the notes are edited, and would add a step to every release.
