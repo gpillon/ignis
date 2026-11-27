@@ -49,7 +49,7 @@ const TRELLIS: &str = "F:/ai/models/Qwen3.8-27B-trellis-3bpw-ignis/qwen3_8_27b_t
 const TOWER_BYTES: u64 = 295_711_648;
 /// Three slots of the largest stage, the merger's fc2 and its bias with the
 /// padding their host spans may add: 25,094,656 bytes each (#409's
-/// prototype, and ADR 0075's 75.3 MB).
+/// prototype), 75.3 MB in all.
 const RING_BYTES: u64 = 3 * 25_094_656;
 /// The processor's item bound for this artifact (a 4096 x 4096 image), which
 /// the server hands every vision load.

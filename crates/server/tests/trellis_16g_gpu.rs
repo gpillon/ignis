@@ -477,7 +477,7 @@ async fn less_3_gib_of_desktop_adapts_the_context_to_65536_on_two_lanes() {
     tokio::task::spawn_blocking(move || model.shut_down()).await.expect("the model shuts down");
 }
 
-/// GitHub #415 (ADR 0075, the build's acceptance 1): under the `host` vision
+/// GitHub #415 (ADR 0075; the first criterion of its build's acceptance finding): under the `host` vision
 /// residency a vision load inside the 16 GiB budget, no image in flight, keeps
 /// exactly the text-only load's KV pool at a 1,024- and a 4,096-token envelope
 /// (7,956 pages in #409's prototype, against 7,437 and 7,384 under `device`):
@@ -516,7 +516,7 @@ async fn under_the_host_residency_vision_keeps_the_text_only_kv_pool_at_1024_and
     }
 }
 
-/// GitHub #418 (ADR 0075, the profile's default): `rtx50-16gb` with no vision
+/// GitHub #418 (ADR 0063's profile, under ADR 0075's `host`): `rtx50-16gb` with no vision
 /// flag at all loads with vision on under the `host` residency at its
 /// 4,096-token envelope, and, no image in flight, costs no context: the same KV
 /// pool as the text-only load, a `media_embedding` line of 0, and a workspace

@@ -1,6 +1,6 @@
 ---
 status: accepted
-amended-by: [ADR-0075, ADR-0079, ADR-0098]
+amended-by: [ADR-0079, ADR-0098]
 ---
 
 # ADR 0063 — the profile follows the card class, and its defaults adapt to the budget

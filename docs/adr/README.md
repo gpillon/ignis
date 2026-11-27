@@ -45,7 +45,7 @@ edit it by hand.
 | [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
 | [0034](0034-the-leaf-answers-without-generating.md) | the leaf answers without generating | accepted | [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) |
-| [0035](0035-the-vision-embedding-outlives-its-encode.md) | the vision embedding outlives its encode | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) |
+| [0035](0035-the-vision-embedding-outlives-its-encode.md) | the vision embedding outlives its encode | accepted | |
 | [0036](0036-the-v1-surface-documents-itself.md) | the `/v1` surface documents itself, and its reference needs no key | accepted | |
 | [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | a vendored file may carry a patch that fixes a known correctness bug | accepted | |
 | [0038](0038-the-seam-carries-one-attention-head.md) | the `Compute` seam carries one attention head's scores | accepted | |
@@ -73,7 +73,7 @@ edit it by hand.
 | [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | the 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
 | [0061](0061-prefill-attention-reads-the-hq-codec.md) | prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
 | [0062](0062-the-token-embedding-lives-in-host-memory.md) | the 27B's token embedding lives in pinned host memory, on every card | accepted | |
-| [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
+| [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0064](0064-a-catalog-entry-states-its-card-class.md) | a catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md), [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | the 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | [0103](0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
 | [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
