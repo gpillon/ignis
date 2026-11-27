@@ -56,7 +56,7 @@ edit it by hand.
 | [0040](0040-the-readout-carries-the-peak-s-neighbours.md) | the attention readout carries each peak's neighbours | accepted | |
 | [0041](0041-the-readout-reads-a-text-span.md) | the attention readout reads a text span, in whole rows | accepted | |
 | [0042](0042-locate-copies-over-a-folded-state.md) | a locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
-| [0043](0043-a-second-model-without-a-ninfer-reference.md) | a second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md), [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) |
+| [0043](0043-a-second-model-without-a-ninfer-reference.md) | a second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) |
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
 | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | the KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) |
 | [0046](0046-one-declaration-per-config-field.md) | one declaration per config field: flag, env, file key, default, validator | accepted | [0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md) |
@@ -64,7 +64,7 @@ edit it by hand.
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | an end of turn drawn inside an open reasoning block closes the block instead | accepted | |
 | [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | an idle model is unloaded, and the next request loads it again | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md), [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) |
 | [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
-| [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | kernel code is ours, adapted from a named source, or vendored | accepted | |
+| [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted | |
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | a reasoning loop is taken back, the model is nudged, and the client is told | accepted | [0053](0053-a-loop-is-acted-on-once-it-persists.md) |
 | [0053](0053-a-loop-is-acted-on-once-it-persists.md) | a loop is acted on once it persists, and a rewind keeps something | accepted | |
 | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | a resident Flash-Next load keeps its experts only in VRAM | accepted | |
