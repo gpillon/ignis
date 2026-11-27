@@ -19,9 +19,9 @@ another is neither a bottleneck nor a bug
   never a kernel rewritten.
 - **A kernel with no counterpart on the older architecture, or one its compiler refuses as written, is not
   patched.** It compiles for the arch-specific Blackwell targets alone, so a launch anywhere else fails with CUDA's
-  "no kernel image is available", never as a stand-in. A load that would take such a route on a card or a build
-  that cannot run it is refused, naming the option, when the operator named it, and falls back when a default or a
-  profile gave it; the routes of ADR 0080 for 8.x cards, the dense prefill and the integer band of the 8-bit prompt
+  "no kernel image is available", never as a stand-in. An option's value the card or the build cannot run falls
+  back when it comes from a default or a profile, and is refused, naming the option, when the operator names it;
+  the routes of ADR 0080 for 8.x cards, the dense prefill and the integer band of the 8-bit prompt
   attention, are checked the same way, so a build that does not carry a route refuses it by name instead of running
   another.
 - **The `reason` names the CUDA architecture or the card size, this ADR and what it fixes**: a compile, or a launch
