@@ -41,8 +41,8 @@ const MAX_CONTEXT_TOKENS: u32 = 128;
 /// one token at 0.32-0.37, just barely over an inherited bound instead of
 /// far over the right one.
 ///
-/// A numerics criterion, not the functional gate -- that remains the G1
-/// canary floor (ADR 0014), kept at >= 95% and never waived.
+/// A numerics criterion, not the functional check -- that remains the G1
+/// canary floor (ADR 0082), kept at >= 95% and never waived.
 const A4_LAYER_TOLERANCE: f64 = 0.006;
 
 fn bf16_to_f64(bits: u16) -> f64 {
