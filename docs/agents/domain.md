@@ -21,6 +21,12 @@ set of decisions, `docs/adr/`, listed in its generated index
 - An ADR states what holds today, and why (ADR 0081). It carries no history
   and no description of how the mechanism works, and it does not restate a
   value the code or the config owns: it names the field or the constant.
+- A length note goes in the final report. `make records-check` prints one, and
+  still passes, for an ADR the change added or rewrote whose text is over the
+  soft limit (`WORD_LIMIT` in `mk/adr-index.py`): shorten the ADR, move the
+  detail to the home that owns it (`docs/agents/findings.md`, "Artifact
+  boundaries"), or say in the report that it stays long.
+  `make records-long` lists every ADR over the limit.
 - A decision that changes rewrites its ADR in place: the new text replaces the
   old, the number stays, and the file is renamed, with the links that name it,
   only when the title changes. The earlier versions are the history of the

@@ -13,6 +13,11 @@
 # concurrency group: a run cancelled by the next push would leave its push's
 # range unchecked, and a run takes seconds.
 #
+# An ADR that the push added or rewrote and that is over the soft length limit
+# gets a notice, an annotation on the commit at the ADR's file, and the run
+# stays green: under GitHub Actions the check prints its length note as a
+# `::notice` workflow command.
+#
 # It also runs the selftest of mk/board-status.py, the board-status
 # workflow's script (#524), which `make records-check` does not: it is the
 # same kind of check, the standard library alone and seconds, and this is the

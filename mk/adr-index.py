@@ -6,6 +6,7 @@
     python3 mk/adr-index.py --check --since REV
                                          and on an accepted ADR `proposed` again since REV
     python3 mk/adr-index.py --selftest   the check's own test, on fixtures in a temp directory
+    python3 mk/adr-index.py --long       list every ADR over the length limit; it writes nothing
 
 `make records` and `make records-check` run it with the host's Python
 (`python` on Windows, `python3` elsewhere: the PYTHON hook of mk/os/<os>.mk),
@@ -51,9 +52,22 @@ release notes (mk/changelog.sh).
 `--since auto` is the merge base with origin/main, which `make records-check`
 uses, and is skipped with a note in a clone with no origin/main or no git; the
 records workflow passes the push's or the pull request's base.
+
+An ADR is short, and the limit that says so is soft: WORD_LIMIT words of that
+same text, so that a status, a back-link or a link's target never counts. With
+--since, each ADR over it that was added since the base or whose text changed
+since it, a `proposed` one too, gets a note that names the ADR, its length, the
+limit and the three ways out: shorten it, move the detail to the home that owns
+it, or say in the final report that it stays long. The check passes, and an ADR
+the change left alone gets no note. Under GitHub Actions the note is a
+`::notice` workflow command, which the run shows as an annotation on the commit
+at the ADR's file. --long lists every ADR over the limit, touched or not, with
+its length, the longest first; it writes nothing and its exit status is 0.
+Neither the index nor an ADR says anything of length.
 """
 
 import argparse
+import os
 import pathlib
 import re
 import shutil
@@ -72,6 +86,9 @@ BARE_TITLE_FROM = 70
 NUMBERED = re.compile(r"ADR[ -]?\d{4}\b")
 # "ADR 0001 — title" in the long form; the index shows the title alone.
 NUMBER_PREFIX = re.compile(r"ADR[ -]?\d{4}\s*(?:—|–|-|:)\s*")
+# The soft limit on an ADR's length: the words of its text as `wc -w` counts
+# them, the frontmatter aside. Provisional: the cleanup's pilot lot sets it (#749).
+WORD_LIMIT = 300
 # --since: a frontmatter's status at the base.
 FRONT_STATUS = re.compile(r"^status: (\S+)", re.MULTILINE)
 
@@ -328,7 +345,56 @@ def since_base(adr_dir, adrs, since):
         elif decision_text(was) != decision_text(adr.path.read_text(encoding="utf-8")):
             notes.append(f"adr-index: ADR {number}'s text changed since {base[:8]}: the live "
                          "places that cite it are reread in the same change")
+    notes += length_notes(adrs, texts)
     return problems, notes
+
+
+def length(text):
+    """An ADR's length, from its file's text: the words of the decision's text,
+    the frontmatter and every link target aside (decision_text). It is what
+    `wc -w` says of the file below its frontmatter, give or take a link target
+    with a space in it, so the one who wrote the ADR can count it too."""
+    return len(decision_text(text).split())
+
+
+def length_notes(adrs, was):
+    """--since: one note for each ADR over WORD_LIMIT that was added or whose
+    text changed since the base, a `proposed` one too; `was` is each ADR file's
+    text at the base, by path. An ADR the change left alone gets none.
+
+    Under GitHub Actions, which sets GITHUB_ACTIONS to `true`, the note is the
+    workflow command for a notice: an annotation on the commit, at the head of
+    the ADR's file, which leaves the run green."""
+    before = {path.rsplit("/", 1)[-1][:4]: decision_text(text) for path, text in was.items()}
+    notes = []
+    for number in sorted(adrs):
+        adr = adrs[number]
+        text = adr.path.read_text(encoding="utf-8")
+        if length(text) > WORD_LIMIT and decision_text(text) != before.get(number):
+            note = (f"ADR {number}'s text is {length(text)} words, over the limit of "
+                    f"{WORD_LIMIT}: shorten it, move the detail to the home that owns it "
+                    "(docs/agents/findings.md, \"Artifact boundaries\"), or say in the final "
+                    "report that it stays long")
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                notes.append(f"::notice file=docs/adr/{adr.name},line=1,title=ADR {number} is "
+                             f"over the length limit::{note}")
+            else:
+                notes.append(f"adr-index: {note}")
+    return notes
+
+
+def over_limit(adr_dir, out=sys.stdout):
+    """--long: every ADR over WORD_LIMIT with its length, the longest first, and
+    their count. It writes nothing and is no gate: its exit status is 0."""
+    adrs, _ = load(adr_dir)
+    lengths = {adr.name: length(adr.path.read_text(encoding="utf-8")) for adr in adrs.values()}
+    over = sorted((name for name in lengths if lengths[name] > WORD_LIMIT),
+                  key=lambda name: (-lengths[name], name))
+    for name in over:
+        print(f"{lengths[name]:>6}  docs/adr/{name}", file=out)
+    count = f"{len(over)} of {len(adrs)} ADRs are" if over else f"none of {len(adrs)} ADRs is"
+    print(f"adr-index: {count} over the limit of {WORD_LIMIT} words", file=out)
+    return 0
 
 
 def render(adrs):
@@ -479,6 +545,24 @@ CASES = [
 THIRD = "---\nstatus: accepted\n---\n\n# ADR 0003 — the third\n\nSee [the finding]({}) and `{}`.\n"
 SINCE_BASE = {**GOOD, "0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md")}
 CHANGED = THIRD.format("../findings/a.md", "docs/a.md").replace("See", "Now see")
+
+
+def long_adr(words, heading="A long one", front="status: accepted"):
+    """A fixture ADR whose text is `words` words, the heading and its '#' among
+    them: the length cases follow WORD_LIMIT, whatever its value above the
+    dozen words of GOOD's ADRs."""
+    filler = " ".join(["word"] * (words - len(f"# {heading}".split())))
+    return f"---\n{front}\n---\n\n# {heading}\n\n{filler}\n"
+
+
+# The base also holds an ADR over the length limit, which a case leaves alone or
+# changes. What the length note says after the ADR's length is WAYS_OUT: a case
+# gives the whole line.
+OLD_LONG = "ADR 0004 — a long one"
+SINCE_BASE["0004-a-long-one.md"] = long_adr(WORD_LIMIT + 50, OLD_LONG)
+WAYS_OUT = (f"words, over the limit of {WORD_LIMIT}: shorten it, move the detail to the home that "
+            "owns it (docs/agents/findings.md, \"Artifact boundaries\"), or say in the final "
+            "report that it stays long")
 REREAD = "ADR 0003's text changed since"
 SINCE_CASES = [
     ("a new ADR that amends an earlier one, whose frontmatter alone changes",
@@ -505,6 +589,37 @@ SINCE_CASES = [
     ("a proposed ADR's text, still being written",
      {"0070-a-short-one.md": GOOD["0070-a-short-one.md"] + "\nSharpened.\n"},
      "The proposal, sharpened (#1)", True, "index in sync", "text changed"),
+    ("a new ADR over the length limit, which gets the note",
+     {"0071-a-new-long-one.md": long_adr(WORD_LIMIT + 1)},
+     "A new decision, at length (#1)", True,
+     f"adr-index: ADR 0071's text is {WORD_LIMIT + 1} {WAYS_OUT}\n"),
+    ("a new ADR over the length limit, not committed yet",
+     {"0071-a-new-long-one.md": long_adr(WORD_LIMIT + 1)},
+     None, True, f"adr-index: ADR 0071's text is {WORD_LIMIT + 1} {WAYS_OUT}\n"),
+    ("an ADR over the length limit whose text changed, which gets the note",
+     {"0004-a-long-one.md": long_adr(WORD_LIMIT + 51, OLD_LONG)},
+     "The long one, a word longer (#1)", True,
+     f"adr-index: ADR 0004's text is {WORD_LIMIT + 51} {WAYS_OUT}\n"),
+    ("a proposed ADR rewritten over the length limit, which gets the note",
+     {"0070-a-short-one.md": long_adr(WORD_LIMIT + 1, "A short one",
+                                      "status: proposed\namends: [ADR-0001]")},
+     "The proposal, at length (#1)", True,
+     f"adr-index: ADR 0070's text is {WORD_LIMIT + 1} {WAYS_OUT}\n"),
+    ("in CI, where the length note is an annotation on the ADR's file",
+     {"0071-a-new-long-one.md": long_adr(WORD_LIMIT + 1)},
+     "A new decision, at length (#1)", True,
+     "::notice file=docs/adr/0071-a-new-long-one.md,line=1,title=ADR 0071 is over the length "
+     f"limit::ADR 0071's text is {WORD_LIMIT + 1} {WAYS_OUT}\n", "adr-index: ADR 0071"),
+    ("an ADR over the length limit that the change did not touch, which gets no note",
+     {"0003-the-third.md": CHANGED},
+     "The third, rewritten (#1)", True, REREAD, "over the limit"),
+    ("an ADR over the length limit whose frontmatter alone changed",
+     {"0004-a-long-one.md": long_adr(WORD_LIMIT + 50, OLD_LONG, "status: deprecated")},
+     "The long one, deprecated (#1)", True, "index in sync", "over the limit"),
+    ("an ADR at the length limit, its frontmatter and a link's target not counted",
+     {"0071-at-the-limit.md": long_adr(WORD_LIMIT - 1, "At the limit")
+      + "[see](../findings/a.md \"a finding's title\")\n"},
+     "A new decision, at the limit (#1)", True, "index in sync", "over the limit"),
     ("a proposed ADR accepted",
      {"0070-a-short-one.md": GOOD["0070-a-short-one.md"].replace("proposed", "accepted")},
      "The proposal, accepted (#1)", True, "index in sync"),
@@ -581,6 +696,36 @@ def selftest():
         check(run(adr_dir, "check", Sink(), Sink()) == 0,
               "a CRLF checkout reads as its LF text")
 
+    with tempfile.TemporaryDirectory() as root:
+        adr_dir = fixture(root, GOOD)
+        out = Sink()
+        none = f"adr-index: none of 3 ADRs is over the limit of {WORD_LIMIT} words\n"
+        check(over_limit(adr_dir, out) == 0 and out.text == none,
+              "--long says so when no ADR is over the length limit")
+        run(adr_dir, "write", Sink(), Sink())
+        index = (adr_dir / INDEX).read_bytes()
+        fixture(root, {"0002-the-second.md": long_adr(
+            WORD_LIMIT + 50, "ADR 0002 — the second | with a pipe",
+            "status: accepted\nsupersedes: [ADR-0001]")})
+        run(adr_dir, "write", Sink(), Sink())
+        check((adr_dir / INDEX).read_bytes() == index,
+              "an ADR that only grew long leaves the index as it was, byte for byte")
+        fixture(root, {"0071-longer.md": long_adr(WORD_LIMIT + 200, "Longer"),
+                       "0072-at-the-limit.md": long_adr(WORD_LIMIT, "At the limit")})
+        held = {path.name: path.read_bytes() for path in adr_dir.iterdir()}
+        out = Sink()
+        status = over_limit(adr_dir, out)
+        said = out.text.split("\n")
+        ok = (status == 0 and len(said) == 4
+              and said[0].split() == [str(WORD_LIMIT + 200), "docs/adr/0071-longer.md"]
+              and said[1].split() == [str(WORD_LIMIT + 50), "docs/adr/0002-the-second.md"]
+              and said[2:] == [f"adr-index: 2 of 5 ADRs are over the limit of {WORD_LIMIT} words",
+                               ""])
+        check(ok, "--long lists every ADR over the length limit with its length, the longest "
+              "first, then their count" + ("" if ok else f" -- got {status}: {out.text.strip()}"))
+        check(held == {path.name: path.read_bytes() for path in adr_dir.iterdir()},
+              "--long writes nothing")
+
     for what, change, expected in CASES:
         with tempfile.TemporaryDirectory() as root:
             adr_dir = fixture(root, GOOD)
@@ -626,7 +771,14 @@ def selftest():
                 since = ("auto" if what.startswith("auto")
                          else f"HEAD~{commits}" if commits else "HEAD")
                 out, err = Sink(), Sink()
+                # GitHub Actions, where this selftest runs too, sets the variable
+                # that makes the length note an annotation: a case says which it is.
+                actions = os.environ.get("GITHUB_ACTIONS")
+                os.environ["GITHUB_ACTIONS"] = "true" if what.startswith("in CI") else "false"
                 status = run(adr_dir, "check", out, err, since=since)
+                os.environ.pop("GITHUB_ACTIONS")
+                if actions is not None:
+                    os.environ["GITHUB_ACTIONS"] = actions
                 said = out.text + err.text
                 ok = ((status == 0) == passes and expected in said
                       and not any(fragment in said for fragment in absent))
@@ -647,6 +799,9 @@ def main(argv=None):
     mode.add_argument("--write", action="store_const", const="write", dest="mode")
     mode.add_argument("--check", action="store_const", const="check", dest="mode")
     mode.add_argument("--selftest", action="store_const", const="selftest", dest="mode")
+    mode.add_argument("--long", action="store_const", const="long", dest="mode",
+                      help="list every ADR over the length limit, the longest first; it "
+                           "writes nothing")
     parser.add_argument("--since", metavar="REV",
                         help="with --check: also refuse an ADR that was accepted at the merge "
                              "base of REV and HEAD and is proposed now ('auto': origin/main)")
@@ -656,6 +811,8 @@ def main(argv=None):
     if args.mode == "selftest":
         return selftest()
     adr_dir = pathlib.Path(__file__).resolve().parent.parent / "docs" / "adr"
+    if args.mode == "long":
+        return over_limit(adr_dir)
     return run(adr_dir, args.mode, since=args.since)
 
 

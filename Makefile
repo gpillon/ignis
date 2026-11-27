@@ -539,6 +539,13 @@ records-check: ## The indexes' selftests, then their check: frontmatter, links b
 	$(PYTHON) mk/adr-index.py --check --since auto
 	$(PYTHON) mk/findings-index.py --check
 
+# An ADR's length limit is soft: records-check prints a note for an ADR over it
+# that the change added or rewrote, and passes. This lists every ADR over it,
+# touched or not, and writes nothing.
+.PHONY: records-long
+records-long: ## List every ADR over the length limit with its length, the longest first
+	@$(PYTHON) mk/adr-index.py --long
+
 $(DOCS_DEPS): docs/site/package.json docs/site/package-lock.json
 	$(NPM) --prefix docs/site ci
 	@touch "$@"
