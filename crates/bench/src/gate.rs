@@ -1,12 +1,14 @@
-//! The v1 acceptance artifact (spec 02, ADR 0007): the **performance
-//! report** (tok-s / ttft vs the reference, per class, the 99% performance
-//! gate) + the **divergence report** (the canary self-consistency check),
-//! shipped as a single JSON file.
+//! The `gate` report (spec 02, once the v1 acceptance artifact): the
+//! **performance report** (tok-s / ttft vs the reference, per class, against
+//! 99% of the reference) + the **divergence report** (the canary
+//! self-consistency check), shipped as a single JSON file.
 //!
-//! ADR 0007: the v1 acceptance is a *performance* gate (≥ 99% of the
-//! reference's speed on the trace-replay load, with a per-class ttft /
-//! tok-s check) **plus** the self-consistency check (the canary suite:
-//! sane output, greedy, fixed seed). It is *not* a token-parity gate. This
+//! What it computes is a comparison of two engines: a threshold of 99% of
+//! the reference's speed on the trace-replay load, with a per-class ttft /
+//! tok-s check, **plus** the self-consistency check (the canary suite:
+//! sane output, greedy, fixed seed). It decides no gate since ADR 0082,
+//! which retires ADR 0007's 99% performance gate; the canary is ADR 0007's
+//! correctness check. It is *not* a token-parity comparison. This
 //! module composes the two halves into the shipped artifact: the
 //! `PerformanceReport` (the per-class 99% verdict) and the canary results
 //! (the divergence report), with a single overall verdict.
@@ -19,17 +21,17 @@ use serde::{Deserialize, Serialize};
 use crate::canary::{suite_consistent, CanaryResult};
 use crate::report::PerformanceReport;
 
-/// The v1 acceptance artifact (spec 02, ADR 0007): the performance report
-/// (the 99% gate, per class) + the canary divergence report, shipped as a
+/// The `gate` report (spec 02): the performance report (the 99% threshold,
+/// per class) + the canary divergence report, shipped as a
 /// single JSON file (`ignis-bench gate --out`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateReport {
     /// The performance report + the per-class 99% gate verdict.
     pub performance: PerformanceReport,
     /// The canary (divergence) results, from the suite run against the
-    /// engine under test: the self-consistency half of the v1 verdict
-    /// (ADR 0007: the gate is the 99% performance gate **and** the
-    /// self-consistency check — both are shipped in the artifact).
+    /// engine under test: the self-consistency half of the verdict (the
+    /// 99% threshold **and** the self-consistency check, both shipped in the
+    /// artifact; a verdict that decides no gate since ADR 0082).
     pub canary: Vec<CanaryResult>,
 }
 
@@ -43,7 +45,8 @@ impl GateReport {
         }
     }
 
-    /// The overall v1 verdict (ADR 0007): the performance gate (≥ 99% of
+    /// The overall verdict, which decides no gate since ADR 0082: the
+    /// threshold (≥ 99% of
     /// the reference's speed, per class) **and** the self-consistency
     /// check (sane, greedy-deterministic canary output).
     pub fn passed(&self) -> bool {
@@ -181,9 +184,9 @@ mod tests {
 
     #[test]
     fn a_slow_run_fails_the_v1_gate_even_when_canaries_are_consistent() {
-        // ADR 0007: the performance gate is the binding constraint here —
-        // a sub class below 99% of the reference fails the gate even when
-        // the canaries are perfectly consistent.
+        // The 99% threshold binds the verdict here — a sub class below 99%
+        // of the reference fails it even when the canaries are perfectly
+        // consistent (a verdict that decides no gate since ADR 0082).
         let artifact = build(true, consistent_canaries());
         assert!(
             !artifact.performance.gate_passed(),

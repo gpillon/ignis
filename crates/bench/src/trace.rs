@@ -4,8 +4,8 @@
 //! the whole trace against a running engine (`client.rs`) and compares the
 //! measured per-request metrics against the reference baseline recorded with
 //! the *same* harness, so the comparison is apples-to-apples (ADR 0005: the
-//! reference is a speed reference only; ADR 0007: the 99% gate is a
-//! performance gate, not token parity).
+//! reference is a speed reference only; the 99% threshold compares speed,
+//! not tokens, and decides no gate since ADR 0082).
 //!
 //! The load shape is a "1 main agent + ~N subagents" concurrent coding
 //! workload (`records-2026-11-27:docs/archive/ignis-v1.md` §4): the main agent and the subagents
@@ -18,8 +18,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// Request class inside a "1 main + N subagents" load. The gate (ADR 0007)
-/// checks ttft / tok-s *per class*, so main and subagent requests are tracked
+/// Request class inside a "1 main + N subagents" load. The report's 99%
+/// threshold checks ttft / tok-s *per class*, so main and subagent
+/// requests are tracked
 /// separately and must not be averaged together.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
@@ -61,7 +62,7 @@ pub struct TraceLine {
     /// baseline (the reference run must emit the same id).
     pub id: String,
 
-    /// Class: main agent vs subagent (per-class gate, ADR 0007).
+    /// Class: main agent vs subagent (the report's per-class threshold).
     #[serde(default = "default_class")]
     pub class: RequestClass,
 
