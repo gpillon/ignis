@@ -542,7 +542,7 @@ int32_t ignis_seq_restore(struct ignis_seq_pool *pool, struct ignis_seq *seq, co
  *
  * These four are entry points rather than fields on an options struct, which
  * ADR 0016 would otherwise ask for. The carve-out and its reasoning are
- * recorded in ADR 0024 ("Lifetime calls are entry points"), not here.
+ * recorded in ADR 0024, not here.
  */
 
 struct ignis_seq_prefix_stats {

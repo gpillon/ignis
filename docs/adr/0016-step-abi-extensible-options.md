@@ -1,7 +1,6 @@
 ---
 status: accepted
 amends: [ADR-0009]
-amended-by: [ADR-0024]
 ---
 
 # ADR 0016 — Step-ABI calls take extensible options structs, and G2 spends the one extension

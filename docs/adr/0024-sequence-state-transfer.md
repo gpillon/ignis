@@ -1,259 +1,91 @@
 ---
 status: accepted
-amends: [ADR-0016]
-amended-by: [ADR-0029, ADR-0045, ADR-0095]
 ---
 
-# ADR 0024 — sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse
+# Sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse
 
-## Current decision
+A sequence is not one buffer: it is sections of state, KV pages, the GDN recurrent slot, conv taps, a position and
+more, consistent together at a completed chunk boundary. One place in the leaf, the section table, knows what a
+sequence is made of, what each section costs, and whether it is shareable read-only or must be cloned per sequence.
+The table is leaf-internal: the ABI (ADR 0009) exposes a snapshot size and a format version, not a layout, and the
+blob is opaque. Prefix reuse clones on the device: KV pages are shared by refcount, owned by the leaf, where the
+block table already lives, and the mutable sections are copied device-to-device. Snapshot, restore and clone share
+the one description, so a new section is carried by all three or by none, and a section added to only one of them is
+a visible omission rather than a silent one.
 
-The section table is leaf-internal, and the ABI exposes a snapshot size and
-a format version, not a layout. The blob is opaque; its header names its
-compatibility identity (artifact content hash, KV format, layout version,
-drafter configuration: ADR 0029), and restore refuses a stale or foreign
-one. Prefix reuse clones on the device: KV pages shared by refcount, the
-mutable sections copied device-to-device. The state-transfer and prefix
-calls are entry points, which amends ADR 0016 for this family.
+**The blob.**
 
-Changed since, by ADR 0029, ADR 0045 and GitHub issues:
+- It carries its own header, which names its compatibility identity: the artifact content hash, the KV format, the
+  layout version and the drafter configuration (ADR 0029). Restore validates it and refuses a stale or foreign
+  layout, or a blob taken under another load, rather than writing it into a live sequence. A blob does not survive a
+  version change, and that is the intent: it is rejected, not reinterpreted. Nothing further is exposed until a
+  consumer needs it.
+- Each model family has its own layout version, and a blob belongs to one drafter: its identity names the drafter,
+  so a load refuses a blob taken under another drafter or under none (ADR 0095).
+- Adding a section is an edit to the table, which makes re-earning the snapshot-point permission an act rather than
+  a memory: a new section does not inherit the permission the others earned at the chunk boundary, and must re-earn
+  it.
+- Transfer is whole-sequence, and partial restore is not offered: GDN state is not recomputable without re-running
+  the prefix that the restore exists to avoid. A transfer may move the blob a window at a time (ADR 0045), through
+  the options struct: the windows laid end to end are the blob's bytes, and a null options pointer is the whole-blob
+  call.
+- A sequence holding a shared prefix is snapshotted, not refused (ADR 0029): its blob materializes the shared pages,
+  a copy that owns every byte it carries and outlives the prefix, at the cost of prefix bytes duplicated per blob.
+  Chained blobs, a reference to a retained prefix plus a tail, stay deferred: every blob, a disk one included, is
+  materialized (ADR 0045). Restoring into a sequence that holds a shared prefix is still refused, since its pages are
+  other claimants' history: a blob is restored into a fresh sequence.
+- A retained checkpoint or prefix spills as the blob its sequence would have written, so it restores like any other.
+- Per-sequence state lives where these calls can reach it, in the pool: they take a pool and a sequence, never a
+  model, so a section must be addressable from those two alone. The drafter's window is the sequence pool's for that
+  reason, and the MTP head's state travels as sections too (ADR 0095).
 
-- **A transfer may move a blob a window at a time** (ADR 0045), through the
-  options struct this ADR reserved for "a partial extent". KV-disk moves
-  32 MiB windows; the windows laid end to end are the blob's bytes, and a
-  null options pointer is the whole-blob call.
-- **A sequence holding a shared prefix is snapshotted, not refused** (ADR
-  0029): its blob materializes the shared pages. Restoring into a sequence
-  that holds a shared prefix is still refused (`IGNIS_SEQ_ERR_SHARED_PREFIX`,
-  #190). Chained blobs stay deferred: every blob, a disk one included, is
-  materialized (ADR 0045).
-- **A prompt checkpoint publishes at its generation opener** (ADR 0029);
-  shared and retained prefixes keep the whole-page point. A claim never
-  consumes. A retained checkpoint or prefix spills as the blob its sequence
-  would have written (#190).
-- **The progress section carries the multimodal `rope_delta`** (#194), which
-  a clone does not. Each model family has its own layout version (GitHub
-  #303).
+**Prefix reuse.**
 
-## History
+- A shared or retained prefix is published at a whole-page boundary, which makes it a scheduling decision: the
+  mutable state a claimant clones is the state at the prefix's end, so the publisher's prefill has to stop exactly
+  there. A prompt whose length is not a whole number of KV pages pays one extra prefill chunk, in exchange for every
+  sibling skipping its head.
+- A prompt checkpoint publishes at its generation opener instead, wherever that falls, and the partial page it ends
+  inside is copied, not shared; a prefix may be published over another (ADR 0029). On a pool built for the MTP head
+  the page holding the publish point's last position is each holder's own copy (ADR 0095).
+- A claim never consumes: retained state is cloned out, so one entry serves any number of claimants.
+- The multimodal `rope_delta` is a progress scalar, which snapshot and restore carry, and the one progress scalar
+  the clone path leaves behind: a multimodal claimant gets its delta from the tail it always prefills (ADR 0029).
 
-### Status
+**The state-transfer and prefix calls are entry points.** ADR 0016's rule, that the step ABI grows by fields on an
+options struct and never by new entry points, is about steps. It does not reach the calls that create and destroy
+the objects a step runs against, and these are of that kind: a snapshot size and a format version are queries with
+no knob, and publish, claim and release are lifetime operations on a leaf-owned object. `ignis_seq_alloc_shared` is
+a second constructor rather than a flag, since a sequence that claims a prefix is built differently, not stepped
+differently. A snapshot control, a policy, a stream or a partial extent, still goes in an options struct, and is not
+another entry point.
 
-Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
-linked from the tickets of #65. Applies ADR 0009
-(step-level device-resident ABI) to the two features that move sequence state.
-Amended 2026-10-07 by ADR 0045: a transfer may move a blob a window at a time,
-through the options struct this ADR reserved for "a partial extent". KV-disk
-moves blobs in 32 MiB windows. The blob's bytes are unchanged, and a null
-options pointer is the whole-blob call.
+## Considered Options
 
-### Context
+- **The section table in the ABI.** It would let the host tier compute layouts, and would put the leaf's internal
+  geometry into a contract that every future section change breaks.
+- **Prefix reuse as the restore of a sibling's snapshot.** One mechanism instead of two, but it moves the mutable
+  sections host-ward and back, two PCIe crossings for bytes that never needed to leave the card, while the read-only
+  KV pages can simply be shared.
+- **Sharing pages without cloning the mutable sections** saves nothing, because prefill must traverse every layer to
+  produce them. Recorded so it is not re-proposed as an optimization.
+- **A feature-gated readback seam** for the tests that inspect a blob: the GPU profile does not build it, so such a
+  test would never run.
 
-Two phase-4 features move a sequence's state, and both were written above an
-ABI that cannot: `ignis_seq_snapshot` and `ignis_seq_restore` are declared and
-return `IGNIS_SEQ_ERR_NOT_IMPLEMENTED` (`kernel/src/seq.cu:217`), while
-`crates/core/src/host.rs` and `crates/core/src/prefix.rs` already model a host
-tier and a refcounted prefix cache in Rust.
+## Consequences
 
-A sequence is not one buffer. It is KV pages, a GDN recurrent slot of 144 MiB,
-conv taps, a position and last token, and since #99 a penalty-count row. The
-G3 session established that all of these are consistent together at a completed
-chunk boundary, and recorded a caveat with it: a *new* state section does not
-inherit that snapshot-point permission and must re-earn it
-(`records-2026-11-27:docs/archive/DEFERRED-DECISIONS.md` item 5).
-
-Two questions followed. First, how much of that structure crosses the C ABI.
-Exposing a section table to Rust would let the host tier compute layouts, and
-would also put the leaf's internal geometry into a contract that every future
-section change breaks. Second, how prefix reuse transfers state. Expressing it
-as "restore a sibling's snapshot" reuses one mechanism, but it would move the
-mutable sections host-ward and back — two PCIe crossings for bytes that never
-needed to leave the card — while the read-only KV pages can simply be shared.
-
-### Decision
-
-**The section table is leaf-internal.** One place in the leaf knows what a
-sequence is made of, what each section costs, and whether it is shareable
-read-only or must be cloned per sequence. Adding a section is an edit to that
-table, which is what makes re-earning the snapshot-point permission an act
-rather than a memory.
-
-**The ABI exposes a size and a version, not a layout.** A caller asks for a
-sequence's snapshot size and gets a number plus a format version; the blob is
-opaque and carries its own header. Restore validates that header and refuses a
-stale or foreign layout rather than writing it into a live sequence. Nothing
-further is exposed until a consumer actually needs it.
-
-**Transfer is whole-sequence.** One call per direction. Partial restore is not
-offered: GDN state is not recomputable without re-running the prefix that the
-restore exists to avoid.
-
-**Prefix reuse clones on the device.** KV pages are shared by refcount, owned
-by the leaf, where the block table already lives. Mutable sections — the GDN
-slot, the conv taps — are copied device-to-device through the same internal
-section machinery the snapshot path uses. The host tier's pinned-memory path is
-a different transport over the same description.
-
-**Lifetime calls are entry points** (amends ADR 0016 for this family). ADR 0016
-rules that the step ABI grows by fields on an options struct, never by new
-entry points, and that a call which plausibly needs per-call modulation takes
-an options pointer from its first version. That rule is about *steps* — a
-forward pass whose route, compute policy or sampling would otherwise multiply
-parameters and `_ex` variants. It does not reach the calls that create and
-destroy the objects a step runs against: `ignis_seq_pool_create`,
-`ignis_seq_alloc` and `ignis_seq_release` predate it and take no options
-struct, because there is nothing about an allocation to modulate per call.
-
-The state-transfer and prefix calls this ADR introduces are of that second
-kind. A snapshot size and a format version are queries with no knob; publish,
-claim and release are lifetime operations on a leaf-owned object. So they are
-entry points, and `ignis_seq_alloc_shared` is a second constructor rather than
-a flag on the first — a sequence that claims a prefix is built differently,
-not stepped differently.
-
-What ADR 0016 still governs, unchanged: a *snapshot control* — a policy, a
-stream, a partial extent — goes in an options struct when a phase needs one,
-and is not a fifth entry point.
-
-### Consequences
-
-- The two parallel page ledgers end. The leaf owns physical pages and their
-  refcounts; `KvPool`'s refcounts in Rust become admission accounting, not
+- The leaf owns the physical pages and their refcounts: the Rust pool's refcounts are admission accounting, not
   truth.
-- **A prefix is published at a page boundary, which makes it a scheduling
-  decision.** The mutable state a claimant clones is the state at the prefix's
-  *end*, so the publishing request's prefill has to stop exactly there. A
-  prompt whose length is not a whole number of KV pages therefore pays one
-  extra prefill chunk — its shareable head, then its remainder — in exchange
-  for every sibling skipping that head entirely (P4-10, GitHub #126).
-- **A sequence that holds a shared prefix cannot be snapshotted.** Its leading
-  pages belong to the prefix, so there is no whole-sequence blob to write: the
-  leaf refuses with its own code and the sequence is released and re-prefilled
-  rather than evicted to the host tier. The alternative — copying another
-  request's history into this request's blob — is the corruption the refusal
-  exists to prevent.
-- Clone, snapshot and restore share one description, so a new section is
-  carried by all three or by none. A section added to only one of them is now a
-  visible omission rather than a silent one.
-- The host tier cannot compute its own buffer layouts, and does not need to: it
-  asks for a size, allocates pinned memory, and stores bytes it does not
-  interpret.
-- A blob does not survive a version change. That is the intent — a snapshot
-  taken before a layout change is unusable and must be rejected, not
-  reinterpreted.
-- **Per-sequence state lives where these calls can reach it: in the pool.**
-  Snapshot, restore and clone take a pool and a sequence, never a model, so a
-  section must be addressable from those two alone. The DFlash2 drafter's
-  window and rewrite checkpoint (P5-03, GitHub #152) therefore moved from the
-  model load, where P5-02 had reserved them per decode lane, into the sequence
-  pool, one lane per slot. The pool is built for a speculative backend, and
-  the program entry points refuse a model loaded for a different one. Spec 05's
-  "Model load" paragraph predates this.
-- **One piece of handle state is deliberately not a section.** A verify round
-  at extent 0 leaves the drafter window untouched and keeps its anchor's
-  feature taps on the sequence handle, host-side, for whatever continues the
-  sequence (GitHub #157). Spec 05 says feature taps are never persisted and
-  never a section, and nothing here needs them to be: a snapshot or a clone
-  taken at that point carries the frontier without the taps, and its sequence
-  resumes with a one-position hole in its window — lower acceptance, never a
-  different text. Restore and clone drop whatever taps the target handle held.
-  The scheduler never reaches that case, since extent 0 is a request's last
-  round; if one ever continues such a sequence across a transfer, the taps
-  become a section.
-- **A GPU test may read the blob layout; a production consumer may not.** The
-  layout stays out of the ABI. A test that must inspect what snapshot carried
-  (`crates/core/tests/dflash2_window_gpu.rs`) spells out the layout for one
-  format version and asserts that version first, so a layout change fails the
-  test instead of being misread. The alternative is a feature-gated readback
-  seam, and the GPU profile does not build it, so such a test would never run.
-- Sharing pages without cloning the mutable sections saves nothing, because
-  prefill must traverse every layer to produce them. This is recorded so it is
-  not re-proposed as an optimization.
-- Costs are asymmetric and worth measuring rather than assuming: a
-  device-to-device clone of the GDN slot is roughly 0.09 ms, while a
-  full-context snapshot is about 528 MB and near 21 ms per direction over
-  pinned PCIe — still two orders of magnitude cheaper than the ~4.6 s
-  re-prefill it replaces.
-  - **Measured (P4-06, GitHub #124):** 508 MiB and **~45 ms per direction**,
-    not 21 ms. This host caps the 5090 at PCIe Gen 3 x16, so both directions
-    run at ~12 GB/s. The asymmetry is around 100x rather than ~220x, which
-    leaves the decision unchanged; the estimate above was made at PCIe 5.0
-    rates. See
-    [Sequence snapshot transfer cost](../findings/2026-09-12-sequence-snapshot-transfer-cost.md).
-  - **Measured (P4-10, GitHub #126):** the device-to-device clone is **~0.25 ms**
-    for the 148 MiB of mutable state at this geometry, not 0.09 ms. The state
-    is strided per GDN layer in the pool and packed in the prefix's image, so
-    the copy runs at ~620 GB/s rather than at the card's flat-copy bandwidth.
-    Against the same 148 MiB over PCIe — ~12 ms per direction at this host's
-    measured 12 GB/s — the clone is ~48x cheaper one way and ~96x cheaper than
-    the round trip a snapshot-and-restore would pay, and it is four orders of
-    magnitude cheaper than re-prefilling the head. The decision to clone on
-    the device rather than route through the host tier therefore stands on a
-    wider margin than the estimate claimed. See
-    [Device prefix clone cost](../findings/2026-09-12-device-prefix-clone-cost.md).
-
-### Amendment (2026-09-16) — cross-request reuse (ADR 0029)
-
-- **A snapshot of a sequence holding a shared prefix materializes the shared
-  pages into its blob** instead of being refused. This replaces the
-  consequence "a sequence that holds a shared prefix cannot be snapshotted".
-  The refusal guarded against a blob that passed another request's history
-  off as its own. A materialized copy owns every byte it carries and outlives
-  the prefix. The cost is prefix bytes duplicated per blob. Chained blobs (a
-  reference to a retained prefix plus a tail) are to be revisited with
-  Tier 2, where deduplication matters more.
-- **A prompt checkpoint's publish point is its generation opener**, wherever
-  that falls. Full pages are shared by refcount. The partial tail page is
-  copied at capture, because the live sequence keeps writing into it, and a
-  claimant copies it again. Shared and retained prefixes keep the
-  whole-page publish point.
-- **A claim never consumes.** Retained state is cloned out, so one entry can
-  serve any number of claimants.
-- **A blob's header names its compatibility identity**: the artifact content
-  hash, the KV format, the layout version, and the drafter configuration. A
-  blob taken under another load is refused like a stale layout.
-
-### Amendment (2026-09-16) — the materialized checkpoint (#190)
-
-- **A retained prompt checkpoint is spilled as the blob its capturing sequence
-  would have written** (`ignis_seq_checkpoint_snapshot`): the prefix chain's
-  pages in block-table order, then the copied tail page, then its image. One
-  layout, written by one packer in `kernel/src/seq.cu`, so a spilled checkpoint
-  restores through `ignis_seq_restore` like any other blob.
-- **Restoring into a sequence that holds a shared prefix is still refused**
-  (`IGNIS_SEQ_ERR_SHARED_PREFIX`): its pages are other claimants' history. A
-  blob is restored into a fresh sequence.
-- **A sequence that owns its history keeps the vendored pack**; only a
-  materialized one goes through the page-run packer.
-
-- **A retained prefix spills as the blob its publisher would have written
-  standing on it** (`ignis_seq_prefix_snapshot`), through the same writer as a
-  checkpoint. It comes back by restoring that blob into a fresh carrier
-  sequence and publishing there (`ignis_seq_prefix_publish`); the kernel test
-  pins that the returned prefix, and a claimant of it, are byte-identical to
-  the original's.
-
-### Amendment (2026-09-16) — the multimodal rope delta (#194)
-
-- **A sequence's `rope_delta` is a progress scalar**, in the progress
-  section's former reserved word, so snapshot and restore carry it with the
-  pending token. It re-earns the snapshot-point permission at the
-  same completed chunk boundary: a prefill span assigns it after its chunks
-  have run and synchronized, and every span of a multimodal prompt assigns
-  the same prompt-wide value, so a sequence evicted between chunks already
-  holds it. Format version 3; a version-2 blob is refused by version, since
-  its reserved word would restore every multimodal sequence at delta 0. No
-  such blob of a multimodal sequence exists (the leaf refused to write one),
-  so the bump is ADR 0024's layout rule rather than a guard on live data.
-- **A clone does not carry it**: a shared prefix's or checkpoint's capture
-  records 0, and so do the blobs a spilled prefix or checkpoint is written as.
-  A multimodal publisher's own blob therefore differs from its prefix's in
-  that one word. The publisher's delta is
-  its whole prompt's, not the head's, and a text request may claim a
-  multimodal publisher's text-only head up to its prompt's end, prefilling
-  nothing that would set its own. A multimodal claimant gets its delta from
-  the tail it always prefills (ADR 0029's one-token tail rule, #201). This is
-  the one progress scalar the clone path leaves behind.
-- **Vision state is not a section.** A request evicted part-way through a
-  media item releases the item's embedding with its sequence; the chunk that
-  continues it after restore encodes the item again.
+- The host tier cannot compute its own buffer layouts, and does not need to: it asks for a size, allocates pinned
+  memory, and stores bytes it does not interpret.
+- A GPU test may read the blob layout; a production consumer may not. Such a test spells out the layout for one
+  format version and asserts that version first, so a layout change fails the test instead of being misread.
+- The feature taps a verify round at extent 0 leaves on the sequence handle are deliberately not a section: a
+  sequence transferred there would lose acceptance, never text, and the scheduler never reaches the case, since
+  extent 0 is a request's last round. If a sequence is ever continued from there across a transfer, the taps become
+  a section.
+- Vision state is not a section: the chunk that continues an evicted media item after restore encodes it again.
+- The costs are asymmetric, and are measured rather than assumed: the device clone is about fifty times cheaper than
+  the same bytes one way over this host's PCIe link, and a full-context snapshot about a hundred times cheaper than
+  the re-prefill it replaces ([snapshot](../findings/2026-09-12-sequence-snapshot-transfer-cost.md),
+  [clone](../findings/2026-09-12-device-prefix-clone-cost.md)).
