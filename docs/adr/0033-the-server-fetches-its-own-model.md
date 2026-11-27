@@ -21,7 +21,8 @@ downloads: a start that blocks forever on a question nobody will answer is worse
   already has it downloads nothing.
 - **The pins are the trust anchor.** A built-in entry's digest is in the binary, never read from the repo: the
   digest the repo publishes sits in the same trust domain as the artifact it describes, so it can attest nothing
-  about it. A file is in place only once its length and its digest match its pins, so bytes republished under the
+  about it. The transfer puts a file in place only once its length and its digest match its pins, and a file
+  already on disk is accepted by its byte count, so bytes republished under the
   same file name fail, by length or by digest. That is the intended direction of the failure: a new artifact is a
   new catalog entry and a new binary, not a silent swap.
 - **A failed fetch refuses the start.** Falling back to the mock after the operator said yes would be the same
