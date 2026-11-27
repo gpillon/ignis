@@ -1,5 +1,5 @@
 //! Fetching a model (GitHub #234 and #313, each with its spec;
-//! ADR 0033, amended by ADR 0047).
+//! ADR 0033, ADR 0047).
 //!
 //! A server started with no `.ninfer` artifact used to fall back to the
 //! placeholder template and `MockCompute` without a word about where the real

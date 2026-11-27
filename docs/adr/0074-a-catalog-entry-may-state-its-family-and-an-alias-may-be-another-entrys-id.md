@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0047, ADR-0064]
+amends: [ADR-0064]
 ---
 
 # A catalog entry may state its family, and an alias may be another entry's id

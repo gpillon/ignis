@@ -262,7 +262,8 @@ pub struct ListRow {
     /// read with `on_disk`, from the same sizes.
     pub bytes_on_disk: u64,
     /// The family the artifact's own header names, when the artifact is on
-    /// disk and names one — never declared in the catalog (ADR 0047).
+    /// disk and names one: the header's, never the one the catalog states
+    /// (ADR 0047).
     pub family: Option<ModelFamily>,
 }
 
