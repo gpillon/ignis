@@ -20,9 +20,10 @@ host activation pointer crossing.
 
 ## Consequences
 
-- Kernel reuse is maximal: matching the reference stack is achievable because the compute is identical, the same MMA
-  instructions in the same accumulation order.
+- Kernel reuse is maximal: parity with the reference stack is achievable because the compute is identical, the same
+  MMA instructions in the same accumulation order.
 - Two toolchains: CMake with nvcc builds the kernel leaf, and Cargo links it through `build.rs`.
-- The FFI boundary is the only place where state crosses between the languages: it is kept flat, checked and logged.
+- The FFI boundary is the only place where state crosses between the languages: it must stay flat, checked and
+  logged.
 - Reused kernel files carry their upstream provenance, which the repo declares in `NOTICE`; how a reused op is
   vendored and tracked is ADR 0010.
