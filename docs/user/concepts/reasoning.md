@@ -81,8 +81,7 @@ wastes up to the whole budget, and an agent that reaches the forced close is
 left only the answer reserve.
 
 The server cannot fix the model, but it can notice and step back
-([ADR 0052](../../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md),
-[ADR 0053](../../adr/0053-a-loop-is-acted-on-once-it-persists.md)).
+([ADR 0052](../../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md)).
 
 ### What it detects
 
@@ -106,7 +105,7 @@ no legitimate agent text stayed over the threshold for more than 6 checks, and
 23 of 25 harmful loops stayed for 9 or more.
 
 From 0.11.2 the guard also watches for a **repeat**
-([ADR 0053](../../adr/0053-a-loop-is-acted-on-once-it-persists.md)). This
+([ADR 0052](../../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md)). This
 catches a loop whose repeated block is longer than the 1,000-character window.
 The window never holds two copies of such a block, so it compresses like prose.
 Each time a sentence of the reasoning ends, the guard looks for the same
@@ -146,7 +145,8 @@ thinking budget would. A second nudge uses a different sentence
 What the client sees: the reasoning carries a tag, `[LOOP DETECTED, REWINDING n
 TOKENS / m CHARS · h]`, after the `m` characters taken back, which the
 Playground strikes through. The rewound tokens stay in `completion_tokens` and
-are also reported as `completion_tokens_details.rewound_tokens`. Reasoning an
+are also reported as `completion_tokens_details.rewound_tokens`, so a rewound
+request can report more `completion_tokens` than its `max_tokens`. Reasoning an
 agent sends back with its tags is repaired before the next prompt, whatever the
 guard's mode, so the model is given back the text it actually saw. A request
 with images is never rewound.
@@ -206,6 +206,8 @@ All the guard's fields can be changed on a running server with `PATCH
 [Prompting](../configuration/prompting.md). `/metrics` counts what the guard does:
 loops by outcome (`ignis_loop_guard_loops_total`), requests watched and looped,
 tokens rewound, and each request's lowest score
-([telemetry](../guides/telemetry.md)). The guard runs on chat completions and on
+([telemetry](../guides/telemetry.md)). Each outcome is also a log line:
+`ignis.loop_guard.detected`, `rewound`, `too_little_kept`, `no_room`,
+`no_tokenizer` and `submit_refused`. The guard runs on chat completions and on
 `/v1/responses`; the [Responses API](../api/responses.md) page covers the
 WebSocket.

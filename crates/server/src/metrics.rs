@@ -330,7 +330,7 @@ impl TokenizeRoute {
     }
 }
 
-/// What the loop guard did about a loop it saw (ADR 0052, 0053):
+/// What the loop guard did about a loop it saw (ADR 0052):
 /// `ignis_loop_guard_loops_total`'s fixed `outcome` label (GitHub #330).
 /// One per `ignis.loop_guard.*` log line, named after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
