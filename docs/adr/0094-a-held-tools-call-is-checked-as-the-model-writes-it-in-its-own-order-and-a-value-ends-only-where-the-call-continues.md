@@ -23,8 +23,8 @@ declared tools. The behaviour, case by case, is in the guide (`docs/user/api/str
   call is a closed block that did not parse; a call still open at the end is a cut, which `finish_reason` reports,
   and is not counted. The check's own bounds on a client's schema (nesting, steps) decide only what is counted, so
   they are not configuration fields. The counts are metrics (ADR 0017), recorded on the HTTP side, since the model
-  thread never sees a call; a held call's misses and repairs count beside structured output's, under a kind of
-  their own.
+  thread never sees a call; a request with a held tool, its misses and its repairs count beside structured
+  output's, under a kind of their own.
 - **What `held` would change is counted apart.** On open schemas, which most agent traffic sends, a call holding
   an undeclared parameter counts valid, so the counts above could not say what `held`, which closes such objects,
   would change. One more count takes, once per call, valid or not, the calls holding a parameter that an object
@@ -95,8 +95,9 @@ declared tools. The behaviour, case by case, is in the guide (`docs/user/api/str
   ([finding](../findings/2026-11-15-held-tools-served-on-the-27b.md)).
 - **The documented exceptions to OpenAI's behaviour.** Flash-Next keeps its tools free until #581: `strict` is
   accepted and inert, since agent SDKs send it by default and a 400 would shut them out. A string value cannot hold
-  a line that is a step of its call, nor, while a required parameter is missing, the two line starts at which the
-  model is steered to that parameter; whitespace after a step's first tag is bounded, so a run of spaces is never
+  a line that is a step of its call, nor can a free string, while a required parameter is missing, hold the two
+  line starts, measured on the 27B's tokenizer, at which the model is steered to that parameter;
+  whitespace after a step's first tag is bounded, so a run of spaces is never
   a dead end. A named function whose name holds `>`, which the dialect cannot write, leaves the call to any
   declared tool. And the dialect refuses some strict tools that may lie inside the strict subset: a name or a
   parameter name it cannot write, a name another tool shares, a held string none of whose values fits on one line,

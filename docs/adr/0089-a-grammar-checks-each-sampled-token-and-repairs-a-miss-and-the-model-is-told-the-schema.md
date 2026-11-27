@@ -14,8 +14,9 @@ folded. The server also describes the schema to the model by default, at the end
 that has not seen the schema misses on nearly every key.
 
 - **Same result as masking every step.** Identical under greedy to masking every step of the route that drew each
-  token; under temperature, the same distribution except for the top-k cut the vendored sampler applies. With
-  DFlash2 on, a token is drawn from a verify column, whose numerics can part from a plain round's at a near-tie, as
+  token; under temperature, the same distribution except for the top-k cut the vendored sampler applies
+  (llama.cpp's check-first default accepts the same). With DFlash2 on,
+  a token is drawn from a verify column, whose numerics can part from a plain round's at a near-tie, as
   they do for an unconstrained answer: a constrained answer equals the speculation-off answer up to that near-tie
   rule, never further.
 - **Speculation stays on for a constrained request.** The host cuts a verified run at its first miss and repairs
@@ -34,15 +35,16 @@ that has not seen the schema misses on nearly every key.
 
 ## Considered Options
 
-- **A full mask every step**, as the other engines we read do. The result is the same, but it needs CPU work every
+- **A full mask every step**, as the other engines we read do, which they overlap with the forward pass.
+  The result is the same, but it needs CPU work every
   step, a round that hands control back between its forward pass and its draw, and, under speculation, one mask per
   draft position, which forces a DFlash2 pass to read the drafts back to the host before verify.
 - **Writing the grammar-forced text ourselves** (jump-forward). Deferred. One engine shipped it and removed it, and
   text tokenized unlike the model's own choice hurts the model's next predictions (DOMINO, arXiv 2403.06988).
   Describing the schema removed the key misses it would have saved.
 - **Leaving the prompt as the client wrote it**, as other local engines do. Measured worse: about a hundred times
-  the misses, several times the DFlash2 decode speed lost, keys forced in odd token splits, and one recursive
-  schema that ran away to `max_tokens` (the
+  the misses, an estimated several times the DFlash2 decode speed lost, keys forced in odd token splits, and one
+  recursive schema that ran away to `max_tokens` (the
   [finding](../findings/2026-11-12-structured-output-grammar-measured-on-the-27b.md), which also has what a check,
   a repair and a schema's compilation cost).
 - **Vendoring a grammar engine.** The inference path is ignis's own Rust; a JSON-schema automaton is a few
@@ -56,6 +58,7 @@ that has not seen the schema misses on nearly every key.
 - **A constrained answer can loop**, and only `max_tokens` stops it (#584): the loop guard watches only the
   reasoning.
 - **Flash-Next comes later (#581).** Its MTP verify round overwrites the scores inside the round.
-- **The metrics (ADR 0017) count completed requests held to a grammar, their misses and their repairs**, and time
+- **The metrics (ADR 0017) count completed requests held to a grammar, their misses and their repairs**, a held
+  tool's calls a kind of their own (ADR 0094), and time
   each repair where it happens, the one place such a request reads the clock: each miss is reported with its repair
   time as a fact of its own, so a round with no grammar adds nothing.
