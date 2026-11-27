@@ -563,7 +563,7 @@ fn assert_the_8x_routes(events: &[serde_json::Value], lines: &serde_json::Value)
 /// prefill), still loads the profile's 262,144 tokens on two lanes with
 /// nothing adapted: the dense buffer's line costs KV pool, not context. The
 /// pool against the fused load's (on our GDN prefill too, since GitHub #536)
-/// is printed, the figure the profiles page and ADR 0080 quote.
+/// is printed, the figure the profiles page quotes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "GPU profile only: scripts/gpu-profile.ps1"]
 async fn the_8x_routes_keep_262144_tokens_on_two_lanes_less_1_gib() {

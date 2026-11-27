@@ -77,8 +77,7 @@ the other. They are no configuration fields: `GET /v1/config` and
 
 - `IGNIS_GDN_PREFILL=ours|vendored` picks the 27B's gated delta net prefill at
   each model load, on any card: ignis's own full-rate kernels, or the vendored
-  chunked kernels they replaced ([ADR 0080](../../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md),
-  [ADR 0085](../../adr/0085-on-blackwell-too-the-27bs-gdn-prefill-runs-ignis-own-kernels.md)).
+  chunked kernels they replaced ([ADR 0080](../../adr/0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md)).
   Unset, every card runs ignis's own. Any other value refuses the load,
   naming the variable. The load logs the route it runs, under
   `ignis.runtime.prefill_routes`, with the trellis prefill and the prompt
