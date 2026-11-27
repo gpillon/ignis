@@ -52,7 +52,7 @@ edit it by hand.
 | [0040](0040-the-readout-carries-the-peak-s-neighbours.md) | the attention readout carries each peak's neighbours | accepted | |
 | [0041](0041-the-readout-reads-a-text-span.md) | the attention readout reads a text span, in whole rows | accepted | |
 | [0042](0042-locate-copies-over-a-folded-state.md) | a locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
-| [0043](0043-a-second-model-without-a-ninfer-reference.md) | a second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | |
+| [0043](0043-a-second-model-without-a-ninfer-reference.md) | A second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | |
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
 | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | the KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) |
 | [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted | |
@@ -65,7 +65,7 @@ edit it by hand.
 | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | a resident Flash-Next load keeps its experts only in VRAM | accepted | |
 | [0055](0055-a-pinned-hot-set-is-opt-in.md) | A pinned hot set of experts: a field off by default, which the rtx5090 profile sets | accepted | |
 | [0056](0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md) | Speculation past 8 verify rows is numerically equivalent, not bit-exact | accepted | |
-| [0057](0057-rope-scaling-is-auto-by-default.md) | rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
+| [0057](0057-rope-scaling-is-auto-by-default.md) | Rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
 | [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | every route has a deadline, and a passed one answers what was generated | accepted | [0096](0096-a-cut-tool-call-reaches-the-client-as-generated-its-name-its-arguments-so-far-and-finish-reason-length.md) |
 | [0059](0059-flash-next-applies-yarn-on-q-and-k.md) | Flash-Next applies YaRN, the attention factor folded into cos and sin on q and k | accepted | |
 | [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | The 27B gets a second body format, trellis, for the 16 GB card class | accepted | |

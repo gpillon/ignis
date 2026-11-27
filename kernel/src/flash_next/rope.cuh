@@ -4,6 +4,9 @@
 // so the two round alike by construction. Device-only: indexer.h, which declares Rope, is also
 // read by host-only tests. GitHub #558: also where the indexer's rows rotate (a batch's rotation
 // source, as the attention's) and a block's AxisRecord in its key slot, which verify.cu restores.
+// The rule (ADR 0059): the angle is an fp32 product, as the model's reference engines compute it,
+// and YaRN's attention factor is folded into cos and sin, rounded to BF16 where HF rounds, on
+// queries and keys alike.
 
 #pragma once
 
@@ -16,8 +19,8 @@
 namespace ignis::flash_next::indexer {
 
 // Rotates pair (x1, x2) -- dims (i, i + 32) of a head, i = `pair` -- to `position` in torch's BF16
-// arithmetic: phi = fp32(position) * inv_freq in fp32 (ADR 0059 D2); cos and sin times the table's
-// scale rounded to BF16 (D1: YaRN's attention factor on queries and keys alike, 1.0f without
+// arithmetic: phi = fp32(position) * inv_freq in fp32 (ADR 0059); cos and sin times the table's
+// scale rounded to BF16 (YaRN's attention factor on queries and keys alike, 1.0f without
 // scaling); each product rounded to BF16, then their sum.
 __device__ __forceinline__ void rope_pair(float &x1, float &x2, const Rope &rope, int32_t position, int pair) {
   const auto bf16 = [](float v) { return __bfloat162float(__float2bfloat16_rn(v)); };
