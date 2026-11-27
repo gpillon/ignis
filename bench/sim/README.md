@@ -5,10 +5,10 @@ Code or similar) for recording a G4 load trace (GitHub #118, runtime spec
 04 section 6, gate G4) when standing up a live agent client by hand is too
 slow or hard to reproduce. It POSTs real prompts straight at the capture
 proxy (`ignis-bench record`, `crates/bench/src/record.rs`) instead of the
-reference engine directly, so the proxy records every request as it
+engine directly, so the proxy records every request as it
 normally would.
 
-**This is not a synthetic-fixture generator.** ADR 0015 / ADR 0021 require
+**This is not a synthetic-fixture generator.** A load trace is
 a *real* recorded session — the synthetic fixture
 (`crates/bench/tests/fixtures/main_plus_10.jsonl`) is explicitly not a
 reference (see `bench/traces/README.md`). Every request this script sends
@@ -27,8 +27,8 @@ left the main branch: the two configs list the files still in the tree.
 
 A real coding agent launches subagents one after another, a few seconds
 apart, not in lockstep — but the subagents then run *concurrently*, and
-that overlap (fighting over the reference's single global prefill lane and
-its decode lanes) is exactly what the gate's per-class TTFT/tok-s cells
+that overlap (fighting over the engine's prefill and
+its decode lanes) is exactly what the replay's per-class TTFT/tok-s cells
 measure. `simulate-session.ps1` reproduces that shape: each request is
 launched in its own background job `-StaggerSeconds` after the previous
 one (default 2s), but nothing waits for a prior request to *finish* before
@@ -37,10 +37,11 @@ fact.
 
 ## Prerequisites
 
-This script only fires the load — it manages neither the reference engine
+This script only fires the load — it manages neither the engine
 nor the capture proxy.
 
-1. Start the reference engine (ninfer) per its own docs.
+1. Start the engine the proxy forwards to (`ignis-server`, or any
+   OpenAI-compatible engine), here on port 8080.
 2. Start the capture proxy:
    ```
    ignis-bench record --listen 127.0.0.1:8090 --target http://127.0.0.1:8080 \
@@ -116,8 +117,8 @@ working content).
 ## Picking `maxTokens` and `staggerSeconds`
 
 Bump `maxTokens` and shrink `staggerSeconds` to lengthen how long the
-session's requests stay concurrently in flight — the reference's single
-global prefill lane and bounded decode-lane concurrency mean a denser,
+session's requests stay concurrently in flight — an engine's
+prefill lane and bounded decode-lane concurrency mean a denser,
 longer-running load matches a real burst more closely than a handful of
 short, barely-overlapping ones. There is no single right value: pick
 whatever makes the *session's own overlap window* — the time between the
