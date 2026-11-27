@@ -1,7 +1,7 @@
 ---
 status: accepted
 amends: [ADR-0047]
-amended-by: [ADR-0074, ADR-0079, ADR-0084, ADR-0098]
+amended-by: [ADR-0074, ADR-0079, ADR-0098]
 ---
 
 # ADR 0064 — a catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown
