@@ -17,8 +17,8 @@ model moved it to mapped pinned memory with identical perplexity.
   Flash-Next's is, naming the 27B's own flags.
 - **The table has a placement of its own in the binder**: a host-mapped allocation its file span is read straight
   into. The gather takes a raw table pointer, which does not care whether it is device or mapped host memory.
-- **The 32 GB artifact and its W8G32 format are unchanged.** The format is the artifact's: for the small-card body
-  it was left open between W8 and BF16 (ADR 0060), and in host memory BF16 costs only RAM, 2.54 GB, and is exact.
+- **The 32 GB artifact and its W8G32 format are unchanged.** The format is the artifact's, and in host memory BF16
+  costs only RAM, 2.54 GB, and is exact.
 
 ## Considered Options
 
