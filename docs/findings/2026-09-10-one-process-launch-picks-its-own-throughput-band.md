@@ -103,6 +103,12 @@ and it has only to hold for one launch's life to give a stable band.
   depend on finding the cause. It is the practice ADR 0082 keeps for a speed
   claim, and what `ignis-bench g4-gate` and `g5-gate` hold their records to
   (`crates/bench/src/lib.rs`).
+- The rule's cost, as accepted on 2026-09-10 (#116's closing comment): a
+  comparison costs roughly twice per side what one launch did, two launches
+  instead of one, inside the same GPU-exclusive session. Model load plus
+  decode-graph capture cost seconds, not minutes, on the 27B then, so a second
+  launch is cheap next to the session's own cost, and that keeps the rule
+  proportionate.
 - A cell whose spread across launches is larger than the spread inside its
   own launches is worth recording, not averaging away.
 
