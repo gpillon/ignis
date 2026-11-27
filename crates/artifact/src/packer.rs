@@ -53,7 +53,8 @@
 //! And the 27B's 16 GB artifact ([`Family::Qwen27bTrellis`], spec
 //! 27b-16gb/01): `frontend/`, then the tensors.json units of
 //! [`TRELLIS_27B_UNITS`], each object under its unit's prefix, written by
-//! `tools/27b-16gb-converter`.
+//! `tools/27b-16gb-converter`, which repacks the public `SC_3.00bpw_H4`
+//! quant's trellis into the body (ADR 0060).
 //!
 //! And an NVFP4 container of the 27B ([`Family::Qwen27bNvfp4`], GitHub
 //! #467): the same five units, planned from the inventory
@@ -149,7 +150,7 @@ pub const TRELLIS_27B_HEADER_BYTES: u64 = 4 << 20;
 pub const TRELLIS_27B_UNITS: &[&str] = &["text", "mtp", "vision", "dflash2"];
 
 /// The 16 GB artifact's identity: the 27B family, its body the public
-/// `SC_3.00bpw_H4` quant's trellis (ADR 0060 §4).
+/// `SC_3.00bpw_H4` quant's trellis (ADR 0060).
 pub fn trellis_27b_identity() -> ArtifactIdentity {
     ArtifactIdentity {
         model_id: "qwen3.8-27b".into(),
