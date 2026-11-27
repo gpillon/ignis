@@ -54,7 +54,7 @@ const MAX_CONTEXT_TOKENS: u32 = 128;
 /// GPU profile; re-measured 2026-09-09 at 0.194071 and 0.262192 -- exact, and
 /// deterministic run to run). This is the A4-route precision bound (the
 /// observed max with ~20% margin); it is a numerics criterion, not the
-/// functional gate -- that remains the G1 canary floor (ADR 0014), which this
+/// functional check -- that remains the G1 canary floor (ADR 0082), which this
 /// ticket keeps at >= 95% and never waives.
 ///
 /// This bound belongs to the GDN layer and to nothing else. GitHub #96:
