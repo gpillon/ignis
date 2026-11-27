@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0077]
 ---
 
 # On a card smaller than the RTX 5090 the GDN gating planner takes the largest split it holds, and its test caps the SM count

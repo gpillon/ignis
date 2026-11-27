@@ -177,8 +177,7 @@ enum ignis_prefill_compute_policy {
   IGNIS_PREFILL_COMPUTE_POLICY_A16_ONLY = 1,
 };
 
-/* Extensible per-call options for ignis_program_prefill (ADR 0016, amending
- * ADR 0009's "not an ABI change" claim). `size` must be
+/* Extensible per-call options for ignis_program_prefill (ADR 0016). `size` must be
  * `sizeof(struct ignis_prefill_options)`; a NULL options pointer means the
  * production defaults (chunked route, engine default policy). A future
  * phase (G3 sampling, G4 snapshot controls) appends fields and bumps a new
