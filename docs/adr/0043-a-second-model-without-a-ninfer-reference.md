@@ -1,7 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0014, ADR-0015]
-amended-by: [ADR-0082]
 ---
 
 # ADR 0043 — a second model, Qwen3.8-Flash-Next, served without a ninfer reference
@@ -13,7 +11,7 @@ Accepted (2026-10-04): the owner approved the Flash-Next specs
 acceptance verifies it; its numbers are written here when it holds.
 **Amends** the "one model family" scope (`GLOSSARY.md`, *ignis*).
 **Extends ADR 0010**: ops with no ninfer provenance are our own
-implementation. **Replaces ADR 0014's oracle and ADR 0015's gate for this model
+implementation. **Replaces ADR 0082's canary oracle and the gates it retired for this model
 only**; both stand unchanged for Qwen3.8-27B.
 **Amended by ADR 0051** (2026-10-13): "ExLlamaV3 code is read, never copied
 into the engine. Our kernels are original." gives way to three tiers (our
@@ -30,8 +28,8 @@ untracked, local to the owner's clone), the owner's /to-spec decisions of
 ignis serves one model, Qwen3.8-27B, and every correctness and speed rule
 assumes a reference engine running the same weights: vendored ops are ninfer's
 files tested against ninfer's fp64 references (ADR 0010), G1 is teacher-forced
-agreement with ninfer's recorded greedy completions (ADR 0014), G2 is a
-live/live latency comparison against ninfer (ADR 0015).
+agreement with ninfer's recorded greedy completions (ADR 0082), G2 is a
+live/live latency comparison against ninfer (ADR 0082).
 
 The owner wants a second model, **Qwen3.8-Flash-Next** (125B MoE, 6B active),
 for the tasks where the 27B falls short: general knowledge, languages,

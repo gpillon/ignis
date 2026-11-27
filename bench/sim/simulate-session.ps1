@@ -3,8 +3,8 @@ Simulates a real "1 main agent + N subagents" coding session against
 ignis-bench's capture proxy (crates/bench/src/record.rs), to record a G4
 load trace (GitHub #118, runtime spec 04 section 6, gate G4).
 
-Why this exists: the G4 trace must come from a REAL agent session against
-the reference stack (ADR 0015 / ADR 0021 -- no synthetic fixture is a
+Why this exists: a load trace must come from a REAL agent session against
+a running engine (no synthetic fixture is a
 reference; see bench/traces/README.md). Standing up a live coding-agent
 client (Qwen Code or similar) for ~10 real subagent turns by hand is slow
 and hard to reproduce. This script plays that role directly: it POSTs
@@ -16,7 +16,7 @@ measure. The trace this produces is real, not synthetic.
 
 This is NOT a lorem-ipsum load generator. Every request's content is real
 repository text you choose via -Config's `files` lists -- "real working
-content" is what ADR 0015 requires, and exactly why the resulting trace is
+content" is what a load trace is made of, and exactly why the resulting trace is
 never committed (only its SHA-256 + shape are; see bench/traces/README.md
 and bench/sim/README.md). Write a fresh config describing your actual
 current task before recording -- do not reuse an old config's task text
@@ -24,7 +24,8 @@ for unrelated work; the files it names may also have moved on.
 
 Prerequisites (this script only fires the load; it manages neither
 process):
-  1. Start the reference engine (ninfer) per its own docs.
+  1. Start the engine the proxy forwards to (ignis-server, or any
+     OpenAI-compatible engine), here on port 8080.
   2. Start the capture proxy:
        ignis-bench record --listen 127.0.0.1:8090 --target http://127.0.0.1:8080 `
          --out bench/traces/<load>-trace.jsonl --class first-is-main
