@@ -48,6 +48,8 @@ only until it was shown that they cost the inference path nothing, and every ser
   source that keeps the invariant above: the load's own plan, and the scheduler's host-side accounting on the tick.
 - Labels take fixed, finite sets. Request, trace, span, sequence, lane and token ids, prompts, completions, paths,
   client model strings and error text are never labels. Histogram buckets are fixed.
+- The retained-state families are split by `tier` and by `kind`, so a dashboard that sums one without aggregating
+  `kind` away double-counts nothing and reads one line a kind.
 
 **When a family appears.** A family is exported from the first scrape, zeros included, unless it belongs to a route or
 a feature most servers never use. Such a family is absent until its first event: a server that never uses the feature
