@@ -1,4 +1,4 @@
-//! The Qwen3 decoder's graph, ours (spec speech/01 §2, ADR 0068 decision 8):
+//! The Qwen3 decoder's graph, ours (spec speech/01 §2, ADR 0068):
 //! per layer RMSNorm, the Q/K/V projections, QK-norm, M-RoPE, GQA attention
 //! over our KV cache, the output projection, RMSNorm and SwiGLU; then the
 //! final norm and the LM head.

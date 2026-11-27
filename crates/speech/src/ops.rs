@@ -1,4 +1,4 @@
-//! The graphs' other ops, ours (spec speech/01 §2, ADR 0068 decision 8):
+//! The graphs' other ops, ours (spec speech/01 §2, ADR 0068):
 //! LayerNorm, RMSNorm, GELU, SiLU, softmax, RoPE / M-RoPE, attention and the
 //! 3×3 stride-2 convolution.
 //!

@@ -78,7 +78,7 @@ edit it by hand.
 | [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | the 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | [0103](0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md) |
 | [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | The speech model waits on the host and borrows free KV pages | accepted | |
-| [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
+| [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | The speech model's CPU executor is ours, in Rust | accepted | |
 | [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
