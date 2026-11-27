@@ -6,8 +6,10 @@ status: accepted
 
 A decode round is one traversal of the model at batch width W, for every exact width a round serves: one call per
 op per layer with the lanes on the batch axis, so that W lanes stream the model's weights once rather than W times.
-The round was first W complete single-sequence forward passes in program order, sharing only the final sample, and
-that round was the whole gap to the reference in a decoding lane's blocked inter-token interval, a prefill chunk
+The spec of the serving loop (GitHub #64) asked for exactly that, "one decode call spanning every decode-ready
+lane, so that eight lanes stream the model's weights once rather than eight times", and the round was first the
+opposite, W complete single-sequence forward passes in program order, sharing only the final sample. That round was
+the whole gap to the reference in ITL p95, a decoding lane's blocked inter-token interval being a prefill chunk
 plus a decode round: at four lanes the round cost 70.2 ms against the reference's 17.3 ms (4.06 times), 4.81 times
 its own one-lane round where the reference paid 1.07, the signature of streaming the weights once per lane, while
 the 1,024-token prefill chunk beside it, at 32K context, was 21% faster than the reference's (116.3 ms against
@@ -34,9 +36,10 @@ the 1,024-token prefill chunk beside it, at 32K context, was 21% faster than the
 - The round's dispatch counter (`kernel_count` in the program statistics) is the layer count at every width and on
   both paths: at more than one lane it must equal the one-lane round's, which is the leaf's own evidence of one
   traversal per round.
-- The replay-against-eager equality test no longer compares two independent implementations. It still earns its
-  place, catching anything the capture bakes in that a direct run would have read fresh, but isolation needs a test
-  of its own: the same sequences presented to the round in reverse row order, each one's token stream unchanged.
+- The replay-against-eager equality test, run at every exact width, no longer compares two independent
+  implementations. It still earns its place, catching anything the capture bakes in that a direct run would have
+  read fresh, but isolation needs a test of its own: the same sequences presented to the round in reverse row
+  order, each one's token stream unchanged.
 - The decode call advances each sequence's per-layer attention position counter at the end of a successful round,
   on both paths, so the counter has one owner and stays truthful for the per-token prefill route and for the layer
   bodies' KV-capacity check.
