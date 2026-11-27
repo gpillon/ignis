@@ -20,7 +20,7 @@ went nowhere before, and the device victim KV-RAM cannot take. How the modules c
   is in the test (ADR 0054). The test is plan arithmetic, done before anything is allocated.
 - **Offloaded**, the default is the owner's, `OFFLOADED_KV_POOL_TOKENS`, capped at every lane's whole context, since
   a larger pool can hold only retained pages and a one-lane load so keeps its expert cache, and floored at the
-  invariant, which wins, so a `--model-max-context` past the default starts instead of being refused.
+  invariant, which wins, so a `--model-max-context` at the default or past it starts instead of being refused.
 - **The invariant**, on both models: the pool holds one `--model-max-context` sequence and one page per retained
   slot (ADR 0030's floor), and a smaller pool refuses the start, naming the knobs. `--model-max-context` bounds
   every request, so with retained state given up and every other sequence moved, a sequence alone always fits.
@@ -42,8 +42,9 @@ went nowhere before, and the device victim KV-RAM cannot take. How the modules c
 - **A request that names no cap generates at most `--model-default-max-tokens` tokens**, its reasoning included, on
   both models: the output Qwen recommends for complex tasks by default (`DEFAULT_MAX_TOKENS`), `0` for none. It is
   clamped to what the prompt leaves of the context, so a long prompt is never refused for it, only one that fills
-  the context alone. An explicit cap always wins, `ignore_eos` still needs one, and a decision or a constrained
-  decode keeps its own budget. It has one home, `SchedulerConfig::default_max_tokens`, read by `generation_budget`:
+  the context alone. An explicit cap always wins, but past the context it is refused, not clamped; `ignore_eos` still
+  needs one, and a decision or a constrained decode keeps its own budget. It has one home,
+  `SchedulerConfig::default_max_tokens`, read by `generation_budget`:
   every entry point gets it, a request's remaining work becomes finite for the admission machine, and the same
   number sizes the reservation. It fixes the clients that send no cap, and it alone lets three of them run at once
   on the default pool.
@@ -53,10 +54,9 @@ went nowhere before, and the device victim KV-RAM cannot take. How the modules c
 - **A need is met in order**: free pages; retained state on the device; what requests waiting below the entry
   claimed; then a live sequence that ranks below the requester, moved down a tier, KV-RAM else KV-disk, at a round
   or chunk boundary, mid-generation if need be, and only when that makes the whole room. With nothing left the
-  admission waits in the queue: no refusal, no 503, nothing discarded. The in-flight cap's 503 is unchanged: it
-  concerns lanes, not tiers.
-- **The trigger is reactive** (ADR 0023) and an admission is the only one: a restore never moves anything, no lane
-  ever parks, and every sequence on the device keeps decoding to its end.
+  admission waits in the queue, no lane ever parks, and every sequence on the device keeps decoding to its end: no
+  refusal, no 503, nothing discarded. The in-flight cap's 503 is unchanged: it concerns lanes, not tiers.
+- **The trigger is reactive** (ADR 0023) and an admission is the only one: a restore never moves anything.
 - **Rank gates the victim**: class first, `Interactive` above `Agent`, then submission order, and a moved sequence
   keeps its rank. "Never the requester" alone would let an `Agent` need move an `Interactive` lane, and two equal
   lanes move each other in turn. With rank an `Agent` need never moves an `Interactive` sequence; within a class an
@@ -80,7 +80,8 @@ went nowhere before, and the device victim KV-RAM cannot take. How the modules c
 ## KV-disk
 
 - **One mechanism under the `Compute` seam, for both models**, on by default on Flash-Next and off on the 27B
-  (`kv_disk::default_bytes`): the 27B's RAM is not taken by experts, its prefill is fast enough that a crossing
+  (`kv_disk::default_bytes`): the 27B's RAM is not taken by experts and `make` gives it a large KV-RAM arena above
+  the disk, its prefill is fast enough that a crossing
   from disk pays only past its floor, the development volume is nearly full, and its defaults stay byte-identical.
   One flag turns it on.
 - **No lost work.** With the tier on, an evicted live sequence is never discarded to make room, in KV-RAM or on
@@ -104,7 +105,8 @@ went nowhere before, and the device victim KV-RAM cannot take. How the modules c
 - **Reservations that grow page by page** (the growth branch). Preferred, since concurrency would follow what lanes
   use and not what they are capped at, but not without measuring: growth puts a leaf call on the serving path at
   every page, on decode, the number everything else is weighed against. Its gate, P0, grew one page at a time, the
-  worst case, and by the owner's rule passed only if, at every lane count on both models, decode tok/s was at most
+  worst case for a branch that grows by 32-page steps, and by the owner's rule passed only if, at every lane count on
+  both models, decode tok/s was at most
   0.5% below the mean of the two whole-mapping legs and ITL p99 no worse than the higher of them plus their
   difference, the run's own noise. It moved the 27B's ITL p99 past the rule
   ([the finding](../findings/2026-10-08-kv-page-growth-gate.md)), so the fixed branch above was built, the owner
@@ -124,10 +126,16 @@ went nowhere before, and the device victim KV-RAM cannot take. How the modules c
 - **A newcomer moves an older sequence of its class**, as before. A stream of newcomers could keep moving a
   sequence that has done the work.
 - **Moving sequences at a pool low-water mark.** Pre-emptive, which ADR 0023 rules out.
+- **Keeping the KV-RAM moves synchronous**, one call per direction (ADR 0024). A move stalls every lane for its
+  length, about 0.32 s as measured, so a move goes a window at a time.
 - **Raising the in-flight cap so that a burst beyond the lanes queues.** That changes HTTP backpressure, is not a
   tier decision, and is left to the owner.
 - **Writing to disk eagerly**, at request end or on every spill. It writes state that may never be needed and wears
   the drive.
+- **Restoring disk to KV-RAM to device.** It needs arena room the host does not have, and it is still one PCIe
+  crossing.
+- **One preallocated arena file for the disk.** NTFS zero-fills up to any write past the valid data length, and
+  writing the whole budget at start takes about 15 s at 1.2 GB/s.
 - **Persistence across a restart in v1.** Not nearly free: only retained state would be worth keeping, a live
   sequence dying with its connection; the retained index would be rebuilt from the file headers and the identity
   would have to hold across loads; and a wiped tier is a cache, where a kept one is every conversation's state at
