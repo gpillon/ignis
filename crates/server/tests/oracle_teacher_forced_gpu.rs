@@ -1,4 +1,4 @@
-//! The G1 cross-engine canary gate (ADR 0014, GitHub #76): **teacher-forced
+//! The G1 cross-engine canary floor (ADR 0082, GitHub #76): **teacher-forced
 //! next-token agreement** against the recorded canary oracle, with a >= 95%
 //! floor.
 //!
@@ -13,7 +13,7 @@
 //! the first divergence. GitHub #72 showed the first divergence on two
 //! canaries is an exact BF16 logit tie between ignis's pick and the oracle's
 //! — a coin flip, not a compute error — and the cascade dragged the suite to
-//! 52%. Free-running comparison is now a diagnostic (ADR 0014); this is the
+//! 52%. Free-running comparison is now a diagnostic (ADR 0082); this is the
 //! correctness floor.
 //!
 //! What this gate is for: catching **gross implementation errors** — wrong
@@ -27,7 +27,7 @@
 //!
 //! No mismatch class is waived. The two known BF16 exact-tie positions count
 //! as mismatches and the suite still clears the floor (99/102 = 97.1%,
-//! measured 2026-09-07; see ADR 0014 for the per-canary numbers).
+//! measured 2026-09-07; `ignis_bench::oracle`'s tests hold the per-canary numbers).
 //!
 //! The scoring arithmetic lives in `ignis_bench::oracle` so it is
 //! CPU-unit-tested without a GPU; this file is the GPU driver that produces
@@ -233,7 +233,7 @@ fn teacher_forced_canary_agreement_meets_the_g1_floor() {
         }
 
         // Scored against the fixture's expected-argmax column when it has one
-        // (spec flash-next/04), else against the fed tokens, as ADR 0014 scores.
+        // (spec flash-next/04), else against the fed tokens, the 27B's fixture.
         let result = score_canary(canary, &predictions, FIRST_N)
             .unwrap_or_else(|e| panic!("{}: {e}", canary.id));
         for m in &result.mismatches {

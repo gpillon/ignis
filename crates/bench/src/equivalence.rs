@@ -130,7 +130,7 @@ impl Side {
 pub struct Capture {
     pub side: Side,
     /// The gate session the capture belongs to; two captures compare only
-    /// within one session (ADR 0015).
+    /// within one session.
     pub session: String,
     /// The output budget every request was sent with; two captures compare
     /// only at the same budget.
