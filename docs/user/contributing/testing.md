@@ -498,7 +498,7 @@ reverse and forward are mirrored. The defaults took four legs a load at the
 served context below (`IGNIS_ROUND_IDENTITY_TIMING_CONTEXT=3584`), each cell's
 period the median of its blocks' medians over all of them, since a busy
 machine slows a block now and then and never speeds one
-([ADR 0106](../../adr/0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md)):
+([finding](../../findings/2026-11-23-the-27bs-mixed-rounds-numerical-class-on-the-rtx-5090.md)):
 
 ```sh
 make gpu-run CMD='CARGO_INCREMENTAL=0 IGNIS_ROUND_IDENTITY_LOADS=trellis-24gb-w15-rule IGNIS_ROUND_IDENTITY_ARMS=mixed-round-timing IGNIS_ROUND_IDENTITY_TIMING_ROUNDS=600 IGNIS_ROUND_IDENTITY_TIMING_TABLE=1 cargo test -p ignis-core --features cuda --test round_identity_gpu -- --ignored --nocapture --exact every_arm_commits_the_reference_rounds_tokens_at_every_width_and_the_draft_window'

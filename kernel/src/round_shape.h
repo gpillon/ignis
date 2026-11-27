@@ -7,7 +7,8 @@
 // A DFlash2 load past IGNIS_BASE_SHAPE_DRAFT_TOKENS drafts holds two round shapes on one set of
 // buffers (kernel/src/model_internal.h `ignis_model::extended_shape`): its base shape, 8 columns a
 // lane at every lane count, and its extended shape, the load's window + 1 columns a lane at up to
-// IGNIS_EXTENDED_SHAPE_MAX_LANES lanes. A round has one shape for all its lanes, chosen before it
+// IGNIS_EXTENDED_SHAPE_MAX_LANES lanes. Under `all` and `aggregate` a round has one shape for all
+// its lanes, chosen before it
 // launches and handed to it (kernel/src/step.cu `ignis_program_decode`): the shape rule says what
 // each lane asks from its own earlier rounds (`asks_extended`), which the host has before the next
 // round launches (the deferred verify's ticket, GitHub #676), and the shape policy turns the asks
