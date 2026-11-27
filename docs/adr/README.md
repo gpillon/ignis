@@ -50,7 +50,7 @@ edit it by hand.
 | [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | a vendored file may carry a patch that fixes a known correctness bug | accepted | |
 | [0038](0038-the-compute-seam-carries-an-attention-readout.md) | The `Compute` seam carries an attention readout | accepted | |
 | [0041](0041-the-readout-reads-a-text-span.md) | The attention readout reads a text span, in whole rows | accepted | |
-| [0042](0042-locate-copies-over-a-folded-state.md) | a locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
+| [0042](0042-locate-copies-over-a-folded-state.md) | A locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
 | [0043](0043-a-second-model-without-a-ninfer-reference.md) | a second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) |
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
 | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | the KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) |
