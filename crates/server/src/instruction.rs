@@ -1,5 +1,5 @@
 //! Instruction-message policies (GitHub #209, spec
-//! `docs/specs/vram-budget/01-vram-budget.md` §Slice 2).
+//! of GitHub #207, §Slice 2).
 //!
 //! An **instruction message** is a `system` or `developer` message. The Qwen
 //! 3.8 template accepts exactly one `system`, at index 0, and no `developer`

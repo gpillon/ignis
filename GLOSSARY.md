@@ -2014,7 +2014,7 @@ _Avoid_: context note
 **Gate**:
 A milestone acceptance measured **on the GPU**, never on CPU tests. G1
 correctness floor, G2 prefill, G3 decode + serving loop, G4 the reference
-feature floor, G5 speculative decoding (`docs/archive/ROADMAP.md`). The
+feature floor, G5 speculative decoding (`records-2026-11-27:docs/archive/ROADMAP.md`). The
 phases ended with G5 (2026-09-14); an artifact or a route is now admitted by
 ADR 0082's gate: the KLD against BF16, DFlash2 on against off and the loop
 rate.
@@ -2118,7 +2118,7 @@ The acceptance criterion at G4: ≥ 99% of the reference's performance
 correctness is self-checked (sane output, same model, greedy, fixed seed). It
 is the first of a ladder of performance gates: G5 asks ≥ 99% of the
 reference's committed tok/s under DFlash2, and the phase beyond the reference
-gates each item on its own (`docs/archive/ROADMAP.md`). Historical: ADR 0082
+gates each item on its own (`records-2026-11-27:docs/archive/ROADMAP.md`). Historical: ADR 0082
 superseded the gates against the reference.
 
 **Trace replay**:

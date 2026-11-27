@@ -1,5 +1,5 @@
 """EXPERIMENT (branch locate-long-context): spec 23's judge, committed before
-sets R4 and P2 are asked (`docs/specs/decide/23-zero-decode-locate-confirmatory.md`).
+sets R4 and P2 are asked (`records-2026-11-27:docs/specs/decide/23-zero-decode-locate-confirmatory.md`).
 
     python z23_judge.py --r4 R4-logpipe.json --p2 <P2 dir> --p2-multi P2-multi.json \
         --p2-rank P2-rank.json --auto auto.json --out z23-judge.json

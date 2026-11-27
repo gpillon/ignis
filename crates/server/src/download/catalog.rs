@@ -1,5 +1,5 @@
 //! The catalog (ADR 0047, spec
-//! `docs/specs/model-download/02-catalog-and-model-command.md`): every model
+//! of GitHub #313): every model
 //! the server knows how to fetch, each pinned file by file.
 //!
 //! Two layers, with two trust standings. The **built-in catalog**

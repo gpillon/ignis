@@ -1,6 +1,5 @@
-//! Fetching a model (GitHub #234 and #313; specs
-//! `docs/specs/model-download/01-model-download.md` and
-//! `02-catalog-and-model-command.md`; ADR 0033, amended by ADR 0047).
+//! Fetching a model (GitHub #234 and #313, each with its spec;
+//! ADR 0033, amended by ADR 0047).
 //!
 //! A server started with no `.ninfer` artifact used to fall back to the
 //! placeholder template and `MockCompute` without a word about where the real

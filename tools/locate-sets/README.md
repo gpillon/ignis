@@ -1,7 +1,7 @@
 # Locate sets, the attention-tap harness and the scorer
 
-The tools behind spec 18 phase A (`docs/specs/decide/18-locate-by-attention.md`,
-GitHub #274): which heads of the served 27B point into a **text** state, which
+The tools behind spec 18 phase A
+(GitHub #274): which heads of the served 27B point into a **text** state, which
 reading of them to use, and whether that is good enough for `locate` to ship.
 Kept as they were run, so that recalibrating for a new artifact is a repeat and
 not a new study, the way `tools/pointing-scenes/` is for `point`.
@@ -14,7 +14,7 @@ not a new study, the way `tools/pointing-scenes/` is for `point`.
 | `prose.py` | HotpotQA distractor dev (CC BY-SA 4.0), one line per sentence of the ten paragraphs, an empty line between paragraphs; correct on any gold supporting sentence. Downloads the dev file into `.scratch/` (never committed): the official URL first, the Hugging Face copy (`hotpotqa/hotpot_qa`) when it does not answer. |
 | `common.py` | The word rules behind the lexical / paraphrase split, checked on every generated question. |
 | `score.py` | Scores the harness's dumps: R1, R2 and R3, each with and without the content-free baseline, per scaffold; `dev` cross-validates on A+B and applies rule 1, `check` judges the choice on C and applies rules 2-4. Needs NumPy. |
-| `profiles.py` | Spec 19's phase 0 (`docs/specs/decide/19-a-span-read-from-attention.md`, GitHub #276): reads a dump as *profiles* -- per head, the weight, the lift over the content-free prefill and the prior alone -- and reports token-level localisation, where each head's peak sits against the target, span-aligned averages, line offsets, head votes, a conditional logit over every head, the top-k ceiling and where lexical misses land. `extract` once per set, then `report`. Needs NumPy and SciPy, and `tokenizers` for the rare-word keys. |
+| `profiles.py` | Spec 19's phase 0 (GitHub #276): reads a dump as *profiles* -- per head, the weight, the lift over the content-free prefill and the prior alone -- and reports token-level localisation, where each head's peak sits against the target, span-aligned averages, line offsets, head votes, a conditional logit over every head, the top-k ceiling and where lexical misses land. `extract` once per set, then `report`. Needs NumPy and SciPy, and `tokenizers` for the rare-word keys. |
 | `spans.py` | Spec 19's span sets (phase 1): 300 questions whose golds are **character spans** -- a value inside a log line (`logvalue`) or a record (`recvalue`), SQuAD 2.0 answers (`squad`), HotpotQA answers inside a gold sentence (`hotspan`), several or no whole lines (`logmulti`), every supporting sentence (`hotfacts`). Downloads SQuAD 2.0 dev into `.scratch/` beside HotpotQA. |
 | `generation.py` | The generation route, spec 19's comparator for spans: the same render through `/v1/chat/completions`, greedy, thinking off, and the answer searched for in the state (exact, else case- and space-folded). |
 | `spanscore.py` | Scores the span harness's dumps on the key grid: gold spans onto keys, one head / vote / summed profile / segment-then-key readings chosen in CV (and nested), span F1, the generation route on the same keys, where the full row's mass goes (Q4), and the forced quote's queries. `extract` per set, then `report`. |

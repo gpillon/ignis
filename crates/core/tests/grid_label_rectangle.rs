@@ -1,4 +1,4 @@
-//! **E0 of the study** (`docs/specs/decide/11-point-in-one-pass.md`): which
+//! **E0 of the study** (`records-2026-11-27:docs/specs/decide/11-point-in-one-pass.md`): which
 //! 2-D grids can this tokenizer *name*?
 //!
 //! A chain-free point needs the whole answer in one vocabulary entry, and the

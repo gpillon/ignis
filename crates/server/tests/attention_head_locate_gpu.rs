@@ -1,6 +1,6 @@
 //! Where does the model's attention point in a **text** state? The
 //! calibration harness of spec 18 phase A
-//! (`docs/specs/decide/18-locate-by-attention.md`, GitHub #274).
+//! (GitHub #274).
 //!
 //! For every question of a set written by `tools/locate-sets/generate.py`,
 //! the state is rendered the way a `locate` would be — layout L1: the system

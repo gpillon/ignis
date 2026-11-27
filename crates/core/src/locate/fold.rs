@@ -1,4 +1,4 @@
-//! **`template_fold`** (spec `docs/specs/decide/22-locate-by-copy-over-a-folded-state.md`,
+//! **`template_fold`** (spec 22,
 //! GitHub #278, ADR 0042): a log's lines grouped into **templates**,
 //! Drain-style, so a `locate` over a very long log reads a short text first.
 //!

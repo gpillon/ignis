@@ -1,7 +1,5 @@
 //! Pointing in one pass: the **attention readout**, the **pointing head** and
-//! the **head set** (specs `docs/specs/decide/13-point-by-attention-head.md`,
-//! `14-point-and-box-from-the-head-set.md` and
-//! `15-the-head-box-reads-inside-the-cell.md`, GitHub #260, #263 and #264,
+//! the **head set** (specs 13, 14 and 15 of `/v1/decide`: GitHub #260, #263 and #264,
 //! ADR 0038, ADR 0039 and ADR 0040).
 //!
 //! One attention head of the served model, read at the position after the

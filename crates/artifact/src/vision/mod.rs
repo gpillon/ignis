@@ -1,4 +1,4 @@
-//! The vision processor (GitHub #176, spec `docs/specs/vision/01-image-input.md`
+//! The vision processor (GitHub #176, spec of GitHub #174,
 //! §Processor): message text rendered by the chat template plus image bytes
 //! become a [`PreparedPrompt`] — token ids, per-token modality, three-axis
 //! positions, `rope_delta`, and one [`MediaItem`] per image (grid, token

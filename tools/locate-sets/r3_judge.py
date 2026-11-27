@@ -1,6 +1,6 @@
 """Spec 22's judge (GitHub #278), committed with the builders before any
 route is asked on sets R3, P3 or J3
-(`docs/specs/decide/22-locate-by-copy-over-a-folded-state.md` § The runs,
+(the spec GitHub #278 links, § The runs,
 § Scoring, § The rules).
 
 Inputs: `accept22.py run`'s records of runs 1, 3, 4, 5 and 6, run 2's
