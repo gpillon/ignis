@@ -47,7 +47,7 @@ on every layer and the owner chose a rate allocated per expert
 - Allocation trades robustness on unseen languages for quality on calibrated ones, so the calibration corpus is part
   of the artifact's contract: a language that matters must be in it. The artifact records its corpus manifest and
   its K map.
-- A conversion that misses the study's quality falls back to a 3.0-bit average, which still fits RAM (45.3 GB
+- A conversion that misses the study's quality has a fallback, a 3.0-bit average, which still fits RAM (45.3 GB
   pinned).
 - Updating the exllamav3 pin is a converter change, re-verified by the bit-exact decode test.
 - A uniform K remains expressible: one K for every expert is a degenerate map.
