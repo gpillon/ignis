@@ -746,7 +746,7 @@ fn a_live_siblings_prefix_is_no_retained_match_so_claiming_it_is_a_miss() {
 
 #[test]
 fn a_live_request_takes_a_retained_prefix_back_rather_than_waiting_for_it() {
-    // ADR 0023 as amended by 0029: on the device, retained state is the first
+    // ADR 0023: on the device, retained state is the first
     // victim — always, and before the eviction machinery is asked for
     // anything. A retained prefix must never be the reason a live request is
     // refused, evicted or made to wait.
