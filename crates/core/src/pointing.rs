@@ -1,6 +1,6 @@
 //! Pointing in one pass: the **attention readout**, the **pointing head** and
 //! the **head set** (specs 13, 14 and 15 of `/v1/decide`: GitHub #260, #263 and #264,
-//! ADR 0038, ADR 0039 and ADR 0040).
+//! ADR 0038).
 //!
 //! One attention head of the served model, read at the position after the
 //! forced `{"x":`, names the object the question asked for; 96 heads of the
@@ -63,7 +63,7 @@ pub(crate) const SERVED_NVFP4_27B: [u8; 32] = [
     0xc3, 0x2d, 0x2f, 0xae, 0x30, 0xda, 0x8b, 0x09, 0xd8, 0x45, 0x0e, 0x83, 0xb6, 0x54, 0x25, 0x13,
 ];
 
-/// A **head set** (spec 14, ADR 0039): the heads read together beside the
+/// A **head set** (spec 14, ADR 0038): the heads read together beside the
 /// pointing head, one cell each, and the **fallback cells** their argmax
 /// skips.
 ///
@@ -310,10 +310,10 @@ pub fn calibrated_artifacts() -> impl Iterator<Item = ArtifactHash> {
 /// that cannot read them says so, and the question fails; it never answers
 /// from some other copy of the keys.
 ///
-/// With a [`SetQuery`] (spec 14, ADR 0039) the job also names a head set:
+/// With a [`SetQuery`] (spec 14, ADR 0038) the job also names a head set:
 /// every GQA layer holding one of its heads is read the same way, and one
 /// argmax key index per head comes back beside the pointing head's scores,
-/// with the four scores around it (spec 15, ADR 0040) — enough to read the
+/// with the four scores around it (spec 15, ADR 0038) — enough to read the
 /// peak's position *inside* its image cell ([`AttentionScores`]) — or, over
 /// a text span (GitHub #275, ADR 0041), every head's whole row. A read any
 /// armed layer cannot make leaves the whole readout unread — never a partial
@@ -332,7 +332,7 @@ pub struct AttentionQuery {
     pub set: Option<SetQuery>,
 }
 
-/// The head set half of an [`AttentionQuery`] (spec 14, ADR 0039).
+/// The head set half of an [`AttentionQuery`] (spec 14, ADR 0038).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetQuery {
     /// The heads, at most [`MAX_SET_HEADS`] — at most [`MAX_ROW_HEADS`] read
@@ -345,7 +345,7 @@ pub struct SetQuery {
 /// What a [`SetQuery`] reads of each of its heads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetRead {
-    /// An image's head set (spec 14 and 15, ADR 0039 and 0040): each head's
+    /// An image's head set (spec 14 and 15, ADR 0038): each head's
     /// argmax key, its score there and the four scores around it in the
     /// image grid.
     Peaks {
@@ -354,7 +354,7 @@ pub enum SetRead {
         /// [`MAX_EXCLUDED_KEYS`]. The pointing head's own scores still cover
         /// every key: its region rule reads the whole map.
         excluded: Arc<[u32]>,
-        /// The image grid's columns (spec 15, ADR 0040). The span is a
+        /// The image grid's columns (spec 15, ADR 0038). The span is a
         /// row-major grid, and the leaf walks it to find each peak's four
         /// in-line neighbours: the left neighbour of a cell in column 0 does
         /// not exist, and is never the previous row's last cell.
@@ -412,7 +412,7 @@ pub const MAX_ROW_HEADS: usize = 32;
 pub const MAX_EXCLUDED_KEYS: usize = 32;
 
 /// What an [`AttentionQuery`] reads back across the `Compute` seam (ADR 0038,
-/// ADR 0039, ADR 0040, ADR 0041): the pointing head's scores, and one key
+/// ADR 0041): the pointing head's scores, and one key
 /// index per head of the set with the four scores around it when it named an
 /// image's set — at 4096 px that is 64 KB, 384 bytes and 1.5 KB, where every
 /// head's row would be 6.3 MB — or every head's row when it named a text
@@ -430,11 +430,11 @@ pub struct AttentionScores {
     /// named no set.
     pub set_argmax: Option<Arc<[u32]>>,
     /// Each head's score **at** its [`AttentionScores::set_argmax`] cell, in
-    /// the set's order (spec 15, ADR 0040). It costs the leaf nothing: it is
+    /// the set's order (spec 15, ADR 0038). It costs the leaf nothing: it is
     /// the high half of the packed value the argmax was reduced with.
     pub set_peak: Option<Arc<[f32]>>,
     /// Four scores per head of the set, in the set's order (spec 15,
-    /// ADR 0040): the argmax's **left, right, up and down** neighbours in
+    /// ADR 0038): the argmax's **left, right, up and down** neighbours in
     /// the image grid, in that order. `None` for a neighbour off the grid —
     /// a peak on the image's border has no score beyond it. The excluded
     /// keys are ordinary neighbours: a head may not *peak* on a fallback

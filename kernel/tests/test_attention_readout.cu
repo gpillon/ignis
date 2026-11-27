@@ -30,7 +30,7 @@
 //   unread       every guard that leaves the readout unread instead of
 //                scoring the wrong keys: no prompt attention, keys past the
 //                history -- and the one geometry it refuses outright.
-//   set          GitHub #263 (ADR 0039): the fused launch over a head set,
+//   set          GitHub #263 (ADR 0038): the fused launch over a head set,
 //                on the hq keys and on the pages -- each head's argmax against
 //                the host's, an excluded key scoring above everything
 //                skipped, an exact tie won by the larger key, the pointing
@@ -384,7 +384,7 @@ void a_read_that_cannot_be_made_is_left_unread(std::mt19937 &rng) {
   check(got.rc != 0 && !got.read, "a head geometry it was not built for: refused");
 }
 
-// ── GitHub #263 (ADR 0039): the head set, in one fused launch ────────────
+// ── GitHub #263 (ADR 0038): the head set, in one fused launch ────────────
 
 // The heads of a set one layer holds, across all four KV heads and more than
 // one per KV head; 10 is the pointing head (KV head 1).

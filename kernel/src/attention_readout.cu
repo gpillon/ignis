@@ -1,5 +1,5 @@
-// The attention readout (GitHub #260, ADR 0038; the head set GitHub #263,
-// ADR 0039; its rows over a text span GitHub #275, ADR 0041). See
+// The attention readout (GitHub #260, ADR 0038; the head set GitHub #263;
+// its rows over a text span GitHub #275, ADR 0041). See
 // attention_readout.h.
 //
 // One warp per key: eight coordinates per lane against a query held in shared
@@ -114,7 +114,7 @@ __global__ void attention_readout_kernel(const __nv_bfloat16 *query, const Ignis
   }
 }
 
-// GitHub #263 (ADR 0039): the most query heads one KV head serves -- the
+// GitHub #263 (ADR 0038): the most query heads one KV head serves -- the
 // armed heads a block of the fused kernel holds at once.
 constexpr int kGroup = 6;
 
@@ -127,7 +127,7 @@ __device__ __forceinline__ unsigned long long pack_score(float score, std::uint3
   return (static_cast<unsigned long long>(u) << 32) | key;
 }
 
-// GitHub #264 (ADR 0040): one gather launch's arguments. The fused kernel
+// GitHub #264 (ADR 0038): one gather launch's arguments. The fused kernel
 // above has already reduced this layer's heads to their argmax; this reads the
 // four keys around each of them so the host can place the peak inside its
 // image cell.

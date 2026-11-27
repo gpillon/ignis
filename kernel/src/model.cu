@@ -2460,7 +2460,7 @@ LoadSizes plan_load_sizes(const ignis_model &model, const ignis_topology &topolo
     // load can be asked one (the span is an image's), so a text load
     // reserves nothing for it.
     //
-    // GitHub #263 (ADR 0039): and beside them the head set's results, one
+    // GitHub #263 (ADR 0038): and beside them the head set's results, one
     // packed (score, key) per head, reserved for the largest set a readout
     // may name -- under 4 KB -- and (GitHub #264) the four neighbour scores
     // per head that ride with it, 6 KB more. `step.cu` takes all three from

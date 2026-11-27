@@ -402,7 +402,7 @@ pub struct PrefillOutcome {
     /// The **attention readout** this job asked for (GitHub #260, ADR 0038):
     /// one `q · k / sqrt(head_dim)` per key of its
     /// [`PrefillJob::attention`] span, in order, before any softmax — and,
-    /// when the job named a head set (GitHub #263, ADR 0039), one argmax key
+    /// when the job named a head set (GitHub #263, ADR 0038), one argmax key
     /// index per head of it.
     ///
     /// `None` when the job asked for none — and when it asked and the leaf

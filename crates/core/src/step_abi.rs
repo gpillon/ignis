@@ -112,7 +112,7 @@ pub struct IgnisPrefillOptions {
     pub attention_key_count: i64,
     pub out_attention_scores: *mut f32,
     pub out_attention_read: *mut i32,
-    /// GitHub #263 (ADR 0039): the head set read beside the attention
+    /// GitHub #263 (ADR 0038): the head set read beside the attention
     /// readout, or none when `attention_set_count` is 0. Head `i` is
     /// query head `attention_set_query_heads[i]` of GQA layer
     /// `attention_set_gqa_ordinals[i]`; its argmax over the span minus
@@ -125,7 +125,7 @@ pub struct IgnisPrefillOptions {
     pub attention_excluded_count: u32,
     pub attention_excluded: *const i32,
     pub out_attention_set_argmax: *mut i32,
-    /// GitHub #264 (ADR 0040): with the set, head `i`'s own score at its
+    /// GitHub #264 (ADR 0038): with the set, head `i`'s own score at its
     /// argmax, and the four scores around it — the argmax's left, right,
     /// up and down neighbours in an image grid of `attention_grid_cols`
     /// columns, `NaN` for one off the grid.

@@ -1,4 +1,4 @@
-//! Spec 14 acceptance 1, its last clause (GitHub #263, ADR 0039): **if any
+//! Spec 14 acceptance 1, its last clause (GitHub #263, ADR 0038): **if any
 //! armed layer cannot read, the question fails** — through the production
 //! `CudaLeaf` and `RuntimeCompute`, on an hq-e8-2b load with vision.
 //!
