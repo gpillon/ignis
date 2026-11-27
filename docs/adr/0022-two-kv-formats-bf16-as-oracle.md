@@ -5,9 +5,9 @@ status: accepted
 # Two KV formats, with BF16 retained as the correctness oracle
 
 Both KV formats ship, and the format is a model-load option, fixed for the life of a load. hq-e8-2b is the serving
-default: the capacity argument is decisive, a sequence-token costing about a seventh of BF16's bytes
-([finding](../findings/2026-09-11-hq-e8-2b-kv-capacity.md)), and without it `N-lane concurrency` in `GLOSSARY.md` is a
-short-context promise. The reference served in hq-e8-2b the whole time, so while ignis carried only BF16 every
+default: the capacity argument is decisive at the 27B's geometry, a sequence-token costing about a seventh of BF16's
+bytes ([finding](../findings/2026-09-11-hq-e8-2b-kv-capacity.md)), and without it `N-lane concurrency` in `GLOSSARY.md`
+is a short-context promise. The reference served in hq-e8-2b the whole time, so while ignis carried only BF16 every
 comparison of the two recorded the format difference as a known inequality rather than measuring through it (the
 measuring rule in the opening comment of `crates/bench/src/lib.rs`, `g2::Verdict::notes`). BF16 is retained, and is
 the format every correctness oracle runs against; the GPU profile keeps its correctness checks on it.
