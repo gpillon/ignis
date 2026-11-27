@@ -4,9 +4,10 @@ status: accepted
 
 # A client may unload the active model at once, and load it again without generating
 
+Without the two routes of this decision,
 [ADR 0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) gives the card back only after
 `model.idle_unload` seconds with nobody using the model, and leaves `unloaded` only when a request needs the
-model, a switch or a reloading `PATCH /v1/config` loads one. A client sharing the card with another program, a
+model, a switch or a reloading `PATCH /v1/config` loads one: a client sharing the card with another program, a
 video encoder on a 16 GB card for instance, cannot give it back when it knows it is done, nor take it again before
 its first request without generating. So two routes do both on the active model, with OpenAI's retrieve beside them.
 
