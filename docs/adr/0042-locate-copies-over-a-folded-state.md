@@ -5,7 +5,8 @@ status: accepted
 # A locate narrows by attention heads and decides by a labelled choice, by kind of text
 
 The texts a `locate` is for are logs, documents and record arrays of hundreds of thousands to millions of tokens,
-and the head vote of ADR 0041 is one prefill measured on short spans: on real logs it finds the right kind of line
+and the head vote of ADR 0041 is one pass over the text, measured on short spans: on real logs it finds the right kind of
+line
 and loses the instance among its near-duplicates
 ([finding](../findings/2026-09-28-locating-a-line-in-real-logs.md)). Read at each line's end the heads keep the
 right line among their first few candidates even at great length, and a labelled `choice` resolves near-duplicates
@@ -32,8 +33,9 @@ decides, with a reading per kind of text, and the vote stays as the other method
   twin, the scores standardized per window and merged. The context stops being the limit of a `locate`.
 - **`auto`**: a JSON array of objects is `records`; otherwise the fold's own statistic tells a log, a target whose
   first segments fall largely in shared templates, from prose.
-- **The answer names the resolved kind, method and compression**, and carries `pointers`, every final candidate the
-  `choice` gave a share worth naming, and `found`.
+- **The answer names the resolved kind, method and compression**, and carries `found` and `pointers`, every final
+  candidate the `choice` gave a share worth naming: prose often answers with several sentences, and the `choice`'s
+  probabilities give them.
 - **The vote is kept unchanged** under `vote` with no compression, bounded by its measured ceiling. The calibration
   table gains the end heads, the sum heads and the window per artifact, and both methods need it: a load with no
   `locate` calibration refuses both.
