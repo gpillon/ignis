@@ -36,6 +36,9 @@ ported, its source being a design reference.
   run alone.** The chain's rows are scratch: built from the head's hidden, not the target's, they are not entries. The
   head drafts the fixed draft, at every temperature, its only rule. The continuation hidden moves last, so a round
   that fails before it leaves the lane's frontier and its hidden together.
+- **The head's state is held to its weights in double precision**: that state, the head's first draft at the frontier
+  and its scores are held to a double-precision recomputation from the stored `mtp/` weights, from the exact BF16
+  inputs the device read, under BF16 KV, within the relative L2 the BF16 roundings on each path allow.
 - **The head's state is held to the committed run in each round, not bit for bit against a sequence that committed
   the same tokens by plain rounds**, as spec #618 asked. That cannot hold, for a reason outside the head: a committed
   row is built from the target's hidden at its position, which is the round's that computed it, and a plain round's, a
