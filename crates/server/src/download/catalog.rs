@@ -25,7 +25,9 @@
 //! an alias resolves. [`Catalog::answering`] is the one card-aware step a
 //! requested id goes through — at start, for a switch, a request, a download
 //! and `GET /v1/models` — so a model the card cannot load is refused before
-//! anything is torn down or fetched.
+//! anything is torn down or fetched. `GET /v1/models` lists an entry above
+//! the card as unavailable with its reason, which names the entry that
+//! answers to its id here when one does ([`Catalog::unavailable`]).
 //!
 //! The rules of that step and of the aliases it reads (ADR 0064). An entry
 //! that states no class is never refused by class, and the VRAM plan's
