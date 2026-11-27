@@ -52,7 +52,8 @@ the same machine. With the scripts, the server touches no file and ADR 0073's "i
 
 ## Consequences
 
-- **The tool list depends on the start configuration alone.** The tools that change the server are listed only when
+- **The tool list depends on the start configuration alone.** `decide`, `generate_image`, `read_config`,
+  `describe_config` and `read_catalog` are always listed; the tools that change the server are listed only when
   `connector.allow_changes` is on, and it is off by default; `connector.enabled` is on by default and, off, the MCP
   server and the skill's route answer 404. Both are config fields declared once like any other (ADR 0046), but they
   take effect at start only and cannot be patched.
