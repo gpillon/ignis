@@ -6,7 +6,7 @@ status: accepted
 
 An op the program takes from the reference is a verbatim vendored copy of the reference's op: the kernel, its
 launcher, its public wrapper and header, its storage-layout decoders and its own op test, never a scalar
-re-implementation. This is what "port the proven CUDA" means in ADR 0005: vendored verbatim under the manifest. The
+re-implementation. This is what ADR 0005 means by its ported CUDA kernels: vendored verbatim under the manifest. The
 hand-written stand-ins it replaced, under headers that claimed a 1:1 port, were 10 to 100 times slower than the
 reference's ops and wrong as well, since the storage-layout decoders went with the kernels and the scale plane and
 the weight divisor were the first things lost; a reviewer who trusted the header would not have opened the
