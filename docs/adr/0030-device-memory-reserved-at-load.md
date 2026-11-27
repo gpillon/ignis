@@ -1,6 +1,6 @@
 ---
 status: accepted
-amended-by: [ADR-0045, ADR-0092, ADR-0101]
+amended-by: [ADR-0092, ADR-0101]
 ---
 
 # ADR 0030 — device memory reserved at load, within a VRAM budget

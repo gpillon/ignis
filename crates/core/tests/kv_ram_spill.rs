@@ -959,7 +959,7 @@ fn a_claim_given_up_and_chosen_again_is_one_hit_where_it_lands() {
     // continuing T's conversation, chooses the checkpoint and waits: its 8
     // pages past it do not fit beside X. I, Interactive, needs 57 pages, which
     // only R's claim keeps out: R ranks below I, so its claim goes as retained
-    // state goes (ADR 0045 as amended by #445), the checkpoint goes to KV-RAM,
+    // state goes (ADR 0045, #445), the checkpoint goes to KV-RAM,
     // and I enters. Once I and X are done R chooses the checkpoint again, in
     // KV-RAM, and lands it there. It resumed once: one hit, in KV-RAM, and
     // none on the device for the claim it gave up.

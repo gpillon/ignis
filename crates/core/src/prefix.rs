@@ -652,7 +652,7 @@ impl PrefixCache {
 
     /// The pages of `entry`'s chain that come back once one of its holders
     /// lets go and the retained state left on the chain is given up (GitHub
-    /// #444, ADR 0045 as amended 2026-10-31): what a live request standing on
+    /// #444, ADR 0045): what a live request standing on
     /// `entry` frees by leaving the device, whether it published the chain,
     /// lent it or claimed it. 0 when `entry` is gone.
     ///
@@ -678,8 +678,8 @@ impl PrefixCache {
     }
 
     /// The links that come back once the holders `letting_go` counts on each
-    /// link let go, whatever order they go in (GitHub #445, ADR 0045 as
-    /// amended 2026-10-31): a link goes when they are all of its holders but
+    /// link let go, whatever order they go in (GitHub #445, ADR 0045):
+    /// a link goes when they are all of its holders but
     /// the links above it that go too, each of which held one reference on
     /// it. Unlike [`PrefixCache::pages_a_holder_frees`], which follows one
     /// holder up its chain, a link two holders reach through links of their

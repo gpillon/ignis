@@ -39,7 +39,7 @@ edit it by hand.
 | [0027](0027-make-as-the-dev-entrypoint.md) | make is the development entry point, with per-OS hooks | accepted | |
 | [0028](0028-expose-modes-always-keyed.md) | Exposure is a named mode, and an exposed server always has a key | accepted | |
 | [0029](0029-cross-request-state-reuse.md) | Cross-request state reuse: content-matched retained state across three residency tiers | accepted | |
-| [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md), [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) |
+| [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md), [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
 | [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
@@ -54,7 +54,7 @@ edit it by hand.
 | [0042](0042-locate-copies-over-a-folded-state.md) | a locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
 | [0043](0043-a-second-model-without-a-ninfer-reference.md) | A second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | |
 | [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
-| [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | the KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) |
+| [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | The KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | |
 | [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted | |
 | [0047](0047-a-catalog-the-operator-can-extend.md) | a model catalog the operator can extend, and a `model` command to fetch from it | accepted | [0064](0064-a-catalog-entry-states-its-card-class.md), [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) |
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | An end of turn drawn inside an open reasoning block closes the block instead | accepted | |
@@ -62,7 +62,7 @@ edit it by hand.
 | [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
 | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted | |
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | A reasoning loop is taken back, the model is nudged, and the client is told | accepted | |
-| [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | a resident Flash-Next load keeps its experts only in VRAM | accepted | |
+| [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | A resident Flash-Next load keeps its experts only in VRAM | accepted | |
 | [0055](0055-a-pinned-hot-set-is-opt-in.md) | A pinned hot set of experts: a field off by default, which the rtx5090 profile sets | accepted | |
 | [0056](0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md) | Speculation past 8 verify rows is numerically equivalent, not bit-exact | accepted | |
 | [0057](0057-rope-scaling-is-auto-by-default.md) | Rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
