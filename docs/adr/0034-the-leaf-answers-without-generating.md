@@ -10,7 +10,9 @@ branch, paying a decode round per token and a parser that has to survive every s
 the answer is already in the model before a token is generated: a prompt that names each option by a label puts the
 decision in one position's next-token distribution
 ([finding](../findings/2026-09-19-typed-option-logit-readout.md)). So the leaf grows two paths beside decode, and
-the sampling invariant is restated for them rather than excepted.
+the sampling invariant is restated for them rather than excepted: lane independence rests on the glossary's sentence
+that logits are never shipped to the host, and a feature that quietly contradicted it would leave a reader unable to
+trust either the sentence or the code.
 
 - **A readout receives logits and draws no sample.** The answer tokens go in across the `Compute` seam and the
   readout comes out. The gather happens below the seam: the full-vocabulary buffer never crosses it, only the answer
@@ -48,7 +50,8 @@ the sampling invariant is restated for them rather than excepted.
 
 - The `Compute` trait is no longer purely "give me tokens". It is the only GPU-coupled seam in the engine and it
   carries a second kind of answer, so every CPU-only implementation of it, the mock above all, must produce a
-  deterministic readout, or the scheduler's tests stop covering the path (ADR 0006).
+  deterministic readout, or the scheduler's tests stop covering the path (ADR 0006: the engine is testable without a
+  GPU).
 - A decision holds no residency and takes no decode lane, so eviction priority has nothing of its to take and the
   admission classes mean something different for it. That is why a decision request defaults to `Agent` where every
   other route defaults to `Interactive`.
