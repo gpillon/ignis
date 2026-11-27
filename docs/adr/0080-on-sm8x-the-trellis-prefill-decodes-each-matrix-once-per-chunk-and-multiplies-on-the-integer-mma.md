@@ -33,7 +33,9 @@ balance per SM.
   vendored chunked kernels there only if the RTX 5090 measures them faster with its KLD holding, which it did on
   Blackwell's default routes, the fused prefill and the FP8 band, with one binary for both routes
   ([finding](../findings/2026-11-08-blackwell-gdn-prefill-on-ignis-kernels.md)): the kernels alone ran 2.4 to 2.6
-  times faster, the time to first token was shorter on both 27B entries, and the full-vocabulary KLD against BF16
+  times faster; the time to first token was shorter on both 27B entries over alternated legs, on the NVFP4 entry
+  within each regime of its legs (the finding says why its registered rule's second part failed there); and the
+  full-vocabulary KLD against BF16
   stayed within its interval on both. The vendored kernels stay the leaf test's oracle and the other route of
   `IGNIS_GDN_PREFILL=vendored|ours`, a switch for a measurement on every card, not a setting. Flash-Next keeps its
   own vendored GDN layers.
