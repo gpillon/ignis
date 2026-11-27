@@ -7,7 +7,7 @@
 //! decision to the vendored dispatch's own per-projection token thresholds
 //! (the A4 multi-token kernels where they exist). The two routes are
 //! teacher-forced on the identical span and tail, and their agreement must
-//! clear the same G1 floor (>= 95%, ADR 0014) the canary suite uses -- a
+//! clear the same G1 floor (>= 95%, ADR 0082) the canary suite uses -- a
 //! drop below the floor is filed as its own ticket, never waived here.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`

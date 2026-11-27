@@ -15,7 +15,7 @@ ignis has carried BF16 KV since G1 because the review chose it as the first KV
 dtype and put hq-e8-2b at G4 (§7 decision 5). The reference has run hq-e8-2b in
 the owner's production profile the whole time, so every gate verdict to date
 records the format difference as a known inequality rather than measuring
-through it (ADR 0015; `crates/bench/src/g2.rs:416`).
+through it (ADR 0082; `crates/bench/src/g2.rs:416`).
 
 The capacity argument for hq is decisive at this geometry. A sequence-token
 costs 65,536 bytes of BF16 KV against 9,216 bytes of hq-e8-2b, a factor of
@@ -26,7 +26,7 @@ promise until that changes.
 The complication is not the codec, which is vendored and whose format keeps the
 paged-KV contract's fixed-bytes-per-token property. It is that every
 correctness oracle this project owns was calibrated on BF16: the teacher-forced
-canary floor (ADR 0014), the f64 layer references, and the chunked-versus-
+canary floor (ADR 0082), the f64 layer references, and the chunked-versus-
 per-token self-oracle. Replacing the KV format outright would re-derive all of
 those tolerances under a lossy format in the same change that introduces the
 lossy format — and #96 is this project's own record of what a tolerance nobody
