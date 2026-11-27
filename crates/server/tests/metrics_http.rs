@@ -600,7 +600,7 @@ async fn labels_stay_within_the_bounded_sets() {
         "ignis_retained_state_spills_total",
         "ignis_retained_state_discards_total",
         "ignis_retained_state_restores_total",
-        // GitHub #216, ADR 0030 §Observability.
+        // GitHub #216, ADR 0030.
         "ignis_retained_slot_skips_total",
         "ignis_retained_slots",
         "ignis_vram_reserved_bytes",
@@ -630,9 +630,9 @@ async fn labels_stay_within_the_bounded_sets() {
     .collect();
     assert_eq!(names, expected, "{text}");
 
-    /// The plan's sixteen lines, as ADR 0030 §Observability spells them
-    /// (GitHub #339 added `trellis_workspace`, #509 `trellis_dense`, #650
-    /// `tma_descriptors`, ADR 0101, #714 `mixed_graphs`), then Flash-Next's
+    /// The plan's sixteen lines, in the plan's own spellings (ADR 0030;
+    /// GitHub #339 added `trellis_workspace`, #509 `trellis_dense`, #650
+    /// `tma_descriptors`, #714 `mixed_graphs`), then Flash-Next's
     /// two and the image model's condition budget.
     const VRAM_LINES: &[&str] = &[
         "weights",
@@ -670,7 +670,7 @@ async fn labels_stay_within_the_bounded_sets() {
             // and never per allocation.
             "ignis_vram_reserved_bytes" => &[("line", VRAM_LINES)],
             // Two states of one family, and the two families spell the
-            // second one differently (ADR 0030 §Observability).
+            // second one differently (ADR 0030).
             "ignis_kv_ram_arena_bytes" => &[("state", &["capacity", "used"])],
             "ignis_retained_slots" => &[("state", &["capacity", "in_use"])],
             "ignis_retained_slot_skips_total" => &[(

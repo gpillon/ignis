@@ -414,7 +414,7 @@ async fn main() {
         }
     };
 
-    // GitHub #216 (ADR 0030 §Observability): what the load's VRAM plan
+    // GitHub #216 (ADR 0030): what the load's VRAM plan
     // reserved, kept past the load so `/metrics` can name it. `None` on the
     // placeholder path, which loads no model and plans no device memory, and
     // on a build without `cuda`, which plans none either.

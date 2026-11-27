@@ -58,7 +58,7 @@ Flash-Next). The lines include:
   product's tensor maps on the device instead of allocating and copying them
   before every product, so the first request after a load
   allocates nothing a later one does not
-  ([ADR 0101](../../adr/0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md)).
+  ([ADR 0030](../../adr/0030-device-memory-reserved-at-load.md)).
   0 on Linux, which passes the maps by value, on every
   other entry and card, and below a 1,024-token chunk;
 - the **lane state** of every decode lane (on the 27B, about 144 MiB per lane
@@ -217,3 +217,9 @@ the load, and it is the figure Windows reports as shared GPU memory
   ([the Playground](../playground/index.md)).
 - Prometheus gauges carry the plan lines, the KV pool and KV-RAM; they read zero
   while no model is loaded ([telemetry](../guides/telemetry.md)).
+- With the image model loaded the same gauges carry its plan:
+  `ignis_vram_reserved_bytes` has its weights as `weights`, the one arena its
+  calls share as `workspace` and its condition budget as `condition_budget`
+  (0 on a text load), `ignis_kv_pool_pages` reads 0, since it has no KV pool,
+  and `ignis_condition_budget_used_bytes` reads what its jobs hold of that
+  budget ([Metrics](../reference/metrics.md)).
