@@ -1,0 +1,56 @@
+# Running the gate
+
+ADR 0082's gate admits an artifact, or a change to a served route's numerics,
+by three legs measured on ignis alone, in the load the artifact serves. The
+decision, what passes each leg and who approves a limit are the ADR's. This
+page says how each leg is run, and lists the limits registered so far. The
+release's sm_86 gate is in [testing.md](../testing.md#the-sm_86-gate).
+
+The sets the legs read are not in the repo (ADR 0082), so the gate runs where
+they are: check `make gpu-status` first, as for any GPU run.
+
+## KLD against BF16
+
+- The engine's `span_logits` dump of set A, at the serving configuration
+  (hq-e8-2b KV, the served chunk), is scored per position against the model's
+  own BF16 checkpoint, run layer by layer: KL(BF16 ‖ engine) over the full
+  vocabulary, the mean over every position, with top-1 and a window-bootstrap
+  95% CI beside it. The tools, set A's windows and the commands are in
+  [`tools/kld-gate/README.md`](../../../tools/kld-gate/README.md) (`ref_kld.py`,
+  `gate1.py`).
+- A fine-tune is scored against its own BF16, with `gate1.py`'s two cross
+  terms. Each holds when the 95% CI of its difference from the matched pair is
+  above 0; its count of windows above is reported, not required.
+- Where the card cannot run the checkpoint, the reference is the BF16 model's
+  64 most probable tokens per position, built once on the RTX 5090
+  (`ref_top64.py`, `score_top64.py`).
+
+## DFlash2 on against off
+
+- Nine decode cells, the ones #340 measured: 8,192, 65,536 and 253,440 tokens
+  of context, each at one lane cold, at two lanes, and at one lane with reuse.
+  Decode tok/s, the drafter on against off.
+- Reported beside it, not binding: #267's teacher-forced replay of 200 recorded
+  agent turns, tokens per round against the counterpart's, with the 0.90 floor
+  that #340 and #422 held as binding.
+
+## Loop rate
+
+- #340's loop set, four prompts at seeds 101 to 108, 32 requests, runs on the
+  artifact and on its counterpart: one build, the same prompts and seeds.
+- A request loops if the guard rewound it, if its reasoning holds a 6-gram at
+  least 25 times, or if its worst 3,000-character zlib window compresses below
+  0.20.
+- The leg fails if the artifact loops more, at a one-sided Fisher exact p
+  below 0.05 on the pooled counts.
+- It is the one leg that runs with the loop guard at its default, since a
+  rewind is one of its calls.
+
+## Registered limits
+
+Once registered a limit is a number (ADR 0082). The ones registered so far:
+
+| What | Limit | From |
+|---|---|---|
+| The NVFP4 layout at chunk 2,048 | KLD at most 0.0590 | 1.2 × 0.04916 |
+| The 16 GB body at chunk 1,024 | KLD at most 0.0484 | 1.2 × 0.04034 |

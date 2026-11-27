@@ -1,7 +1,7 @@
 ---
 status: accepted
 supersedes: [ADR-0003]
-amended-by: [ADR-0050, ADR-0082]
+amended-by: [ADR-0050]
 ---
 
 # ADR 0007 — The 99% gate is a performance gate, not a parity gate

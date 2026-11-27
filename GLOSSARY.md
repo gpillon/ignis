@@ -2052,11 +2052,11 @@ since ADR 0082: the KLD against BF16 does.
 How the canary oracle is scored, and the G1 correctness floor: at each of the
 first 32 positions the engine is fed the *oracle's own* token prefix, and its
 greedy next-token argmax is compared with the oracle's recorded token. The
-floor is ≥ 95% overall (ADR 0014).
+floor is ≥ 95% overall (ADR 0082).
 
 **Free-running agreement**:
 The older scoring, where the engine generates its own continuation and the two
-token streams are diffed. **Diagnostic only** (ADR 0014): after the first
+token streams are diffed. **Diagnostic only** (ADR 0082): after the first
 divergence the engines no longer share a prefix, so it measures continuation
 similarity, not forward-pass health.
 
@@ -2126,7 +2126,7 @@ Re-sending a recorded "1 main agent + N subagents" load trace against both
 engines to compare scheduler behavior, scored per **lane tag**. The trace is
 the load, not the baseline: the reference's own run is measured live in the
 same session (**live/live gate**), over at least two launches per engine (ADR
-0021), and the verdict is the pooled cell statistic.
+0082), and the verdict is the pooled cell statistic.
 
 **Load trace**:
 The recorded agent session a **trace replay** sends. It holds real working

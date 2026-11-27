@@ -1,5 +1,5 @@
 //! DFlash2 on a multimodal prefill span (GitHub #195, spec
-//! `docs/specs/vision/01-image-input.md` §Compute seam, ADR 0014).
+//! of GitHub #174, §Compute seam).
 //!
 //! GitHub #178 fenced `--vision-enabled` and `--spec-backend dflash2` apart at load. What
 //! stood in the way was one thing: the verify round staged each lane's raw KV
@@ -17,7 +17,7 @@
 //!
 //! - AC 1: `--vision-enabled` with `--spec-backend dflash2` loads -- the tower and the
 //!   drafter bind together and the vision reservation is still reported.
-//! - AC 2: the vision canary's teacher-forced floor (ADR 0014, >= 95%) holds
+//! - AC 2: the vision canary's teacher-forced floor (ADR 0082, >= 95%) holds
 //!   on this load, so the drafter riding the multimodal prefill does not
 //!   disturb the target's own next-token agreement with the reference.
 //! - AC 3: greedy spec-on equals spec-off on the canary images. Spec-off here
@@ -111,7 +111,7 @@ const WINDOW: u32 = 7;
 /// whatever the round's extent, the columns past it padded with the anchor
 /// (`lane_columns` in `run_verify_round`, `kernel/src/step.cu`).
 const VERIFY_COLUMNS: u32 = WINDOW + 1;
-/// Scored teacher-forced positions per canary (ADR 0014's first 32).
+/// Scored teacher-forced positions per canary (the text canary's first 32).
 const FIRST_N: usize = 32;
 /// Tokens each canary emits in the spec-on/spec-off comparison.
 const TOTAL: usize = 48;
@@ -571,7 +571,7 @@ fn follows_an_image_prompt(backend: SpeculativeBackend) {
         assert_eq!(embedding.columns() as usize, item.token_span.count);
         let mut logits = vec![0f32; vocab];
 
-        // --- AC 2: ADR 0014's floor, on this load ------------------------
+        // --- AC 2: the canary floor (ADR 0082), on this load -------------
         {
             let mut sequence = prefilled(&model, &pool, &prompt, &embedding, PREFILL_CHUNK, &mut logits);
             let compared = FIRST_N.min(canary.expected.len());

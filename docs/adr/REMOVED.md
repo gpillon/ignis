@@ -11,3 +11,6 @@ holds this list to the folder.
 
 | ADR | Title | File | Where it went |
 |---|---|---|---|
+| 0014 | G1's cross-engine canary floor is teacher-forced next-token agreement | `0014-g1-teacher-forced-canary-agreement.md` | ADR 0082, which retired G1 as a gate and keeps its scoring for the canary test; the scoring rule is the opening comment of `crates/bench/src/oracle.rs` |
+| 0015 | G2 is judged live/live against the reference, on cold-prefix samples | `0015-g2-live-live-cold-prefix-gate.md` | retired by ADR 0082; the measuring rule the bench instruments still follow is the opening comment of `crates/bench/src/lib.rs` |
+| 0021 | a live/live gate pools at least two independent process launches per engine | `0021-live-live-launch-pooling.md` | retired as a gate's rule by ADR 0082, which keeps the two launches for a speed claim; its measurement is `docs/findings/2026-09-10-one-process-launch-picks-its-own-throughput-band.md` |
