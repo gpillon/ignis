@@ -292,7 +292,7 @@ The 27B's trellis prefill route (spec #503, GitHub #505): `fp16` (the fused pref
 | Models | Qwen3.8-27B |
 | `/v1/config` | shown by `GET`, patchable, with a model reload |
 
-How the 27B holds its nine BF16 exception tensors on the device (GitHub #341, #682): `fp8`, converted at load to FP8 row-scale for the FP8 tensor cores, or `bf16`, as the artifact stores them. `auto`, the default, is `fp8` on a card of compute capability 12.0 (the RTX 50 and RTX PRO cards), which runs the block-scaled FP8 MMA, and `bf16` on any other card and when no card is read. A named `bf16` is kept on every card; a named `fp8` is refused below 12.0. FP8 holds 534.6 MB less, which the KV pool takes, and changes greedy text against a BF16 load (ADR 0103). The load's `ignis.runtime.exception_weights` line names the value it runs and where it came from. A trellis artifact holds no BF16 exception tensor, so the field changes nothing there; Flash-Next has none.
+How the 27B holds its nine BF16 exception tensors on the device (GitHub #341, #682): `fp8`, converted at load to FP8 row-scale for the FP8 tensor cores, or `bf16`, as the artifact stores them. `auto`, the default, is `fp8` on a card of compute capability 12.0 (the RTX 50 and RTX PRO cards), which runs the block-scaled FP8 MMA, and `bf16` on any other card and when no card is read. A named `bf16` is kept on every card; a named `fp8` is refused below 12.0. FP8 holds 534.6 MB less, which the KV pool takes, and changes greedy text against a BF16 load (ADR 0065). The load's `ignis.runtime.exception_weights` line names the value it runs and where it came from. A trellis artifact holds no BF16 exception tensor, so the field changes nothing there; Flash-Next has none.
 
 ### `model.prefill_chunk`
 

@@ -8,7 +8,7 @@
 - Topic: artifacts-and-gates
 - Related: GitHub #341 (spec [prefill-5090/01](../specs/prefill-5090/01-the-prefill-fixed-part.md), lever 1), [ADR 0065](../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md), [the prefill chunk at 2,048](2026-10-21-the-27b-prefill-chunk-at-2048.md) (the same session's method, the baseline width), [image model kernels](2026-10-13-image-model-kernels-on-the-5090.md) (the W8A8 GEMM), `.scratch/341/`
 - Superseded by: none
-- Corrected by: [ADR 0103](../adr/0103-on-compute-capability-12-0-the-27b-holds-its-exception-tensors-in-fp8-by-default.md), [the decide regression sets under both exception weights](2026-11-18-the-decide-regression-sets-under-both-exception-weights.md)
+- Corrected by: [ADR 0065](../adr/0065-the-bf16-exception-tensors-can-be-held-in-fp8.md), [FP8 exception weights at their served shape](2026-11-18-the-27bs-fp8-exception-weights-at-their-served-shape-on-the-rtx-5090.md), [the decide regression sets under both exception weights](2026-11-18-the-decide-regression-sets-under-both-exception-weights.md)
 - Summary: Held in FP8 row-scale and converted at load, the 27B's nine BF16 exception matrices free 534.6 MB and speed cold prefill 2.8-4.1% at the same 4K KLD; the two fixture reads that kept FP8 opt-in proved a coin, and FP8 is the default on 12.0.
 
 ## Question
