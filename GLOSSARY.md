@@ -1957,8 +1957,10 @@ logs, and spans (ADR 0012).
 **Hot-path logging constraint**:
 Normal INFO operation must not emit one record per
 token/layer/kernel/allocation on the prefill/decode path; any logging or
-tracing change touching that path must pass the G4 performance gate (ADR
-0007) before merge, not just design review.
+tracing change touching that path must have its cost to decode speed measured
+before merge, ignis against ignis as ADR 0082 states for a speed claim (a
+branch against main, at least two launches per build), not just design
+review.
 
 **Hotpath lint**:
 The grep-based, hand-maintained scan over a fixed list of
