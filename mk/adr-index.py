@@ -2,15 +2,19 @@
 """The ADR index, generated from each ADR's frontmatter, and its check (docs/agents/domain.md).
 
     python3 mk/adr-index.py --write      regenerate docs/adr/README.md
-    python3 mk/adr-index.py --check      fail on a wrong frontmatter or a stale index
+    python3 mk/adr-index.py --check      fail on a wrong frontmatter, a stale index, a
+                                         citation of an ADR that has no file, or a
+                                         wrong list of removed ADRs
     python3 mk/adr-index.py --check --since REV
-                                         and on an accepted ADR `proposed` again since REV
+                                         and on an accepted ADR `proposed` again, or
+                                         gone with no line in that list, since REV
     python3 mk/adr-index.py --selftest   the check's own test, on fixtures in a temp directory
 
 `make records` and `make records-check` run it with the host's Python
 (`python` on Windows, `python3` elsewhere: the PYTHON hook of mk/os/<os>.mk),
-and the records workflow runs it on every push that touches docs/adr/. It is
-the standard library alone, so it needs no virtual environment.
+and the records workflow runs it on every push, since a citation of an ADR can
+be anywhere. It is the standard library alone, so it needs no virtual
+environment.
 
 Every `docs/adr/NNNN-*.md` opens with a frontmatter and a blank line before its
 heading:
@@ -37,9 +41,11 @@ With --since, the check also compares the ADRs with what they were at the merge
 base of REV and HEAD. An ADR's text may change: a decision that changes rewrites
 its ADR in place, under its number, and the earlier versions are the history of
 its file (ADR 0081). What the check refuses is an ADR that was no longer
-`proposed` at that base and is `proposed` now, or is gone: an accepted ADR never
-goes back to `proposed`, and a change that still waits for the owner stays in
-its issue or its branch. For each of those ADRs whose text changed it prints a
+`proposed` at that base and is `proposed` now: an accepted ADR never goes back
+to `proposed`, and a change that still waits for the owner stays in its issue
+or its branch. And one that is gone with no line in the list of removed ADRs,
+or whose line names another file than the one it had. For each of those ADRs
+whose text changed it prints a
 note, because the live places that cite a changed ADR are reread in the same
 change. The text is compared as mk/changelog.sh compares it, the frontmatter
 dropped and every link target and every path in backticks blanked, so a status,
@@ -51,6 +57,27 @@ release notes (mk/changelog.sh).
 `--since auto` is the merge base with origin/main, which `make records-check`
 uses, and is skipped with a note in a clone with no origin/main or no git; the
 records workflow passes the push's or the pull request's base.
+
+An ADR can be deleted (docs/agents/domain.md says when), and nothing is left
+pointing at it. The check reads every live file of the checkout, the tracked
+ones and the new ones git does not ignore, and refuses a citation of an ADR
+that has no file, deleted or never written: `ADR 0029`, `ADR-0029`, a list or a
+range of them, or a path into docs/adr/. Live is everything but HISTORICAL
+below, and FIXTURES, the tests that build ADRs of their own. Outside a git
+checkout the files are unknown, and it says that no citation was checked.
+
+docs/adr/REMOVED.md is the list of removed ADRs, written by hand, one line of a
+table for each in ascending order:
+
+    | 0070 | Its title | `0070-the-name-its-file-had.md` | where it went |
+
+Where it went names the ADR that now holds the decision (`ADR 0045`), the home
+that took the content as a path from the root in backticks, or says that the
+decision was retired. The check refuses a line out of that format or that
+order, one that names no such place or one that does not exist, and a line for
+an ADR that still has a file. That last one is also a new ADR on a removed
+number, which is never used again: its message names the next free number, one
+above every number in the folder and in the list.
 """
 
 import argparse
@@ -67,7 +94,7 @@ STATUS = re.compile(r"(?:proposed|accepted|deprecated|superseded by (ADR-\d{4}))
 REF_LIST = re.compile(r"\[(ADR-\d{4}(?:, ADR-\d{4})*)\]")
 KEY_LINE = re.compile(r"([A-Za-z_-]+): (.*)")
 ADR_FILE = re.compile(r"(\d{4})-[a-z0-9][a-z0-9-]*\.md")
-# The short format (ADR 0070) takes the number from the file name only.
+# The short format takes the number from the file name only.
 BARE_TITLE_FROM = 70
 NUMBERED = re.compile(r"ADR[ -]?\d{4}\b")
 # "ADR 0001 — title" in the long form; the index shows the title alone.
@@ -84,12 +111,14 @@ Each ADR states what holds today, and why: a decision that changes rewrites its
 ADR in place, and the earlier versions are the history of its file,
 `git log -p -- "docs/adr/NNNN-*"`.
 
-How an ADR is written, numbered and changed is in
+How an ADR is written, numbered, changed and removed is in
 [docs/agents/domain.md](../agents/domain.md), and
-[ADR 0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md)
-lists where the repo differs from the `/domain-modeling` skill. This file is
-generated from the ADRs' frontmatter by `mk/adr-index.py` (`make records`), and
-`make records-check` fails when it is out of date: never edit it by hand.
+[docs/agents/skill-differences.md](../agents/skill-differences.md)
+lists where the repo differs from the `/domain-modeling` skill. An ADR that
+left the tree is in [REMOVED.md](REMOVED.md), with where its decision went.
+This file is generated from the ADRs' frontmatter by `mk/adr-index.py`
+(`make records`), and `make records-check` fails when it is out of date: never
+edit it by hand.
 
 | ADR | Title | Status | Amended by |
 |---|---|---|---|
@@ -193,7 +222,7 @@ def parse(path, problems):
     if adr.heading is None:
         problem("no '# ' heading")
     elif int(adr.number) >= BARE_TITLE_FROM and NUMBERED.match(adr.heading):
-        problem(f"from ADR 0070 on the heading is the bare title, without its number: "
+        problem(f"from number 0070 on the heading is the bare title, without its number: "
                 f"{adr.heading!r}")
     return adr
 
@@ -203,7 +232,7 @@ def load(adr_dir):
     problems = []
     adrs = {}
     for path in sorted(adr_dir.glob("*.md")):
-        if path.name == INDEX:
+        if path.name in (INDEX, REMOVED):
             continue
         if not ADR_FILE.fullmatch(path.name):
             problems.append(f"docs/adr/{path.name}: not an ADR file name (NNNN-slug.md, "
@@ -252,6 +281,134 @@ def load(adr_dir):
                 problems.append(f"docs/adr/{other.name}: {ref(adr.number)} is superseded by it, "
                                 f"but its supersedes does not list {ref(adr.number)}")
     return adrs, problems
+
+
+# The list of removed ADRs, beside the index.
+REMOVED = "REMOVED.md"
+# Everything is live but this historical set, where an ADR that left the tree
+# stays cited as it was written: the findings, the specs and the archive from
+# before 2026-10-25 (whole, or the page that says where they went), and the
+# release notes the guide's build writes. Commit messages and issues are
+# historical too, and are not files. A folder nobody lists here is live.
+HISTORICAL = ("docs/findings/", "docs/specs/", "docs/archive/", "docs/user/changelog/")
+# Tests that build ADRs of their own, under numbers that mean nothing outside.
+FIXTURES = ("mk/adr-index.py", "mk/changelog-selftest.sh",
+            "docs/site/src/plugins/relative-links.test.mjs")
+# A citation is "ADR 0029" or "ADR-0029", a list or a range after it ("ADRs
+# 0029, 0030 and 0045", "ADR 0015/0021", "ADRs 0001-0069": a range's two ends),
+# and a file of docs/adr/ by its path. Prose wraps, so a number may open the
+# next line behind a comment leader; a number there or further along a list is
+# read only with its leading zero, so a date or a size after a citation is not
+# one.
+GAP = r"(?:[ \t]+|[ \t]*\r?\n[ \t]*(?:(?://[/!]?|#+|\*|--|>)[ \t]*)?)"
+CITED = re.compile(
+    r"\bADRs?(?:[ -]?\d{4}|" + GAP + r"0\d{3})\b"
+    r"(?:(?:,?" + GAP + r"(?:and|or|to)" + GAP + r"|," + GAP + r"|[/–-])0\d{3}\b(?!-\d))*")
+CITED_PATH = re.compile(r"\badr/(\d{4})-[a-z0-9]")
+# In an ADR, a link to the ADR beside it.
+CITED_BESIDE = re.compile(r"\]\((\d{4})-[a-z0-9-]*\.md")
+
+
+# A line of the list: | 0070 | Its title | `0070-the-name-its-file-had.md` | where it went |
+LINE = re.compile(r"\| (\d{4}) \| (.+) \| `(\1-[a-z0-9][a-z0-9-]*\.md)` \| (.+) \|")
+
+
+def removed_adrs(adr_dir, adrs):
+    """The list of removed ADRs, the name each one's file had by its number,
+    and what the check refuses in it: a line out of its format or out of order,
+    one for an ADR that still exists, which is also a new ADR on a removed
+    number, and one that names no ADR, path or retirement as where the decision
+    went, or one that does not exist."""
+    listed = adr_dir / REMOVED
+    rows, problems = [], []
+
+    def problem(message):
+        problems.append(f"docs/adr/{REMOVED}: {message}")
+
+    text = listed.read_text(encoding="utf-8") if listed.exists() else ""
+    for at, line in enumerate(text.replace("\r\n", "\n").split("\n"), start=1):
+        if not line.startswith("|") or re.match(r"\| ?(?:ADR|-+) ?\|", line):
+            continue
+        row = LINE.fullmatch(line)
+        if not row:
+            problem(f"line {at} is not a line of the list: | NNNN | its title | "
+                    "`NNNN-the-name-its-file-had.md` | where its decision or its content went |")
+            continue
+        if rows and row.group(1) <= rows[-1][0]:
+            problem(f"the lines are not in ascending order without repeats: ADR {row.group(1)} "
+                    f"after ADR {rows[-1][0]}")
+        rows.append((row.group(1), row.group(3), row.group(4)))
+    removed = {number: name for number, name, _ in rows}
+    for number, name, went in rows:
+        if number in adrs and adrs[number].name == name:
+            problem(f"ADR {number} has a line here and its file, {name}, still exists: the "
+                    "line is written in the change that deletes the file")
+        elif number in adrs:
+            problems.append(
+                f"docs/adr/{adrs[number].name}: ADR {number} was removed (docs/adr/{REMOVED}: "
+                f"it was {name}) and a removed number is never used again: a new ADR takes "
+                f"the next free number, {max(map(int, [*adrs, *removed])) + 1:04d}")
+        holders = re.findall(r"ADR[ -]?(\d{4})", went)
+        homes = re.findall(r"`([^`]+)`", went)
+        for holder in holders:
+            if holder not in adrs:
+                problem(f"the line of ADR {number} says it went to ADR {holder}, which "
+                        + ("was removed too" if holder in removed else "does not exist"))
+        for home in homes:
+            if not (adr_dir.parent.parent / home.split("#")[0]).exists():
+                problem(f"the line of ADR {number} says it went to `{home}`, which does not "
+                        "exist")
+        if not holders and not homes and "retired" not in went.lower():
+            problem(f"the line of ADR {number} does not say where its decision or its content "
+                    "went: the ADR that holds it (ADR NNNN), the path, in backticks, of the "
+                    "home that took it, or that the decision was retired")
+    return removed, problems
+
+
+def dangling(adr_dir, adrs, removed):
+    """The citations, in the live files of the checkout, of an ADR that has no
+    file: one problem for each file and ADR, at the first line that cites it.
+    None when this is not a git checkout, whose files are then unknown."""
+    root = adr_dir.parent.parent
+    if shutil.which("git") is None:
+        return None
+    listed = git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if listed.returncode:
+        return None
+    folder = adr_dir.relative_to(root).as_posix() + "/"
+    problems = []
+    for path in sorted(set(listed.stdout.decode("utf-8", "replace").split("\0"))):
+        if not path or path.startswith(HISTORICAL) or path in FIXTURES:
+            continue
+        if path in (folder + INDEX, folder + REMOVED) or not (root / path).is_file():
+            continue
+        data = (root / path).read_bytes()
+        if b"\0" in data or (b"ADR" not in data and b"adr/" not in data):
+            continue
+        text = data.decode("utf-8", "replace")
+        start, patterns = 0, [CITED, CITED_PATH]
+        if path.startswith(folder):
+            # The frontmatter's references are the frontmatter check's.
+            front = re.match(r"---\r?\n.*?\n---\r?\n", text, re.DOTALL)
+            start = front.end() if front else 0
+            patterns.append(CITED_BESIDE)
+        lines = {}
+        for pattern in patterns:
+            for match in pattern.finditer(text, start):
+                cited = (re.findall(r"\d{4}", match.group(0)) if pattern is CITED
+                         else [match.group(1)])
+                for number in cited:
+                    if number not in adrs:
+                        lines.setdefault(number, set()).add(text.count("\n", 0, match.start()) + 1)
+        for number in sorted(lines):
+            at = sorted(lines[number])
+            more = (f" (and on line{'s' * (len(at) > 2)} {', '.join(map(str, at[1:]))})"
+                    if at[1:] else "")
+            why = ("was removed (docs/adr/REMOVED.md): an ADR is deleted only once no live "
+                   "part cites it, so the citation moves to where its line there says the "
+                   "decision went, or goes" if number in removed else "does not exist")
+            problems.append(f"{path}:{at[0]}: cites ADR {number}{more}, which {why}")
+    return problems
 
 
 def decision_text(text):
@@ -308,7 +465,7 @@ def since_base(adr_dir, adrs, since):
             texts[path] = out[at:at + size].decode("utf-8", "replace")
             at += size + 1
 
-    problems, notes = [], []
+    problems, notes, removed = [], [], removed_adrs(adr_dir, adrs)[0]
     for path, was in texts.items():
         number = path.rsplit("/", 1)[-1][:4]
         front = was.replace("\r\n", "\n").split("\n---", 1)[0] if was.startswith("---") else ""
@@ -317,8 +474,16 @@ def since_base(adr_dir, adrs, since):
             continue
         adr = adrs.get(number)
         if adr is None:
-            problems.append(f"{path}: ADR {number} existed at {base[:8]} and is gone: an ADR "
-                            "that is no longer proposed is not deleted")
+            name, had = removed.get(number), path.rsplit("/", 1)[-1]
+            if name is None:
+                problems.append(
+                    f"{path}: ADR {number} existed at {base[:8]} and is gone with no line in "
+                    f"docs/adr/{REMOVED}: a deleted ADR is listed there, with its title, the "
+                    "name its file had and where its decision or its content went "
+                    "(docs/agents/domain.md)")
+            elif name != had:
+                problems.append(f"docs/adr/{REMOVED}: the line of ADR {number} names the file "
+                                f"{name}, but it was {had} at {base[:8]}")
         elif status and adr.status == "proposed":
             problems.append(
                 f"docs/adr/{adr.name}: it was {status.group(1)} at {base[:8]} and is proposed "
@@ -374,6 +539,13 @@ def run(adr_dir, mode, out=sys.stdout, err=sys.stderr, since=None):
         problems += more
         for line in notes:
             print(line, file=out)
+    removed, more = removed_adrs(adr_dir, adrs)
+    problems += more
+    cited = dangling(adr_dir, adrs, removed)
+    if cited is None:
+        print("adr-index: not a git checkout, so no citation of an ADR was checked", file=out)
+    else:
+        problems += cited
     for line in problems:
         print(line, file=err)
     if problems:
@@ -517,10 +689,105 @@ SINCE_CASES = [
     ("an ADR accepted at the base and proposed now, not committed yet",
      {"0003-the-third.md": SINCE_BASE["0003-the-third.md"].replace("accepted", "proposed")},
      None, False, "was accepted at"),
-    ("an earlier ADR deleted", {"0003-the-third.md": None},
-     "The third, gone (#1)", False, "is gone"),
+    ("an ADR deleted with no line in the list of removed ADRs", {"0003-the-third.md": None},
+     "The third, gone (#1)", False, "is gone with no line in docs/adr/REMOVED.md"),
     ("auto, in a clone with no origin/main", {"0003-the-third.md": CHANGED},
      "The third, rewritten (#1)", True, "no origin/main here"),
+]
+
+# Removal and citations, in the same repo: files the base commit also holds and
+# what the second commit changes, both as paths from the root (None deletes),
+# whether the check passes, a fragment it must print and fragments it must not.
+LISTED = "# Removed ADRs\n\n| ADR | Title | File | Where it went |\n|---|---|---|---|\n"
+THIRD_GONE = {"docs/adr/0003-the-third.md": None, "docs/adr/REMOVED.md": LISTED
+              + "| 0003 | the third | `0003-the-third.md` | the decision was retired |\n"}
+REMOVAL_CASES = [
+    ("a citation in a live file to an ADR that does not exist",
+     {}, {"src/lib.rs": "// The pool is one arena (ADR 0009).\n"},
+     False, "src/lib.rs:1: cites ADR 0009, which does not exist"),
+    ("a citation to an ADR that does not exist in a new file, not committed yet",
+     {}, {"src/new.rs": "// The pool is one arena (ADR 0009).\n"},
+     False, "src/new.rs:1: cites ADR 0009, which does not exist"),
+    ("the same citation in a finding, a frozen spec, the archive and a test's fixtures",
+     {}, {"docs/findings/2026-01-01-a.md": "ADR 0009 held then.\n",
+          "docs/specs/README.md": "See ADR 0009.\n", "docs/archive/ROADMAP.md": "ADR-0009.\n",
+          "mk/changelog-selftest.sh": "# ADR 0009 -- a made-up one\n"},
+     True, "index in sync", "cites"),
+    ("a citation whose number opens the next comment line",
+     {}, {"src/lib.rs": "/// The pool is one arena, as ADR\n/// 0009 decided.\n"},
+     False, "src/lib.rs:1: cites ADR 0009, which"),
+    ("a missing ADR further along a list of them, each file's lines named once",
+     {}, {"docs/user/a.md": "ADRs 0002, 0003 and 0009.\n\nADR 0001/0009 again, and ADRs "
+                            "0002 to\n0008.\n"},
+     False, "docs/user/a.md:1: cites ADR 0009 (and on line 3), which does not exist"),
+    ("the far end of a range of ADRs",
+     {}, {"docs/user/a.md": "ADRs 0001-0009 keep their long form.\n"},
+     False, "docs/user/a.md:1: cites ADR 0009, which does not exist"),
+    ("a missing ADR on the last line of a list that wraps",
+     {}, {"src/lib.rs": "//! The pool (ADRs 0002,\n//! 0003 and\n//! 0008).\n"},
+     False, "src/lib.rs:1: cites ADR 0008, which does not exist"),
+    ("a missing ADR cited by its file's path",
+     {}, {"Makefile": "# see docs/adr/0009-gone.md\n"},
+     False, "Makefile:1: cites ADR 0009, which does not exist"),
+    ("a missing ADR linked from the ADR beside it",
+     {}, {"docs/adr/0003-the-third.md": SINCE_BASE["0003-the-third.md"]
+          + "\nAs [the arena](0008-the-arena.md) says.\n"},
+     False, "docs/adr/0003-the-third.md:9: cites ADR 0008, which does not exist"),
+    ("a date and a size after a citation, and a year that opens the next line",
+     {}, {"src/lib.rs": "// ADR 0002, 2026-09-07; ADR 0003 and 4096 tokens; ADR\n// 2026 is "
+                        "no number of ours on a new line.\n"},
+     True, "index in sync", "cites"),
+    ("an uncited ADR deleted, with its line in the list of removed ADRs",
+     {}, THIRD_GONE, True, "3 ADRs, index in sync", "is gone"),
+    ("an ADR deleted while a live file still cites it",
+     {"src/lib.rs": "// The pool is one arena (ADR 0003).\n"}, THIRD_GONE,
+     False, "src/lib.rs:1: cites ADR 0003, which was removed (docs/adr/REMOVED.md)"),
+    ("an ADR deleted, its line naming another file than the one it had",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"].replace(
+         "0003-the-third.md", "0003-the-thrid.md")},
+     False, "names the file 0003-the-thrid.md, but it was 0003-the-third.md"),
+    ("a line in the list of removed ADRs for an ADR that still exists",
+     {}, {"docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"]},
+     False, "ADR 0003 has a line here and its file, 0003-the-third.md, still exists"),
+    ("a new ADR on a removed number, the next free one named above the folder and the list",
+     {"docs/adr/REMOVED.md": LISTED + "| 0071 | a last one | `0071-a-last-one.md` | retired |\n"
+                             "| 0075 | a later one | `0075-a-later-one.md` | retired |\n"},
+     {"docs/adr/0071-a-new-one.md": "---\nstatus: accepted\n---\n\n# A new one\n"},
+     False, "docs/adr/0071-a-new-one.md: ADR 0071 was removed (docs/adr/REMOVED.md: it was "
+            "0071-a-last-one.md) and a removed number is never used again: a new ADR takes "
+            "the next free number, 0076"),
+    ("a removed ADR's line naming a holder that does not exist",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"].replace(
+         "the decision was retired", "absorbed into ADR 0009")},
+     False, "the line of ADR 0003 says it went to ADR 0009, which does not exist"),
+    ("a removed ADR's line naming a holder that was removed too",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"].replace(
+         "the decision was retired", "absorbed into ADR 0071")
+          + "| 0071 | a last one | `0071-a-last-one.md` | retired |\n"},
+     False, "the line of ADR 0003 says it went to ADR 0071, which was removed too"),
+    ("a removed ADR's line naming a home that does not exist",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"].replace(
+         "the decision was retired", "not a decision: `docs/agents/gone.md`")},
+     False, "the line of ADR 0003 says it went to `docs/agents/gone.md`, which does not exist"),
+    ("a removed ADR's line naming the ADR and the home that hold it",
+     {"docs/agents/skills.md": "# Skills\n"},
+     {**THIRD_GONE, "docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"].replace(
+         "the decision was retired", "absorbed into ADR 0002, its list in "
+                                     "`docs/agents/skills.md`")},
+     True, "3 ADRs, index in sync"),
+    ("a removed ADR's line that says nowhere its decision went",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md": THIRD_GONE["docs/adr/REMOVED.md"].replace(
+         "the decision was retired", "gone")},
+     False, "the line of ADR 0003 does not say where its decision or its content went"),
+    ("a line of the list out of its format",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md":
+          LISTED + "| 0003 | the third | 0003-the-third.md | the decision was retired |\n"},
+     False, "docs/adr/REMOVED.md: line 5 is not a line of the list"),
+    ("the lines of the list out of order",
+     {}, {**THIRD_GONE, "docs/adr/REMOVED.md": LISTED
+          + "| 0071 | a last one | `0071-a-last-one.md` | retired |\n"
+          + "| 0003 | the third | `0003-the-third.md` | the decision was retired |\n"},
+     False, "the lines are not in ascending order without repeats: ADR 0003 after ADR 0071"),
 ]
 
 
@@ -561,6 +828,8 @@ def selftest():
         check(run(adr_dir, "check", out, err) == 0,
               "a consistent set and its index pass the check"
               + (f" -- {err.text.strip()}" if err.text else ""))
+        check("no citation of an ADR was checked" in out.text,
+              "outside a git checkout the check says that no citation was checked")
         check("| [0001](0001-the-first.md) | the first decision | superseded by "
               "[0002](0002-the-second.md) | [0070](0070-a-short-one.md) |" in index,
               "a row links the ADR, drops the number from a long-form heading, links the "
@@ -633,6 +902,37 @@ def selftest():
                 check(ok, f"{'passes' if passes else 'refused'}: {what}"
                       + ("" if ok else f" -- got {status}: {said.strip()}"))
 
+        for what, before, change, passes, expected, *absent in REMOVAL_CASES:
+            with tempfile.TemporaryDirectory() as root:
+                adr_dir = fixture(root, SINCE_BASE)
+                hooks = pathlib.Path(root) / "no-hooks"
+                hooks.mkdir()
+                config = ["-c", "user.name=selftest", "-c", "user.email=selftest@invalid",
+                          "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false",
+                          "-c", f"core.hooksPath={hooks.as_posix()}"]
+                git(root, "init", "-q")
+                pending = what.endswith("not committed yet")
+                for files, message in ((before, "The base"),
+                                       (change, None if pending else "The change (#1)")):
+                    for name, text in files.items():
+                        path = pathlib.Path(root) / name
+                        if text is None:
+                            path.unlink()
+                        else:
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            path.write_text(text, encoding="utf-8", newline="\n")
+                    run(adr_dir, "write", Sink(), Sink())
+                    if message:
+                        git(root, *config, "add", "-A")
+                        git(root, *config, "commit", "-q", "-m", message)
+                out, err = Sink(), Sink()
+                status = run(adr_dir, "check", out, err, since="HEAD" if pending else "HEAD~1")
+                said = out.text + err.text
+                ok = ((status == 0) == passes and expected in said
+                      and not any(fragment in said for fragment in absent))
+                check(ok, f"{'passes' if passes else 'refused'}: {what}"
+                      + ("" if ok else f" -- got {status}: {said.strip()}"))
+
     print()
     if failed:
         print(f"adr-index selftest: {failed} failed", file=sys.stderr)
@@ -649,7 +949,8 @@ def main(argv=None):
     mode.add_argument("--selftest", action="store_const", const="selftest", dest="mode")
     parser.add_argument("--since", metavar="REV",
                         help="with --check: also refuse an ADR that was accepted at the merge "
-                             "base of REV and HEAD and is proposed now ('auto': origin/main)")
+                             "base of REV and HEAD and is proposed now, or gone with no line "
+                             "in the list of removed ADRs ('auto': origin/main)")
     args = parser.parse_args(argv)
     if args.since and args.mode != "check":
         parser.error("--since goes with --check")

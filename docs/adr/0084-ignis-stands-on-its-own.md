@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0005, ADR-0006, ADR-0064, ADR-0070]
+amends: [ADR-0005, ADR-0006, ADR-0064]
 ---
 
 # ignis stands on its own

@@ -4,12 +4,14 @@ Each ADR states what holds today, and why: a decision that changes rewrites its
 ADR in place, and the earlier versions are the history of its file,
 `git log -p -- "docs/adr/NNNN-*"`.
 
-How an ADR is written, numbered and changed is in
+How an ADR is written, numbered, changed and removed is in
 [docs/agents/domain.md](../agents/domain.md), and
-[ADR 0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md)
-lists where the repo differs from the `/domain-modeling` skill. This file is
-generated from the ADRs' frontmatter by `mk/adr-index.py` (`make records`), and
-`make records-check` fails when it is out of date: never edit it by hand.
+[docs/agents/skill-differences.md](../agents/skill-differences.md)
+lists where the repo differs from the `/domain-modeling` skill. An ADR that
+left the tree is in [REMOVED.md](REMOVED.md), with where its decision went.
+This file is generated from the ADRs' frontmatter by `mk/adr-index.py`
+(`make records`), and `make records-check` fails when it is out of date: never
+edit it by hand.
 
 | ADR | Title | Status | Amended by |
 |---|---|---|---|
@@ -82,7 +84,7 @@ generated from the ADRs' frontmatter by `mk/adr-index.py` (`make records`), and
 | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
 | [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
 | [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
-| [0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md) | A spec is a GitHub issue and its tickets are sub-issues | accepted | [0081](0081-an-adr-states-what-holds-today-and-a-changed-decision-rewrites-it-in-place.md), [0084](0084-ignis-stands-on-its-own.md) |
+| [0070](0070-a-spec-is-a-github-issue-and-its-tickets-are-sub-issues.md) | A spec is a GitHub issue and its tickets are sub-issues | accepted | |
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
 | [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |

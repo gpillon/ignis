@@ -523,17 +523,19 @@ docs-reference: ## Regenerate docs/user/reference/ from the code: fields, profil
 # The ADR and findings indexes, docs/adr/README.md and docs/findings/README.md,
 # are generated from each file's frontmatter and never edited by hand. The
 # scripts are the standard library alone; the records workflow
-# runs records-check on every push that touches either folder. The ADR check
+# runs records-check on every push. The ADR check
 # also compares the ADRs with the merge base with origin/main (--since auto):
 # an ADR rewritten in place passes (ADR 0081), and one that was accepted there
-# and is proposed now is refused.
+# and is proposed now is refused. It reads every live file too, for a citation
+# of an ADR that has no file, and holds the list of removed ADRs,
+# docs/adr/REMOVED.md, to the folder.
 .PHONY: records
 records: ## Regenerate the ADR and findings indexes from each file's frontmatter
 	$(PYTHON) mk/adr-index.py --write
 	$(PYTHON) mk/findings-index.py --write
 
 .PHONY: records-check
-records-check: ## The indexes' selftests, then their check: frontmatter, links both ways, index in sync, no accepted ADR proposed again
+records-check: ## The indexes' selftests, then their check: frontmatter, links both ways, index in sync, no accepted ADR proposed again, no citation of an ADR that is gone
 	$(PYTHON) mk/adr-index.py --selftest
 	$(PYTHON) mk/findings-index.py --selftest
 	$(PYTHON) mk/adr-index.py --check --since auto

@@ -38,10 +38,10 @@
 #                             merged yet, and such an issue is not in the
 #                             release.
 #
-# ADRs get their own section. A decision amended or recorded in the window is
-# the part of a release that outlives its version number. Commits that name
-# no issue at all come last, so the per-issue list can be read for what it
-# dropped.
+# ADRs get their own section. A decision amended, recorded or removed in the
+# window is the part of a release that outlives its version number. Commits
+# that name no issue at all come last, so the per-issue list can be read for
+# what it dropped.
 #
 # Nothing here writes a file or touches git state.
 
@@ -251,8 +251,11 @@ fi
 # the ADRs it names. A mark covers its own commit only: a decision changed by
 # another commit of the range is amended. A status that changed is said, "(now
 # superseded by ADR 0082)", against the long form's `## Status` section when
-# the older side has no frontmatter yet. docs/adr/README.md is the generated
-# index, not a decision.
+# the older side has no frontmatter yet. An ADR deleted in the range is
+# "(removed)", under the title it had, by the same rule: not when the commits
+# that changed and deleted it carry a mark, as a cleanup commit that deletes an
+# ADR absorbed into another does. docs/adr/README.md is the generated index and
+# docs/adr/REMOVED.md the list of removed ADRs, not decisions.
 adr_at() { # <rev> <number>: the path of that ADR's file at <rev>, nothing when it has none
     git ls-tree --name-only "$1" docs/adr/ 2>/dev/null |
         grep -E "^docs/adr/$2-[^/]*\.md\$" | head -1
@@ -302,13 +305,20 @@ decisions=""
 for number in $numbers; do
     old="$(adr_at "$from" "$number")"
     path="$(adr_at "$to" "$number")"
-    [ -n "$path" ] || continue
-    heading="$(git show "$to:$path" 2>/dev/null | sed -n 's/^# *//p' | head -1)"
-    [ -n "$heading" ] || heading="$path"
+    [ -n "$old$path" ] || continue
+    # An ADR that left the tree is named as it was when the range began.
+    shown="$to:$path"
+    [ -n "$path" ] || shown="$from:$old"
+    heading="$(git show "$shown" 2>/dev/null | sed -n 's/^# *//p' | head -1)"
+    [ -n "$heading" ] || heading="${shown#*:}"
     case "$heading" in
         "ADR "[0-9][0-9][0-9][0-9]*) ;;
         *) heading="ADR $number — $heading" ;;
     esac
+    if [ -z "$path" ]; then
+        ! amended "$number" || decisions="$decisions- $heading (removed)"$'\n'
+        continue
+    fi
     if [ -z "$old" ]; then
         decisions="$decisions- $heading"$'\n'
         continue

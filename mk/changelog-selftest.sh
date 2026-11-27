@@ -28,8 +28,9 @@
 # format. It also pins when an ADR the range changes is a decision: when its
 # text changed, not its frontmatter or a link's target, by a commit that
 # carries no mark for it (`[adr-cleanup]`, `[typo ADR-NNNN]`), under whatever
-# name its file has, and when its status changed, said as "(now ...)"; the
-# generated index never is.
+# name its file has, when its status changed, said as "(now ...)", and when
+# its file left the tree, said as "(removed)" unless a marked commit deleted
+# it; the generated index never is.
 
 set -uo pipefail
 
@@ -120,6 +121,9 @@ adr 0013-cleaned-then-changed.md 'A decision cleaned, then changed' 'Its decisio
 adr 0014-old-title.md 'A decision under its old title' 'Its old decision.'
 adr 0015-old-name.md 'A decision the cleanup retitles' 'Its decision, with its history.'
 adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Its reasno.'
+# The ADRs the range deletes.
+adr 0017-retired.md 'A decision the range retires and removes' 'Its decision.'
+adr 0018-absorbed.md 'A decision the cleanup absorbs into another' 'Its decision.'
 commit "Groundwork, and the earlier half of #20"
 git tag -a v9.9.8 -m v9.9.8
 export GIT_AUTHOR_DATE='2026-01-03T00:00:00Z' GIT_COMMITTER_DATE='2026-01-03T00:00:00Z'
@@ -170,6 +174,7 @@ adr 0012-cleaned-too.md 'A second decision the cleanup shortens' 'Its decision.'
 adr 0013-cleaned-then-changed.md 'A decision cleaned, then changed' 'Its decision.'
 git rm -q docs/adr/0015-old-name.md
 adr 0015-new-name.md 'A decision the cleanup retitled' 'Its decision.'
+git rm -q docs/adr/0018-absorbed.md
 commit "Four decisions, shortened to what holds today [adr-cleanup] (#10)"
 # A decision that changes rewrites its ADR in place, with no mark: amended,
 # whether a marked commit touched the ADR before it, and under its new name.
@@ -181,6 +186,9 @@ adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Its reason
 commit "A typo in a decision, fixed [typo ADR-0016] (#10)"
 adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Another reason.'
 commit "The decision's reason, changed (#10)"
+# An ADR that leaves the tree is said, unless a cleanup commit deletes it.
+git rm -q docs/adr/0017-retired.md
+commit "A decision, retired and removed (#10)"
 commit "The duplicate, mentioned anyway (#40)"
 commit "Merge: a branch"
 commit "ignis 9.9.9"
@@ -293,6 +301,14 @@ has "ADR 0014 — A decision under its new title (amended)" "$decisions" \
 has "ADR 0016 — A decision with a typo, then changed (amended)" "$decisions" \
     && note "a typo mark covers its own commit, not a later change of the decision" \
     || fail "the ADR changed after its typo fix is not marked amended: $decisions"
+
+has "ADR 0017 — A decision the range retires and removes (removed)" "$decisions" \
+    && note "an ADR deleted in the range is listed as removed" \
+    || fail "the deleted ADR is not listed as removed: $decisions"
+
+has "ADR 0018" "$decisions" \
+    && fail "an ADR a cleanup commit deleted reached the Decisions: $decisions" \
+    || note "an ADR a commit with the cleanup mark deletes is not listed"
 
 has "Architecture decision records" "$decisions" \
     && fail "the generated index reached the Decisions: $decisions" \

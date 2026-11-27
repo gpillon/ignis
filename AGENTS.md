@@ -23,6 +23,12 @@ repo's `idea` and `quick` markers. See `docs/agents/triage-labels.md`.
 
 Single-context: root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
 
+### Differences from the skills
+
+Running the skills' setup again, checking the repo against a skill, or adding
+a difference: the list of where the repo differs on purpose. See
+`docs/agents/skill-differences.md`.
+
 ## Repo conventions
 
 ### Scratch

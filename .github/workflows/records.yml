@@ -1,9 +1,10 @@
 # Hold the ADRs and the findings to their frontmatter and their generated
 # indexes: docs/adr/README.md and docs/findings/README.md are written
 # by mk/adr-index.py and mk/findings-index.py, never by hand. This runs what
-# `make records-check` runs, each script's selftest and then its check, on a
-# push that touches either folder or either script. Python's standard library
-# alone: nothing to install.
+# `make records-check` runs, each script's selftest and then its check, on
+# every push and pull request, whatever it touches: the ADR check reads every
+# live file for a citation of an ADR that has no file, so a change to a source
+# file alone can fail it. Python's standard library alone: nothing to install.
 #
 # The ADR check also compares the ADRs with what they were before the push
 # (--since): an ADR rewritten in place passes (ADR 0081), and one that was
@@ -17,31 +18,14 @@
 # workflow's script (#524), which `make records-check` does not: it is the
 # same kind of check, the standard library alone and seconds, and this is the
 # workflow that runs on every branch and pull request. The selftest compares
-# the script's mapping with the table in docs/agents/issue-tracker.md, so a
-# change to either starts it.
+# the script's mapping with the table in docs/agents/issue-tracker.md.
 
 name: records
 
 on:
   push:
     branches: ["**"]
-    paths:
-      - "docs/adr/**"
-      - "docs/findings/**"
-      - "mk/adr-index.py"
-      - "mk/findings-index.py"
-      - "mk/board-status.py"
-      - "docs/agents/issue-tracker.md"
-      - ".github/workflows/records.yml"
   pull_request:
-    paths:
-      - "docs/adr/**"
-      - "docs/findings/**"
-      - "mk/adr-index.py"
-      - "mk/findings-index.py"
-      - "mk/board-status.py"
-      - "docs/agents/issue-tracker.md"
-      - ".github/workflows/records.yml"
 
 permissions:
   contents: read

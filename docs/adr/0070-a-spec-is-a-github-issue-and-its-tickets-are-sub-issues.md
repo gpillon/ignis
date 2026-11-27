@@ -1,6 +1,5 @@
 ---
 status: accepted
-amended-by: [ADR-0081, ADR-0084]
 ---
 
 # A spec is a GitHub issue and its tickets are sub-issues

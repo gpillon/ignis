@@ -39,8 +39,8 @@ make changelog                   # since the last v* tag, to HEAD
 make changelog FROM=v0.1.1 TO=v0.1.2
 ```
 
-It reads the issues the range's commits name, the ADRs added or amended in it,
-and the commits that name no issue, and prints Markdown for the version-bump
+It reads the issues the range's commits name, the ADRs added, amended or
+removed in it, and the commits that name no issue, and prints Markdown for the version-bump
 commit and the GitHub release body. It is a draft: the headings are sorted by
 what the range can prove, not by what matters most.
 

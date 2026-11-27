@@ -12,8 +12,10 @@ set of decisions, `docs/adr/`, listed in its generated index
 - A new ADR is written in the `/domain-modeling` skill's short format, with the
   bare title as its heading: the release notes take the number from the file
   name.
-- An ADR takes the next free number when it merges into `main`; if `main` took
-  that number first, the ADR is renumbered with every line that cites it
+- An ADR takes the next free number when it merges into `main`: one above
+  every number in `docs/adr/` and in the list of removed ADRs,
+  `docs/adr/REMOVED.md`, since a removed number is never used again. If `main`
+  took that number first, the ADR is renumbered with every line that cites it
   (b61a224f).
 - An ADR opens with a frontmatter that gives its `status`: `proposed`,
   `accepted`, `deprecated` or `superseded by ADR-NNNN`. `mk/adr-index.py`
@@ -27,9 +29,11 @@ set of decisions, `docs/adr/`, listed in its generated index
   file: `git log -p -- "docs/adr/NNNN-*"`.
 - When a decision changes, the live places that cite its ADR are reread in the
   same change: the number stays valid, a comment that paraphrases the old
-  decision may not. Live is everything but `docs/findings/`, the release
-  notes, `docs/specs/` and `docs/archive/`; `make records-check` names each
-  ADR whose text changed.
+  decision may not. Live is everything but the historical set:
+  `docs/findings/`, the release notes, `docs/specs/` and `docs/archive/`, with
+  commit messages and issues. A folder nobody lists there is live
+  (`HISTORICAL` in `mk/adr-index.py`). `make records-check` names each ADR
+  whose text changed.
 - When an ADR is written:
   - a new decision is a new ADR, `proposed` while it waits for the owner;
   - a change to a decision that the owner has confirmed, in a grilling for
@@ -39,11 +43,39 @@ set of decisions, `docs/adr/`, listed in its generated index
     and rewrites the ADR once accepted: an accepted ADR never goes back to
     `proposed`, and `make records-check` and the records workflow refuse one
     that does.
-- The release notes call an ADR amended when a commit changes its text
-  (`mk/changelog.sh`), so a commit that changes no decision says so with a
-  mark in its message, before the closing issue: `[typo ADR-NNNN]` (or a list,
-  `[typo ADR-0032, ADR-0045]`) for a typo fix in the ADRs it names, and
-  `[adr-cleanup]`, once, for a commit that brings ADRs to the short format,
-  whichever ADRs it touches. A commit that changes a decision carries neither.
-- Where a skill's convention and the repo's disagree, ADR 0070 lists where the
-  repo differs.
+- An ADR that holds no decision any more is deleted, for one of three reasons:
+  - it was superseded;
+  - it only amended another ADR and was absorbed into it;
+  - it is not a decision by the `/domain-modeling` skill's three criteria,
+    hard to reverse, surprising without its context and the result of a real
+    trade-off: a default of the skills, a rule a check already holds, or a
+    register that only grows. This one is a judgement: two agents that judge
+    independently agree, or the ADR stays.
+- Before an ADR is deleted, what it held has its home and no live part cites
+  it. The ADR that now holds the decision carries why the old one died and any
+  fact from it that still holds; the content of one that was not a decision is
+  in the home that owns it, the agents' docs, the coding standards or the
+  guide. Each citation in a live part moves to the ADR that holds the
+  decision, or the code that cites it changes or goes.
+- The change that deletes an ADR's file adds its line to
+  `docs/adr/REMOVED.md`, in ascending order:
+  ``| NNNN | its title | `NNNN-the-name-its-file-had.md` | where it went |``.
+  Where it went names the ADR that holds the decision (`ADR NNNN`), the home
+  that took the content (its path from the root, in backticks), or says that
+  the decision was retired.
+- `make records-check` and the records workflow hold the removal: they refuse
+  a citation in a live part, by number or by path, of an ADR that has no file;
+  a deleted ADR with no line in the list; a line for an ADR that still exists,
+  or naming an ADR or a path that does not; and a new ADR on a removed number,
+  naming the next free one. A test that builds ADRs of its own is listed in
+  `FIXTURES` in `mk/adr-index.py`.
+- The release notes call an ADR amended when a commit changes its text and
+  removed when one deletes it (`mk/changelog.sh`), so a commit that changes no
+  decision says so with a mark in its message, before the closing issue:
+  `[typo ADR-NNNN]` (or a list, `[typo ADR-0032, ADR-0045]`) for a typo fix in
+  the ADRs it names, and `[adr-cleanup]`, once, for a commit that brings ADRs
+  to the short format or deletes one whose decision did not change, whichever
+  ADRs it touches. A commit that changes a decision carries neither.
+- Where a skill's convention and the repo's disagree,
+  `docs/agents/skill-differences.md` lists where the repo differs; a new
+  difference is a line there.

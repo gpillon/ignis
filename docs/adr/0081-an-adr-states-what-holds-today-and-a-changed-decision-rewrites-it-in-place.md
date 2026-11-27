@@ -1,6 +1,5 @@
 ---
 status: accepted
-amends: [ADR-0070]
 ---
 
 # An ADR states what holds today, and a decision that changes rewrites it in place
