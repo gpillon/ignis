@@ -43,7 +43,7 @@ pub fn utc_timestamp(secs: u64) -> String {
 /// A session identifier for a fresh measurement session: the UTC
 /// timestamp, compacted. The operator passes the *same* one to both
 /// engines' runs — that shared value is what lets the gate check confirm
-/// the two records are live/live (ADR 0015).
+/// the two records are live/live.
 pub fn new_session_id() -> String {
     utc_timestamp(unix_now()).replace(['-', ':'], "")
 }
