@@ -8,11 +8,6 @@ here.
 
 ## Tracker
 
-- `docs/specs/` is frozen and not migrated: an issue opened before 2026-10-25
-  links its spec there. Migration was rejected because GitHub cannot backdate
-  an issue, four of the 158 files exceed the 65,536-character body limit, about
-  275 citations would move, and about half the specs were edited after their
-  tickets closed.
 - The `idea` marker (parked) and the `quick` marker (a fast owner decision)
   sit beside the five triage roles and the two categories
   (`docs/agents/triage-labels.md`).
