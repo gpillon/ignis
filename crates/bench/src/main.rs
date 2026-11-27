@@ -72,8 +72,9 @@
 //!       One engine's `ttft` records from at least two independent launches
 //!       of one session, pooled into one record: every sample of every
 //!       launch, the median over all of them. `g2` then compares pooled
-//!       records. Refuses launches of different sessions, engines or cells,
-//!       and a launch with a failed cell.
+//!       records. Refuses launches of different sessions, engines, profiles,
+//!       `--max-tokens` or cells, one launch given twice, a record already
+//!       pooled, and a launch with a failed cell.
 //!   `g2      --ours <ignis-record.json> --ref <reference-record.json>
 //!             [--note <text>] [--out <verdict.json>]`
 //!       The G2 verdict over two such records: the ratio of medians per

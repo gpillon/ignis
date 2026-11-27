@@ -1203,10 +1203,19 @@ pub fn median(values: &[f64]) -> Option<f64> {
 /// compares the pooled result and not one launch against another (the
 /// crate's measuring rule: a launch picks its own throughput band).
 ///
-/// Refused: fewer than two launches; launches that differ in session, label,
-/// engine or artifact, or that did not measure the same cells in the same
-/// order; a launch with a failed cell. A void sample is carried as it is, so
-/// the comparison still refuses it.
+/// Refused: fewer than two launches; a launch that is itself a pooled record
+/// (its profile ends with the mark this function writes, "(pooled over N
+/// launches)"); launches that differ in session, label, engine, artifact,
+/// profile or `max_tokens` (each engine as it is served, asked the same
+/// request shape), or that did not measure the same cells in the same order;
+/// two launches with the same `date`, which is one record given twice: a
+/// record is stamped to the second when its run ends, and two independent
+/// launches, the server stopped and started between them, never end in the
+/// same second (the date and not the samples: the date is the one field the
+/// run stamps on its record alone, while samples are measurements, which
+/// this function does not judge); a launch with a failed
+/// cell. A void sample is carried as it is, so the comparison still refuses
+/// it.
 pub fn pool_launches(launches: &[Record]) -> Result<Record, String> {
     if launches.len() < 2 {
         return Err(format!(
@@ -1215,6 +1224,16 @@ pub fn pool_launches(launches: &[Record]) -> Result<Record, String> {
             launches.len()
         ));
     }
+    for (number, launch) in launches.iter().enumerate() {
+        if is_pooled(&launch.profile) {
+            return Err(format!(
+                "launch {}: its profile is {:?}, a pooled record: a pooled record takes the \
+                 launches themselves, not a record already pooled from them",
+                number + 1,
+                launch.profile
+            ));
+        }
+    }
     let first = &launches[0];
     for (number, launch) in launches.iter().enumerate().skip(1) {
         for (field, theirs, ours) in [
@@ -1222,14 +1241,33 @@ pub fn pool_launches(launches: &[Record]) -> Result<Record, String> {
             ("label", &launch.label, &first.label),
             ("engine", &launch.engine, &first.engine),
             ("artifact", &launch.artifact, &first.artifact),
+            ("profile", &launch.profile, &first.profile),
         ] {
             if theirs != ours {
                 return Err(format!(
                     "launch {}: its {field} is {theirs:?} and the first launch's is {ours:?}: a \
-                     pooled record is one engine's launches in one session",
+                     pooled record is one engine's launches in one session, served and asked alike",
                     number + 1
                 ));
             }
+        }
+        if launch.max_tokens != first.max_tokens {
+            return Err(format!(
+                "launch {}: its max_tokens is {} and the first launch's is {}: a pooled record is \
+                 one engine's launches in one session, served and asked alike",
+                number + 1,
+                launch.max_tokens,
+                first.max_tokens
+            ));
+        }
+        if let Some(earlier) = launches[..number].iter().position(|other| other.date == launch.date) {
+            return Err(format!(
+                "launch {}: its date is {:?}, as is launch {}'s: the same record given twice, and \
+                 a pooled record takes independent launches",
+                number + 1,
+                launch.date,
+                earlier + 1
+            ));
         }
         // A cell is named by its length and, for an image cell, its image.
         let names = |record: &Record| -> Vec<(u32, Option<ImageIdentity>)> {
@@ -1265,8 +1303,22 @@ pub fn pool_launches(launches: &[Record]) -> Result<Record, String> {
         let ttfts: Vec<f64> = cell.samples.iter().map(|s| s.ttft_ms).collect();
         cell.median_ttft_ms = median(&ttfts);
     }
-    pooled.profile = format!("{} (pooled over {} launches)", first.profile, launches.len());
+    pooled.profile = format!("{}{}", first.profile, pooled_mark(launches.len()));
     Ok(pooled)
+}
+
+/// The mark [`pool_launches`] ends a pooled record's profile with.
+fn pooled_mark(launches: usize) -> String {
+    format!(" (pooled over {launches} launches)")
+}
+
+/// Whether `profile` ends with [`pooled_mark`] for some number of launches:
+/// the mark itself, not the words "pooled over" anywhere in a profile.
+fn is_pooled(profile: &str) -> bool {
+    profile
+        .strip_suffix(" launches)")
+        .and_then(|rest| rest.rsplit_once(" (pooled over "))
+        .is_some_and(|(_, count)| count.parse::<usize>().is_ok())
 }
 
 // ── measuring ────────────────────────────────────────────────────────────

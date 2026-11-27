@@ -2,7 +2,8 @@
 
 Repo-root layout per `records-2026-11-27:docs/archive/ignis-v1.md` §6: the *recorded* load
 traces (JSONL) and the artifacts the `ignis-bench` harness produces from
-them. The v1 99% performance gate (ADR 0007) is only runnable on
+them. The 99% threshold, a comparison of two engines that decides no gate
+since ADR 0082, is only runnable on
 **recorded** data: a trace recorded against the reference stack + a
 reference run recorded with the *same harness* (apples-to-apples — eager
 CUDA graph on both sides, design §4). The synthetic fixture
@@ -46,8 +47,8 @@ which trace a given verdict replayed.
    `ignis-bench replay --trace bench/traces/<load>-trace.jsonl --endpoint <ignis-url> --label ignis --out bench/traces/<load>-ignis.json`
 4. **Canary suite:** `ignis-bench canary --endpoint <ignis-url> --out bench/traces/<load>-canary.json`
    (greedy + fixed seed; exits non-zero when a canary diverges).
-5. **The v1 gate** (the 99% performance gate **and** the self-consistency
-   check, ADR 0007):
+5. **The `gate` report** (the 99% threshold **and** the self-consistency
+   check, ADR 0007's correctness check; it decides no gate since ADR 0082):
    `ignis-bench gate --ours bench/traces/<load>-ignis.json --ref bench/traces/<load>-ninfer.json --canary bench/traces/<load>-canary.json --out bench/traces/<load>-v1-gate.json`
    — exits 0 only when the v1 verdict passes (≥ 99% of the reference's
    speed per class **and** self-consistent canaries). A performance-only

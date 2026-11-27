@@ -79,8 +79,9 @@ cargo run -p ignis-bench -- g2 `
 ```
 
 Another engine is a side like any other: its own endpoint, label and profile.
-`ttft-pool` refuses launches of different sessions, labels, engines or cells,
-and a launch with a failed cell.
+`ttft-pool` refuses launches of different sessions, labels, engines, profiles,
+`--max-tokens` or cells, one launch given twice (the same `date`), a record
+already pooled, and a launch with a failed cell.
 
 ## The multimodal TTFT cell (GitHub #181)
 

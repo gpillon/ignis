@@ -1,4 +1,5 @@
-//! The `gate` workflow end to end (spec 02, ADR 0007): two recorded runs
+//! The `gate` workflow end to end (spec 02; since ADR 0082 it decides no
+//! gate, comparing two engines): two recorded runs
 //! (as `replay --out` writes them) + the canary results (as `canary --out`
 //! writes them) are read back from JSON and the shipped v1 acceptance
 //! artifact — the performance report + the divergence report + the overall
@@ -28,8 +29,8 @@ fn m(id: &str, class: RequestClass, ttft: f64, n: u32, total: f64) -> RequestMet
 }
 
 /// The runs both engines produced on the load (both classes present, as
-/// `replay --out` records them). Identical on purpose: the 99% performance
-/// gate holds (ratio 1.0), so the verdicts exercised here isolate the
+/// `replay --out` records them). Identical on purpose: the 99% threshold
+/// holds (ratio 1.0), so the verdicts exercised here isolate the
 /// self-consistency half.
 fn runs() -> (Run, Run) {
     (
@@ -84,8 +85,9 @@ fn load_shipped(ours: &Run, reference: &Run, canary: &[CanaryResult]) -> GateRep
 
 #[test]
 fn the_v1_gate_artifact_is_built_from_shipped_json() {
-    // The v1 acceptance (spec 02, ADR 0007): the performance gate holds
-    // (identical runs) and the canaries are self-consistent -> the shipped
+    // The report's verdict (spec 02, deciding no gate since ADR 0082): the
+    // 99% threshold holds (identical runs) and the canaries are
+    // self-consistent -> the shipped
     // artifact's verdict is PASS.
     let (ours, reference) = runs();
     let artifact = load_shipped(&ours, &reference, &consistent_canaries());

@@ -82,7 +82,7 @@ fn decode_steps_are_batched_across_all_lanes() {
 fn token_stream_is_deterministic_and_seed_sensitive() {
     // The token stream of a request is a pure function of (mock seed,
     // request seed): same inputs → same stream (determinism, the
-    // self-consistency property the 99% gate relies on, ADR 0007), and a
+    // self-consistency property the canary check relies on, ADR 0007), and a
     // different request seed → a different stream (the mock is not a
     // constant).
     fn stream_for(request_seed: u64) -> Vec<u32> {

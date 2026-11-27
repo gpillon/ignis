@@ -6,7 +6,8 @@
 //! Spec: GitHub #66 — not written
 //! yet (#66: "to write when G4 lands"); this module is built from #66's and
 //! #151's own acceptance criteria plus `records-2026-11-27:docs/archive/REVIEW-2026-09-05.md` §6
-//! Phase 5's depth table. ADR 0007 (performance gate, not parity); the
+//! Phase 5's depth table. ADR 0082 (an instrument comparing two engines,
+//! which decides no gate: ADR 0007's performance gate is retired); the
 //! crate's measuring rule (the crate's opening documentation): one session,
 //! cold samples, pooled launches.
 //!

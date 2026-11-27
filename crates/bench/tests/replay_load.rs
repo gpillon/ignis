@@ -5,7 +5,8 @@
 //!
 //! The trace fixture (`tests/fixtures/main_plus_10.jsonl`) is **synthetic**:
 //! no recorded trace exists in the repo yet (the recorded reference
-//! baseline for the 99% gate, ADR 0007, is a separate GPU-driven item). The
+//! baseline for the 99% threshold, a comparison of two engines that decides
+//! no gate since ADR 0082, is a separate GPU-driven item). The
 //! fixture shapes the load like a real "1 main + ~10 subagents" coding
 //! workload: one shared system + tools-style prefix, a long main-agent
 //! request, and 10 staggered subagent requests sharing the prefix
@@ -55,7 +56,7 @@ fn a_main_plus_ten_subagents_load_is_replayed_with_per_request_metrics() {
         assert!(m.tok_s() > 0.0, "{id}: a measured decode speed (streaming)", id = m.id);
     }
 
-    // The classes are preserved (ADR 0007: the per-class gate tracks main
+    // The classes are preserved (the report's per-class threshold tracks main
     // and subagents separately).
     let run = Run::new("mock", results.clone());
     let main = run.stats_for(RequestClass::Main).expect("main stats");

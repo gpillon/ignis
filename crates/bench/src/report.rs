@@ -1,10 +1,10 @@
-//! Performance report + the 99% gate (ADR 0007).
+//! Performance report + the 99% threshold, a comparison of two engines.
 //!
-//! ADR 0007: the 99% acceptance is a *performance* gate (≥ 99% of the
-//! reference's speed), **not** a token-parity gate. The acceptance artifacts
-//! are (1) this performance report (tok-s, ttft vs reference) and
-//! (2) the self-consistency check (`canary::suite_consistent`). Token-level
-//! divergence reports are *not* the acceptance artifact (ADR 0007).
+//! The threshold is ≥ 99% of the reference's *speed*, **not** token parity,
+//! and it decides no gate since ADR 0082, which retires ADR 0007's 99%
+//! performance gate. This report (tok-s, ttft vs reference) ships beside the
+//! self-consistency check (`canary::suite_consistent`), ADR 0007's
+//! correctness check; a token-level divergence report is neither (ADR 0007).
 //!
 //! The gate is checked *per class* (main vs subagent): the aggregate numbers
 //! must keep classes separate, or a fast main could mask a slow subagent.
@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::metrics::Run;
 use crate::trace::RequestClass;
 
-/// The performance gate threshold (ADR 0007): ≥ 99% of the reference's speed.
+/// The threshold the report checks: ≥ 99% of the reference's speed, a
+/// comparison of two engines that decides no gate since ADR 0082.
 pub const GATE_THRESHOLD: f64 = 0.99;
 
 /// The two classes the gate checks (main vs subagent).

@@ -396,7 +396,8 @@ pub struct Record {
     /// When the record was made (UTC, RFC 3339 seconds).
     pub date: String,
     /// The trace-replay run: one [`crate::metrics::RequestMetrics`] per
-    /// trace line (main + subagent classes, ADR 0007's per-class gate).
+    /// trace line (main + subagent classes, compared per class, a comparison
+    /// that decides no gate since ADR 0082).
     pub run: Run,
     /// The needle-retrieval cells (64K / 128K by default).
     pub needles: Vec<NeedleResult>,

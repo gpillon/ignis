@@ -368,8 +368,9 @@ FlashAttention-2 forward (cp.async K/V staging, m16n8k16 MMA, online-softmax
 in exp2, the hq-e8-2b rotated-frame variant) templated on the engine's
 Geometry/Metadata dispatch. That dispatch layer is C++ state, which the flat C
 ABI of ADR 0001 forbids across the boundary, so it is not ported; the
-tensor-core micro-optimization is likewise deferred to the performance gate
-(ADR 0007). The bottom-right causal mask, the paged-KV element-offset math
+tensor-core micro-optimization is likewise deferred (to ADR 0007's performance
+gate, which ADR 0082 retires). The bottom-right causal mask, the
+paged-KV element-offset math
 (paged_kv_element_offset, shared with ticket 03) and the online-softmax
 (value-weighted running max/sum) are ported 1:1; this is a faithful,
 self-contained (non-tensor-core) causal prefill that compiles standalone in
@@ -417,8 +418,9 @@ epilogue. The ABI's `center` argument centers first (base[i] = x[i] -
 center[i], the "LayerNorm mode"); the reference's data-dependent Welford
 mean/m2 dispatch is not ported (the ABI centers with an explicit vector,
 per the header contract). A single 1024-thread block grid-strides over n
-(the reference's bf16x2 / warp-tiled row variants are the performance-gate
-material, ADR 0007); fp32 internal math, bf16 in/out. Self-contained;
+(the reference's bf16x2 / warp-tiled row variants were material for
+ADR 0007's performance gate, which ADR 0082 retires); fp32 internal math,
+bf16 in/out. Self-contained;
 compiles standalone in the leaf.
 
 ### `kernel/src/embed_gather.cuh` (ticket 06, kernel-abi-02)
@@ -443,7 +445,8 @@ rows, and the launcher dispatches a tiled atomic-cas route for wide
 vocabularies; the ABI contract is an f32 [batch][vocab] matrix with no
 padding (vocab == the valid row count), so the single-tile finite route is
 ported 1:1 with the input typed to f32, and the tiled-atomic route is
-deferred to the performance gate (ADR 0007). Self-contained; compiles
+deferred (to ADR 0007's performance gate, which ADR 0082 retires).
+Self-contained; compiles
 standalone in the leaf.
 
 ### `kernel/src/norms_sampling_surface.cu` (ticket 06, kernel-abi-02)
@@ -467,8 +470,8 @@ verification: capture a representative prefill + decode kernel sequence —
 the ticket-05 GQA prefill attention + GDN step and the ticket-03 GQA
 decode attention, a few KB of VRAM — into a CUDA graph, replay it, and
 confirm the replayed outputs match the eager outputs bit-exactly; the
-99% performance gate on the canary suite is ADR 0007 / ignis-bench,
-ticket 20). Built on the CUDA runtime stream-capture API
+99% threshold on the canary suite is ignis-bench's, ticket 20, and
+decides no gate since ADR 0082). Built on the CUDA runtime stream-capture API
 (`cudaStreamBeginCapture` / `cudaStreamEndCapture` /
 `cudaGraphInstantiate` / `cudaGraphLaunch`); the captured launches are
 the ported kernels from the sibling .cuh files, launched directly with
@@ -496,7 +499,8 @@ large-tokens path is a tensor-core W4A4 MMA that requires FP4-quantized
 ADR 0001 forbids across the boundary, so it is not ported; the PDL syncs are
 stripped in favor of plain `<<<>>>` launches; and the tensor-core W4A4 MMA
 (which needs FP4 activations, not the bf16 activations of this ABI) is
-deferred to the performance gate (ADR 0007). The math (bf16 activations ×
+deferred (to ADR 0007's performance gate, which ADR 0082 retires). The
+math (bf16 activations ×
 E2M1/E4M3-dequantized NVFP4 weights, fp32 FMA accumulation, the rowsplit
 grid, and the plain row-major [m][k/2] / [m][k/16] code/scale layouts) is
 ported 1:1; the E2M1/E4M3 decode helpers are ported 1:1 (inlined in the header
@@ -571,8 +575,9 @@ the proven rowsplit FMA pattern of the ticket-22 NVFP4 prefill GEMM
 (nvfp4_gemm_prefill.cuh — the rowsplit "rows-of-W x tokens" tiling, fp32
 FMA accumulation, shared-memory k-chunk staging, bf16 store) with the NVFP4
 dequant staging replaced by a plain bf16 weight read (the A1 artifact
-dequant produces a bf16 lm_head). The tensor-core MMA (the later
-performance-gate material, ADR 0005/0007) is deliberately not used: v1 is
+dequant produces a bf16 lm_head). The tensor-core MMA (material for the
+later performance gate of ADR 0005/0007, which ADR 0082 retires) is
+deliberately not used: v1 is
 the correctness-first scalar-FMA baseline. Self-contained; compiles
 standalone in the leaf.
 
