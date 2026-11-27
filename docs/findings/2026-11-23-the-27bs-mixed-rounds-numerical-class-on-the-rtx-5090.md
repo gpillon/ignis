@@ -75,10 +75,10 @@ found the mix adds nothing to it:
 ### The NVFP4 body: the mixed rows over a uniform cell's window (2026-11-22)
 
 Each lane held over the rows after its text's first 224 tokens, against the base rows a leg of base rounds at its
-lane count gives over the same window, at least 64 of them; the near tie read over the base rows of the kind's uniform cells at 1 to 4 lanes
-(both kinds' widest moved gap 12.0 ulps, so 24). NVFP4 body, FP8 exception weights, hq-e8-2b, over 12,096 forced
-and 11,887 graph mixed rows at 2 to 7 lanes (224 a lane forced, 217 to 223 on graph rounds), each leg 28 forced
-rounds or 45 to 88 graph rounds at its mix:
+lane count gives over the same window, at least 64 of them; the near tie read over the base rows of the kind's
+uniform cells at 1 to 4 lanes (both kinds' widest moved gap 12.0 ulps, so 24). NVFP4 body, FP8 exception weights,
+hq-e8-2b, over 12,096 forced and 11,887 graph mixed rows at 2 to 7 lanes (224 a lane forced, 217 to 223 on graph
+rounds), each leg 28 forced rounds or 45 to 88 graph rounds at its mix:
 
 | bound | margin | forced mixed rounds | graph mixed rounds |
 |---|---|---|---|

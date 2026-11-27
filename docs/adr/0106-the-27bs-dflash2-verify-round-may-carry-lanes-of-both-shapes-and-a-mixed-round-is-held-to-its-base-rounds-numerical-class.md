@@ -68,12 +68,12 @@ as ADR 0104 holds the extended round: its method, its margins and its window.
   the base row at the same text index and lane count exactly as ADR 0104 holds the extended round, the margins
   unchanged: each lane over a uniform cell's window, on a leg long enough for every lane to reach a uniform cell's row
   count, every round at its mix; the near tie read as ADR 0104 reads it, over the base rows of the kind's uniform
-  cells at 1 to 4 lanes, not over the mixed cells' own base rows nor pooled with them. On a shorter window of prose the likelihood
-  sits past its margin in the uniform cells too, and a looser margin for a short lane would be set by a window the
-  extended round was never held on; every row a longer leg reaches would read the bounds on texts ADR 0104 did not
-  measure them over, the base round's own near tie widening there, with gigabytes of rows on the host; and the mixed
-  cells' own base rows move a pick at a narrower gap than the uniform cells', so the extended round's own move, which
-  ADR 0104's reading passes, fails against them.
+  cells at 1 to 4 lanes, not over the mixed cells' own base rows nor pooled with them. On a shorter window of prose
+  the likelihood sits past its margin in the uniform cells too, and a looser margin for a short lane would be set by a
+  window the extended round was never held on; every row a longer leg reaches would read the bounds on texts ADR 0104
+  did not measure them over, the base round's own near tie widening there, with gigabytes of rows on the host; and the
+  mixed cells' own base rows move a pick at a narrower gap than the uniform cells', so the extended round's own move,
+  which ADR 0104's reading passes, fails against them.
 - **The class on the trellis body.** A mixed row is held, bit for bit, to the row of a uniform round of its lane's
   shape at its round's columns, and the uniform rounds to the class by ADR 0104's cells, its margins unchanged. There
   a lane's rows follow its round's columns, not its lane count, the trellis projection routing by the call's token
