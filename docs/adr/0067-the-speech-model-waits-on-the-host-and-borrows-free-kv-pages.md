@@ -65,8 +65,8 @@ unavailable too, with its own reason.
 ## Consequences
 
 - ignis serves audio in. Audio out is still not served.
-- Host RAM is held only while the model is in use, its KV included; the first dictation after an unload waits for
-  the load.
+- Host RAM: 1.4-3.1 GB resident while the model is in use, its KV at a 4,096-token context included, as measured on
+  llama.cpp. Unloading frees it all, and the first dictation after an unload waits for the load.
 - A CPU transcription uses all but one physical core by default (`speech.threads`). The larger model's decode is
   bound by memory bandwidth, so it competes with whatever else uses host memory. That default is accepted only if
   text decode slows by less than 10% during a CPU transcription, measured on the GPU.
