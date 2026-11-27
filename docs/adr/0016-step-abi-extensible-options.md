@@ -1,114 +1,48 @@
 ---
 status: accepted
-amends: [ADR-0009]
-amended-by: [ADR-0024]
 ---
 
-# ADR 0016 — Step-ABI calls take extensible options structs, and G2 spends the one extension
+# Step-ABI calls take extensible options structs
 
-## Status
+A step-ABI call that needs per-call modulation takes a pointer to an extensible options struct, whose first field is
+`uint32_t size`, the `sizeof` of the struct the caller compiled against; `NULL` means the production defaults, and
+the leaf rejects a size it does not recognize. The ABI then grows by fields on these structs, not by parameters and
+not by entry points. The span, position and batch parameters of ADR 0009 cover the shape of the work, a chunked
+prefill is still "this token span from this position", but not how a call is modulated: the first need, a prefill
+route and a compute policy chosen per call, had no place in the signature, and answered one parameter at a time
+every later phase would have been another ABI break.
 
-Accepted (2026-09-07, grilling session for GitHub #63). **Amends ADR 0009** —
-specifically its claim that chunked prefill would be "a leaf change, not an
-ABI change". The step-level, device-resident, opaque-handled design of ADR
-0009 is unchanged.
+- **An addition is a field append plus a size bump**, and old callers keep compiling. One exception: a field that
+  fits the struct's tail padding leaves `size` as it was, so the size check accepts the layout before it and the
+  one after it alike. The layout pin guards it instead: a `static_assert` on `sizeof` and on each appended field's
+  `offsetof` in the header, mirrored by an `offset_of!` test on the Rust mirror, so a drift on either side fails
+  the build or `cargo test`.
+- **No compatibility wrapper is kept.** The only consumer of this ABI is the Rust binding in this repository, kept
+  1:1 with the header and compiled from the same tree, so the leaf and the binding change together. If the ABI ever
+  gains a consumer outside the repository, stability is declared then, in its own ADR, with a versioning story,
+  which also says whether an append into padding needs a version field of its own: it is not simulated before.
+- **A new step-ABI call that plausibly needs per-call modulation takes an options pointer from its first version**,
+  even if the struct starts with nothing but `size`.
+- **The prefill call's options select the route and the compute policy**: chunked by default and per-token for
+  tests, the engine's default policy or `A16Only` forced. The per-token prefill route is a supported, documented,
+  test-only route: it is the chunked path's self-oracle (the same prompt through both routes must agree), and the
+  policy override lets a test compare routes on identical inputs.
+- **The rule is about steps, not about lifetime calls or queries.** A step is a forward pass, whose route, compute
+  policy or sampling would otherwise multiply parameters and `_ex` variants. A call that creates or destroys an
+  object a step runs against (the sequence pool, a sequence) has nothing to modulate per call, and a query has no
+  knob: these are entry points and take no options struct. So are the state-transfer and prefix calls (ADR 0024: a
+  snapshot's size and its format version are queries, publish, claim and release are lifetime operations on an
+  object the leaf owns, and the allocation that claims a shared prefix is a second constructor, not a flag on the
+  first, such a sequence being built differently, not stepped differently), and the decode graphs' capture, a
+  one-time startup action with no per-round counterpart (ADR 0019). A snapshot control, that is a policy, a stream
+  or a partial extent, still goes in an options struct when a phase needs one, and is not one more entry point.
 
-**Amended by #520** (2026-11-06): a field appended into the struct's tail
-padding leaves `size` as it was, and a layout pin guards it; see the
-amendment at the end.
+## Considered Options
 
-Sources: the spec of GitHub #63.
-
-## Context
-
-ADR 0009 put the span and start-position parameters on `ignis_prefill` from
-day one precisely so that G2's chunked prefill and G4's tail prefill would
-need no ABI change. That reasoning held for the *shape of the work*: a
-chunked prefill is still "this token span, starting at this position", and
-the leaf can cut it into chunks internally.
-
-It did not hold for *how the call is modulated*. G2 keeps the G1 per-token
-prefill path as a test-only route so the chunked path has a self-oracle
-(same prompt, both routes, must agree), and it wants tests able to force the
-`A16Only` compute policy to compare routes on identical inputs. Selecting a
-route per call is not expressible in the current signature, which has no
-options or flags parameter.
-
-So G2 must either change the signature or work around it. Three options:
-
-- **(a) A parallel `_ex` entry point**, with the old symbol kept as a
-  defaulting wrapper. Preserves the existing ABI literally. But the only
-  consumer of this ABI is the Rust binding in this same repository, compiled
-  from this same tree — there is no external caller to preserve it for, so
-  the wrapper is dead code from the day it is written. And the pattern
-  repeats: G3's sampling parameters and G4's snapshot controls would each add
-  another `_ex`.
-- **(b) Change the signature, and say so.** Honest, and correct for a
-  single-consumer ABI. But done naively (add a parameter now, add another at
-  G3, another at G4) it makes every phase an ABI break.
-- **(c) Make it a model-load option instead.** No signature change, but the
-  self-oracle test would have to load the 19 GB model twice to compare two
-  routes, and a test-only switch would sit in production configuration.
-
-The real decision is not "break or not" — it is *what shape the ABI takes so
-that this is the last break of its kind.*
-
-## Decision
-
-- **Step-ABI calls that need per-call modulation take a pointer to an
-  extensible options struct**, whose first field is `uint32_t size` carrying
-  `sizeof` the struct the caller compiled against. `NULL` means "production
-  defaults". The leaf rejects a size it does not recognize.
-- **G2 spends this extension on `ignis_program_prefill`**, adding
-  `struct ignis_prefill_options` with the prefill route (chunked by default,
-  per-token for tests) and a compute-policy override (engine default, or
-  force `A16Only`).
-- **Later phases add fields, not parameters and not entry points.** G3's
-  sampling parameters and G4's snapshot controls extend the relevant options
-  struct; each such addition is a field append plus a size bump, and old
-  callers keep compiling.
-- **No compatibility wrapper is kept.** The Rust binding
-  (`crates/core/src/step.rs`, kept 1:1 with the header) is updated in the
-  same change. If this ABI ever gains a consumer outside this repository,
-  stability is declared then, in its own ADR, with a versioning story — not
-  pre-emptively simulated now.
-- **ADR 0009 is amended, not superseded.** Its span+position and batch
-  parameters did their job: no chunking-driven parameter was needed. Its
-  blanket "not an ABI change" wording is corrected to "not an ABI *shape*
-  change; per-call options were added under ADR 0016."
-
-## Consequences
-
-- G2 is an ABI break, recorded as such. The leaf and the Rust binding are
-  updated together, which is already how every change in this repository
-  ships.
-- The default call site does not get more complicated: passing `NULL` keeps
-  today's ergonomics for the production path, and only tests construct an
-  options struct.
-- The per-token prefill route becomes a supported, documented, test-only
-  route rather than dead code left behind by G2. Deleting it later is a G3
-  decision.
-- A future reader who wonders why a C struct carries its own `sizeof` finds
-  the reason here: it is the mechanism that lets G3 and G4 extend prefill and
-  decode without another break.
-- The rule generalizes: any new step-ABI call that plausibly needs per-call
-  modulation should take an options pointer from its first version, even if
-  the struct starts with nothing but `size`.
-
-## Amendment (2026-11-06) — an append into tail padding keeps `size` (#520)
-
-#520 appended `int32_t keeps_draw` to `struct ignis_prefill_options`, after
-`next_prompt_token`. It took the four bytes of tail padding the struct
-already had, so `sizeof` stayed 224 and the size bump the Decision promises
-for every append did not happen: the leaf's `size` check accepts the layout
-before #520 and the one after it alike.
-
-- A field that fits the tail padding keeps `size` as it was. The layout pin
-  guards it instead: a `static_assert` on `sizeof` and on each appended
-  field's `offsetof` in `kernel/include/ignis_step.h`, mirrored by an
-  `offset_of!` test in `crates/core/src/step_abi.rs`, so a drift on either
-  side fails the build or `cargo test`.
-- It costs nothing today: the Rust binding in this tree is the ABI's only
-  caller, built together with the leaf. If the ABI gains a consumer outside
-  this repository, the versioning story the Decision asks for then says
-  whether an append into padding needs a version field of its own.
+- **A parallel `_ex` entry point, the old symbol kept as a defaulting wrapper**: rejected. There is no external
+  caller to preserve the old symbol for, so the wrapper is dead code from the day it is written, and the pattern
+  repeats at every phase that modulates a call.
+- **Change the signature a parameter at a time**: honest for an ABI with one consumer, but it makes every phase an
+  ABI break.
+- **A model-load option in place of a per-call one**: rejected. The self-oracle test would load the 19 GB model
+  twice to compare two routes, and a test-only switch would sit in production configuration.
