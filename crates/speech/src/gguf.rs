@@ -1,7 +1,7 @@
 //! Our own GGUF reader (spec speech/01 §1, Q60): the header, the metadata,
 //! the tensor table and the tensor data, memory-mapped.
 //!
-//! The format is the file the kernels read (ADR 0068 decision 9): GGUF v2
+//! The format is the file the kernels read (ADR 0068): GGUF v2
 //! and v3, little-endian, every metadata value type, `general.alignment`
 //! (32 when absent). Nothing here interprets the model; `model.rs` does.
 

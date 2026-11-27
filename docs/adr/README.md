@@ -57,7 +57,7 @@ edit it by hand.
 | [0047](0047-a-catalog-the-operator-can-extend.md) | A model catalog the operator can extend, and a `model` command to fetch from it | accepted | |
 | [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | An end of turn drawn inside an open reasoning block closes the block instead | accepted | |
 | [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | An idle model is unloaded, and the next request loads it again | accepted | |
-| [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) |
+| [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | |
 | [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted | |
 | [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | A reasoning loop is taken back, the model is nudged, and the client is told | accepted | |
 | [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | A resident Flash-Next load keeps its experts only in VRAM | accepted | |
@@ -73,9 +73,9 @@ edit it by hand.
 | [0064](0064-a-catalog-entry-states-its-card-class.md) | A catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | |
 | [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | The 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | |
 | [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
-| [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | the speech model waits on the host and borrows free KV pages | accepted | |
-| [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | the speech model's CPU executor is ours, in Rust | accepted | |
-| [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | the speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
+| [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | The speech model waits on the host and borrows free KV pages | accepted | |
+| [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | The speech model's CPU executor is ours, in Rust | accepted | |
+| [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | The speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
 | [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
 | [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
 | [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |

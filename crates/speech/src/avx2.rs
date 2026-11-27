@@ -1,4 +1,4 @@
-//! The AVX2 + FMA + F16C kernels (spec speech/01 §1, ADR 0068 decision 5).
+//! The AVX2 + FMA + F16C kernels (spec speech/01 §1, ADR 0068).
 //!
 //! Compiled only on x86-64. Nothing sets a global `target-cpu`: every
 //! function carries its own `#[target_feature]`, and it is reached only

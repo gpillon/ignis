@@ -2,7 +2,7 @@
 //! dot products and the fp64 dequantization the tests compare against.
 //!
 //! The block layouts and the Q8_K / Q8_0 quantization rules are the GGUF file
-//! format (ADR 0068 decision 9): data the kernels read, not copied code. The
+//! format (ADR 0068): data the kernels read, not copied code. The
 //! scalar kernels are the reference every AVX2 kernel is tested against; on
 //! x86-64 they are never served (Q28, Q35, Q64).
 

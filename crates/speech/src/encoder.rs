@@ -1,5 +1,5 @@
-//! The AuT audio encoder's graph, ours (spec speech/01 §2, ADR 0068
-//! decision 8): per 1 s chunk the three stride-2 convolutions with GELU,
+//! The AuT audio encoder's graph, ours (spec speech/01 §2, ADR 0068):
+//! per 1 s chunk the three stride-2 convolutions with GELU,
 //! `conv_out` and the chunk's sinusoidal positions; then, per 8 s window of up
 //! to 104 tokens, the pre-LN layers with bidirectional attention inside the
 //! window; the final norm and the two-layer projector.
