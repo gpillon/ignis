@@ -52,9 +52,11 @@ only until it was shown that they cost the inference path nothing, and every ser
 **When a family appears.** A family is exported from the first scrape, zeros included, unless it belongs to a route or
 a feature most servers never use. Such a family is absent until its first event: a server that never uses the feature
 is the normal one, and its permanent zeros on every scrape would be clutter that says nothing. The families of one
-model or of an optional tier (Flash-Next's, KV-disk's) render only on a load that has them. A memory gauge is always
-exported, whatever the load: its zero is a reading. Once a family is there, every series of it renders, zeros
-included, so a label value never vanishes with its count.
+model or of an optional tier (Flash-Next's, KV-disk's) render only on a load that has them, and so does the label
+value that is the tier's on families every load has, `tier="disk"` on the retained-state families. The plan's lines
+(`ignis_vram_reserved_bytes`) and the image model's condition-budget gauge are exported on every load, 0 for a line or
+a budget the load does not have: a memory gauge's zero is a reading. Once a family is there, every series of it
+renders, zeros included, so a label value never vanishes with its count.
 
 **The listener.** Prometheus scrapes `GET /metrics` on a listener of its own, `server.metrics_bind`: it asks for no
 API key, is never the API's `bind`, is never tunnelled by `--server-expose` (the tunnel of ADR 0028), and is refused
