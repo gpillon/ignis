@@ -30,12 +30,13 @@ every later phase would have been another ABI break.
 - **The rule is about steps, not about lifetime calls or queries.** A step is a forward pass, whose route, compute
   policy or sampling would otherwise multiply parameters and `_ex` variants. A call that creates or destroys an
   object a step runs against (the sequence pool, a sequence) has nothing to modulate per call, and a query has no
-  knob: these are entry points and take no options struct. So are the state-transfer and prefix calls (ADR 0024: a
-  snapshot's size and its format version are queries, publish, claim and release are lifetime operations on an
-  object the leaf owns, and the allocation that claims a shared prefix is a second constructor, not a flag on the
-  first, such a sequence being built differently, not stepped differently), and the decode graphs' capture, a
-  one-time startup action with no per-round counterpart (ADR 0019). A snapshot control, that is a policy, a stream
-  or a partial extent, still goes in an options struct when a phase needs one, and is not one more entry point.
+  knob: these are entry points and take no options struct. The state-transfer and prefix calls are entry points for
+  the same reason (ADR 0024: a snapshot's size and its format version are queries, publish, claim and release are
+  lifetime operations on an object the leaf owns, and the allocation that claims a shared prefix is a second
+  constructor, not a flag on the first, such a sequence being built differently, not stepped differently), and so
+  is the decode graphs' capture, a one-time startup action with no per-round counterpart (ADR 0019). A snapshot
+  control, that is a policy, a stream or a partial extent, still goes in an options struct when a phase needs one,
+  and is not one more entry point.
 
 ## Considered Options
 
