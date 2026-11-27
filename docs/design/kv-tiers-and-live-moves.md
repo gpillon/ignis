@@ -57,7 +57,9 @@ shared prefix, or lends the pages below its opener at its capture, hands those
 pages to the prefix cache and its reservation shrinks by them; counted by its
 reservation alone, a need that only those pages would cover moved nothing and
 waited behind a request that could have moved: every 27B request that
-published a head, and every Flash-Next one that captured.
+published a head, and every Flash-Next one that captured. The chain changes
+what a victim counts as freeing, never which victims are eligible or their
+order ([step 4](#a-need-for-pages)).
 
 - The walk goes from the entry the victim stands on toward the chain's root. A
   link counts while its holders, but for the one reference from below, are
