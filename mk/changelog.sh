@@ -43,7 +43,8 @@
 # that name no issue at all come last, so the per-issue list can be read for
 # what it dropped.
 #
-# Nothing here writes a file or touches git state.
+# Nothing here writes a file of the repo or touches git state: the only files
+# it writes are three texts in a temp directory, removed on exit.
 
 set -uo pipefail
 
@@ -249,7 +250,9 @@ fi
 # that brings ADRs to the short format and changes no decision, which covers
 # every ADR the commit touches, or `[typo ADR-0032]` (or a list), which covers
 # the ADRs it names. A mark covers its own commit only: a decision changed by
-# another commit of the range is amended. A status that changed is said, "(now
+# another commit of the range is amended. A merge is judged by its own
+# resolution, what it changes against both parents, and not by what it brings
+# in from a branch whose commits are judged themselves. A status that changed is said, "(now
 # superseded by ADR 0082)", against the long form's `## Status` section when
 # the older side has no frontmatter yet. An ADR deleted in the range is
 # "(removed)", under the title it had, by the same rule: not when the commits
@@ -278,9 +281,39 @@ adr_status() { # <rev> <path>: the frontmatter's status, else the Status section
              section && /^## / { exit }
              section && NF { word = tolower($1); gsub(/[^a-z]/, "", word); print word; exit }'
 }
+# Does commit <sha> change the text of ADR <number> itself? A commit with one
+# parent does when the text differs from its parent's. A merge does only by its
+# own resolution: when the text differs from every parent's and from what git
+# merges of the two sides' texts with no conflict, since what a merge only
+# brings in was changed, and judged, in the commits of the branch.
+changes_text() { # <sha> <number>
+    local mine parent parents texts=() base merged
+    parents="$(git log -1 --format=%P "$1")"
+    mine="$(adr_text "$1" "$(adr_at "$1" "$2")")"
+    for parent in $parents; do
+        texts+=("$(adr_text "$parent" "$(adr_at "$parent" "$2")")")
+        [ "${texts[${#texts[@]} - 1]}" != "$mine" ] || return 1
+    done
+    [ "${#texts[@]}" -eq 2 ] || return 0
+    # $parents is two words here, the two sides of the merge.
+    # shellcheck disable=SC2086
+    base="$(git merge-base $parents 2>/dev/null | head -1)"
+    [ -n "$base" ] || return 0
+    [ -n "$scratch" ] || scratch="$(mktemp -d 2>/dev/null)" || die "no temp directory"
+    printf '%s\n' "${texts[0]}" > "$scratch/ours"
+    printf '%s\n' "$(adr_text "$base" "$(adr_at "$base" "$2")")" > "$scratch/base"
+    printf '%s\n' "${texts[1]}" > "$scratch/theirs"
+    merged="$(git merge-file -p -q "$scratch/ours" "$scratch/base" "$scratch/theirs")" || return 0
+    [ "$merged" != "$mine" ]
+}
+# The three texts a merge's resolution is judged by, in a temp directory of
+# their own, made on the first merge that needs them.
+scratch=""
+trap '[ -z "$scratch" ] || rm -rf "$scratch"' EXIT
 # Is ADR <number>, whose text differs between the two ends, amended? Yes when a
 # commit of the range changes its text and carries no mark for it, and when no
-# commit that touches it carries one at all (a merge's own edit shows in none).
+# commit that touches it carries one at all, as a change git's walk of the
+# file's history shows in no commit.
 amended() { # <number>
     local sha message covered=0
     while read -r sha; do
@@ -294,8 +327,7 @@ amended() { # <number>
             covered=1
             continue
         fi
-        [ "$(adr_text "$sha^" "$(adr_at "$sha^" "$1")")" = \
-          "$(adr_text "$sha" "$(adr_at "$sha" "$1")")" ] || return 0
+        ! changes_text "$sha" "$1" || return 0
     done < <(git log --format=%H "$from..$to" -- "docs/adr/$1-*")
     [ "$covered" -eq 0 ]
 }
