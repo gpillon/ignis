@@ -77,7 +77,8 @@ below 14 GiB, where every built-in entry but the two `-12g` entries is above
 it),
 the server refuses an entry above it before unloading or fetching
 anything: a switch to it and a request naming it are answered
-`409 model_above_card_class`, naming both classes, while the loaded model
+`409 model_above_card_class`, naming both classes (`422` on `/v1/decide`, as
+every refusal of a decision's `model` is), while the loaded model
 serves on; a start with no artifact that would load it, and its
 `model download`, are refused; `GET /v1/models`, `GET /v1/models/catalog` and
 the Playground list it as unavailable, with the reason. An entry may answer to

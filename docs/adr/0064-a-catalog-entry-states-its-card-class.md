@@ -8,9 +8,9 @@ A request naming a model that is not loaded switches to it, if its artifact is o
 after the old model is torn down: a target that does not fit fails, the old model is reloaded and the request gets
 `503 model_switch_failed`. On a 16 GB card every request naming a model the card cannot hold, Flash-Next below its
 expert-cache floor or the image model at about 17.6 GiB of budget, would cost a full reload of the 27B. And the
-clients ignis has, a user's agents, other OpenAI-compatible clients and the Playground
-(ADR 0084), are configured with a family's default id, whose entry on a small card is an artifact that does not
-fit. So the catalog (ADR 0047) says what a card loads, before anything moves:
+clients ignis has, a user's agents, other OpenAI-compatible clients and the Playground (ADR 0084), are configured
+with a family's default id, whose entry on a small card is an artifact that does not fit. So the catalog
+(ADR 0047) says what a card loads, before anything moves:
 
 1. **A catalog entry states the smallest card class it loads on** (the classes are ADR 0063's), and an operator
    entry may state its own. It is optional in both catalogs, by one rule: an entry that states none is never
