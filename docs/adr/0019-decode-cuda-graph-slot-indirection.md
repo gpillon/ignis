@@ -6,15 +6,17 @@ status: accepted
 
 A decode round is replayed from a CUDA graph, one captured per exact batch width at startup, and a graph never
 names a sequence: each row reads its token, its position and its physical pool slot from staging buffers the model
-owns, at stable device addresses, refreshed by one host-to-device copy before the replay and read by the kernels
-when they execute. A graph replays a fixed DAG bound to the device addresses it captured, while the round's
-composition changes every round: a sequence keeps the pool slot it was allocated for its lifetime, but which of the
-pool's slots are decode-ready is arbitrary and in general not contiguous. A graph captured against particular slots' addresses would silently replay against another sequence's
-KV pages and GDN state as soon as a different combination of slots filled the same width, a silent bug that depends
-on the batch width, of the kind that had already cost a gate run.
+owns, at stable device addresses, refreshed from the host before each replay and read by the kernels when they
+execute. A graph replays a fixed DAG bound to the device addresses it captured, while the round's composition
+changes every round: a sequence keeps the pool slot it was allocated for its lifetime, but which of the pool's
+slots are decode-ready is arbitrary and in general not contiguous. A graph captured against particular slots'
+addresses would silently replay against another sequence's KV pages and GDN state as soon as a different
+combination of slots filled the same width, a silent bug that depends on the batch width, of the kind that had
+already cost a gate run.
 
 - **A graph is invariant after capture.** What changes from round to round lives in pre-allocated buffers at
-  stable addresses, and the hot path never updates graph nodes.
+  stable addresses, and the hot path never updates graph nodes: it is the standard pattern of an eager graph over
+  fixed-address staging, and the reference stack runs its graphs the same way.
 - **Row `i` of a width-W graph means whichever sequence the slot buffer names this round**, not a fixed physical
   slot: that is what makes one graph per width correct for any combination of W decode-ready lanes, not only a
   canonical low prefix. The one slot value serves the attention's block-table row selector and the recurrence's
