@@ -20,7 +20,8 @@ tokens.
   the tolerance the owner set and the route agreement test holds; the KLD unchanged within noise; and a cold prefill
   on the RTX 5090 no slower beyond the run's noise.
 - **The history is decoded once per chunk and layer into a fixed band, not once per CTA tile** (owner). A CTA holds
-  at most 128 query rows, so a decode per tile would decode each K/V row about 48 times a chunk and cost more than
+  at most 128 query rows, since its FP32 accumulators fill the registers, so a decode per tile would decode each
+  K/V row about 48 times a chunk and cost more than
   the whole attention. The residual window (the sinks, the ring before the chunk, the chunk itself) is attended in
   BF16, its rows exact as before, ADR 0037's ring-before-append included.
 - **The band is 8-bit**: Q·Kᵀ on the INT8 MMA, exact in int32, and P·V on the block-scaled E4M3 MMA, which SM120
