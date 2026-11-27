@@ -383,7 +383,7 @@ pub struct PrefillOutcome {
     /// the device never disagree about what exists.
     pub checkpoint_captured: bool,
     /// The whole pages below the opener that capture lent to a pages-only
-    /// link (GitHub #306, ADR 0029 as amended 2026-10-07), as the leaf
+    /// link (GitHub #306, ADR 0029), as the leaf
     /// counts them: 0 for a capture standing on a prefix. The scheduler
     /// releases a checkpoint whose loan is larger than the charge it moves to
     /// the link, so the ledger never frees pages the leaf still holds.

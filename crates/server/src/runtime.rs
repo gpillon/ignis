@@ -70,7 +70,7 @@ pub struct EngineShape {
     /// Cross-request state reuse (`--reuse-prompt`, GitHub #186, ADR 0029).
     pub prompt_reuse: bool,
     /// Whether the generation opener's page rides the checkpoint capture (ADR
-    /// 0029 as amended 2026-10-07 and 2026-11-05, GitHub #306, #508): decided
+    /// 0029, GitHub #306, #508): decided
     /// by [`crate::config::arch::opener_page_rides_capture`] for the family
     /// the config was fitted to and the card's generation, and again by
     /// [`EngineShape::for_family`]; no flag names it.
@@ -2253,9 +2253,9 @@ mod tests {
 
     #[test]
     fn with_no_card_read_a_load_fitted_to_either_family_lets_the_opener_s_page_ride_the_capture() {
-        // ADR 0029 as amended 2026-10-07 (GitHub #306): Flash-Next hands the
+        // ADR 0029 (GitHub #306): Flash-Next hands the
         // pages below an opener over with its checkpoint; since GitHub #649
-        // (ADR 0100) so does the 27B, on a shape that read no card as on
+        // so does the 27B, on a shape that read no card as on
         // every card, unless the load read IGNIS_SECOND_TAIL_CUT=1.
         use ignis_core::compute::ModelFamily;
         let unnamed = EngineShape::default();
@@ -2280,7 +2280,7 @@ mod tests {
         assert!(switched.for_family(ModelFamily::FlashNext).opener_page_rides_capture, "Flash-Next whatever it says");
     }
 
-    /// GitHub #508 (ADR 0029 as amended 2026-11-05): the 27B's opener page
+    /// GitHub #508 (ADR 0029): the 27B's opener page
     /// rides the capture on the card the start read when it is an Ampere or an
     /// Ada one, on the path its load takes (`load::load_shape`, then its
     /// decode share) and when the shape is fitted to it again; on an RTX 5090

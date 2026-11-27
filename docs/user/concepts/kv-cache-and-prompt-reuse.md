@@ -105,7 +105,10 @@ State lives in three tiers and moves down one when the tier above needs room
 
 Retained state is always the first to go: on the device it never delays or
 refuses an admission, and in KV-RAM it is discarded before any evicted live
-sequence. State reaches KV-RAM lazily, only when the device is about to discard
+sequence. On the device, prompt checkpoints go before retained prefixes, the
+least recently used first within each: a checkpoint serves one conversation's
+next turn, a retained prefix every later request that opens with the same
+system block. State reaches KV-RAM lazily, only when the device is about to discard
 it, never as a copy of what is still resident. A request still waiting for room
 holds the state it chose to resume from; when a request ranked above it needs
 those pages, it lets them go and looks again once it is its turn, resuming from

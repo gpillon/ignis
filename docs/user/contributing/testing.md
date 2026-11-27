@@ -88,7 +88,7 @@ the other. They are no configuration fields: `GET /v1/config` and
   PRO card, or with no card read, its second tail cut back at each model load:
   a reusable prompt is cut at the generation opener's page floor too, where
   its imaged prefix is published
-  ([ADR 0100](../../adr/0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md)),
+  ([ADR 0029](../../adr/0029-cross-request-state-reuse.md)),
   the comparison a time-to-first-token measurement needs. Unset, the 27B cuts a
   reusable prompt once, at the opener, on every card. The 27B on an RTX 30 or
   RTX 40 card and Flash-Next cut once whatever the variable says. Any other

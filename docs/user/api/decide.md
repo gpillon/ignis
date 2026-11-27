@@ -199,3 +199,28 @@ and you can still ask it yourself over a short text (Jev's "line search"):
   the state and in the answer.
 - At most 256 segments, the endpoint's option ceiling — past about 16 to 32
   near-duplicates it degrades, which is why the shortlist narrows first.
+
+## Keeping a state for later requests
+
+A `state` given as content parts sits in the user turn, past the end of the
+system block where a chat's shared prefix is kept
+([what is kept](../concepts/kv-cache-and-prompt-reuse.md#what-is-kept)), so the
+server keeps it at points of its own:
+
+- **A fan-out's head**: the longest common prefix of its rendered questions,
+  kept until the fan-out ends (above).
+- **An observed fork**: the end of the longest run of leading content parts
+  that a recent request's `state` also began with. The second request that
+  repeats a run keeps it, and the third and later ones resume from it.
+- **A reuse marker**: `"cache_control": {"type": "ephemeral"}` on a content
+  part keeps the state up to the end of that part, and a `state` that carries
+  one gets no observed fork. At most four per `state`, since each takes a
+  retained slot: more is a `422 too_many_reuse_markers`. Any other value, a
+  `ttl` included, is a `422 malformed_reuse_marker`, because what is kept goes
+  when the device needs the room, never after a time. `"cache_control": null`
+  is no marker. A string or JSON `state` has no parts and so no markers.
+
+A fork or a marker changes no byte of the prompt and never what a request may
+reuse, which is matched by content: it only chooses where state is kept. Each
+point is rounded down to whole KV pages and never ends inside an image, so one
+placed after a picture usually keeps the text before it.

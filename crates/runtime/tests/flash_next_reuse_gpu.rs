@@ -254,7 +254,7 @@ fn history_reuses_exactly(run: &Run<'_>, history: usize, salt: u32) {
     assert_eq!(used, 0, "{label}: every blob went back to the {capacity}-byte arena");
 }
 
-/// GitHub #306 (ADR 0029 as amended 2026-10-07): the shape Flash-Next now
+/// GitHub #306 (ADR 0029): the shape Flash-Next now
 /// serves. Turn N prefills its history to the opener in one call -- no cut at
 /// the opener's page floor -- and the capture hands the whole pages below the
 /// opener over as a pages-only link. The split control is two spans,

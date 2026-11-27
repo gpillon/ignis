@@ -282,8 +282,8 @@ pub struct ResidencyTier {
 /// The ordered list of [`ResidencyTier`]s this load retains state across:
 /// device first, then whatever is below it.
 ///
-/// **Why a list and not a branch.** Tier 2 (KV-disk) is prepared, not built
-/// (ADR 0029). The thing it would otherwise force a rewrite of is every place
+/// **Why a list and not a branch.** Tier 2 (KV-disk) came after the first
+/// two (ADR 0029, ADR 0045). The thing it would otherwise force a rewrite of is every place
 /// that says "device, or else KV-RAM": a third place turns each of those into
 /// a three-way branch, and the branches drift. Written over a list, adding a
 /// tier is adding an entry — the selection below and the demotion order are

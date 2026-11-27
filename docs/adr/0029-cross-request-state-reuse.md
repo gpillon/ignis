@@ -1,609 +1,154 @@
 ---
 status: accepted
-amended-by: [ADR-0045, ADR-0100]
 ---
 
-# ADR 0029 — cross-request state reuse: content-matched retained state across three residency tiers
-
-## Current decision
-
-What holds today, folded from the Decision and its eight amendments below and
-checked against the code on 2026-11-08; the History keeps the reasons.
-
-**Match by content, not by session.** A request reuses the longest retained
-state whose match key, a hash of its token content and media identity, is a
-prefix of its prompt. No API field selects it, and reuse is global: there is
-one API key. It is on by default; `--reuse-prompt off` (once
-`--prompt-reuse off`) is for cold benches and correctness oracles.
-
-**Two retained objects.** A **prompt checkpoint** is a request's
-whole-sequence state at its generation opener, `<|im_start|>assistant\n`; a
-conversation keeps at most two, its latest and its turn-opening one. A
-**retained prefix** is a shared prefix kept with no claimant, published at
-each of a request's reuse boundaries, floored to whole KV pages and walked out
-of media: the end of the system-and-tools block and, on `/v1/decide`, a
-fan-out's common prefix, an observed fork and a `cache_control` marker
-(#270). A prefix may be chained over another (#187). A fan-out's head goes
-when its fan-out ends, and never to KV-RAM.
-
-**Reuse copies, never consumes**, in every tier: a claim shares the full
-pages, clones the mutable image and copies the tail page, and the entry
-stays.
-
-**Retained state is free until the room is needed.** On the device it is the
-first victim, prompt checkpoints before retained prefixes (#188), and it
-never delays or refuses an admission; since ADR 0045's #445 amendment neither
-does what a waiting request claimed of it. Its images live in retained slots
-reserved at load (ADR 0030): by default in a pinned host block (ADR 0030 as
-amended for #281), in VRAM only where `--reuse-retained-device` or a profile
-names some.
-
-**Three tiers, all built.** Below the device, KV-RAM and KV-disk (ADR 0045)
-take retained state lazily, only when the tier above would discard it, and
-give it up before any evicted live sequence. A retained prefix spills too, and
-comes back once, into a carrier sequence (#190). A restore must beat the best
-reuse still above it by a floor: 1,024 tokens from KV-RAM
-(`KV_RAM_RESTORE_FLOOR_TOKENS`), and from the disk 8,192 on Flash-Next and
-16,384 on the 27B; the disk restores straight to the device. A hit is counted
-when its claim lands (#445). KV-disk reuses nothing across a restart yet; its
-file header carries the identity below, widened by #205.
-
-**The opener's page rides the capture** on Flash-Next and, on Ampere and Ada,
-on the 27B (#306, #508): the prefill is cut once, at the opener, and the
-capture lends the pages below it to a pages-only link that is never claimed
-and takes no slot. The server decides it from the family and the card's
-generation (`config::arch::opener_page_rides_capture`). On Blackwell, and with
-no card read, the 27B keeps the imaged prefix at the opener's page floor,
-except for a request whose image spans that floor, which lends on any load
-(#249).
-
-**Multimodal.** Every match, in every tier, is by token ids and media items,
-and no claimable prefix ends inside an image's placeholders (#193). A
-multimodal claim always leaves one prompt token to prefill, until reused state
-carries `rope_delta` (#201, open).
-
-**The compatibility identity** is the artifact content hash, the KV format,
-the blob layout version and the drafter's presence and draft window. The
-content hash digests the container's declared directory, not its payload
-(#189), so an in-place re-quantization is the one hole, pinned by
-`a_rewritten_payload_alone_is_the_proxys_known_limit` in
-`crates/artifact/src/lib.rs`. Whether the container should carry a payload
-digest was left open for the owner; not re-verified since.
-
-## History
-
-The ADR as accepted on 2026-09-16 and amended in place until 2026-11-05, its
-headings one level down.
-
-### Status
-
-Accepted (2026-09-16) — GitHub #183 (absorbs #168). Spec:
-linked from #183. Builds on ADR 0024
-(sequence state transfer) and ADR 0023 (eviction priority), and amends both.
-Clarified by ADR 0030 (2026-09-17): the device pool of retained images below
-is physical — **retained slots** reserved at load, holding every shared
-prefix image as well as checkpoint images — not a byte ledger over
-request-time allocations.
-**Amended 2026-10-07 by ADR 0045**: Tier 2 (KV-disk) is built — see the
-amendment at the end.
-**Amended 2026-10-31 by ADR 0045 (#445)**: what a request still waiting for
-its admission claimed of retained state on the device goes as retained state
-goes, for an entry ranked above it, and a claim reports its reuse and its hit
-only once it lands — see ADR 0045's amendment of that date.
-
-### Context
-
-Prefix reuse (#126) and the KV-RAM tier (#125) both stop at request
-liveness. A shared prefix is dropped when its last claimant completes, and
-KV-RAM holds only live sequences evicted for overflow. So every turn of a
-chat and every iteration of an agent loop re-sends its whole history and pays
-the whole prefill again, and so does every subagent of a burst that arrives
-after its sibling finished. ninfer, the owner's fork of the reference, keeps
-a finished request's state on its idle lane and spills it to pinned RAM
-(`--kv-ram-capacity`). ignis has no equivalent.
-
-Three facts shape what can be reused:
-
-- GDN state exists only at positions where it was captured. Reuse therefore
-  happens at recorded points, never at an arbitrary longest common prefix.
-- The next turn does not re-render an assistant message the way it was
-  generated: thinking is dropped or emptied, a `\n` follows `<|im_end|>`, and
-  tool arguments are re-serialized. The state after generation never matches.
-  The last position every later turn provably shares is the **generation
-  opener**, `<|im_start|>assistant\n`.
-- The clients (qwen-code, the Playground) send no session identifier.
-
-### Decision
-
-**Match by content, not by session.** A request reuses the longest retained
-state whose token content, media identity included, is a prefix of its
-prompt. There is no API field for it. A wrong session id could hand one
-conversation another's state; a content match can only hand over identical
-history.
-
-**Two retained objects.** A **prompt checkpoint** is the whole-sequence state
-of every request at its generation opener. A **retained prefix** is a shared
-prefix kept alive with no claimant, published at a structural boundary: the
-end of the system-and-tools block, floored to whole KV pages. The first
-serves the next turn; the second serves the next subagent of a burst.
-
-**Reuse copies, never consumes.** Claiming a prompt checkpoint shares its full
-pages, clones its mutable image and copies its partial tail page, and the
-entry stays. Retries, regenerates and forks from the same point all hit. A
-conversation keeps at most two checkpoints: its latest, and its
-turn-opening checkpoint (the one right after its last real user message).
-That turn-opening checkpoint is the only one a new user message can still
-match once history drops the earlier thinking.
-
-**Retained state is free until the room is needed.** On the device it is
-always the first victim, and it never delays or refuses an admission (nor does
-what a waiting request claimed of it: amended by ADR 0045, #445). Its
-mutable images live in a device pool reserved at load (retained slots, ADR 0030); when that pool is
-exhausted, a checkpoint is simply not taken. KV-RAM receives it lazily, only
-when the device would otherwise discard it, and discards it before any
-evicted live sequence.
-
-**Three residency tiers, Tier 2 prepared.** Tier 0 is the device, Tier 1
-KV-RAM, Tier 2 KV-disk. Tier 2 is not built. What is built now is the part it
-would otherwise force a rewrite of:
-
-- a blob's **compatibility identity** is the artifact content hash, the KV
-  format, the blob layout version, and the drafter's presence and draft
-  window. It is never a `RequestId`, and never an operator knob that does not
-  change state;
-- an entry's **key** is a hash of its token content plus its media identity.
-
-**Reuse is global.** Today there is one API key. Anyone who can reach the
-server can tell from TTFT whether a prefix was seen before; that side channel
-is accepted. The day a second key exists, the key's identity joins the match
-key.
-
-**On by default.** `--prompt-reuse off` exists for cold benches and
-correctness oracles.
-
-### Considered options
-
-- **A session id in the API** (#168 option A). Rejected for the reason above,
-  and because no client sends one.
-- **A checkpoint after generation** (ninfer's frontier). Never matches under
-  ignis's rendering.
-- **A checkpoint at the prompt end, after `<think>\n`.** Misses on every new
-  user message once history drops the earlier thinking. The opener costs two
-  or three re-prefilled tokens instead.
-- **Consume on reuse** (ninfer's exclusive claim). Retry, regenerate and forks
-  would all miss.
-- **Eager device-to-host copy at request end.** Costs roughly 15–20 ms per
-  request at PCIe Gen 3, whether the state is ever reused or not.
-- **A learned (observed-LCP) retained-prefix boundary.** To revisit only if
-  measurement shows shared heads extending past the system block.
-- **Per-key isolation.** There is no second key to isolate.
-
-### Consequences
-
-- **Equivalence.** A reused request and a cold prefill of its whole prompt
-  split their chunks differently, so they can diverge at near-ties (the same
-  effect as #153). The correctness claim is bit-exactness against a cold
-  prefill split at the same boundary. Divergence against an unsplit cold
-  prefill is recorded as information, not failure.
-- **Amends ADR 0024.** A prompt checkpoint's publish point is not a page
-  boundary, and a snapshot of a sequence holding a shared prefix materializes
-  the shared pages instead of being refused. A shared prefix may also be
-  published *over* another one (#187, a **chained prefix**): a request that
-  resumed from retained state owns only the pages it warmed past it, so the
-  entry it publishes owns those and holds the chain below — taking over the
-  reference the sequence was holding rather than adding one. One reference per
-  link, every page still charged once, and a claimant of the chain shares all
-  of it. Without it a conversation grown past its first KV page could never
-  take a second checkpoint, and "at most two" above would bound something that
-  never grew.
-- **Amends ADR 0023.** Retained state goes first, on the device and in
-  KV-RAM.
-- **Departure (#189): the "artifact content hash" above is a hash of the
-  container's *directory*, not of its payload.** The v2 container carries no
-  per-tensor digest by design (`ignis_artifact::checksum`'s module doc), and
-  hashing ~19 GB of weights at every startup is not a price a compatibility
-  check may charge. `Reader::content_hash` therefore digests everything the
-  container *declares*: its identity, its byte size, its payload start, and
-  every object's name, kind, numeric format, storage layout, shape, offset and
-  length. That catches a different model, a re-export, a re-layout, a renamed
-  or added object, and a format change. It does **not** catch an *in-place
-  re-quantization* that rewrote payload bytes while preserving every name,
-  format, shape and offset — a different model this identity would accept
-  blobs from, and the one hole left in user story 16. Recorded as a test
-  rather than a comment (`a_rewritten_payload_alone_is_the_proxys_known_limit`
-  in `crates/artifact/src/lib.rs`). Closing it needs a digest the *producer*
-  writes into the container: a change to the artifact format, not to this
-  feature. **Open for the owner** — whether the proxy is enough, or whether
-  the v2 container should start carrying a payload digest.
-- **Vision (#180)** builds its media-aware prefix identity on the match key
-  defined here, instead of adding its own. Landed as #193, which keys the
-  sibling shared prefixes by it too: a prefix cache matching raw token ids
-  would have let a sibling sending another picture share one.
-- **Rendering must be stable.** The chat template has to render history the
-  way the reference does (tool-argument order, `preserve_thinking`); a
-  rendering drift silently turns every match into a miss.
-
-### Amendment (2026-09-16) — which retained object goes first (#188)
-
-The Decision says retained state is "always the first victim" on the device
-but not which of the two kinds goes first. #188 makes both kinds real at the
-same time, so the device's first-victim path needs the order.
-
-**Retained prompt checkpoints are given up before retained prefixes; least
-recently used within each kind.**
-
-Three reasons, in the order they decide it:
-
-- **Width of the bet.** A checkpoint serves one conversation's next turn. A
-  retained prefix serves every future request that opens with that system and
-  tools block, including ones belonging to no conversation seen so far. Between
-  two bets, the narrower one is given up first.
-- **Pages returned per discard.** A checkpoint's prefix reaches past the block
-  its conversation opened with, so discarding one frees at least as many pages
-  as discarding a prefix does. Fewer discards, less reuse lost.
-- **Termination where a prefix carries both.** When the block and the opener
-  fall in the same KV page, one prefix is both the burst's retained block and
-  the pages a checkpoint stands on. Its pages come back only when *every*
-  holder lets go, so the checkpoints on it must go before its retention — any
-  other order gives up the wide bet and still returns no page.
-
-This is a policy the accepted Decision did not fix, recorded here rather than
-left in a comment. The owner may reverse it, and reversing it means two places
-rather than one:
-
-- the order of the two arms in `ConcreteScheduler::reclaim_retained`, which is
-  the ordering itself;
-- `ConcreteScheduler::reclaimable_prefixes`, which must go on listing **both**
-  kinds — checkpoint-held prefixes and bare retained ones — in one set. The
-  third reason above rests on that *membership*, not on the order the union
-  happens to be built in: a prefix carrying both is reclaimable only because
-  both kinds appear in the set, and narrowing it would strand that prefix
-  whichever arm ran first.
-
-`crates/core/tests/retained_prefix.rs`'s
-`the_narrower_bet_is_given_up_first_when_a_pool_holds_both_kinds` is the test
-that changes with it; it is written to fail when the order is flipped.
-
-### Amendment (2026-09-16) — the KV-RAM tier (#190)
-
-What building Tier 1 decided that the Decision left open.
-
-- **The restore floor is `KV_RAM_RESTORE_FLOOR_TOKENS` = 1024**, one prefill
-  chunk: a fixed starting value, to be tuned by measurement (the trace replay,
-  #191), not derived. It is measured against the **best reuse still on the
-  device**, a sibling or retained *prefix* included — a KV-RAM restore that
-  beats a device checkpoint but not a device prefix by a chunk pays the
-  crossing for nothing.
-- **Retained prefixes spill too, and come back to the device** (owner
-  decision). A retained prefix the device gives up is written to KV-RAM, ranked
-  with the checkpoints there. A prompt whose longest reuse is such a prefix —
-  beating every device reuse by the restore floor and every KV-RAM checkpoint
-  outright — brings it back **once**: the blob is restored into a carrier
-  sequence, published again under its original name, and retained on the
-  device, where that request and every later member of its burst claim it in
-  place. The blob stays in KV-RAM, so giving the prefix up again copies
-  nothing. Its pages are taken back from retained state like a request's, and
-  it never evicts live work.
-- **A published head is named by its publisher and its length.** One request
-  publishes its system block and then a chained head over it (#187 x #188);
-  keyed by the publisher alone, the second replaced the first, and a burst
-  member claiming the block was stood up on the chain.
-- **A request restored from a materialized blob owns every page it restored.**
-  No publish point at or below the restored length can be reached again, so
-  it publishes, if at all, at its own generation opener's page — the one that
-  makes its next checkpoint capturable — and only when it has an opener, as a
-  claimant's chained publish already must. Without this a conversation that
-  came back from KV-RAM would never leave another checkpoint.
-- **A blob a request has chosen is held until its restore lands.** Nothing
-  discards it in between; a discard that arrives meanwhile takes effect when
-  the claim lets go.
-- **Lifecycle facts.** Hit (chosen), miss (first chunk landed with no match in
-  a tier), spill, discard and restore (landed) are emitted by the core, one
-  per event, per tier, identically with metrics on or off (ADR 0017 as
-  amended by #190). Since #445 a hit is counted when the claim lands, beside
-  its restore, not when it is chosen (ADR 0045 as amended 2026-10-31).
-
-### Amendment (2026-09-16) — multimodal prompts (#193)
-
-- **Prefix identity is the match key everywhere.** Sibling shared prefixes,
-  retained prefixes, their KV-RAM copies and prompt checkpoints are all matched
-  by token ids *and* media items; a publish point never ends inside a media
-  item's placeholders.
-- **A multimodal claim always leaves one prompt token to prefill** (owner
-  decision). A claimant is built from cloned pages and mutable state, neither
-  of which carries the sequence's `rope_delta`; only a prefill span hands it to
-  the leaf. So neither a shared prefix nor a prompt checkpoint reaching a
-  multimodal prompt's last token is offered — a claimant's prompt can end
-  exactly at another request's opener. It costs one re-prefilled token in that
-  rare case. Lifting it means carrying `rope_delta` with the reused state
-  (#201).
-
-### Amendment (2026-09-26) — reuse boundaries (#270)
-
-The Decision publishes a retained prefix at one structural point, the end of
-the system-and-tools block. A `/v1/decide` state given as content parts
-never reaches that point: it stays in the user turn, so a static text head
-before a changing image, and a fan-out's whole state, are re-prefilled every
-time. #270 measured it (324 ms per request for a text state the JSON path
-serves in 70 ms). The considered option "a learned (observed-LCP)
-retained-prefix boundary … to revisit only if measurement shows shared heads
-extending past the system block" is that measurement.
-
-**A request carries an ordered list of reuse boundaries, not one.** Each is
-published as a shared prefix (the first plainly, the rest chained, #187),
-one retained slot each, and is retained either until the device needs the
-room (as above) or until the **fan-out** that owns it ends. The system block
-is the first source. `/v1/decide` adds three: a fan-out's **computed common
-prefix** (its rendered questions are all known before the first is
-submitted), an **observed fork** (the end of the longest run of leading
-content parts a recent request also began with — the second occurrence
-publishes, the third claims), and a **reuse marker** (`cache_control:
-{"type": "ephemeral"}` on a content part; a request carrying one gets no
-observed-fork boundary). Spec: GitHub #270.
-
-What does not change, and why it is consistent with the Decision:
-
-- **Matching is still by content.** A marker or a fork decides where state is
-  *kept*, never what a request may *claim*: a claim is still the longest
-  retained state whose match key is a prefix of the prompt. "There is no API
-  field for it" stays true of matching; the marker is an API field for
-  placement only.
-- **The prompt the model reads is unchanged.** The alternative — moving the
-  state's leading text into the system block — was rejected: it changes
-  measured decision prompts (ADR 0034), can never hold an image, and misses
-  whenever changing text precedes the first image.
-- **Retained state is still the first victim.** A fan-out's head is the one
-  departure from "free until the room is needed": it is given up when its
-  fan-out ends, because no later request is expected to send that state
-  again, and eight slots are too few to keep a head per decision.
-
-Considered and rejected: a "first text part" convention (unpublished
-anywhere, and it spends a slot whenever the first part is the one that
-changes); client markers with same-step producer/consumer scheduling (vLLM
-RFC #55697 — the scheduling half would make a decision a live publisher,
-which #238 rules out).
-
-**As built** (2026-09-26), where the spec left a choice:
-
-- **The list lives beside the block, not instead of it.**
-  `RequestInput::reuse_boundaries` carries the server's predictions as exact
-  token prefixes; `Request::reuse_boundaries` joins them with the system
-  block, floors, walks out of media, caps at the publish reach and merges.
-  The registration asks it the lifetime of the head it just published, so the
-  generation opener's page — which is no reuse boundary — is still the only
-  head that dies with its claimants.
-- **#187's gate stays on the structural heads.** A resumed request without an
-  opener still publishes neither its system block nor its opener's page, but it
-  does publish the boundaries the server predicted for it: each is a
-  prediction somebody made, which is what the gate asks a chained head to
-  prove.
-- **A fan-out's head never goes to KV-RAM.** When the device gives one up
-  early it is discarded, and when its fan-out ends its retention is released
-  like any first-victim give-up. The scheduler also strips an ended fan-out's
-  boundary from a question still waiting to publish it, so a client that left
-  mid-fan-out leaves nothing behind. The end reaches the scheduler as its own
-  command (`Scheduler::end_fan_out`) and reports the slot gauge at once — an
-  idle engine may not step again.
-- **The part ends come from the renderer.** A decision asks the template for
-  where each content part of its user turn ends
-  (`TemplateProvider::apply_chat_template_with_part_ends`); the artifact
-  provider renders the conversation cut after each part and keeps the offset
-  only where the whole prompt has the same bytes up to it and it tokenizes to
-  an exact prefix. Each end costs a tokenization of the head, so only the
-  first question under each system text asks (the others share the state and
-  claim the fan-out's head, which covers every end), no end is reported for
-  the message's last part, and chat requests never ask.
-- **`cache_control: null` is no marker.** It is what a client that serializes
-  an absent field sends; it asks for nothing, so it is neither honoured nor
-  refused.
-- **An image's end is rarely a boundary.** A boundary at the end of an image
-  part floors into the image's placeholders unless its page boundary happens
-  to fall after them, and #193 walks it back to before the image. A fork or a
-  marker after a picture therefore usually keeps the text before it; a
-  fan-out's head keeps the picture only when the question text its questions
-  share reaches the next page boundary. Measured live in
-  `docs/findings/2026-09-26-decide-reuse-boundaries-live.md`: that, and each
-  follower's own per-question cost, is why spec 16's `E <= 2 x D` does not hold.
-
-### Amendment (2026-10-07) — the opener's page rides the capture (#306, owner decision)
-
-The Decision publishes the generation opener's page floor as a chained prefix
-(#186, #187) and captures the prompt checkpoint over it, so a request's prefill
-is cut twice: at the floor, where the publish needs the mutable state, and at
-the opener, where the capture does. On the 27B the extra cut costs one ~19 ms
-traversal. On Flash-Next a traversal costs the expert stream it touches, and
-the piece between the floor and the opener (≤ 63 tokens) cost 0.13-0.66 s of a
-reused agent turn's 1.86 s (spec flash-next/05 acceptance 6,
-`docs/findings/2026-10-07-flash-next-agent-turn-tail.md`).
-
-That prefix is published for its **pages**. Its image is read only by a claimant
-whose prompt matches up to the floor and diverges in the ≤ 63 tokens before the
-opener: the conversation's next turn matches the checkpoint, and a burst's next
-subagent matches the system block.
-
-**On a model that asks for it — Flash-Next — the opener's page is published by
-the capture, as a pages-only link.** At the chunk that lands on the generation
-opener, the leaf lends the whole pages between what the sequence already shares
-and the opener's page floor to a chained prefix that carries no image, then
-captures the checkpoint over it. The prefill is cut once, at the opener.
-
-- **The capture moves nothing.** The lent pages stay in the sequence's
-  allocation and block-table row; the link takes them, by host bookkeeping
-  alone, when the sequence is released. A capture that fails has therefore
-  changed nothing, as before. The scheduler moves their charge to the link at
-  the capture: the same pages, counted once.
-
-- **A pages-only link is never claimed.** No sequence stands at its end, so it
-  has no state to hand over: the scheduler never matches it, and the leaf
-  refuses a shared claim of it. A prompt diverging below the opener resumes from
-  the link below it or the system block.
-- **It has no handle and takes no retained slot.** Its holders are the sequence
-  that lent it its pages, the checkpoint over it, the checkpoint's claimants
-  and the links later chained over it; it goes with the last of them.
-- **It exists only with a checkpoint.** A capture the scheduler declines (no
-  retained slot, no spare page, an identical checkpoint already held) publishes
-  nothing at the floor. Two identical prompts in one batch no longer meet at a
-  shared floor prefix (P4-10's one publisher per head), so the scheduler
-  deduplicates their captures by content instead.
-- **Reuse boundaries are unchanged.** The system block and #270's boundaries are
-  still published with their images at their own cuts. When one lands on the
-  opener's page floor the capture stands on it and chains nothing.
-- **The 27B keeps the imaged prefix at the floor** (coordinator decision for
-  #306): the cut costs it ~19 ms, and changing its splits would move its
-  outputs at near-ties without a measured reason to. The leaf mechanism is
-  shared; adopting it there is one `ModelFamily` switch plus the 27B GPU
-  tests' split controls.
-
-**Exactness.** A reused request is bit-exact against a cold prefill split at
-the same boundaries, which are now `[…, opener)` and `[opener, end)`. The
-capturing request goes on exactly as if it had published nothing: the loan
-touches neither its pages nor its state. Its outputs differ from the three-way
-split's only by the chunking effect the Consequences already record.
-
-Considered and rejected:
-
-- **A checkpoint taken mid-chunk.** The state sections agree with one another
-  only at a chunk boundary (`ignis_seq_at_chunk_boundary`); every layer would
-  have to export its state at an interior position.
-- **Publishing the floor later, from a snapshot taken at the cut.** The state
-  at the floor is gone once the chunk passes it; the pages are all that can be
-  published later, which is this amendment.
-- **Skipping the publish when the tail is short.** The checkpoint needs a holder
-  for the pages below the opener; without one the next turn loses its reuse
-  (spec flash-next/05 acceptance 2).
-- **A checkpoint that owns those pages itself.** The same ownership in a second
-  structure; the prefix chain already walks, materializes and releases links.
-
-### Amendment (2026-10-07) — Tier 2 is built (ADR 0045)
-
-The Decision's "Three residency tiers, Tier 2 prepared" is superseded: KV-disk
-is built (ADR 0045, spec of GitHub #309).
-
-- **What KV-RAM gives up goes to the disk** instead of nowhere, and a device
-  victim KV-RAM cannot take goes straight there. A blob comes back from the
-  disk to the device directly, never through KV-RAM.
-- **Retained state ranks on the disk as it does in KV-RAM**, and a spill
-  displaces only what ranks below it. With the tier on, an evicted live
-  sequence is never discarded to make room.
-- **The disk's restore floor is the model's**: 8,192 tokens on Flash-Next and
-  16,384 on the 27B, measured against the best match on the device and in
-  KV-RAM. KV-RAM's stays 1,024.
-- **A claim from the disk never consumes**: a retained blob's file stays after
-  its restore, as a KV-RAM blob stays in the arena.
-- **The identity built here is what each file's header carries**, widened by
-  GitHub #205: the served model id, the sidecar's payload digest when there is
-  one, and the RoPE scaling. v1 still reuses nothing across a restart, and the
-  tier is wiped, so "meant to outlive a server restart" is not yet true. The
-  header is what would make it so without a format change.
-
-### Amendment (2026-10-31) — an image spanning the opener's page floor (#249, coordinator decision 2026-10-31)
-
-#193 keeps a claimable prefix from ending inside an image, so when a picture
-runs past the last page boundary before the generation opener, the opener's
-page floor walks back to the page holding the image's first placeholder.
-Nothing is published at the opener's page, the capture finds no prefix under
-the opener, and no checkpoint is taken. #193 recorded that as a lost
-checkpoint and took it to be rare. It is the common shape: it is taken by any
-image request whose opener lands in the KV page its picture ends in, which a
-short question after the picture makes the usual case.
-GitHub #249's request, a 4096x4096 screenshot and a six-token question, is
-16,404 tokens with the floor at 16,384 inside the image, and an identical
-repeat re-prefilled all of it, as did the conversation's next turn.
-
-**On the 27B too, a request whose image spans its opener's page floor lends
-the pages below the opener at its capture**, to the pages-only link of the #306
-amendment, and the checkpoint stands on it. The request keeps the head its
-floor walked back to (the system block, a reuse boundary, or the page before
-the picture) and gains one cut, at the opener: #249's request goes from 17
-chunks to 18. A next turn whose own floor lies past the picture, the usual one
-(in #249's request, any whose opener lies 48 tokens or more past the first),
-takes no link of its own: standing on the checkpoint, it publishes the pages it
-warmed as a prefix chained over the link at its floor (#187) and captures at
-its opener over that, and the turn after it stands on both.
-
-- **Why now.** The #306 amendment kept the 27B's imaged floor prefix because
-  changing its splits would move its outputs at near-ties without a measured
-  reason to. This is the measured reason: a whole-picture re-prefill on every
-  such repeat and next turn, against one ~19 ms cut. On the 5090, at
-  1,024-token chunks with DFlash2, the repeat went from 17 chunks and ~1.6 s to
-  one 4-token chunk that resumes 16,400 tokens from the device in ~0.17 s, and
-  the next turn resumes the same 16,400.
-- **The link may end inside the image; nothing claimable does.** A pages-only
-  link is never claimed. The checkpoint over it ends at the opener, past the
-  picture, and its key carries the image's identity. A claimant shares the
-  link's pages and copies the tail page, placeholders included, and its own
-  prefill span still hands the leaf its rope delta.
-- **Unchanged.** A request whose opener's floor lies outside every image
-  publishes its imaged floor prefix as before, so the 27B's other splits stay.
-  The 27B's family switch, `ModelFamily::opener_page_rides_capture`, stays
-  off. #193's rule and #201's one-token tail are untouched. A decision
-  captures nothing, so it keeps its floor.
-- **Exactness.** As for #306: bit-exact against a cold prefill split at the
-  same boundaries (`crates/server/tests/vision_checkpoint_link_gpu.rs`). On
-  the 5090 the identical repeat generated what the first request did, and a
-  next turn standing on the link generated what a cold prefill split at the
-  first opener did, from the device and, after a spill, back from KV-RAM. A
-  next turn whose floor lies past the picture, standing on the link with its
-  own prefix chained over it, and a third turn standing on that chain each
-  generated what a cold prefill cut where its whole history was cut did, token
-  for token. The repeat from KV-RAM was the HTTP run's: with the checkpoint
-  spilled, every claim came back from KV-RAM, 16,400 tokens restored in
-  31-47 ms, with the device claimants' answers. Against an unsplit cold
-  prefill the new cut does move outputs at near-ties, as the #306 amendment
-  foresaw: #249's first answer read "shows" where the unsplit one read
-  "displays". That is recorded, not a failure.
-- **Inherited: what a live move counts as freed (#444).** A lender holds the
-  lent pages through its link while it lives, as a publisher holds the pages
-  it published, and its reservation shrinks by them. ADR 0045's `make_room`
-  counted only a mover's reservation as freed, so a need that only the
-  mover's lent or published pages would cover moved nothing and waited. That
-  was already true of every request that publishes, every 27B text request
-  whose opener lies past its first page and every Flash-Next request that
-  captures. For an image request spanning its floor it was an observed
-  regression: in `vision_mixed_load_gpu` an Interactive request needing the
-  whole pool moved the decoding Agent image request 0 times, where it moved
-  once without #249's change. #444 fixes it: counting the pages a mover's chain frees once
-  nothing but retained state holds them is ADR 0045's amendment of
-  2026-10-31. A live move of an image lender is #444's acceptance:
-  `vision_mixed_load_gpu` moves the decoding image request, whose link cuts
-  its picture, and holds its output to the same request served alone on a
-  fresh load, which it matched on the 5090 with both changes.
-- **The limit this leaves (#201).** A prompt that ends exactly at a held
-  checkpoint's opener may not claim it, because a multimodal claim never
-  reaches the prompt's last token (the #193 amendment), so it re-prefills.
-  Such a render also captures nothing itself: a capture at the prompt's end
-  would come from the chunk that samples. This artifact's template renders
-  neither thinking setting that way. Thinking off ends with the empty think
-  block, four tokens past the opener, and thinking on with `<think>\n`, two,
-  so with either the repeat and the next turn resume (on the 5090 the
-  thinking-on repeat resumed 16,442 of its 16,444 tokens). Lifting the limit
-  is #201's.
-
-### Amendment (2026-11-05) — the 27B's opener page rides the capture on Ampere and Ada (#508, spec #503, owner decision 2026-11-05)
-
-The #306 amendment kept the 27B's imaged prefix at the opener's page floor
-because its extra cut costs ~19 ms on the RTX 5090. That cost does not hold on
-an RTX 30 or RTX 40 card: a traversal of the trellis body decodes every
-matrix again, and the cut costs clearly more there.
-
-**On Ampere and Ada the 27B's generation-opener page rides the capture, as
-Flash-Next's does.** The prefill of a reusable prompt is cut once, at the
-opener, and the capture lends the whole pages below it to a pages-only link.
-On Blackwell the 27B keeps both cuts and the imaged prefix at the floor, so
-its splits and its outputs are those of #306.
-
-- **One decision, by the GPU generation.** The family switch the #306 and #249
-  amendments named, `ModelFamily::opener_page_rides_capture`, is gone from the
-  core, which reads no card. The server decides it,
-  `config::arch::opener_page_rides_capture(family, generation)`, from the
-  family the load was fitted to and the generation of the card the start
-  read. With no card read (the mock build, a test's shape) the 27B keeps both
-  cuts. Flash-Next rides on every card, the image model and the diarizer
-  capture nothing.
-- **What it gives up** is the #306 amendment's: the image at the opener's page
-  floor, which only a prompt parting from this one in the last page before its
-  opener would have resumed from.
-- **Exactness.** As for #306: a reused request is bit-exact against a cold
-  prefill split at the same boundaries, now `[…, opener)` and `[opener, end)`
-  (`crates/core/tests/prompt_checkpoint_one_cut_gpu.rs`, on the 16 GB trellis
-  artifact that RTX 30 and RTX 40 cards load, in the FP16 band they run).
+# Cross-request state reuse: content-matched retained state across three residency tiers
+
+A finished request leaves its state behind, and a later request resumes from the longest retained state whose
+content is a prefix of its prompt: without it every turn of a chat and every iteration of an agent loop sends its
+whole history again and pays the whole prefill again, and so does a subagent that arrives after its sibling
+finished. Reuse happens only at recorded points, never at an arbitrary longest common prefix, because GDN state
+exists only at the positions where it was captured. It is on by default; `--reuse-prompt off` is for cold benches
+and correctness oracles.
+
+- **Match by content, not by session.** A request reuses the longest retained state whose match key, a hash of its
+  token content and its media identity, is a prefix of its prompt. No API field selects it: the clients send no
+  session identifier, and a wrong session id could hand one conversation another's state, where a content match can
+  only hand over identical history. Reuse is global, because there is one API key: anyone who can reach the server
+  can tell from the time to first token whether a prefix was seen before, and that side channel is accepted. The day
+  a second key exists, the key's identity joins the match key.
+- **A prompt checkpoint serves the next turn.** It is the whole-sequence state of every request at its generation
+  opener, `<|im_start|>assistant\n`: the last position every later turn provably shares. The next turn does not
+  render an assistant message the way it was generated (thinking is dropped or emptied, a `\n` follows
+  `<|im_end|>`, tool arguments are serialized again), so the state after generation never matches. A conversation
+  keeps at most two, its latest and its turn-opening one, taken right after its last real user message: the only
+  one a new user message can still match once history drops the earlier thinking.
+- **A retained prefix serves the next request that opens the same way.** It is a shared prefix kept alive with no
+  claimant, published at each of a request's reuse boundaries, floored to whole KV pages, one retained slot each.
+  The first is the end of the system-and-tools block, which the next subagent of a burst shares. A `/v1/decide`
+  state given as content parts stays in the user turn and never reaches that point, so a static head before a
+  changing image and a fan-out's whole state were prefilled every time (324 ms per request for a text state the JSON
+  path served in 70 ms); `/v1/decide` therefore adds a fan-out's computed common prefix, an observed fork and a
+  reuse marker, `cache_control: {"type": "ephemeral"}` on a content part, and a request carrying a marker gets no
+  observed fork. A marker or a fork decides where state is kept, never what a request may claim: the marker is an
+  API field for placement only, and the prompt the model reads is unchanged. A fan-out's head is the one departure
+  from "free until the room is needed": it is given up when its fan-out ends, and never goes to KV-RAM, because no
+  later request is expected to send that state again and the retained slots are too few to keep a head per
+  decision.
+- **A prefix may be published over another**, a chained prefix, one reference per link and every page still
+  charged once. Without it a conversation grown past its first KV page could never take a second checkpoint, and
+  "at most two" would bound something that never grew.
+- **Reuse copies, never consumes**, in every tier: the entry stays after a claim, as a blob stays in KV-RAM and a
+  retained blob's file on the disk after a restore. Retries, regenerates and forks from the same point all hit.
+- **Retained state is free until the room is needed.** On the device it is always the first victim, and it never
+  delays or refuses an admission; nor does what a request still waiting for its admission claimed of it, which goes
+  as retained state goes for an entry ranked above the claimant (ADR 0045). Its mutable images live in retained
+  slots reserved at load (ADR 0030), and when none can be had a checkpoint is simply not taken.
+- **Prompt checkpoints are given up before retained prefixes**, least recently used within each kind, for three
+  reasons in the order they decide it. A checkpoint is the narrower bet: it serves one conversation's next turn,
+  where a retained prefix serves every future request that opens with that block, of a conversation seen or not.
+  Its prefix reaches past the block, so discarding one frees at least as many pages: fewer discards, less reuse
+  lost. And when the block and the opener fall in the same KV page, one prefix carries both and its pages come back
+  only when every holder lets go, so any other order gives up the wide bet and still returns no page. The order is
+  a policy the owner may reverse; the third reason rests on both kinds being in the one set the reclaim reads
+  (`ConcreteScheduler::reclaimable_prefixes`), which must go on listing both whichever goes first.
+- **Three residency tiers: the device, KV-RAM and KV-disk** (ADR 0045, which built the third). A tier receives
+  retained state lazily, only when the tier above would otherwise discard it, and gives it up before any evicted
+  live sequence. What KV-RAM gives up goes to the disk, a device victim KV-RAM cannot take goes straight there, a
+  spill displaces only what ranks below it, and with the disk on an evicted live sequence is never discarded to make
+  room. A retained prefix spills to KV-RAM too, ranked with the checkpoints there, and comes back to the device
+  once, for its whole burst, taking pages from retained state only: it never evicts live work.
+- **A restore must beat the best reuse still above it by a restore floor**, a sibling's or a retained prefix
+  included: a KV-RAM restore that beats a device checkpoint but not a device prefix by a chunk pays the crossing
+  for nothing. KV-RAM's floor (`KV_RAM_RESTORE_FLOOR_TOKENS`) is a fixed starting value, to be tuned by measurement,
+  not derived. The disk's is the model's (`kv_disk::restore_floor_tokens`), measured against the best match on the
+  device and in KV-RAM, and a blob comes back from the disk to the device directly, never through KV-RAM. A claim
+  reports its reuse and counts its hit only once it lands (ADR 0045). KV-disk reuses nothing across a restart yet,
+  and the tier is wiped: the identity its file headers carry is what would let it outlive one without a format
+  change.
+- **The generation opener's page rides the capture.** A reusable prompt's prefill is cut once, at the opener: the
+  capture lends the whole pages below it to a pages-only link, a chained prefix with no image, and the checkpoint
+  stands on it. Flash-Next and the 27B do so on every card, and with no card read. The alternative, an imaged
+  prefix published at the opener's page floor, cuts the prefill a second time, and each cut is a traversal: on
+  Flash-Next it costs the expert stream it touches, 0.13-0.66 s of a reused agent turn's 1.86 s; on an RTX 30 or
+  RTX 40 card a traversal of the 27B's trellis body decodes every matrix again; and on the RTX 5090, where it was
+  taken to cost ~19 ms, it measured 45-55 ms per request, the small traversal plus a synchronous 222 MiB copy of the
+  mutable state into a host retained slot over the PCIe link. What the single cut gives up is that image, which
+  only a prompt matching up to the floor and parting in the last page before its opener read: such a request
+  resumes at the reuse point before it, the previous turn's checkpoint or the system block, and an identical retry,
+  a conversation's next turn and a subagent burst resume as before. The closed thinking block keeps its own cut,
+  and the reuse boundaries are still published with their images at their own cuts.
+- **A pages-only link is never claimed**, has no handle, takes no retained slot and exists only with a checkpoint:
+  no sequence stands at its end, so it has no state to hand over. The server decides the single cut in one
+  function, from the family and the card's generation (`config::arch::opener_page_rides_capture`); the core reads
+  no card. A contributor's measurement switch, `IGNIS_SECOND_TAIL_CUT=1`, gives the 27B on Blackwell, and with no
+  card read, the second cut back for comparisons.
+- **A request whose image spans its opener's page floor lends at its capture on any load**, a load under that
+  switch included. No claimable prefix ends inside an image, so its floor walks back to before the picture, and
+  without the loan nothing is published at the opener's page and no checkpoint is taken. That is the common shape,
+  not a rare one, since a short question after a picture puts the opener in the KV page the picture ends in, and
+  it cost a whole-picture prefill on every such repeat and next turn
+  ([the finding](../findings/2026-10-31-a-checkpoint-forms-when-an-image-spans-the-openers-page-floor.md)). The
+  link may end inside the image; nothing claimable does: the checkpoint over it ends at the opener, past the
+  picture, and its key carries the image's identity.
+- **Prefix identity is the match key everywhere**, for multimodal prompts too: sibling shared prefixes, retained
+  prefixes, their KV-RAM copies and prompt checkpoints are all matched by token ids and media items, since a prefix
+  cache matching raw token ids would let a sibling sending another picture share one, and vision adds no key of its
+  own. No publish point ends inside a media item's placeholders. A multimodal claim always leaves one prompt token
+  to prefill, because a claimant is built from cloned pages and mutable state, neither of which carries the
+  sequence's `rope_delta`, and only a prefill span hands it to the leaf; so neither a shared prefix nor a prompt
+  checkpoint reaching a multimodal prompt's last token is offered, which costs one prefilled token in that rare
+  case. A prompt that ends exactly at a held checkpoint's opener may therefore not claim it and prefills again; the
+  served template ends neither thinking setting that way. Lifting the limit means carrying `rope_delta` with the
+  reused state (GitHub #201, open).
+- **A blob's compatibility identity** is the artifact content hash, the KV format, the blob layout version and the
+  drafter's presence and draft window: never a `RequestId`, and never an operator knob that does not change state.
+  A KV-disk file's header carries it, widened by the served model id, the sidecar's payload digest when there is
+  one and the RoPE scaling (ADR 0045). The content hash digests what the container declares, its directory, not
+  its payload: the v2 container carries no per-tensor digest by design, and hashing ~19 GB of weights at every
+  start is not a price a compatibility check may charge. It catches a different model, a re-export, a re-layout, a
+  renamed or added object and a format change. It does not catch an in-place re-quantization that rewrites payload
+  bytes under the same names, formats, shapes and offsets: a different model whose blobs this identity would
+  accept, the one hole, held as a test (`a_rewritten_payload_alone_is_the_proxys_known_limit`). Closing it needs a
+  digest the producer writes into the container, a change to the artifact format and not to reuse; whether the
+  container should carry one is open, for the owner.
+
+## Considered Options
+
+- **A session id in the API**: rejected for the reason above, and because no client sends one.
+- **A checkpoint after generation**, ninfer's frontier: it never matches under ignis's rendering.
+- **A checkpoint at the prompt's end, after `<think>\n`**: it misses on every new user message once history drops
+  the earlier thinking. The opener costs two or three prefilled tokens instead.
+- **Consume on reuse**, ninfer's exclusive claim: a retry, a regenerate and forks would all miss.
+- **An eager device-to-host copy at request end**: roughly 15-20 ms per request at PCIe Gen 3, whether the state
+  is ever reused or not.
+- **Per-key isolation**: there is no second key to isolate.
+- **A learned boundary, the observed longest common prefix, for every request**: to revisit only if measurement
+  shows shared heads extending past the system block. `/v1/decide` is where it did, and the observed fork is that.
+- **For a decision's state, moving its leading text into the system block**: it changes measured decision prompts
+  (ADR 0034), can never hold an image, and misses whenever changing text precedes the first image. **A "first text
+  part" convention**: published nowhere, and it spends a slot whenever the first part is the one that changes.
+  **Client markers with same-step producer and consumer scheduling**: the scheduling half would make a decision a
+  live publisher, which GitHub #238 rules out.
+- **A checkpoint taken mid-chunk**: the state sections agree with one another only at a chunk boundary, so every
+  layer would have to export its state at an interior position.
+- **Publishing the opener's page floor later, from a snapshot taken at the cut**: the state at the floor is gone
+  once the chunk passes it; the pages are all that can be published later, which is the pages-only link.
+- **Skipping the publish when the tail is short**: the checkpoint needs a holder for the pages below the opener,
+  and without one the next turn loses its reuse.
+- **A checkpoint that owns those pages itself**: the same ownership in a second structure, when the prefix chain
+  already walks, materializes and releases links.
+- **Keeping the 27B's second cut and its imaged prefix at the floor**, as it first was, and on Blackwell until the
+  cut was measured there: changing its splits would move its outputs at near-ties without a measured reason to.
+  The costs above are that reason.
+
+## Consequences
+
+- **Exactness is against a cold prefill split at the same boundaries.** A reused request and a cold prefill of its
+  whole prompt split their chunks differently, so they can diverge where two tokens are nearly tied. The
+  correctness claim is bit-exactness against a cold prefill split at the same boundaries, `[…, opener)` and
+  `[opener, end)` at the tail; a divergence against an unsplit cold prefill is recorded as information, not as a
+  failure. Moving a cut therefore moves greedy text at near-ties, as the single cut did the 27B's on Blackwell:
+  byte-identical greedy text is not what correctness is held to (ADR 0007).
+- **Rendering must be stable.** The chat template has to render history the way the reference does (tool-argument
+  order, `preserve_thinking`): a rendering drift silently turns every match into a miss.

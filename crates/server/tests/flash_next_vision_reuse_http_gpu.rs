@@ -1,6 +1,6 @@
 //! A follow-up turn on an image reuses the prompt and the image's encoding on
 //! Flash-Next, and questions fanned out over one image encode it once (GitHub
-//! #559, spec #555; ADR 0029 as amended for multimodal prompts, ADR 0035),
+//! #559, spec #555; ADR 0029 on multimodal prompts, ADR 0035),
 //! through the production load path (`load::prepare_model` then
 //! `load::load_model`, the vision companion beside the main container) and
 //! `POST /v1/chat/completions`, on the RTX 5090 profile's settings with vision

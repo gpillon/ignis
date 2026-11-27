@@ -38,7 +38,7 @@ edit it by hand.
 | [0026](0026-playground-embedded-when-built.md) | The Playground is embedded when built, served by default | accepted | |
 | [0027](0027-make-as-the-dev-entrypoint.md) | make is the development entry point, with per-OS hooks | accepted | |
 | [0028](0028-expose-modes-always-keyed.md) | Exposure is a named mode, and an exposed server always has a key | accepted | |
-| [0029](0029-cross-request-state-reuse.md) | cross-request state reuse: content-matched retained state across three residency tiers | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) |
+| [0029](0029-cross-request-state-reuse.md) | Cross-request state reuse: content-matched retained state across three residency tiers | accepted | |
 | [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md), [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
 | [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
@@ -105,7 +105,6 @@ edit it by hand.
 | [0097](0097-a-normalized-tool-leaves-its-length-bounds-out-and-the-call-check-counts-the-parameters-held-would-close.md) | A normalized tool leaves its length bounds out, and the call check counts the parameters held would close | accepted | |
 | [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) | The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP | accepted | |
 | [0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md) | A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files | accepted | |
-| [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) | The 27B cuts a reusable prompt's tail once, at the generation opener, on every card | accepted | |
 | [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) | On Windows the VRAM plan reserves the W4A4 TMA products' descriptor slots as a line of their own | accepted | |
 | [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) | A request whose images pass the vision budget together drops its oldest, a block at a time, as text | accepted | |
 | [0104](0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round goes past 8 columns a lane, and is held to its base round's numerical class | accepted | |

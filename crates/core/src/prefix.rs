@@ -139,7 +139,7 @@ pub struct PrefixEntry {
     /// publisher's completion — and why the flag lives beside the refcount
     /// rather than in a second ledger that could drift from it.
     pub retained: Option<Retention>,
-    /// A **pages-only link** (ADR 0029 as amended 2026-10-07, GitHub #306):
+    /// A **pages-only link** (ADR 0029, GitHub #306):
     /// the pages below a request's generation opener, handed over by its
     /// prompt-checkpoint capture with no image. No request stands at its end,
     /// so it is never matched and never claimed, carries no state to resume
@@ -295,7 +295,7 @@ impl PrefixCache {
         self.insert(publisher, head.key_at(length), length, gdn, parent, false)
     }
 
-    /// Register a **pages-only link** (ADR 0029 as amended 2026-10-07, GitHub
+    /// Register a **pages-only link** (ADR 0029, GitHub
     /// #306): the whole pages of `head` past `parent`, which `publisher`'s
     /// prompt-checkpoint capture handed over with no image. Returns its id and
     /// its own pages, as [`PrefixCache::register`] does, and is refused the

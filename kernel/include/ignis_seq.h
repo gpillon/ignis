@@ -708,8 +708,8 @@ struct ignis_seq_checkpoint_stats {
  * checkpoint to stand on -- that is what puts the opener inside a page `seq`
  * alone writes. Those `seq` holds as its own (it stands on no prefix, or on
  * one stopping short of the opener's page) this call lends to a **pages-only
- * link** chained over what `seq` stands on (GitHub #306, ADR 0029 as amended
- * 2026-10-07): no image, no handle, held by `seq` and by the checkpoint. The
+ * link** chained over what `seq` stands on (GitHub #306, ADR 0029):
+ * no image, no handle, held by `seq` and by the checkpoint. The
  * pages stay in `seq`'s allocation and block-table row; the link takes them
  * when `seq` is released. A sequence lends once: a second capture at the same
  * opener stands on the link. A caller that published an imaged prefix at

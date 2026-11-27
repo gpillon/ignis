@@ -1421,7 +1421,7 @@ impl<'a> Seq<'a> {
     /// The sequence must stand exactly at `opener_tokens`, at a chunk
     /// boundary. The whole pages below the opener it holds as its own -- past
     /// whatever prefix it stands on -- are lent to a **pages-only link**
-    /// chained over that prefix (GitHub #306, ADR 0029 as amended 2026-10-07):
+    /// chained over that prefix (GitHub #306, ADR 0029):
     /// no image, no handle, held by the sequence and the checkpoint, and the
     /// link's own once the sequence is released. The state
     /// goes into retained slot `retained_slot` (GitHub #215), which must hold

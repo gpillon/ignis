@@ -1,5 +1,5 @@
 //! Prompt reuse with an image on Flash-Next, at the leaf seam (GitHub #559,
-//! spec #555; ADR 0029 as amended for multimodal prompts, ADR 0087): a
+//! spec #555; ADR 0029 on multimodal prompts, ADR 0087): a
 //! sequence holding an image carries what its image put in its state through
 //! a checkpoint claim, a KV-RAM restore and a spill, so what it computes
 //! afterwards is what a cold prefill split at the same boundary computes, bit

@@ -1,5 +1,5 @@
 //! Where a `/v1/decide` state will be resumed (GitHub #270,
-//! ADR 0029 as amended).
+//! ADR 0029).
 //!
 //! A hybrid resumes only where its prefill captured state, so the positions a
 //! later request will resume from have to be predicted before the prefill.

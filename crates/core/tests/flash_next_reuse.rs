@@ -448,8 +448,8 @@ fn another_picture_of_the_same_size_resumes_nothing_of_an_image_turn() {
 
 #[test]
 fn an_image_prompt_ending_at_a_checkpoint_opener_re_prefills_on_flash_next() {
-    // A multimodal claim leaves a tail to prefill (ADR 0029 as amended
-    // 2026-09-16): only a prefill hands the leaf its rope delta. A prompt
+    // A multimodal claim leaves a tail to prefill (ADR 0029):
+    // only a prefill hands the leaf its rope delta. A prompt
     // ending exactly where a longer one left its checkpoint claims nothing.
     let [first, shorter] = served_on_flash_next([image_turn(1_024, 0xAA, 6, 4), image_turn(1_024, 0xAA, 6, 0)]);
     assert_eq!(first.widths, [1024, 16, 4], "the longer prompt captured at 1,040");

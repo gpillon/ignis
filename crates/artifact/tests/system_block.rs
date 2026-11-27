@@ -254,7 +254,7 @@ fn two_subagents_of_a_burst_share_the_boundary_as_an_exact_token_prefix() {
     // They share a little more than the block — the next turn's opening
     // marker — and that remainder is deliberately left unused: reuse happens
     // at recorded structural points, never at an arbitrary longest common
-    // prefix (ADR 0029, Out of Scope), because GDN state exists only where it
+    // prefix (ADR 0029), because GDN state exists only where it
     // was captured.
     println!(
         "two subagents share {common} leading ids; the boundary publishes {} of them",
