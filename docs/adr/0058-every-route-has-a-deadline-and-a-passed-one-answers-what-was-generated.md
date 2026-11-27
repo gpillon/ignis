@@ -9,8 +9,9 @@ and `0` is none. A passed deadline answers what was generated, ended as a length
 operator asks for an error (`server.timeout_reply`: `partial`, the default, or `error`). An inference engine is
 expected to leave a request to its own end: a deadline is there to end what a wedged engine holds, and a whole
 answer thrown away for being late helps no client, since the retry generates it again from nothing. So the default
-is long enough for an agent's long reasoning step. The three fields are live, read per request, and keep a ceiling
-against a fat-fingered value: whoever wants no deadline says `0`. What each route answers is in the guide
+is long enough for an agent's long reasoning step. The three fields are live, read per request, and the two
+deadlines keep a ceiling against a fat-fingered value: whoever wants no deadline says `0`.
+What each route answers is in the guide
 (`docs/user/api/deadlines.md`).
 
 - **Counted from when the request starts to use the engine**: its admission, never a WebSocket's queue; an image
@@ -28,8 +29,9 @@ against a fat-fingered value: whoever wants no deadline says `0`. What each rout
   reports its own model-length limit as `length`. The deadline stays
   distinguishable where it matters: a header on an answer sent whole, the request log on every one. A stream sent
   its headers before the deadline, so only the log tells there.
-- **Under `error`, a stream that already answered `200` ends with the `504`'s body as an error chunk and no finish
-  chunk**, as a stream already ends for an engine error: a client that reads one reads the other.
+- **Under `error`, a chat completions stream that already answered `200` ends with the `504`'s body as an error
+  chunk and no finish chunk**, as a stream already ends for an engine error: a client that reads one reads the
+  other.
 - **A decision and an image are errors either way.** A decision's answer is one readout of one position, with no
   partial readout to return. An image cut between two denoising steps is noise, not a smaller image; a streamed
   job's completed images have gone out, and the error follows them.
