@@ -89,7 +89,7 @@ edit it by hand.
 | [0074](0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md) | A catalog entry may state its family, and an alias may be another entry's id | accepted | |
 | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) | The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device | accepted | |
 | [0076](0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md) | The running notes send the notes back to the text model and the recap does not | accepted | |
-| [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | [0091](0091-on-a-card-smaller-than-the-rtx-5090-the-gdn-gating-planner-takes-the-largest-split-it-holds-and-its-test-caps-the-sm-count.md) |
+| [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | |
 | [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted | |
 | [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
 | [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | |

@@ -1,6 +1,5 @@
 ---
 status: accepted
-amended-by: [ADR-0091]
 ---
 
 # A vendored file may carry a portability patch
