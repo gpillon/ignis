@@ -31,9 +31,8 @@ question, never a partial set.
   without an entry refuses `locate` and says so at
   load.
 
-Since ADR 0042 the vote is no longer `locate`'s default: it is served unchanged as one of two methods, and the
-readout decided here reads the shortlist's heads too, over that method's windows, which is the span the room is
-sized for.
+The vote is one of `locate`'s two methods, served unchanged, and not its default (ADR 0042); the readout decided
+here reads the shortlist's heads too, over that method's windows, which is the span the room is sized for.
 
 ## Considered Options
 
