@@ -74,7 +74,7 @@ and correctness oracles.
   RTX 40 card a traversal of the 27B's trellis body decodes every matrix again; and on the RTX 5090, where it was
   taken to cost ~19 ms, it measured 45-55 ms per request, the small traversal plus a synchronous 222 MiB copy of the
   mutable state into a host retained slot over the PCIe link. What the single cut gives up is that image, which
-  only a prompt matching up to the floor and parting in the last 63 tokens before the opener read: such a request
+  only a prompt matching up to the floor and parting in the last page before its opener read: such a request
   resumes at the reuse point before it, the previous turn's checkpoint or the system block, and an identical retry,
   a conversation's next turn and a subagent burst resume as before. The closed thinking block keeps its own cut,
   and the reuse boundaries are still published with their images at their own cuts.
