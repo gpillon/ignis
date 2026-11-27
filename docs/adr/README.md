@@ -37,7 +37,7 @@ edit it by hand.
 | [0025](0025-scheduler-interval-as-a-log-event.md) | Scheduler interval counters are a DEBUG log event | accepted | |
 | [0026](0026-playground-embedded-when-built.md) | The Playground is embedded when built, served by default | accepted | |
 | [0027](0027-make-as-the-dev-entrypoint.md) | make is the development entry point, with per-OS hooks | accepted | |
-| [0028](0028-expose-modes-always-keyed.md) | exposure is a named mode, and an exposed server always has a key | accepted | |
+| [0028](0028-expose-modes-always-keyed.md) | Exposure is a named mode, and an exposed server always has a key | accepted | |
 | [0029](0029-cross-request-state-reuse.md) | cross-request state reuse: content-matched retained state across three residency tiers | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) |
 | [0030](0030-device-memory-reserved-at-load.md) | device memory reserved at load, within a VRAM budget | accepted | [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md), [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md), [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md), [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) |
 | [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
@@ -45,7 +45,7 @@ edit it by hand.
 | [0033](0033-the-server-fetches-its-own-model.md) | the server fetches its own model, and asks first only when somebody is there | accepted | [0047](0047-a-catalog-the-operator-can-extend.md) |
 | [0034](0034-the-leaf-answers-without-generating.md) | The leaf answers without generating | accepted | |
 | [0035](0035-the-vision-embedding-outlives-its-encode.md) | The vision embedding outlives its encode | accepted | |
-| [0036](0036-the-v1-surface-documents-itself.md) | the `/v1` surface documents itself, and its reference needs no key | accepted | |
+| [0036](0036-the-v1-surface-documents-itself.md) | The `/v1` surface documents itself, and its reference needs no key | accepted | |
 | [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | A vendored file may carry a patch that fixes a known correctness bug | accepted | |
 | [0038](0038-the-seam-carries-one-attention-head.md) | the `Compute` seam carries one attention head's scores | accepted | |
 | [0039](0039-the-seam-carries-a-head-set.md) | the attention readout carries a head set | accepted | |
@@ -105,7 +105,7 @@ edit it by hand.
 | [0096](0096-a-cut-tool-call-reaches-the-client-as-generated-its-name-its-arguments-so-far-and-finish-reason-length.md) | A cut tool call reaches the client as generated: its name, its arguments so far, and finish_reason length | accepted | |
 | [0097](0097-a-normalized-tool-leaves-its-length-bounds-out-and-the-call-check-counts-the-parameters-held-would-close.md) | A normalized tool leaves its length bounds out, and the call check counts the parameters held would close | accepted | |
 | [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) | The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP | accepted | |
-| [0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md) | A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files | accepted | [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) |
+| [0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md) | A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files | accepted | |
 | [0100](0100-the-27b-cuts-a-reusable-prompts-tail-once-at-the-generation-opener-on-every-card.md) | The 27B cuts a reusable prompt's tail once, at the generation opener, on every card | accepted | |
 | [0101](0101-on-windows-the-vram-plan-reserves-the-w4a4-tma-products-descriptor-slots-as-a-line-of-their-own.md) | On Windows the VRAM plan reserves the W4A4 TMA products' descriptor slots as a line of their own | accepted | |
 | [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) | A request whose images pass the vision budget together drops its oldest, a block at a time, as text | accepted | |
