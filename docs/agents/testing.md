@@ -335,9 +335,11 @@ that doesn't run anything.
 - Testing structured output's grammar (the per-token reference on the real
   tokenizer, the independent validator, the bench's bounds):
   [testing/structured-output.md](testing/structured-output.md).
-- Running a bench or a gate leg (TTFT and G2, the multimodal TTFT cell, the
+- Running a bench (the measuring rule, TTFT, the multimodal TTFT cell, the
   KV-format A/B, the harness's request deadline):
   [testing/bench.md](testing/bench.md).
+- Running the gate that admits an artifact or a route's numerics (ADR 0082's
+  three legs): [testing/gate.md](testing/gate.md).
 
 ## Where tests live
 

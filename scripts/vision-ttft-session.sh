@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# GitHub #181: the live/live multimodal TTFT session (ADR 0015, pooled over two
-# launches per engine per ADR 0021). Run from the repository root on a free
+# GitHub #181: the multimodal TTFT session, its sides measured in one session,
+# on cold prefixes, each pooled over two launches (the measuring rule of
+# crates/bench/src/lib.rs). Run from the repository root on a free
 # 5090, after `cargo build --release -p ignis-server -p ignis-bench
 # --features cuda`:
 #
 #   bash scripts/vision-ttft-session.sh <out-dir>
 #
-# Three engines, each launched twice, in order: the reference with --vision
-# (the owner's hq-e8-2b-262k preset), ignis with --vision-enabled, ignis without it.
+# Two loads of ignis, each launched twice, in order: with --vision-enabled and
+# without it. Another engine is one more `launch` loop with its own command.
 # Every launch writes a text record (1024/8192/32768) and, with vision, an
 # image record — separate records, since g2 cannot pair a record carrying the
 # image cell with one that has none. Each launch measures its prompts once:
@@ -24,7 +25,6 @@ OUT=${1:?usage: vision-ttft-session.sh <out-dir>}
 mkdir -p "$OUT"
 ARTIFACT=${ARTIFACT:-'F:\ai\q38\ninfer-models\qwen3_8_27b_nvfp4full-v2.ninfer'}
 CORPUS=${CORPUS:-'F:\ai\q38\ninfer\bench\fixtures\bench_corpus.ids'}
-NINFER=${NINFER:-/f/ai/q38/ninfer/build-ninja/apps/ninfer-serve.exe}
 BIN=target/x86_64-pc-windows-msvc/release
 IMAGE=crates/bench/tests/fixtures/vision_ttft/screenshot.png
 SESSION=${SESSION:-vision-ttft-$(date -u +%Y%m%dT%H%M%SZ)}
@@ -68,18 +68,11 @@ launch() {
   echo "$name peak memory.used $(cut -d, -f2 "$OUT/$name-smi.csv" | tr -d ' MiB' | sort -n | tail -1) MiB"
 }
 
-REFERENCE_PROFILE="ninfer-serve --vision --spec mtp --draft-tokens 3 --lm-head-draft, hq-e8-2b KV, 262144 context, 4 concurrency, 450000 KV capacity, graphs"
 IGNIS_PROFILE="hq-e8-2b KV, 262144 context, 1024 chunk, dflash2/7, prompt reuse"
 IGNIS=("$BIN/ignis-server.exe" --server-bind 127.0.0.1:8000 --model-artifact "$ARTIFACT" --model-kv-format hq-e8-2b --model-max-context 262144
   --model-prefill-chunk 1024 --reuse-kv-host-pool-bytes 8G --server-request-timeout 1800 --spec-backend dflash2 --spec-draft-tokens 7
   --model-idle-unload 0 --model-loop-guard off)
 
-for n in 1 2; do
-  launch "reference-$n" http://127.0.0.1:8080 ninfer-serve.exe reference "$REFERENCE_PROFILE" 1 \
-    "$NINFER" "$ARTIFACT" --model-id qwen3.8-27b-nvfp4full-hq-e8-2b-262k --vision --spec mtp --draft-tokens 3 \
-    --lm-head-draft --host 127.0.0.1 --port 8080 --preserve-thinking --max-pending-requests 50 \
-    --pending-timeout-ms 3000000 --kv-dtype hq-e8-2b --max-context 262144 --max-concurrency 4 --kv-capacity 450000
-done
 for n in 1 2; do
   launch "ignis-vision-$n" http://127.0.0.1:8000 ignis-server.exe ignis-vision "$IGNIS_PROFILE, --vision-enabled" 1 "${IGNIS[@]}" --vision-enabled
 done
@@ -88,13 +81,13 @@ for n in 1 2; do
 done
 wait_free
 
-for record in reference-text reference-image ignis-vision-text ignis-vision-image ignis-text-text; do
+for record in ignis-vision-text ignis-vision-image ignis-text-text; do
   engine=${record%-*}; kind=${record##*-}
   echo "pooled $record"
-  python scripts/ttft-pool.py --out "$OUT/$record.json" "$OUT/$engine-1-$kind.json" "$OUT/$engine-2-$kind.json"
+  "$BIN/ignis-bench.exe" ttft-pool --out "$OUT/$record.json" --launch "$OUT/$engine-1-$kind.json" --launch "$OUT/$engine-2-$kind.json"
 done
-# The 1.5 threshold g2 prints is G2's; these ratios are error detectors.
-for pair in "ignis-vision-image reference-image" "ignis-vision-text reference-text" "ignis-vision-text ignis-text-text"; do
+# The 1.5 threshold g2 prints decides nothing; this ratio is an error detector.
+for pair in "ignis-vision-text ignis-text-text"; do
   set -- $pair
   "$BIN/ignis-bench.exe" g2 --ours "$OUT/$1.json" --ref "$OUT/$2.json" --out "$OUT/g2-$1-vs-$2.json" 2>&1 | grep -E "^ +[0-9]+ |tokens"
 done

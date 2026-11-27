@@ -9,7 +9,7 @@ the processor's 32-pixel grid, so it is not resized: 40x25 merged blocks,
     python tools/vision-ttft/screenshot.py crates/bench/tests/fixtures/vision_ttft/screenshot.png
 
 The cell itself is `ignis-bench ttft --image <this png>`; see
-`docs/agents/testing/bench.md` for the live/live run.
+`docs/agents/testing/bench.md` for the session that runs it.
 """
 
 import sys
