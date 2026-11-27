@@ -33,7 +33,8 @@ and its start-time behaviour stand.
   companion the load will not use included.
 - **The served id is the entry's id.** Artifacts of one model family are told apart by the served id, never by the
   family. The family stays what the artifact's own header says: where a catalog entry states one, it is a claim
-  the header verifies (ADR 0064). What an entry states of the cards it loads on is ADR 0064's and ADR 0079's.
+  the header verifies (ADR 0064). What an entry states of the cards it loads on, and the other ids it answers to
+  there (its aliases), is ADR 0064's and ADR 0079's.
 - **`ignis-server model download` and `model list`** share the catalog and the transfer with the start-time fetch.
   The download is an explicit yes: it asks nothing, ignores `download.enabled`, which gates only the implicit
   start-time fetch, and runs on a build without `cuda`. The gate ADR 0033 put on the start path keeps CI off the
