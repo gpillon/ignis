@@ -16,20 +16,23 @@ instead.
 **What passes each leg** (how each is run: `docs/agents/testing/gate.md`):
 - **KLD against BF16.** The mean KL(BF16 ‖ engine) over the full vocabulary, at the serving configuration, against the
   model's own BF16 checkpoint, is within the registered limit. A fine-tune is scored against its own BF16, with the
-  two cross terms that show that the gate measured the fine-tune and not the base. Where the card cannot run the
-  checkpoint, the reference is the BF16 model's 64 most probable tokens per position, built on the RTX 5090: that
-  figure is a lower bound of the full KLD, so its limit comes from a top-64 figure of the RTX 5090, never from a
-  full-vocabulary one.
+  two cross terms that show that the gate measured the fine-tune and not the base: each holds when the 95% CI of its
+  difference from the matched pair is above 0, its count of windows above reported, not required. Where the card
+  cannot run the checkpoint, the reference is the BF16 model's 64 most probable tokens per position, built on the
+  RTX 5090: that figure is a lower bound of the full KLD, so its limit comes from a top-64 figure of the RTX 5090,
+  never from a full-vocabulary one.
 - **DFlash2 on against off.** With the drafter on, decode tok/s beats off in each of nine decode cells: 8,192, 65,536
   and 253,440 tokens of context, at one lane cold, two lanes, and one lane with reuse.
 - **Loop rate.** On the loop set, one build, the same prompts and seeds, the artifact does not loop more than its
-  counterpart at a one-sided Fisher exact p below 0.05.
+  counterpart at a one-sided Fisher exact p below 0.05. It is the one leg that runs with the loop guard at its
+  default, since a rewind is one of its calls.
 
 **The limits are the ones the repo has registered**, and the point estimate decides against them:
 - **A new artifact of a served family** (a new body or format, a re-quantization, a fine-tune): a KLD at most 1.2×
   its counterpart's, the ratio the owner set. The counterpart is the served artifact a new body stands in for, or,
   for a re-quantization or a fine-tune, the family's artifact of the same layout. Once registered the limit is a
-  number. All three legs run.
+  number: 1.2 × 0.04916 = 0.0590 for the NVFP4 layout at chunk 2,048, 1.2 × 0.04034 = 0.0484 for the 16 GB body at
+  chunk 1,024. All three legs run.
 - **A change to a served route's numerics** (a kernel, or a route made a default): the KLD of each entry the route
   serves at most 1.05× that of the route it replaces, with top-1 within 0.5 points. The DFlash2 and loop legs run
   when its spec asks for them.
@@ -56,9 +59,9 @@ Flash-Next, and the owner approves it.
   (`ignis-bench canary`, sane and deterministic output) is that check.
 - The GPU profile's correctness tests are error detectors, not the gate. The teacher-forced canary test keeps G1's
   scoring against its fixture, recorded on ninfer on 2026-09-05 and never since: at least 95% of the suite's
-  positions agree, each scored on the fixture's own prefix, with no mismatch waived, an exact logit tie included, and
-  ignis's argmax is not changed to make a tie agree (`crates/bench/src/oracle.rs`); a free-running comparison is a
-  diagnostic only. Flash-Next's G1 scores the same way against its quantized reference (ADR 0043). The f64 oracles,
+  positions agree, each scored on the fixture's own prefix, with no mismatch waived (an exact logit tie included, no
+  epsilon, no position or canary left out) and no lower threshold, and ignis's argmax is not changed to make a tie
+  agree (`crates/bench/src/oracle.rs`); a free-running comparison is a diagnostic only. Flash-Next's G1 scores the same way against its quantized reference (ADR 0043). The f64 oracles,
   the leaf's op tests and the recorded fixtures catch a broken forward pass; a change of the numerics is judged for
   quality by the KLD leg.
 - `ignis-bench ttft`, `g3`, `g4` and `g5` and their gate checks stay instruments that measure ignis. A record of

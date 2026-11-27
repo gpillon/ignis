@@ -339,7 +339,7 @@ that doesn't run anything.
   KV-format A/B, the harness's request deadline):
   [testing/bench.md](testing/bench.md).
 - Running the gate that admits an artifact or a route's numerics (ADR 0082's
-  three legs, the registered limits): [testing/gate.md](testing/gate.md).
+  three legs): [testing/gate.md](testing/gate.md).
 
 ## Where tests live
 

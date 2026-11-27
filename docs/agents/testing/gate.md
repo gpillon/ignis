@@ -2,9 +2,9 @@
 
 ADR 0082's gate admits an artifact, or a change to a served route's numerics,
 by three legs measured on ignis alone, in the load the artifact serves. The
-decision, what passes each leg and who approves a limit are the ADR's. This
-page says how each leg is run, and lists the limits registered so far. The
-release's sm_86 gate is in [testing.md](../testing.md#the-sm_86-gate).
+decision, what passes each leg, the limits and who approves one are the
+ADR's. This page says how each leg is run. The release's sm_86 gate is in
+[testing.md](../testing.md#the-sm_86-gate).
 
 The sets the legs read are not in the repo (ADR 0082), so the gate runs where
 they are: check `make gpu-status` first, as for any GPU run.
@@ -19,8 +19,7 @@ they are: check `make gpu-status` first, as for any GPU run.
   [`tools/kld-gate/README.md`](../../../tools/kld-gate/README.md) (`ref_kld.py`,
   `gate1.py`).
 - A fine-tune is scored against its own BF16, with `gate1.py`'s two cross
-  terms. Each holds when the 95% CI of its difference from the matched pair is
-  above 0; its count of windows above is reported, not required.
+  terms.
 - Where the card cannot run the checkpoint, the reference is the BF16 model's
   64 most probable tokens per position, built once on the RTX 5090
   (`ref_top64.py`, `score_top64.py`).
@@ -43,14 +42,4 @@ they are: check `make gpu-status` first, as for any GPU run.
   0.20.
 - The leg fails if the artifact loops more, at a one-sided Fisher exact p
   below 0.05 on the pooled counts.
-- It is the one leg that runs with the loop guard at its default, since a
-  rewind is one of its calls.
-
-## Registered limits
-
-Once registered a limit is a number (ADR 0082). The ones registered so far:
-
-| What | Limit | From |
-|---|---|---|
-| The NVFP4 layout at chunk 2,048 | KLD at most 0.0590 | 1.2 × 0.04916 |
-| The 16 GB body at chunk 1,024 | KLD at most 0.0484 | 1.2 × 0.04034 |
+- The loop guard stays at its default for this leg alone (ADR 0082).
