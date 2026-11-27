@@ -42,7 +42,9 @@ as ADR 0104 holds the extended round: its method, its margins and its window.
 - **Its default.** `mixed` on the `rtx5090` profile for the NVFP4 body, the one the gate served, and `aggregate` on
   every other profile; the trellis bodies keep `aggregate`, under `rtx5090` as under their own profiles, and a trellis
   body at 15 drafts runs `mixed` where the operator names it. A run on a 16 GB or 24 GB card would be a new decision.
-  The served gate ([finding](../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)) missed by the
+  The served gate ([finding](../findings/2026-11-23-the-27bs-mixed-rounds-served-on-the-rtx-5090.md)) passed its
+  threshold, a JSON answer beside three conversations at four lanes at least 10% faster together than the build before
+  it, and its line of no conversation lane more than 15% below that build, and missed by the
   letter its line of no one-lane or free-text cell more than 2% below the build before it, and the owner made `mixed`
   the default all the same: one lane forms no mix, and seeded, a request alone wrote the same text in the same rounds
   under both builds. A load given `mixed` that holds no mix, or whose DFlash2 window is not 15, runs `aggregate`, and
