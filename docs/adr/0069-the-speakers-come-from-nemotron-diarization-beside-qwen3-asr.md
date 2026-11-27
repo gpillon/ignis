@@ -64,8 +64,9 @@ Italian to Qwen3-ASR.
 
 ## Consequences
 
-- A user who never asks for speakers pays nothing: no download, no load, no CPU. With speakers on, the diarizer's
-  threads compute beside the speech model's, and on a machine with few cores they share them.
+- A user who never asks for speakers pays nothing: no download, no load, no CPU. With speakers on, live
+  transcription costs more CPU on top of Qwen3-ASR's partials: the diarizer's threads compute beside the speech
+  model's, and on a machine with few cores they share them.
 - A label never changes the transcript. Corrections (rename, move, merge, split) are mappings of labels in the
   Playground, and nothing goes back to the model: Sortformer has no enrolment input that could take them.
 - At most 8 speakers, the model's channels. A ninth voice lands on one of the eight.
