@@ -136,7 +136,8 @@
 //! then every mix as above, each lane riding at its mix to [`MAX_TOKENS`] rows,
 //! every one of them its prompt's row in the uniform leg of its shape. The
 //! uniform rounds are held to the class by the uniform cells above; no mixed
-//! row is read against a base row there.
+//! row is read against a base row there. A change that splits the rounds of 24
+//! to 56 columns fails it, and the uniform legs then follow the split.
 //!
 //! Explicit GPU profile (ADR 0006, GitHub #38): outside `IGNIS_GPU_PROFILE=1`
 //! a missing artifact or GPU is a **skip**; under the profile the same
@@ -297,7 +298,7 @@ const CLASS_PICK_GAP_MARGIN: f32 = 2.0;
 /// 0.0242 and 0.0177 over 64, inside 0.02 for good only from row 87 and 180
 /// (#717). The owner decided on 2026-11-22 that the mixed rows are held as the
 /// extended round is, on legs that reach a uniform cell's rows; this test holds
-/// a mixed lane over the same window (ADR 0106, proposed): the mixed rounds,
+/// a mixed lane over the same window (ADR 0106): the mixed rounds,
 /// forced at most 0.0005, graph at most 0.0158, the essay prompt's extended
 /// lane at the mix 3+2 over 218 rows, which reads 0.0229 over its first 64.
 const EXTENDED_VS_BASE_LOG_PROB_NATS: f64 = logit_drift::MEAN_LOG_PROB_NATS;

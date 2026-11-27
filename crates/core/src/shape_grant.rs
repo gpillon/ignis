@@ -20,8 +20,11 @@
 //!   base shape.
 //! - `mixed`: at one lane, the lane's ask; at 2 to 7 lanes the asking lanes
 //!   are granted the extended shape one by one, the highest expected extra
-//!   tokens first, at a tie the lane refused longest, a lane with no estimate
-//!   (no extended round among its recent rounds) after those with one. Each
+//!   tokens first, at a tie the lane refused longest, then the caller's
+//!   order, a lane with no estimate (no extended round among its recent
+//!   rounds) after those with one. Each lane's expectations are read over its
+//!   own last `spec.shape_estimate_rounds` verify rounds, as under
+//!   `aggregate`. Each
 //!   grant takes the round from its `w` extended lanes to `w + 1`, while
 //!   `16 (w + 1) + 8 (n - 1)` columns stay within 64, and is made when
 //!
@@ -31,9 +34,12 @@
 //!   ```
 //!
 //!   or, for a lane with no estimate, whenever the columns allow, so that its
-//!   estimate has an extended round to read. A refused lane does not end the
+//!   estimate has an extended round to read. A step to a round the cost table
+//!   says costs less than the round before it is granted, which no step of a
+//!   default table is (`PeriodTable::held`). A refused lane does not end the
 //!   grant; only the columns do, and a step to a mix the load holds no graph
-//!   of, so that the grant stops at the last mix it holds. A round at a lane
+//!   of, so that the grant stops at the last mix it holds and a pool that
+//!   holds some of the mixes keeps their gain. A round at a lane
 //!   count where the load holds no mix takes `aggregate`'s choice. Eight
 //!   lanes are always at the base shape.
 //!
@@ -229,8 +235,10 @@ impl Default for PeriodTable {
 /// greedy rounds of its lanes forced to its shapes; four legs, two in each
 /// order; each cell's period the median of its 256-round blocks' medians on
 /// the GPU clock, an entry that period over the base round's at its lane
-/// count. The ratio grows with context: these are figures at about 3.5-5K
-/// tokens.
+/// count, never read off a line between lane counts: the base round's cost
+/// rises in steps with its columns, and on this card not always by much (8
+/// lanes cost 0.3% more than 7 on this body). The ratio grows with context:
+/// these are figures at about 3.5-5K tokens.
 ///
 /// The step from 56 columns to 64 costs nothing or less: near the card's
 /// 575 W limit the 56-column rounds ran at a lower clock than the 64-column
@@ -259,7 +267,8 @@ const TRELLIS_MEASURED: PeriodTable = PeriodTable {
 /// GitHub #720 (spec #711): the cost table as `spec.shape_period_ratios`
 /// gives it, which a 27B load turns into the table it runs once its body is
 /// known ([`Self::of_body`]), as `model.exception_weights` and
-/// `model.rope_scaling` resolve their `auto`.
+/// `model.rope_scaling` resolve their `auto` under ADR 0046's one
+/// declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PeriodTableSetting {
     /// The loaded body's own table, [`PeriodTable::NVFP4`] or
