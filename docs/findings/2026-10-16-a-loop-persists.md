@@ -1,14 +1,15 @@
 # A reasoning loop persists and a legitimate enumeration ends: the loop guard acts on four checks in a row
 
 - Kind: experiment
-- Status: current
+- Status: corrected
 - Observed: 2026-10-16
 - Last verified: 2026-10-16
 - Scope: server / reasoning-loop guard trigger and cut (`crates/server/src/loop_guard.rs`, config v2 `model.loop_guard*`); sampled reasoning on qwen3.8-27b, the Playground's Rome prompt and the owner's opencode and qwen-code agentic sessions
 - Topic: reasoning-and-context
 - Related: [ADR 0053](../adr/0053-a-loop-is-acted-on-once-it-persists.md), [ADR 0052](../adr/0052-a-reasoning-loop-is-taken-back-and-nudged.md), [Reasoning-loop guard](2026-10-14-reasoning-loop-guard.md), [Reasoning loops are the model's](2026-10-12-reasoning-loops-are-the-models.md)
 - Superseded by: none
-- Summary: Duration separates loops from legitimate enumerations where depth does not (legitimate text at most 6 low checks in a row, harmful loops mostly 9+): ratio 0.265 on 4 checks in a row catches 25/25 harmful loops with 0 agentic fires.
+- Corrected by: [A loop longer than the window repeats verbatim](2026-11-27-a-loop-longer-than-the-window-repeats-verbatim.md)
+- Summary: Duration separates loops from legitimate enumerations (legitimate text at most 6 low checks in a row): 0.265 on 4 checks in a row catches 25/25 harmful loops, 0 agentic fires; agent reasoning also loops verbatim past the window.
 
 ## Question
 
@@ -97,6 +98,12 @@ Fibonacci table computed by hand (5).
 - Two longer indecision tails, a decision sentence repeated between reconsiderations, never go
   under 0.40: compression does not see them.
 - No agentic part shows a persistent loop of the Rome kind.
+- *Corrected 2026-11-27 (#727,
+  [A loop longer than the window repeats verbatim](2026-11-27-a-loop-longer-than-the-window-repeats-verbatim.md)):*
+  15 of the qwen-code parts counted legitimate here are verbatim loops that the compression score
+  never acted on: their blocks are longer than the 1,000-character window, or they stop at two
+  copies, too few for the persistence rule. 6 of them are turns of one session that loop until
+  the reasoning closes. The "0 agentic fires" was measured with them among the negatives.
 
 **Literature.**
 - Loops self-reinforce: the more a sentence repeats, the likelier its continuation (Xu et al.

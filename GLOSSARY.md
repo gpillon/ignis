@@ -116,6 +116,14 @@ The server task between a reasoning request's engine event stream and its
 consumer that watches the reasoning for a loop (ADR 0052, config
 `model.loop_guard*`, `rewind` by default).
 
+**Repeat signal**:
+The loop guard's detector beside its compression score (ADR 0053, GitHub #727):
+the same sentences of the reasoning written twice back to back, compared as
+written, each copy allowed `loop_guard_repeat_varying` sentences the one before
+it lacks and repeating at least `loop_guard_repeat_min` characters of prose
+verbatim. It sees a loop whose block is longer than the score's window; its
+rewind cuts at the start of the second copy, keeping the first.
+
 **Rewind**:
 The loop guard's action: the engine request is cancelled and a
 **continuation** submitted. The client keeps what it received and gets the tag

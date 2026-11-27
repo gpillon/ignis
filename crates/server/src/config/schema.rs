@@ -456,7 +456,8 @@ config_group! {
         /// reasoning ends with its content. 1, at the first.
         loop_guard_persist: Checks = crate::loop_guard::DEFAULT_PERSIST_CHECKS, between(1, 100), ALL, [Visible, Patchable];
         /// A rewind that would keep fewer characters of reasoning than this
-        /// is only logged, and that run of loop scores is not acted on: a
+        /// is only logged, and that run of loop scores, or that repeat, is
+        /// not acted on: a
         /// reasoning that opens in a loop, or in an enumeration scored as
         /// one, would otherwise be dropped whole. 0, always rewind.
         loop_guard_min_kept: Chars = crate::loop_guard::DEFAULT_MIN_KEPT_CHARS, between(0, 100_000), ALL, [Visible, Patchable];
@@ -480,6 +481,22 @@ config_group! {
         /// once. A WebSocket request's continuation waits in the socket's
         /// admission queue instead, as the socket's own requests do.
         loop_guard_submit_wait: Secs = crate::loop_guard::DEFAULT_SUBMIT_WAIT_SECS, between(0, 3600), ALL, [Visible, Patchable];
+        /// The loop guard's repeat signal: the least a copy of a block the
+        /// reasoning repeats back to back must repeat verbatim, in characters
+        /// of scored reasoning, its sentences that vary left out. A loop
+        /// whose block is too long for `loop_guard_window` to hold two copies
+        /// of it scores like prose; this signal sees it.
+        loop_guard_repeat_min: Chars = crate::loop_guard::DEFAULT_REPEAT_MIN_CHARS, between(1, 100_000), ALL, [Visible, Patchable];
+        /// The longest copy the repeat signal looks for, in characters of
+        /// scored reasoning. 0, no repeat signal.
+        loop_guard_repeat_max: Chars = crate::loop_guard::DEFAULT_REPEAT_MAX_CHARS, between(0, 1_000_000), ALL, [Visible, Patchable];
+        /// The copies back to back, the last one complete, that make a
+        /// repeat: the guard acts at the end of the last one, and a rewind
+        /// keeps the first and cuts at the start of the second.
+        loop_guard_repeat_copies: Copies = crate::loop_guard::DEFAULT_REPEAT_COPIES, between(2, 100), ALL, [Visible, Patchable];
+        /// The sentences a copy may have that the copy before it does not,
+        /// and still count as a copy. 0, every copy verbatim.
+        loop_guard_repeat_varying: Sentences = crate::loop_guard::DEFAULT_REPEAT_VARYING, between(0, 10), ALL, [Visible, Patchable];
         /// The sentence, in the model's own voice, the loop guard's first
         /// rewind puts after the kept reasoning, on a paragraph of its own.
         loop_guard_nudge: Text = crate::loop_guard::DEFAULT_NUDGE.to_owned(), NO_RULE, ALL, [Visible, Patchable];

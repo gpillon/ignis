@@ -1671,6 +1671,39 @@ fn the_loop_guards_persistence_and_minimum_kept_resolve_from_flag_env_and_file()
     assert_eq!((file.persist_checks, file.min_kept_chars), (3, 200));
 }
 
+/// The repeat signal's four limits (#727) resolve from flag, env and file,
+/// visible and patchable with no reload, and refuse what they cannot take.
+#[test]
+fn the_loop_guards_repeat_limits_resolve_from_flag_env_and_file() {
+    let defaults = config(&[]).loop_guard;
+    let limits = |p: &crate::loop_guard::LoopGuardParams| (p.repeat_min_chars, p.repeat_max_chars, p.repeat_copies, p.repeat_varying);
+    assert_eq!(limits(&defaults), (150, 16_000, 2, 1));
+    let flags = config(&[
+        "--model-loop-guard-repeat-min", "200", "--model-loop-guard-repeat-max", "0",
+        "--model-loop-guard-repeat-copies", "3", "--model-loop-guard-repeat-varying", "0",
+    ])
+    .loop_guard;
+    assert_eq!(limits(&flags), (200, 0, 3, 0), "0 turns the signal off; every copy verbatim");
+    let env = env_map(&[("IGNIS_MODEL_LOOP_GUARD_REPEAT_MAX", "32000"), ("IGNIS_MODEL_LOOP_GUARD_REPEAT_VARYING", "2")]);
+    let from_env = expect_config(resolve(&[], env).expect("resolve")).loop_guard;
+    assert_eq!(limits(&from_env), (150, 32_000, 2, 2));
+    for (flag, value) in [
+        ("--model-loop-guard-repeat-min", "0"),
+        ("--model-loop-guard-repeat-copies", "1"),
+        ("--model-loop-guard-repeat-varying", "11"),
+        ("--model-loop-guard-repeat-max", "1000001"),
+    ] {
+        assert!(refused(&[flag, value]).contains(flag), "{flag} {value}");
+    }
+    for name in ["loop_guard_repeat_min", "loop_guard_repeat_max", "loop_guard_repeat_copies", "loop_guard_repeat_varying"] {
+        let field = schema::field("model", name).expect("declared");
+        assert!(field.visible && field.patchable && !field.reload_required, "{field:?}");
+    }
+    let files = MemFiles::with(&[("c.yaml", "model:\n  loop_guard_repeat_min: 120\n  loop_guard_repeat_copies: 2\n")]);
+    let file = with_files(&["--config", "c.yaml"], no_env, &files).unwrap().loop_guard;
+    assert_eq!(limits(&file), (120, 16_000, 2, 1));
+}
+
 /// The two nudges are the model's own words by default and config fields
 /// like the rest, from flag, env and file, visible and patchable with no
 /// reload.

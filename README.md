@@ -339,11 +339,13 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
   the loop was and `rewound_tokens` in the usage; the reasoning sent back on
   the next turn is repaired to what the model saw.
 - Scored on recorded runs of the prompt its thresholds were tuned on, it
-  catches **25 of 25 harmful loops**, and **6 of 7 on 40 fresh seeds**; it
-  never fires on the recorded opencode and qwen-code sessions it was also
-  tuned against. On 79K- and 138K-token agent contexts a rewind restores the
-  prompt in 0.08-0.10 s
+  catches **25 of 25 harmful loops**, and **6 of 7 on 40 fresh seeds**. From
+  0.11.2 it also catches a block written twice back to back, however long:
+  on the recorded opencode and qwen-code sessions it was tuned against it
+  fires only on the 21 parts that loop verbatim. On 79K- and 138K-token agent
+  contexts a rewind restores the prompt in 0.08-0.10 s
   ([a loop persists](docs/findings/2026-10-16-a-loop-persists.md),
+  [a loop longer than the window](docs/findings/2026-11-27-a-loop-longer-than-the-window-repeats-verbatim.md),
   [the guard](docs/findings/2026-10-14-reasoning-loop-guard.md)).
 - **An end of turn drawn inside the reasoning closes it** — it becomes
   `</think>`, and the model goes on to the answer or the tool call it was

@@ -543,7 +543,7 @@ How many checks in a row must score a loop before the guard acts: a loop persist
 | Models | all |
 | `/v1/config` | shown by `GET`, patchable live |
 
-A rewind that would keep fewer characters of reasoning than this is only logged, and that run of loop scores is not acted on: a reasoning that opens in a loop, or in an enumeration scored as one, would otherwise be dropped whole. 0, always rewind.
+A rewind that would keep fewer characters of reasoning than this is only logged, and that run of loop scores, or that repeat, is not acted on: a reasoning that opens in a loop, or in an enumeration scored as one, would otherwise be dropped whole. 0, always rewind.
 
 ### `model.loop_guard_holdback`
 
@@ -614,6 +614,62 @@ The least of a request's `max_tokens` a continuation must have left after the cu
 | `/v1/config` | shown by `GET`, patchable live |
 
 How long a continuation the engine refuses as full waits for room, in seconds, before the loop is left as it is; 0 tries once. A WebSocket request's continuation waits in the socket's admission queue instead, as the socket's own requests do.
+
+### `model.loop_guard_repeat_min`
+
+| | |
+|---|---|
+| Flag | `--model-loop-guard-repeat-min` |
+| Env var | `IGNIS_MODEL_LOOP_GUARD_REPEAT_MIN` |
+| Kind | `chars` |
+| Default | `150` |
+| Rule | 1..=100000 |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+The loop guard's repeat signal: the least a copy of a block the reasoning repeats back to back must repeat verbatim, in characters of scored reasoning, its sentences that vary left out. A loop whose block is too long for `loop_guard_window` to hold two copies of it scores like prose; this signal sees it.
+
+### `model.loop_guard_repeat_max`
+
+| | |
+|---|---|
+| Flag | `--model-loop-guard-repeat-max` |
+| Env var | `IGNIS_MODEL_LOOP_GUARD_REPEAT_MAX` |
+| Kind | `chars` |
+| Default | `16000` |
+| Rule | 0..=1000000 |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+The longest copy the repeat signal looks for, in characters of scored reasoning. 0, no repeat signal.
+
+### `model.loop_guard_repeat_copies`
+
+| | |
+|---|---|
+| Flag | `--model-loop-guard-repeat-copies` |
+| Env var | `IGNIS_MODEL_LOOP_GUARD_REPEAT_COPIES` |
+| Kind | `copies` |
+| Default | `2` |
+| Rule | 2..=100 |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+The copies back to back, the last one complete, that make a repeat: the guard acts at the end of the last one, and a rewind keeps the first and cuts at the start of the second.
+
+### `model.loop_guard_repeat_varying`
+
+| | |
+|---|---|
+| Flag | `--model-loop-guard-repeat-varying` |
+| Env var | `IGNIS_MODEL_LOOP_GUARD_REPEAT_VARYING` |
+| Kind | `sentences` |
+| Default | `1` |
+| Rule | 0..=10 |
+| Models | all |
+| `/v1/config` | shown by `GET`, patchable live |
+
+The sentences a copy may have that the copy before it does not, and still count as a copy. 0, every copy verbatim.
 
 ### `model.loop_guard_nudge`
 

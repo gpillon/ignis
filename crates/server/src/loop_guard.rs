@@ -31,6 +31,19 @@
 //! an enumeration scored as one, has no clean window to go back to, so that
 //! run of loop scores is only logged and held ([`Watch::hold`]).
 //!
+//! **Repeats** (GitHub #727, ADR 0053). A loop whose block is longer than the
+//! window never shows two copies in it and scores like prose. Each time a
+//! sentence of the scored reasoning ends, the guard also looks for the same
+//! sentences back to back ([`Normalized::repeat`]): `repeat_copies` copies,
+//! each allowed `repeat_varying` sentences the one before it lacks, compared
+//! as written, with at least `repeat_min` characters of prose repeated
+//! verbatim per copy and a period up to `repeat_max`. A repeat is acted on
+//! when its last copy ends, and its cut is the start of the second copy, which
+//! keeps the first ([`Watch::cut`]). Measured offline on 2026-11-27
+//! (`docs/findings/2026-11-27-a-loop-longer-than-the-window-repeats-verbatim.md`):
+//! verbatim loops of 250 to 8,000 characters caught at their second copy, 21
+//! looping agent parts the score never saw, no fire on the legitimate ones.
+//!
 //! **Rewind.** The engine request is cancelled and a **continuation**
 //! submitted: the same input, its prompt extended by the generated tokens
 //! kept from before the loop ([`Watch::cut_point`]: back to the start of the
@@ -87,6 +100,7 @@
 //! made.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -191,6 +205,19 @@ pub const DEFAULT_PERSIST_CHECKS: u32 = 4;
 /// in an enumeration the score takes for one, has no clean window to go back
 /// to, and a rewind there would drop all of it.
 pub const DEFAULT_MIN_KEPT_CHARS: u32 = 1;
+/// `--model-loop-guard-repeat-min`'s default, in scored characters: the
+/// least a copy must repeat verbatim, the sentences that vary left out, for
+/// the repeat signal.
+pub const DEFAULT_REPEAT_MIN_CHARS: u32 = 150;
+/// `--model-loop-guard-repeat-max`'s default, in scored characters: the
+/// longest copy the repeat signal looks for.
+pub const DEFAULT_REPEAT_MAX_CHARS: u32 = 16_000;
+/// `--model-loop-guard-repeat-copies`'s default: the copies back to back
+/// that make a repeat, the last one complete.
+pub const DEFAULT_REPEAT_COPIES: u32 = 2;
+/// `--model-loop-guard-repeat-varying`'s default: the sentences a copy may
+/// have that the one before it does not.
+pub const DEFAULT_REPEAT_VARYING: u32 = 1;
 /// `--model-loop-guard-nudge`'s default: the model's own words when it
 /// caught itself (2026-10-12 seed 109: "I'm repeating. Let me stop the
 /// repetition and just write the content directly.").
@@ -242,6 +269,16 @@ pub struct LoopGuardParams {
     /// How long a continuation the engine refuses as full waits for room,
     /// in seconds, before the loop is left as it is. 0, it is tried once.
     pub submit_wait_secs: u32,
+    /// The repeat signal: the least a copy repeats verbatim, in scored
+    /// characters, the sentences that vary left out.
+    pub repeat_min_chars: u32,
+    /// The repeat signal's longest copy, in scored characters. 0, no repeat
+    /// signal.
+    pub repeat_max_chars: u32,
+    /// The copies back to back that make a repeat.
+    pub repeat_copies: u32,
+    /// The sentences a copy may have that the one before it does not.
+    pub repeat_varying: u32,
     /// The sentence the first rewind puts after the kept reasoning.
     pub nudge: String,
     /// The sentence every later rewind puts there, until the close.
@@ -291,6 +328,10 @@ impl Default for LoopGuardParams {
             snap_chars: DEFAULT_SNAP_CHARS,
             min_continuation_tokens: DEFAULT_MIN_CONTINUATION_TOKENS,
             submit_wait_secs: DEFAULT_SUBMIT_WAIT_SECS,
+            repeat_min_chars: DEFAULT_REPEAT_MIN_CHARS,
+            repeat_max_chars: DEFAULT_REPEAT_MAX_CHARS,
+            repeat_copies: DEFAULT_REPEAT_COPIES,
+            repeat_varying: DEFAULT_REPEAT_VARYING,
             nudge: DEFAULT_NUDGE.to_owned(),
             nudge_again: DEFAULT_NUDGE_AGAIN.to_owned(),
         }
@@ -441,6 +482,8 @@ pub struct Normalized {
     /// What one step hands the next.
     pass: Vec<(char, usize)>,
     spare: Vec<(char, usize)>,
+    /// The scored text's sentences, for the repeat signal.
+    sentences: Sentences,
 }
 
 impl Normalized {
@@ -451,7 +494,15 @@ impl Normalized {
         } else {
             Vec::new()
         };
-        Self { steps, text: Vec::new(), raw_at: Vec::new(), raw: Vec::new(), pass: Vec::new(), spare: Vec::new() }
+        Self {
+            steps,
+            text: Vec::new(),
+            raw_at: Vec::new(),
+            raw: Vec::new(),
+            pass: Vec::new(),
+            spare: Vec::new(),
+            sentences: Sentences::default(),
+        }
     }
 
     /// The next character of the raw reasoning.
@@ -469,6 +520,101 @@ impl Normalized {
         for &(c, raw) in &self.pass {
             self.text.push(c);
             self.raw_at.push(raw);
+            self.sentences.push(&self.text, &self.raw_at, &self.raw);
+        }
+    }
+
+    /// The sentences of scored text finished so far.
+    pub fn sentence_count(&self) -> usize {
+        self.sentences.all.len()
+    }
+
+    /// The repeat the scored text ends in, both its last copies after the
+    /// raw character `floor`, under `params`' `repeat_*` limits; see
+    /// [`Repeat`].
+    ///
+    /// The periods tried, shortest first, are the distances back to an
+    /// earlier copy of one of the last sentences: as many of them as may
+    /// vary in a copy, and one more, so one of them is a copy's own. At each,
+    /// the sentences from the last one back are compared with the ones a
+    /// period before them, until one more than `repeat_varying` differ
+    /// within a period, or `repeat_max` characters back. The shortest period
+    /// whose copies reach `repeat_copies` decides: a repeat when a copy
+    /// repeats at least `repeat_min` characters of prose verbatim, none when
+    /// a shorter block repeating over and over does (a loop of one short
+    /// sentence: the compression score's), the next period when neither, as
+    /// two short sentences in a row are. Lines of material take part in the
+    /// copies but count for nothing towards `repeat_min`: a listing or a log
+    /// transcribed twice, to compare two outputs, is no loop.
+    ///
+    /// A copy is read from the earliest sentence that matches: when the
+    /// sentence that varies opens each copy, the copies start after it, so
+    /// the repeat is found one sentence into the third copy and its cut keeps
+    /// the second copy's varying sentence. With one sentence free to vary,
+    /// `X A B C D A B C D` is as much a loop of `D A B C` whose first sentence
+    /// varies as one of `A B C D`; the later reading never cuts into what
+    /// came before the loop.
+    pub fn repeat(&self, floor: usize, params: &LoopGuardParams) -> Option<Repeat> {
+        let sentences = &self.sentences;
+        let last = sentences.all.len().checked_sub(1)?;
+        let first = sentences.all.partition_point(|sentence| self.raw_at[sentence.span.0] < floor);
+        let varying = params.repeat_varying as usize;
+        let (min, max) = (params.repeat_min_chars as usize, params.repeat_max_chars as usize);
+        let copies = f64::from(params.repeat_copies.max(2));
+        let end = sentences.all[last].span.1;
+        let seeds: Vec<usize> = (first..=last).rev().filter(|&j| sentences.has_text(j)).take(varying + 1).collect();
+        // For each seed, its earlier copies (`by_text` is in order): the
+        // next one to propose a period is the last of the slice.
+        let mut earlier: Vec<(usize, &[usize])> = seeds
+            .iter()
+            .map(|&j| {
+                let all = &sentences.by_text[&sentences.all[j].hash][..];
+                (j, &all[..all.partition_point(|&i| i < j)])
+            })
+            .collect();
+        let mut tried = 0;
+        loop {
+            let mut period = usize::MAX;
+            for (j, before) in &mut earlier {
+                while let Some((&i, rest)) = before.split_last() {
+                    if i < first {
+                        *before = &[];
+                    } else if *j - i <= tried || !sentences.same(&self.raw, i, *j) {
+                        *before = rest;
+                    } else {
+                        period = period.min(*j - i);
+                        break;
+                    }
+                }
+            }
+            if period == usize::MAX || last < first + period {
+                return None;
+            }
+            tried = period;
+            let chars = end - sentences.all[last + 1 - period].span.0;
+            if chars > max {
+                return None;
+            }
+            let needed = (copies - 1.0) * chars as f64;
+            let enough = |span: usize, matched: usize| span as f64 >= needed && matched >= min || span > max;
+            let Some((low, matched)) = sentences.walk(&self.raw, period, first, varying, enough) else { continue };
+            let span = end - sentences.all[low].span.0;
+            if (span as f64) < needed {
+                continue;
+            }
+            if matched as f64 * chars as f64 / span as f64 >= min as f64 {
+                let (low, _) = sentences.walk(&self.raw, period, first, varying, |_, _| false)?;
+                return Some(Repeat {
+                    period: chars,
+                    copies: 1.0 + (end - sentences.all[low].span.0) as f64 / chars as f64,
+                    first: self.raw_at[sentences.all[low - period].span.0],
+                    second: self.raw_at[sentences.all[low].span.0],
+                    end: self.raw.len(),
+                });
+            }
+            if matched >= min {
+                return None;
+            }
         }
     }
 
@@ -598,6 +744,217 @@ impl Step for Digits {
     }
 }
 
+/// A sentence's stop: `.`, `!` or `?`, which ends one before white space
+/// (so a file name, a decimal or `!=` ends none), past any [`closes`].
+fn stops(c: char) -> bool {
+    matches!(c, '.' | '!' | '?')
+}
+
+/// A full-width stop, which ends a sentence where it stands: the languages
+/// that write it put no space after it.
+fn stops_wide(c: char) -> bool {
+    matches!(c, '。' | '！' | '？')
+}
+
+/// What may follow a sentence's stop and still close the sentence: a quote,
+/// a bracket, emphasis.
+fn closes(c: char) -> bool {
+    matches!(c, '"' | '\'' | ')' | ']' | '}' | '*' | '_' | '`' | '”' | '’' | '»' | '」' | '』' | '）')
+}
+
+/// `text` ends in a stop, past its closers and white space.
+fn ends_in_stop(text: &[char]) -> bool {
+    let end = text.iter().rposition(|&c| !c.is_whitespace() && !closes(c));
+    end.is_some_and(|end| stops(text[end]) || stops_wide(text[end]))
+}
+
+/// The scored text cut into sentences as it streams, for the repeat signal
+/// ([`Normalized::repeat`]): a sentence ends at a line break, at a
+/// full-width stop, and at white space after a stop. One that ends in a
+/// stop is **prose**; a line that ends in none is a line of **material**: a
+/// list's item, a log's or a table's line, a heading. Two sentences are the
+/// same when the raw text they span, white space trimmed off both ends, is:
+/// a table or a list whose numbers differ repeats once its digits fold, not
+/// as written.
+#[derive(Default)]
+struct Sentences {
+    /// Every finished sentence, in order.
+    all: Vec<Sentence>,
+    /// The sentences with text, by their hash, in order.
+    by_text: HashMap<u64, Vec<usize>>,
+    /// Where the sentence being written starts.
+    open: usize,
+}
+
+/// One finished sentence of [`Sentences`].
+struct Sentence {
+    /// Its span of the scored text.
+    span: (usize, usize),
+    /// The raw text it spans, white space trimmed off both ends.
+    trimmed: (usize, usize),
+    /// The FNV-1a hash of that trimmed raw text.
+    hash: u64,
+    /// It ends in a stop.
+    prose: bool,
+}
+
+impl Sentence {
+    /// Its scored characters.
+    fn chars(&self) -> usize {
+        self.span.1 - self.span.0
+    }
+}
+
+impl Sentences {
+    /// After the scored `text`'s last character was appended, `raw_at` its
+    /// characters' raw offsets in `raw`: it may end a sentence, or show that
+    /// the one before it ended.
+    fn push(&mut self, text: &[char], raw_at: &[usize], raw: &[char]) {
+        let at = text.len() - 1;
+        let end = if text[at] == '\n' || stops_wide(text[at]) {
+            at + 1
+        } else if text[at].is_whitespace() && at > self.open && ends_in_stop(&text[self.open..at]) {
+            // Ends before this white space, which opens the next one.
+            at
+        } else {
+            return;
+        };
+        let start = std::mem::replace(&mut self.open, end);
+        let (mut from, mut to) = (raw_at[start], raw_at[end - 1] + 1);
+        while from < to && raw[from].is_whitespace() {
+            from += 1;
+        }
+        while to > from && raw[to - 1].is_whitespace() {
+            to -= 1;
+        }
+        let hash = raw[from..to]
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |hash, &c| (hash ^ u64::from(u32::from(c))).wrapping_mul(0x0000_0100_0000_01b3));
+        if to > from {
+            self.by_text.entry(hash).or_default().push(self.all.len());
+        }
+        self.all.push(Sentence { span: (start, end), trimmed: (from, to), hash, prose: ends_in_stop(&text[start..end]) });
+    }
+
+    /// Sentence `i` has text beside white space.
+    fn has_text(&self, i: usize) -> bool {
+        self.all[i].trimmed.0 < self.all[i].trimmed.1
+    }
+
+    /// Sentences `a` and `b` are the same, as `raw` has them.
+    fn same(&self, raw: &[char], a: usize, b: usize) -> bool {
+        let (a, b) = (&self.all[a], &self.all[b]);
+        a.hash == b.hash && raw[a.trimmed.0..a.trimmed.1] == raw[b.trimmed.0..b.trimmed.1]
+    }
+
+    /// From the last sentence back, each compared with the one `period`
+    /// before it, none of those before `first`: the earliest that is the
+    /// same, and the characters of the prose that is, from it on. The walk
+    /// stops at one more than `varying` different ones within a period, or
+    /// once `enough` says so of the span (scored characters from that
+    /// sentence's start to the end) and those characters.
+    fn walk(&self, raw: &[char], period: usize, first: usize, varying: usize, enough: impl Fn(usize, usize) -> bool) -> Option<(usize, usize)> {
+        let last = self.all.len() - 1;
+        let end = self.all[last].span.1;
+        let mut differ: VecDeque<usize> = VecDeque::new();
+        let (mut found, mut matched) = (None, 0);
+        let mut j = last;
+        while j >= first + period {
+            if self.same(raw, j, j - period) {
+                if self.all[j].prose {
+                    matched += self.all[j].chars();
+                }
+                found = Some((j, matched));
+                if enough(end - self.all[j].span.0, matched) {
+                    break;
+                }
+            } else {
+                while differ.front().is_some_and(|&k| k >= j + period) {
+                    differ.pop_front();
+                }
+                if differ.len() >= varying {
+                    break;
+                }
+                differ.push_back(j);
+            }
+            j -= 1;
+        }
+        found
+    }
+}
+
+/// A repeat the reasoning ends in, which the repeat signal found
+/// ([`Normalized::repeat`]): the same sentences back to back, copy after
+/// copy, each copy allowed to differ from the one before it in
+/// `repeat_varying` sentences. A loop whose block is too long for the
+/// compression score's window to hold two copies of it is one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Repeat {
+    /// One copy, in scored characters: the repeat's period.
+    pub period: usize,
+    /// The copies back to back, the last one counted in part.
+    pub copies: f64,
+    /// The raw reasoning character the first copy starts at.
+    pub first: usize,
+    /// The raw character the second copy starts at: a rewind keeps the
+    /// first copy and cuts here.
+    pub second: usize,
+    /// The raw reasoning length it was found at.
+    pub end: usize,
+}
+
+/// What the watch found: a loop score that persisted, or a repeat.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Found {
+    /// A loop score, the `persist_checks`-th in a row.
+    Score(Score),
+    /// A repeat ([`Normalized::repeat`]).
+    Repeat(Repeat),
+}
+
+impl Found {
+    /// The log's name for the signal that found it.
+    pub fn signal(&self) -> &'static str {
+        match self {
+            Self::Score(_) => "compression",
+            Self::Repeat(_) => "repeat",
+        }
+    }
+
+    /// The raw character what it looked at starts at: the window's, or the
+    /// repeat's first copy's.
+    pub fn start(&self) -> usize {
+        match self {
+            Self::Score(score) => score.start,
+            Self::Repeat(repeat) => repeat.first,
+        }
+    }
+
+    /// The raw reasoning length it was found at.
+    pub fn end(&self) -> usize {
+        match self {
+            Self::Score(score) => score.end,
+            Self::Repeat(repeat) => repeat.end,
+        }
+    }
+
+    /// The loop score, when a score found it.
+    pub fn score(&self) -> Option<&Score> {
+        match self {
+            Self::Score(score) => Some(score),
+            Self::Repeat(_) => None,
+        }
+    }
+
+    /// The repeat, when the repeat signal found it.
+    pub fn repeat(&self) -> Option<&Repeat> {
+        match self {
+            Self::Repeat(repeat) => Some(repeat),
+            Self::Score(_) => None,
+        }
+    }
+}
+
 /// A scored window of reasoning.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Score {
@@ -640,12 +997,24 @@ pub struct Watch {
     loop_run: u32,
     /// The run of loop scores in progress is not acted on ([`Watch::hold`]).
     held: bool,
+    /// The sentences of scored text the repeat signal has looked at.
+    sentences: usize,
+    /// The repeat in progress is not acted on ([`Watch::hold`]).
+    repeat_held: bool,
 }
 
 impl Watch {
     /// A watch whose first score is the first full window after `floor`.
     pub fn from(floor: usize, params: &LoopGuardParams) -> Self {
-        Self { floor, next_check: floor + params.window_chars as usize, history: Vec::new(), loop_run: 0, held: false }
+        Self {
+            floor,
+            next_check: floor + params.window_chars as usize,
+            history: Vec::new(),
+            loop_run: 0,
+            held: false,
+            sentences: 0,
+            repeat_held: false,
+        }
     }
 
     /// The window's score when the reasoning has grown enough to score it
@@ -674,10 +1043,34 @@ impl Watch {
         Some(score)
     }
 
-    /// [`Watch::score`], when it is a loop and the `persist_checks`-th in a
-    /// row or later (every one, at 1), unless the run is held. A score that
-    /// is not a loop starts the count over and ends the hold.
-    fn check(&mut self, scored: &Normalized, params: &LoopGuardParams) -> Option<Score> {
+    /// What the watch finds after the reasoning grew: a repeat, each time a
+    /// sentence ends ([`Normalized::repeat`]), or [`Watch::score`], when it
+    /// is a loop and the `persist_checks`-th in a row or later (every one,
+    /// at 1), unless what found it is held. A score that is not a loop starts
+    /// the count over and ends the scores' hold; a sentence that ends no
+    /// repeat ends the repeat's.
+    pub fn check(&mut self, scored: &Normalized, params: &LoopGuardParams) -> Option<Found> {
+        let repeat = self.repeat(scored, params);
+        let score = self.persisted(scored, params);
+        repeat.map(Found::Repeat).or(score.map(Found::Score))
+    }
+
+    fn repeat(&mut self, scored: &Normalized, params: &LoopGuardParams) -> Option<Repeat> {
+        let sentences = scored.sentence_count();
+        if sentences == self.sentences || params.repeat_max_chars == 0 {
+            return None;
+        }
+        self.sentences = sentences;
+        match scored.repeat(self.floor, params) {
+            Some(repeat) => (!self.repeat_held).then_some(repeat),
+            None => {
+                self.repeat_held = false;
+                None
+            }
+        }
+    }
+
+    fn persisted(&mut self, scored: &Normalized, params: &LoopGuardParams) -> Option<Score> {
         let score = self.score(scored, params)?;
         if !score.is_loop(params) {
             (self.loop_run, self.held) = (0, false);
@@ -688,11 +1081,31 @@ impl Watch {
         (self.loop_run >= params.persist_checks.max(1) && !self.held).then_some(score)
     }
 
-    /// Act on no more loop scores until one that is not a loop: the run in
-    /// progress is left as it is, and the scores taken so far stay for a
-    /// later cut.
-    fn hold(&mut self) {
-        self.held = true;
+    /// Act on no more loop scores until one that is not a loop, and on no
+    /// more repeats until a sentence that ends none: what is in progress is
+    /// left as it is, and the scores taken so far stay for a later cut.
+    pub fn hold(&mut self) {
+        (self.held, self.repeat_held) = (true, true);
+    }
+
+    /// Where to take the raw reasoning `text` back to, for what the watch
+    /// `found`: for a loop score, [`Watch::cut_point`]; for a repeat, the
+    /// start of its second copy, which keeps the first (a sentence's start
+    /// already, so no snap and no margin). A cut inside a code block moves
+    /// before its fence as [`Watch::cut_point`]'s does, never before the
+    /// floor.
+    pub fn cut(&self, text: &[char], found: &Found, params: &LoopGuardParams) -> usize {
+        match found {
+            Found::Score(_) => self.cut_point(text, params),
+            Found::Repeat(repeat) => {
+                // Both copies lie after the floor ([`Normalized::repeat`]).
+                let cut = repeat.second;
+                match open_block(&text[..cut]) {
+                    Some(fence) => fence.max(self.floor),
+                    None => cut,
+                }
+            }
+        }
     }
 
     /// Where to take the raw reasoning `text` back to, for the loop the last
@@ -1114,31 +1527,35 @@ impl<O: GuardOps> Guard<O> {
         if let (Some(_), Some(scored)) = (&self.metrics, self.watch.history.get(scores)) {
             self.lowest = Some(self.lowest.map_or(scored.ratio, |lowest| lowest.min(scored.ratio)));
         }
-        let score = found?;
+        let found = found?;
         let at = self.view.text().len();
         // What a rewind keeps: the whole tokens before the cut, counted in
         // the reasoning the model reads.
-        let cut = self.watch.cut_point(self.view.text(), &self.params);
+        let cut = self.watch.cut(self.view.text(), &found, &self.params);
         let kept = self.view.tokens_before(cut);
         let kept_chars = self.view.chars_through(kept);
+        let (score, repeat) = (found.score(), found.repeat());
         if kept_chars < self.params.min_kept_chars as usize {
             tracing::info!(
                 name: "ignis.loop_guard.too_little_kept",
-                request = self.original, engine_request = self.current.get(), at_chars = at, ratio = score.ratio,
-                raw_ratio = score.raw_ratio, window_start_chars = score.start, cut_chars = cut, kept_chars,
+                request = self.original, engine_request = self.current.get(), at_chars = at, signal = found.signal(),
+                ratio = score.map(|s| s.ratio), raw_ratio = score.map(|s| s.raw_ratio), period_chars = repeat.map(|r| r.period),
+                copies = repeat.map(|r| r.copies), window_start_chars = found.start(), cut_chars = cut, kept_chars,
                 "loop with too little reasoning before it to keep: log only"
             );
             self.count(LoopOutcome::TooLittleKept);
             // The watch goes on: a clean window later gives a later loop
-            // something to keep, and this run of loop scores fires no more.
+            // something to keep, and what found this one fires no more
+            // until it finds nothing ([`Watch::hold`]).
             self.watch.hold();
             return None;
         }
         if !self.rewindable {
             tracing::info!(
                 name: "ignis.loop_guard.detected",
-                request = self.original, engine_request = self.current.get(), at_chars = at, ratio = score.ratio,
-                raw_ratio = score.raw_ratio, window_start_chars = score.start,
+                request = self.original, engine_request = self.current.get(), at_chars = at, signal = found.signal(),
+                ratio = score.map(|s| s.ratio), raw_ratio = score.map(|s| s.raw_ratio), period_chars = repeat.map(|r| r.period),
+                copies = repeat.map(|r| r.copies), window_start_chars = found.start(),
                 cut_chars = cut,
                 "loop in the reasoning (log only)"
             );
@@ -1146,11 +1563,11 @@ impl<O: GuardOps> Guard<O> {
             self.watch = Watch::from(at, &self.params);
             return None;
         }
-        self.rewind(at, score, kept).await
+        self.rewind(at, found, kept).await
     }
 
-    async fn rewind(&mut self, at: usize, score: Score, kept: usize) -> Option<Continuation> {
-        let ratio = score.ratio;
+    async fn rewind(&mut self, at: usize, found: Found, kept: usize) -> Option<Continuation> {
+        let (score, repeat) = (found.score(), found.repeat());
         let generated = self.view.tokens.len();
         // The kept text and what the client received, as the client shows
         // them: a decoder holds back a trailing line break until the text
@@ -1222,7 +1639,8 @@ impl<O: GuardOps> Guard<O> {
         tracing::info!(
             name: "ignis.loop_guard.rewound",
             request = self.original, cancelled, continuation = request,
-            at_chars = at, ratio = ratio, raw_ratio = score.raw_ratio, window_start_chars = score.start, cut_chars = kept_chars,
+            at_chars = at, signal = found.signal(), ratio = score.map(|s| s.ratio), raw_ratio = score.map(|s| s.raw_ratio),
+            period_chars = repeat.map(|r| r.period), copies = repeat.map(|r| r.copies), window_start_chars = found.start(), cut_chars = kept_chars,
             rewound_tokens = generated - kept, rewound_chars = at - kept_chars,
             struck_chars = struck.as_ref().map_or(0, |struck| struck.chars().count()), held_back = struck.is_none(),
             attempt = self.rewinds + 1, closed = close,
@@ -1441,7 +1859,7 @@ mod loop_text;
 
 #[cfg(test)]
 mod tests {
-    use super::loop_text::{looping, prose};
+    use super::loop_text::{looping, prose, Source};
     use super::*;
     use crate::decoder::TokenDecoder;
     use ignis_core::{DecodeParams, FinishReason};
@@ -1568,8 +1986,10 @@ mod tests {
         let mut watch = Watch::from(floor, p);
         for c in text.chars() {
             scored.push(c);
-            if let Some(score) = watch.check(&scored, p) {
-                return Some((scored.raw_len(), score));
+            match watch.check(&scored, p) {
+                Some(Found::Score(score)) => return Some((scored.raw_len(), score)),
+                Some(found) => panic!("a repeat where a loop score was looked for: {found:?}"),
+                None => {}
             }
         }
         None
@@ -1592,7 +2012,7 @@ mod tests {
     /// the last one the loop.
     fn watch_with(floor: usize, checks: &[(usize, f64)]) -> Watch {
         let history = checks.iter().map(|&(start, ratio)| Score { ratio, raw_ratio: ratio, start, end: start + 1000 }).collect();
-        Watch { floor, next_check: 0, history, loop_run: 0, held: false }
+        Watch { floor, next_check: 0, history, loop_run: 0, held: false, sentences: 0, repeat_held: false }
     }
 
     /// Text for the cut to read: no line break, no backtick.
@@ -1618,8 +2038,10 @@ mod tests {
     /// list, is no loop; a score that is not one starts the count over.
     #[test]
     fn a_run_of_loop_scores_shorter_than_the_persistence_is_no_loop() {
-        let once = LoopGuardParams { persist_checks: 1, ..params(LoopGuardMode::Log) };
-        let eight = LoopGuardParams { persist_checks: 8, ..params(LoopGuardMode::Log) };
+        // The same prose comes back after each loop: the loop scores alone.
+        let scores = LoopGuardParams { repeat_max_chars: 0, ..params(LoopGuardMode::Log) };
+        let once = LoopGuardParams { persist_checks: 1, ..scores.clone() };
+        let eight = LoopGuardParams { persist_checks: 8, ..scores };
         let short = prose(3000) + &looping(1200) + &prose(3000);
         assert!(first_loop(&short, 0, &once).is_some(), "a loop at the first check");
         assert_eq!(first_loop(&short, 0, &eight), None);
@@ -1715,7 +2137,7 @@ mod tests {
         grow(&mut scored, &text, 1999);
         assert_eq!(watch.check(&scored, &p), None, "the window would start before the floor");
         grow(&mut scored, &text, 2000);
-        assert_eq!(watch.check(&scored, &p).map(|score| score.start), Some(1000));
+        assert_eq!(watch.check(&scored, &p).map(|found| found.start()), Some(1000));
     }
 
     /// The floor is raw: a window of scored text after it is a window
@@ -1845,6 +2267,443 @@ mod tests {
         for p in [params(LoopGuardMode::Log), raw(LoopGuardMode::Log)] {
             let (at, _) = first_loop(&text, 0, &p).expect("a loop");
             assert!(at > 3000, "flagged at {at}, before the loop, with {p:?}");
+        }
+    }
+
+    /// A reasoning that opens with `lead` characters of `source`'s
+    /// sentences (none: it opens in the loop), then loops on a block of
+    /// whole sentences about `period` characters long, `copies` paragraphs of
+    /// it; with `varying`, each copy's middle sentence is its own. The text,
+    /// and where each copy's text starts and ends, in characters.
+    fn sentence_loop(source: Source, period: usize, lead: usize, copies: usize, varying: bool) -> (String, Vec<(usize, usize)>) {
+        let pool = source.sentences(400);
+        let mut next = pool.iter();
+        let mut text = String::new();
+        while text.chars().count() < lead {
+            text.push_str(next.next().unwrap());
+            text.push(' ');
+        }
+        if !text.is_empty() {
+            text.pop();
+            text.push_str("\n\n");
+        }
+        let mut block: Vec<&String> = Vec::new();
+        while block.iter().map(|s| s.chars().count() + 1).sum::<usize>() < period {
+            block.push(next.next().unwrap());
+        }
+        let mut spans = Vec::new();
+        for _ in 0..copies {
+            let mut sentences = block.clone();
+            if varying {
+                sentences[block.len() / 2] = next.next().unwrap();
+            }
+            let start = text.chars().count();
+            text.push_str(&sentences.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "));
+            spans.push((start, text.chars().count()));
+            text.push_str("\n\n");
+        }
+        (text, spans)
+    }
+
+    /// The first thing the watch finds in `text`, looking after every
+    /// character: the raw length then, what it found, and the watch.
+    fn first_found(text: &str, p: &LoopGuardParams) -> Option<(usize, Found, Watch)> {
+        let mut scored = Normalized::new(p.normalize);
+        let mut watch = Watch::from(0, p);
+        for c in text.chars() {
+            scored.push(c);
+            if let Some(found) = watch.check(&scored, p) {
+                return Some((scored.raw_len(), found, watch));
+            }
+        }
+        None
+    }
+
+    /// `text` as the detector scores it, cut into its sentences: each one's
+    /// scored text and whether it is prose.
+    fn sentences_of(text: &str) -> Vec<(String, bool)> {
+        let scored = normalized(text, true);
+        let sentences = &scored.sentences;
+        sentences.all.iter().map(|s| (scored.text()[s.span.0..s.span.1].iter().collect(), s.prose)).collect()
+    }
+
+    /// A loop whose block repeats back to back is a repeat by the time its
+    /// third copy starts, whatever its period from 250 to 8,000 scored
+    /// characters, in three sources (one Italian), verbatim or with one
+    /// sentence of each copy its own, opening the reasoning or after 3,000
+    /// characters of it; and its cut keeps the first copy, at the start of
+    /// the second.
+    #[test]
+    fn a_loop_of_any_period_is_a_repeat_by_its_third_copy_and_cut_at_its_second() {
+        let p = params(LoopGuardMode::Log);
+        for source in Source::ALL {
+            for period in [250, 300, 400, 500, 750, 1000, 1500, 2000, 3000, 4000, 6000, 8000] {
+                for varying in [false, true] {
+                    for lead in [0, 3000] {
+                        let (text, copies) = sentence_loop(source, period, lead, 3, varying);
+                        let case = format!("{source:?}, period {period}, varying {varying}, lead {lead}");
+                        let (at, found, watch) = first_found(&text, &p).unwrap_or_else(|| panic!("{case}: nothing found"));
+                        let Found::Repeat(repeat) = found else { panic!("{case}: {found:?}") };
+                        assert!(at > copies[1].1 && at <= copies[2].0 + 1, "{case}: found at {at}, copies at {copies:?}");
+                        let cut = watch.cut(&text.chars().collect::<Vec<_>>(), &found, &p);
+                        assert!(copies[0].1 <= cut && cut <= copies[1].0, "{case}: cut at {cut}, copies at {copies:?}");
+                        assert!(repeat.period.abs_diff(copies[1].0 - copies[0].0) <= 100, "{case}: {repeat:?}, copies at {copies:?}");
+                        assert!(repeat.copies >= 2.0 && repeat.first <= copies[0].0 + 1, "{case}: {repeat:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The compression score's window holds no two copies of a long block:
+    /// only the repeat signal sees such a loop, and with it off the guard
+    /// sees nothing (the issue's `A × 4`).
+    #[test]
+    fn a_long_block_loops_unseen_by_the_compression_score() {
+        let (text, _) = sentence_loop(Source::Agent, 1900, 3000, 4, false);
+        let off = LoopGuardParams { repeat_max_chars: 0, ..params(LoopGuardMode::Log) };
+        assert_eq!(first_found(&text, &off).map(|(at, found, _)| (at, found)), None);
+        assert!(matches!(first_found(&text, &params(LoopGuardMode::Log)), Some((_, Found::Repeat(_), _))));
+    }
+
+    /// A pasted log transcribed, twice to compare two runs.
+    fn transcribed_log() -> String {
+        let prose = Source::Agent.sentences(12);
+        let run = |r: u32| {
+            let mut out = String::new();
+            let ts = |i: u32| format!("2026-11-26T21:{:02}:{:02}.{:03}Z", 51 + r * 3 + i / 60, (i * 7 + r * 13) % 60, (i * 389 + r * 71) % 1000);
+            out.push_str(&format!("{} INFO  ignis.server: listening on 127.0.0.1:8000\n", ts(0)));
+            out.push_str(&format!("{} INFO  ignis.runtime.load: model qwen3.8-27b ready in {}.{} s\n", ts(1), 41 + r, 2 + r));
+            for i in 0..12 {
+                out.push_str(&format!("{} INFO  ignis.request: request {} admitted with {} prompt tokens\n", ts(2 + i), 4100 + i + 100 * r, 812 + 37 * i));
+                if i % 4 == 3 {
+                    out.push_str(&format!("{} INFO  ignis.health: ok\n", ts(2 + i)));
+                }
+            }
+            out.push_str(&format!("{} WARN  ignis.engine: the prefill of request {} failed, retrying.\n", ts(15), 4111 + 100 * r));
+            out.push_str("thread 'model' panicked at crates/core/src/engine.rs:812:31:\n");
+            out.push_str("called `Result::unwrap()` on an `Err` value: OutOfMemory\n");
+            for frame in ["ignis_core::engine::Engine::step", "ignis_core::engine::Engine::run", "ignis_server::model::spawn::{{closure}}"] {
+                out.push_str(&format!("   at {frame}\n"));
+            }
+            out
+        };
+        format!(
+            "The user pasted the log of the failed run. Let me go through it line by line.\n{}{} {}\nNow the log of the run that worked, to compare.\n{}{} {}",
+            run(0),
+            prose[0],
+            prose[1],
+            run(1),
+            prose[2],
+            prose[3]
+        )
+    }
+
+    /// A plan re-drafted after a review: steps reworded, one added.
+    fn redrafted_plan() -> String {
+        let first = [
+            "Read the failing test and the module it covers, to see what the test expects.",
+            "Add a field for the new limit to the config schema, with the measured default.",
+            "Thread the field through the start config into the scheduler's admission check.",
+            "Refuse a request over the limit with a clear error that names the field.",
+            "Write a test that a request at the limit is admitted and one over it is not.",
+            "Update the configuration page and the troubleshooting entry for the new error.",
+            "Run the crate's tests, then the whole workspace on the CI branch.",
+        ];
+        let second = [
+            "Read the failing test and the module it covers, to see what the test expects.",
+            "Add a field for the new limit to the config schema, with the measured default.",
+            "Read the field from the live config at each admission, so a patch applies at once.",
+            "Refuse a request over the limit with a clear error that names the field.",
+            "Log the refusal once per request, with the limit and the request's size.",
+            "Write a test that a patched limit holds for the next request without a reload.",
+            "Update the configuration page, the telemetry page and the troubleshooting entry.",
+            "Run the crate's tests, then the whole workspace on the CI branch.",
+        ];
+        let steps = |steps: &[&str]| steps.iter().enumerate().map(|(i, s)| format!("{}. {s}\n", i + 1)).collect::<String>();
+        format!(
+            "Here is my plan for the change.\n{}The reviewer says the limit belongs in the live config, not the start config, so a patch \
+             applies without a reload. They also want the refusal logged. Let me write the plan again with both.\n{}Now the first step.",
+            steps(&first),
+            steps(&second)
+        )
+    }
+
+    /// A per-item checklist: each item its own first sentence, then the same
+    /// two.
+    fn checklist() -> String {
+        let items = [
+            ("core", "Its engine module gained the new admission check."),
+            ("server", "Its handler now returns the refusal as a 400 error."),
+            ("bench", "Its fixture sets the limit explicitly for every arm."),
+            ("artifact", "Its loader does not read the field at all, which is right."),
+            ("kernel", "Its build script is untouched, so only the tests matter."),
+            ("web", "Its settings view shows the field beside the other limits."),
+        ];
+        let mut out = String::from("Every crate needs the same checks before the merge.\n");
+        for (name, own) in items {
+            out.push_str(&format!(
+                "- The {name} crate. {own} Its tests pass with the default features and with every feature on. Mark it done in \
+                 the ticket once both runs are green.\n"
+            ));
+        }
+        out + "That is the list, so the next thing is the first crate."
+    }
+
+    /// A listing two agents returned, quoted twice to compare them.
+    fn listing_twice() -> String {
+        let files: String = ["Cargo.toml", "Cargo.lock", "README.md", "AGENTS.md", "GLOSSARY.md", "Makefile", "crates", "docs", "kernel", "web"]
+            .iter()
+            .chain(["tools", "scripts", "mk", "ci", "tests", ".github", ".githooks", ".gitignore", "rustfmt.toml", "LICENSE"].iter())
+            .map(|f| format!("- {f}\n"))
+            .collect();
+        format!(
+            "The two agents both listed the root of the checkout. Let me put the lists side by side.\nAgent one:\n{files}Agent two:\n{files}\
+             They are the same, so both agents saw the same checkout."
+        )
+    }
+
+    /// Repetition that is no loop: a pasted log transcribed twice to compare
+    /// two runs, a plan re-drafted after a review, a per-item checklist and a
+    /// listing quoted twice. Neither signal acts on any of them.
+    #[test]
+    fn legitimate_repetition_is_no_loop() {
+        let p = params(LoopGuardMode::Log);
+        for (name, text) in [("log", transcribed_log()), ("plan", redrafted_plan()), ("checklist", checklist()), ("listing", listing_twice())] {
+            let text = Source::Agent.sentences(60).join(" ") + "\n\n" + &text;
+            assert_eq!(first_found(&text, &p).map(|(at, found, _)| (at, found)), None, "{name}");
+        }
+    }
+
+    /// A sentence ends at a line break, at a full-width stop, and at white
+    /// space after a stop and its closers, not at a stop inside a word; one
+    /// that ends in a stop is prose, a line that ends in none is material.
+    #[test]
+    fn sentences_end_at_a_stop_before_white_space_and_at_a_line_break() {
+        let text = "Read engine.rs and 0.5 first. Then stop! He said \"done.\" Why?\n- an item\n## A heading\nfin。下一句。tail";
+        let sentences: Vec<(String, bool)> = sentences_of(text);
+        let expect = [
+            ("Read engine.rs and 0.0 first.", true),
+            (" Then stop!", true),
+            (" He said \"done.\"", true),
+            (" Why?\n", true),
+            ("- an item\n", false),
+            ("## A heading\n", false),
+            ("fin。", true),
+            ("下一句。", true),
+        ];
+        assert_eq!(sentences, expect.map(|(s, prose)| (s.to_owned(), prose)));
+    }
+
+    /// The repeat signal compares sentences as written: rows whose numbers
+    /// differ repeat once the digits fold, and are no repeat.
+    #[test]
+    fn rows_whose_numbers_differ_are_no_repeat() {
+        let p = params(LoopGuardMode::Log);
+        let rows: String = (0..40).map(|n| format!("Row {n} holds the value {} and the checksum {}.\n", n * 37 + 11, n * 7919 % 1000)).collect();
+        let lead = Source::History.sentences(40).join(" ");
+        let mut scored = Normalized::new(true);
+        for c in format!("{lead}\n{rows}").chars() {
+            let sentences = scored.sentence_count();
+            scored.push(c);
+            if scored.sentence_count() > sentences {
+                assert_eq!(scored.repeat(0, &p), None, "at {}", scored.raw_len());
+            }
+        }
+        assert_eq!(scored.sentence_count(), 80, "every row a sentence");
+    }
+
+    /// Only prose counts towards `repeat_min`: a block of material lines
+    /// repeated is no repeat, the same block with a paragraph of prose is.
+    #[test]
+    fn only_prose_counts_towards_the_least_a_copy_repeats() {
+        let p = params(LoopGuardMode::Log);
+        let lines: String = (0..12).map(|i| format!("- item {} of the listing\n", ["one", "two", "three", "four"][i % 4].repeat(1 + i / 4))).collect();
+        let lead = Source::Agent.sentences(30).join(" ") + "\n";
+        assert_eq!(first_found(&format!("{lead}{lines}{lines}{lines}"), &p).map(|(at, found, _)| (at, found)), None);
+        let paragraph = Source::Agent.sentences(40)[35..].join(" ") + "\n";
+        let block = format!("{lines}{paragraph}");
+        assert!(matches!(first_found(&format!("{lead}{block}{block}{block}"), &p), Some((_, Found::Repeat(_), _))));
+    }
+
+    /// One short sentence over and over is the compression score's: the
+    /// repeat signal leaves it, at every multiple of it that would reach
+    /// `repeat_min`, and the loop score finds it.
+    #[test]
+    fn a_short_sentence_over_and_over_is_the_compression_scores() {
+        let p = params(LoopGuardMode::Log);
+        let text = prose(3000) + &"I'll write the tool call now. ".repeat(120);
+        let (_, found, _) = first_found(&text, &p).expect("a loop");
+        assert!(matches!(found, Found::Score(_)), "{found:?}");
+    }
+
+    /// Two short sentences in a row inside a long block hide nothing: the
+    /// shorter period they repeat at is too short to decide.
+    #[test]
+    fn two_short_sentences_in_a_row_do_not_hide_a_long_repeat() {
+        let p = params(LoopGuardMode::Log);
+        let mut sentences = Source::History.sentences(30);
+        sentences.insert(8, "Hmm.".to_owned());
+        sentences.insert(8, "Hmm.".to_owned());
+        let block = sentences[..20].join(" ") + "\n\n";
+        let text = Source::Agent.sentences(20).join(" ") + "\n\n" + &block.repeat(3);
+        let (_, found, _) = first_found(&text, &p).expect("the repeat");
+        assert!(matches!(found, Found::Repeat(repeat) if repeat.period == block.chars().count()), "{found:?}");
+    }
+
+    /// A copy may have `repeat_varying` sentences the one before it does
+    /// not, and no more.
+    #[test]
+    fn a_copy_may_differ_in_as_many_sentences_as_may_vary() {
+        let pool = Source::Italian.sentences(80);
+        let block = |k: usize| {
+            let mut sentences = pool[..12].to_vec();
+            sentences[3] = pool[20 + k].clone();
+            sentences[8] = pool[40 + k].clone();
+            sentences.join(" ") + "\n\n"
+        };
+        let text = pool[60..].join(" ") + "\n\n" + &block(0) + &block(1) + &block(2);
+        let one = params(LoopGuardMode::Log);
+        assert_eq!(first_found(&text, &one).map(|(at, found, _)| (at, found)), None, "two sentences vary in each copy");
+        let two = LoopGuardParams { repeat_varying: 2, ..one.clone() };
+        assert!(matches!(first_found(&text, &two), Some((_, Found::Repeat(_), _))));
+        let verbatim = LoopGuardParams { repeat_varying: 0, ..one };
+        let (same, _) = sentence_loop(Source::Agent, 600, 1000, 3, false);
+        let (varying, _) = sentence_loop(Source::Agent, 600, 1000, 3, true);
+        assert!(first_found(&same, &verbatim).is_some());
+        assert_eq!(first_found(&varying, &verbatim).map(|(at, found, _)| (at, found)), None, "0: every copy verbatim");
+    }
+
+    /// `repeat_copies` copies back to back make a repeat; a copy longer than
+    /// `repeat_max` is none, and 0 turns the signal off.
+    #[test]
+    fn the_copies_needed_and_the_longest_copy_are_limits() {
+        let (text, copies) = sentence_loop(Source::History, 1200, 2000, 4, false);
+        let three = LoopGuardParams { repeat_copies: 3, ..params(LoopGuardMode::Log) };
+        let (at, _, _) = first_found(&text, &three).expect("three copies");
+        assert!(at > copies[2].1 && at <= copies[3].0 + 1, "found at {at}, copies at {copies:?}");
+        for max in [0, 1000] {
+            let short = LoopGuardParams { repeat_max_chars: max, ..params(LoopGuardMode::Log) };
+            assert_eq!(first_found(&text, &short).map(|(at, found, _)| (at, found)), None, "max {max}");
+        }
+    }
+
+    /// Both copies a repeat is found from lie after the floor: the end of
+    /// the last nudge, as for the compression score.
+    #[test]
+    fn a_repeat_is_found_only_after_the_floor() {
+        let p = params(LoopGuardMode::Log);
+        let (text, copies) = sentence_loop(Source::Agent, 1000, 2000, 4, false);
+        let chars: Vec<char> = text.chars().collect();
+        let mut scored = Normalized::new(true);
+        let mut watch = Watch::from(copies[0].0 + 10, &p);
+        let mut found = None;
+        for (i, &c) in chars.iter().enumerate() {
+            scored.push(c);
+            if let Some(Found::Repeat(repeat)) = watch.check(&scored, &p) {
+                found = Some((i + 1, repeat));
+                break;
+            }
+        }
+        // Two periods after the floor end in the third copy, not with the
+        // second as they would from 0.
+        let (at, repeat) = found.expect("the copies after the floor");
+        assert!(at > copies[2].0 && repeat.first >= copies[0].0 + 10, "found at {at}: {repeat:?}, copies at {copies:?}");
+    }
+
+    /// A held repeat is acted on no more until a sentence ends none.
+    #[test]
+    fn a_held_repeat_fires_no_more_until_a_sentence_ends_none() {
+        let p = params(LoopGuardMode::Log);
+        let (looped, _) = sentence_loop(Source::Agent, 500, 0, 4, false);
+        let text: Vec<char> = (looped.clone() + &Source::History.sentences(30).join(" ") + "\n\n" + &looped).chars().collect();
+        let mut scored = Normalized::new(true);
+        let mut watch = Watch::from(0, &p);
+        let mut fires = Vec::new();
+        for (i, &c) in text.iter().enumerate() {
+            scored.push(c);
+            if watch.check(&scored, &p).is_some() {
+                fires.push(i + 1);
+                watch.hold();
+            }
+        }
+        let first = looped.chars().count();
+        assert!(fires.len() == 2 && fires[0] < first && fires[1] > first, "{fires:?}");
+    }
+
+    /// The rewind of a repeat keeps the reasoning through the first copy and
+    /// strikes from the second's start; the tag hashes what it struck.
+    #[tokio::test]
+    async fn a_repeat_is_rewound_to_the_end_of_its_first_copy() {
+        let ops = ops_with(vec![(2, scripted(2, "Done.</think>\n\nOK.", true))]);
+        let (reasoning, copies) = sentence_loop(Source::Agent, 2000, 3000, 3, true);
+        let (text, _) =
+            drain(guard(params(LoopGuardMode::Rewind), ops.clone(), input("P", 40_000), 1, scripted(1, &reasoning, false))).await;
+        let continued = text_of(&ops.submitted.lock().unwrap()[0].tokens);
+        let kept = continued.strip_prefix('P').unwrap().strip_suffix(NUDGES[0].trim_start_matches('\n')).expect("the nudge last");
+        let chars: Vec<char> = reasoning.chars().collect();
+        let kept_chars = kept.chars().count();
+        assert!(copies[0].1 <= kept_chars && kept_chars <= copies[1].0, "kept {kept_chars}, copies at {copies:?}");
+        assert_eq!(kept, chars[..kept_chars].iter().collect::<String>());
+        let (m, struck) = first_struck(&client_reasoning(&tokens_of(&text)));
+        assert_eq!(struck, chars[kept_chars..kept_chars + m].iter().collect::<String>(), "struck from the cut on");
+        assert!(kept_chars + m > copies[1].1, "the whole second copy struck");
+    }
+
+    /// `repeat_min` is the least a copy repeats of prose: a loop whose copy
+    /// holds less is no repeat.
+    #[test]
+    fn the_least_a_copy_repeats_is_a_limit() {
+        let (text, copies) = sentence_loop(Source::History, 500, 2000, 3, false);
+        let copy = copies[1].0 - copies[0].0;
+        for (min, found) in [(100, true), (copy as u32 - 10, true), (copy as u32 + 10, false)] {
+            let p = LoopGuardParams { repeat_min_chars: min, ..params(LoopGuardMode::Log) };
+            assert_eq!(first_found(&text, &p).is_some(), found, "min {min}, copy {copy}");
+        }
+    }
+
+    /// When the sentence that varies opens each copy, the copies are read
+    /// from the sentence after it: the repeat is found one sentence into the
+    /// third copy, and its cut keeps the second copy's varying sentence.
+    #[test]
+    fn a_repeat_whose_opening_sentence_varies_is_read_from_the_sentence_after_it() {
+        let pool = Source::Agent.sentences(60);
+        let copy = |k: usize| format!("{} {}", pool[40 + k], pool[..6].join(" "));
+        let lead = pool[20..32].join(" ");
+        let text = format!("{lead} {} {} {} {}", copy(0), copy(1), copy(2), pool[50]);
+        let at = |s: &str| text.find(s).unwrap();
+        let (found_at, found, watch) = first_found(&text, &params(LoopGuardMode::Log)).expect("the repeat");
+        assert_eq!(found_at, at(&copy(2)) + pool[42].len() + 1, "found once the third copy's opening sentence ends");
+        let cut = watch.cut(&text.chars().collect::<Vec<_>>(), &found, &params(LoopGuardMode::Log));
+        assert_eq!(cut, at(&copy(1)) + pool[41].len(), "cut after the second copy's varying sentence");
+    }
+
+    /// A repeat's cut inside a code block moves before its fence, as a loop
+    /// score's does: with `normalize` off, code is scored as written.
+    #[test]
+    fn a_repeats_cut_inside_a_code_block_moves_before_its_fence() {
+        let p = params(LoopGuardMode::Rewind);
+        let text: Vec<char> = format!("{}```\n{}", "x".repeat(900), "y".repeat(3000)).chars().collect();
+        let repeat = Repeat { period: 1000, copies: 2.0, first: 1000, second: 2000, end: 3000 };
+        assert_eq!(watch_with(0, &[]).cut(&text, &Found::Repeat(repeat), &p), 900);
+        assert_eq!(watch_with(950, &[]).cut(&text, &Found::Repeat(repeat), &p), 950, "never before the floor");
+        let closed: Vec<char> = format!("{}```\n```\n{}", "x".repeat(900), "y".repeat(3000)).chars().collect();
+        assert_eq!(watch_with(0, &[]).cut(&closed, &Found::Repeat(repeat), &p), 2000, "a block closed before it stays");
+    }
+
+    /// In `log` mode a repeat is only logged, the reasoning passes through
+    /// untouched; a repeat whose cut would keep too little is only logged in
+    /// `rewind` mode too.
+    #[tokio::test]
+    async fn a_repeat_is_only_logged_in_log_mode_and_with_too_little_to_keep() {
+        let (reasoning, _) = sentence_loop(Source::Italian, 1500, 2000, 4, false);
+        let too_little = LoopGuardParams { min_kept_chars: 100_000, ..params(LoopGuardMode::Rewind) };
+        for p in [params(LoopGuardMode::Log), too_little] {
+            let ops = ops_with(Vec::new());
+            let (text, done) = drain(guard(p.clone(), ops.clone(), input("p", 40_000), 1, scripted(1, &reasoning, true))).await;
+            assert_eq!(text, reasoning, "{:?}", p.mode);
+            assert!(done.is_some());
+            assert!(ops.cancelled.lock().unwrap().is_empty() && ops.submitted.lock().unwrap().is_empty(), "{:?}", p.mode);
         }
     }
 

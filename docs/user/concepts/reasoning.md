@@ -105,13 +105,31 @@ persists: `persist` checks in a row (4) must score as a loop. On recorded runs,
 no legitimate agent text stayed over the threshold for more than 6 checks, and
 23 of 25 harmful loops stayed for 9 or more.
 
+From 0.11.2 the guard also watches for a **repeat**
+([ADR 0053](../../adr/0053-a-loop-is-acted-on-once-it-persists.md)). This
+catches a loop whose repeated block is longer than the 1,000-character window.
+The window never holds two copies of such a block, so it compresses like prose.
+Each time a sentence of the reasoning ends, the guard looks for the same
+sentences written twice back to back, compared as written:
+
+- a copy may have one sentence (`repeat-varying`) that the copy before it does
+  not;
+- a copy must repeat at least `repeat-min` characters of prose verbatim (150);
+- a copy can be at most `repeat-max` characters long (16,000).
+
+A line that ends without a full stop, such as a list item, a log line or a
+table row, counts for nothing towards the 150. So a listing or a log written out
+twice to compare it is not a loop. A repeat is acted on when its second copy
+ends, before a third is written.
+
 ### What it does
 
 In `rewind` mode, the default, the guard **takes the loop back**:
 
 1. It walks back to the last window that scored clean (compressing to at least
    `clean`, 400 thousandths), moves back `margin` characters and snaps the cut to
-   a line break within `snap` characters (300).
+   a line break within `snap` characters (300). For a repeat (from 0.11.2) the
+   cut is the start of the second copy, so the first copy stays.
 2. It cancels the engine request and submits a **continuation**: the same input,
    its prompt extended by the reasoning kept before the cut and a **nudge**, a
    sentence in the model's own voice ("Wait, I'm starting to repeat myself. Let
@@ -159,11 +177,27 @@ opencode and qwen-code sessions
 a fire a median 500 characters later than the first-check rule would have, and
 loops the model leaves by itself within four checks are no longer touched.
 
+The repeat signal (from 0.11.2) was measured offline
+([a loop longer than the window](../../findings/2026-11-27-a-loop-longer-than-the-window-repeats-verbatim.md)):
+
+- verbatim loops with blocks of 250 to 8,000 characters are caught at the end
+  of their second copy;
+- on the recorded agent sessions it found 21 parts that loop verbatim, which
+  the compression score never acted on, among them 8 consecutive turns of one
+  session;
+- once those are counted as loops (one reader's call, 8 of them made after the
+  signal found them), it fired on no legitimate part, and the prompt above
+  stays at 25 of 25.
+
 It does not see every loop. Indecision loops, whose text varies between repeats
 (a decision sentence between reconsiderations), do not compress, and the only
-harmful agentic loop observed was of that kind. The margins between the
-thresholds are thin and come from one prompt and two texts; a false rewind or a
-missed loop found later reopens the defaults.
+harmful agentic loop observed was of that kind. Loops that reword their copies,
+changing whole passages between repeats, are missed by both signals. Two copies
+of a paragraph that the model would have left by itself are taken back too, and
+so is any block of prose written twice in a row, a checklist whose items share
+150 characters of it among them. The
+margins between the thresholds are thin and come from one prompt and two texts;
+a false rewind or a missed loop found later reopens the defaults.
 
 ### Tuning it
 

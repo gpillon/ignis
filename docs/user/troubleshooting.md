@@ -886,7 +886,10 @@ error either way. The log line `ignis.request.cancelled` says `cause: timeout`
 
 That is the loop guard: it saw the model repeating itself in its reasoning,
 took the repeated text back and nudged the model on. It is working as
-designed, and `usage` reports the tokens as `rewound_tokens`. To only log
+designed, and `usage` reports the tokens as `rewound_tokens`. From 0.11.2 the
+log line `ignis.loop_guard.rewound` says which signal saw it: `signal:
+compression`, with its `ratio`, or `signal: repeat`, a block written twice back
+to back, with its `period_chars` and `copies`. To only log
 loops, set `--model-loop-guard log`; `off` turns the guard off
 ([Prompting](configuration/prompting.md)).
 

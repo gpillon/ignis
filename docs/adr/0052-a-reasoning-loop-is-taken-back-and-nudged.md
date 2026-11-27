@@ -12,7 +12,9 @@ holds its detection and action**: read it for when the guard acts. A tokio task 
 reasoning request's event stream and its consumer scores the normalized reasoning every 250
 characters. It acts only once `loop_guard_persist` checks in a row (4) have scored a loop, under
 `loop_guard_ratio` (265, was 200) and the raw gate, and a cut that would keep fewer than
-`loop_guard_min_kept` characters of reasoning (1) is only logged (`too_little_kept`). The action
+`loop_guard_min_kept` characters of reasoning (1) is only logged (`too_little_kept`). Beside the
+score, ADR 0053 also holds the **repeat signal** (edited 2026-11-27, #727): the same sentences
+twice back to back, which catches a loop whose block is longer than the window. The action
 is a rewind: cancel, then a continuation whose prompt is the kept text and a nudge,
 `loop_guard_nudge` then `loop_guard_nudge_again` (config fields since 2026-10-16), and the
 thinking budget's close after `loop_guard_retries` (2).
@@ -36,6 +38,8 @@ Amended 2026-10-16 (owner): the two nudges are config fields, `loop_guard_nudge`
 Amended 2026-10-16 by [ADR 0053](0053-a-loop-is-acted-on-once-it-persists.md): the guard acts
 once a loop persists (`loop_guard_persist` 4 checks in a row), the ratio is 265, and a rewind
 that would keep no reasoning is only logged (`loop_guard_min_kept`).
+Edited 2026-11-27 (#727): the repeat signal (ADR 0053) beside the score, and the novelty
+alternative below answered.
 Proposed 2026-10-14. The design is the owner's (2026-10-13: an
 engine-level detector off the critical path, an injected sentence, a few retries before
 the reasoning is closed, a visible tag the Playground strikes through). The numbers are in
@@ -289,7 +293,10 @@ live `PATCH`) rewinds, so no test meets a rewind it did not ask for.
   loops and code are both predictable. Logprobs are not served either (GitHub #288).
 - **Other text signals:**
   - **Novelty against the reasoning's history** and **the share of repeated lines.**
-    Reasoning legitimately re-drafts code it wrote earlier, and both fire on it.
+    Reasoning legitimately re-drafts code it wrote earlier, and both fire on it. (Edited
+    2026-11-27, #727: ADR 0053's repeat signal is neither. It leaves code out, compares sentences
+    as written and asks for two copies back to back, and on the agent reasoning it fired on no
+    legitimate part.)
   - **A raw score alone.** It cannot separate counting and template loops from code.
 - **Guard in the clients.** Every client would need one, and the Playground, opencode and
   Codex all differ. The server sees every request.

@@ -20,7 +20,10 @@ characters is normalized (digits are folded, so log lines with different
 numbers match) and compressed; a window that compresses far below the norm is
 repetition. A list, a log or a table is redundant by nature, so one low score
 is not enough: the guard acts only when 4 checks in a row score under the
-ratio. Then it cuts the reasoning back to the last clean window, appends a
+ratio. A loop whose repeated block is longer than the window compresses like
+prose, so from 0.11.2 the guard also looks for the same sentences written twice
+back to back, and cuts such a repeat at the start of its second copy. Otherwise it
+cuts the reasoning back to the last clean window. Then it appends a
 nudge in the model's own voice, and the generation goes on in the same
 response. The client sees a tag where the loop was and `rewound_tokens` in
 `usage`; the reasoning it sends back is repaired to what the model saw, so the
@@ -54,7 +57,8 @@ The mechanics, the modes and the tuning are in
 | About a third of first turns loop on a long-enumeration prompt at the model card's sampling; the same with YaRN, speculation or the compressed KV off, and the same on the reference engine with the same weights. `presence_penalty` 1.5 gives 2/8 against 4/8 on the same seeds | 27B NVFP4, the Playground's defaults, 8 seeds per arm | [Reasoning loops are the model's](../../findings/2026-10-12-reasoning-loops-are-the-models.md) |
 | 25 of 25 harmful loops and 34 of 38 acute onsets caught | recorded runs of the prompt the thresholds were tuned on (in-sample) | [A loop persists](../../findings/2026-10-16-a-loop-persists.md) |
 | 6 of 7 harmful loops caught on 40 fresh seeds; the seventh is a numeric loop the raw gate misses, and 2 more harmful runs were long legitimate planning | held-out run, guard in `log` mode, scored offline | same |
-| 0 fires on 12,936 recorded agent reasoning parts (5,654 long enough to score); the first rule fired twice | recorded sessions that also informed the thresholds | same |
+| 0 fires on 12,936 recorded agent reasoning parts (5,654 long enough to score); the first rule fired twice. 15 of those parts later proved to be verbatim loops the compression score never acted on | recorded sessions that also informed the thresholds | same, and the next row |
+| From 0.11.2, verbatim loops with blocks of 250 to 8,000 characters caught at their second copy. 21 looping agent parts found that compression never acted on, and 0 fires on the legitimate ones once those are read as loops (one reader's reading). 7 of one session's 8 looping turns caught before a third copy | recorded Rome runs and agent sessions, scored offline | [A loop longer than the window](../../findings/2026-11-27-a-loop-longer-than-the-window-repeats-verbatim.md) |
 | A rewind restores a 79K-138K-token agent prompt in 0.08-0.10 s with little kept, 1.276 s with about 3,645 tokens kept; 9 of 16 runs escaped for good after the first nudge | 27B, long agent prompts | [Reasoning loop guard](../../findings/2026-10-14-reasoning-loop-guard.md) |
 | An end of turn inside open reasoning: 1 of 115 Flash-Next turns, 0 of 413 on the 27B | one agent session database | [ADR 0048](../../adr/0048-an-end-of-turn-inside-the-reasoning-closes-it.md) |
 | The old close answered 2 of 8 sampled runs and always deferred under greedy; the new wording answered both captured turns and left no short deferral in 8 sampled runs | two captured agent turns, 8 sampled reruns | [A close that answers](../../findings/2026-10-01-a-close-that-answers.md) |
@@ -63,7 +67,8 @@ The mechanics, the modes and the tuning are in
 The 25 of 25 is in-sample; the held-out figure is 6 of 7. "No fire on real
 sessions" holds on the sessions the thresholds were tuned against. Loops where
 the text varies between repeats, and slow numeric templates, do not compress
-and are missed. A false rewind found later reopens the defaults
+and are missed; so are loops that reword whole passages between their
+copies. A false rewind found later reopens the defaults
 ([ADR 0053](../../adr/0053-a-loop-is-acted-on-once-it-persists.md)).
 :::
 
@@ -74,7 +79,9 @@ and are missed. A false rewind found later reopens the defaults
   [`model.loop_guard_ratio`](../reference/configuration.md#modelloop_guard_ratio),
   [`model.loop_guard_persist`](../reference/configuration.md#modelloop_guard_persist),
   [`model.loop_guard_min_kept`](../reference/configuration.md#modelloop_guard_min_kept),
-  [`model.loop_guard_retries`](../reference/configuration.md#modelloop_guard_retries)
+  [`model.loop_guard_retries`](../reference/configuration.md#modelloop_guard_retries),
+  the repeat signal's [`model.loop_guard_repeat_min`](../reference/configuration.md#modelloop_guard_repeat_min)
+  and its three neighbours (from 0.11.2),
   and the two nudges, [`model.loop_guard_nudge`](../reference/configuration.md#modelloop_guard_nudge)
   and [`model.loop_guard_nudge_again`](../reference/configuration.md#modelloop_guard_nudge_again).
   All are patchable live.

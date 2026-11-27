@@ -218,6 +218,14 @@ count_kind!(
     /// A count of checks in a row.
     Checks: u32, "checks", "check count"
 );
+count_kind!(
+    /// A count of copies back to back.
+    Copies: u32, "copies", "copy count"
+);
+count_kind!(
+    /// A count of sentences.
+    Sentences: u32, "sentences", "sentence count"
+);
 
 count_kind!(
     /// A count of milliseconds.
