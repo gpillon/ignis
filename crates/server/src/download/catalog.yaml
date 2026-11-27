@@ -150,7 +150,7 @@ models:
   # artifact's (GitHub #472). Its id and its alias name no family, so it
   # states its own (ADR 0064); it answers to the 32 GB entry's served id on a
   # 16 or 24 GB card, and on an RTX 3090. It states no generation, as the 16 GB
-  # 27B (GitHub #529, ADR 0079 as amended): its layout is that build's, and its
+  # 27B (GitHub #529, ADR 0079): its layout is that build's, and its
   # quality on the 8.x routes passed #513.
   # Pinned to the upload's hub commit.
   - id: swift-1.5-27b-16g
