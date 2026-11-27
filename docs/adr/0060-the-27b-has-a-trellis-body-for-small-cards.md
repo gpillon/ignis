@@ -5,15 +5,16 @@ status: accepted
 # The 27B gets a second body format, trellis, for the 16 GB card class
 
 The 27B's served NVFP4 artifact cannot be loaded on a 16 GiB card at any context: its text scope alone is 16.03 GiB,
-and its body is 14.51 GB at 4.76 bits per weight. The owner's targets were the 27B on 16 GB Blackwell cards, a
-context of at least 256K and DFlash2 kept, and a trellis code at about 3 bits per weight fits with room for both. So
-the 27B gets a second artifact of the same family, for the 16 GB card class, whose body format is trellis; the 32 GB
-NVFP4 artifact, its kernels and its numbers do not change. The rest of the 16 GB plan is ADRs 0061, 0062, 0063 and
-0064.
+the smallest plan when this was decided (no speculation, no vision, 32K, 8 lanes) was 20.1 GB, and its body is
+14.51 GB at 4.76 bits per weight, NVFP4 at 4.5 bpw plus nine BF16 exception matrices. The owner's targets were the
+27B on 16 GB Blackwell cards, a context of at least 256K and DFlash2 kept, and a trellis code at about 3 bits per
+weight fits with room for both. So the 27B gets a second artifact of the same family, for the 16 GB card class,
+whose body format is trellis; the 32 GB NVFP4 artifact, its kernels and its numbers do not change. The rest of the
+16 GB plan is ADRs 0061, 0062, 0063 and 0064.
 
-On others' suites the 3.0 bpw EXL3 quant reads a KLD of 0.0257, an NVFP4 0.0092, EXL3 at 4.0 bpw 0.0082 and a 12 GiB
-GGUF Q3 0.0209. The served NVFP4 runs W4A4, FP4 activations too, and FP4 activations account for half or more of an
-NVFP4's KLD in two sources; a trellis body runs with 16-bit activations.
+On others' suites turboderp's self-calibrated EXL3 at 3.0 bpw reads a KLD of 0.0257, Unsloth's NVFP4 0.0092, EXL3 at
+4.0 bpw 0.0082 and a 12 GiB GGUF Q3 0.0209. The served NVFP4 runs W4A4, FP4 activations too, and FP4 activations
+account for half or more of an NVFP4's KLD in two sources; a trellis body runs with 16-bit activations.
 
 - **The format.** The code is EXL3's, the one Flash-Next's experts are stored in
   ([ADR 0044](0044-experts-in-trellis-with-a-k-per-expert.md)): the `mul1` codebook, Hadamard rotation with
@@ -51,8 +52,8 @@ Every lever that keeps NVFP4 was costed and fails:
   offload wins in the literature need a τ of 10-30 or batches of 100 and more.
 - **A smaller model:** Qwen3.8 has no dense model below 27B, and the nearest is two generations older and far weaker
   on agentic coding: Qwen3.5-9B scores 65.6 on LiveCodeBench, the 27B 90.3.
-- **GGUF k/i-quants:** at equal VRAM about 2.5x the KLD of EXL3 on this exact model, and they would need a kernel
-  family of their own.
+- **GGUF k/i-quants:** at equal VRAM about 2.5x the KLD of EXL3 on this exact model (turboderp's chart), and they
+  would need a kernel family of their own.
 - **Pruning:** every positive result paid 50-480B tokens of distillation.
 
 Among trellis bodies:
