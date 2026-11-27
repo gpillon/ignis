@@ -258,7 +258,7 @@ pub const NONE_PROFILE: &str = "none";
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
 /// DFlash2 at 7 tokens, as every other profile but `rtx5090`, and vision on, explicit
-/// (ADR 0063 as amended by ADR 0075): at a 4,096-token envelope, an item bound
+/// (ADR 0063, ADR 0075): at a 4,096-token envelope, an item bound
 /// of about 2,048 x 2,048 pixels, and residency `host`, written out so the
 /// profile table shows it. The tower sits in pinned host RAM and the pool is
 /// host-mapped, so a load with no image in flight keeps the text-only KV pool

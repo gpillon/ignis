@@ -5092,7 +5092,7 @@ fn rtx_24gb_keeps_the_27b_s_device_retained_slots_and_its_context() {
     }
 }
 
-/// GitHub #418 (ADR 0063 as amended by ADR 0075): `rtx50-16gb` turns vision
+/// GitHub #418 (ADR 0063, ADR 0075): `rtx50-16gb` turns vision
 /// on at a 4,096-token envelope, residency `host`; an operator's own
 /// `--vision-enabled false` or `--vision-max-tokens` wins, and the 5090's
 /// profile keeps the 32,768 default.

@@ -184,7 +184,8 @@ pub fn router(state: Arc<Server>) -> Router {
     // `/v1/openapi.json`. Merged *after* the key layer above, so a browser
     // pointed at `/v1` on a keyed server reaches the page rather than a
     // bare 401 it has no way to answer. Always served: the reference is
-    // part of the `/v1` surface, not of the opt-in Playground.
+    // part of the `/v1` surface, not of the Playground, which
+    // `--server-ui false` withholds.
     router = router.merge(crate::openapi::router(document));
     // The liveness and readiness probes (GitHub #327), past every `/v1`
     // layer above: no key, no use counted, none of the gate's per-model
