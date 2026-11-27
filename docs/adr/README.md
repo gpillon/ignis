@@ -17,11 +17,10 @@ edit it by hand.
 |---|---|---|---|
 | [0001](0001-cpp-kernel-leaf-c-abi.md) | C++ kernel leaf behind a C ABI | accepted | [0009](0009-step-level-device-resident-abi.md) |
 | [0002](0002-load-ninfer-artifact.md) | The engine loads `.ninfer` artifacts directly | accepted | |
-| [0003](0003-parity-gate-99pct.md) | 99% token-agreement parity gate | superseded by [0007](0007-performance-gate-not-parity.md) | |
 | [0004](0004-full-admission-in-v1.md) | Full admission state machine in v1 | accepted | |
 | [0005](0005-performance-first-principle.md) | Performance-first as the organizing principle | accepted | [0050](0050-ignis-serves-an-image-model.md), [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md), [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md) |
 | [0006](0006-exclusive-gpu-testing.md) | Exclusive GPU testing (no concurrent engines) | accepted | |
-| [0007](0007-performance-gate-not-parity.md) | The 99% gate is a performance gate, not a parity gate | accepted | [0050](0050-ignis-serves-an-image-model.md), [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) |
+| [0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md) | Correctness is self-checked, not matched against a reference engine | accepted | |
 | [0008](0008-cuda-graph-staging-buffers.md) | CUDA-graph decode replay: persistent device staging buffers | superseded by [0009](0009-step-level-device-resident-abi.md) | [0019](0019-decode-cuda-graph-slot-indirection.md) |
 | [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted | [0016](0016-step-abi-extensible-options.md) |
 | [0010](0010-vendored-reference-kernels.md) | Kernel policy: vendor the reference ops verbatim, under a manifest | accepted | |
