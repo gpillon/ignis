@@ -611,7 +611,7 @@ fn decimal(value: u64, scale: u64) -> String {
     format!("{whole}.{}", frac.trim_end_matches('0'))
 }
 
-/// `ignis_structured_repair_seconds`' bucket boundaries (ADR 0089,
+/// `ignis_structured_repair_seconds`' bucket boundaries (ADRs 0017 and 0089,
 /// #593), in microseconds: a repair samples one position again from the
 /// round's own scores, tens of microseconds to a few milliseconds, which the
 /// latency scales above (from 50 ms) would put in one bucket.
@@ -1173,7 +1173,7 @@ impl Metrics {
 
     /// A call just counted by [`Metrics::record_tool_call`], valid or not,
     /// held a parameter that an object the operator's switch at `held` would
-    /// close does not declare (GitHub #641, ADR 0097). A family of its own,
+    /// close does not declare (GitHub #641, ADR 0094). A family of its own,
     /// not a kind of `ignis_tool_call_violations_total`: that one counts
     /// invalid calls, and these may be valid. Never counted on a model that
     /// holds no tool, for a key an object admits by name, or in a tool that

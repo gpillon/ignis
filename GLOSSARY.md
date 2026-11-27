@@ -90,7 +90,7 @@ The most a request may generate, reasoning included: its `max_tokens`
 
 **Cut tool call**:
 A tool call a `length` ending stopped before it closed: it reaches the client
-with its name and the arguments written so far (ADR 0096).
+with its name and the arguments written so far (ADR 0058).
 _Avoid_: truncated call, partial call, interrupted call.
 
 **Deadline**:
