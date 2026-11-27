@@ -36,8 +36,8 @@ option and scope disagree is refused, both ways. The media embedding is bit-iden
   16,384-token item, nor in the smallest scratch beside a 1,024-token one. The tower is staged through a ring of
   slots sized for its largest stage instead; slots sized to a block, with one of the merger's own, would take less
   but are unmeasured.
-- **The merger writing the pool in place through the mapped pointer.** `add_bias` reads each page back over PCIe:
-  +17 ms at 1,024, against +7.7 ms through a device page.
+- **The merger writing the pool in place through the mapped pointer.** The mapped writes are slow and `add_bias` reads
+  each page back over PCIe: +17 ms at 1,024, against +7.7 ms through a device page, with two slots.
 - **The GEMMs reading the tower's weights in place from host memory.** Their tiles re-read the weights 37 to 128
   times.
 - **`cpu` and `on-demand` residencies (#407).** `cpu` takes 25-170 s an image and holds the compute lock; `on-demand`
@@ -51,8 +51,9 @@ option and scope disagree is refused, both ways. The media embedding is bit-iden
   is not VRAM oversubscription.
 - The first encode of an image costs a few milliseconds more under `host`, +7.1 ms at 1,024 on a PCIe Gen 3 x16 host
   under WDDM, most of it cross-stream synchronisation, not bytes. A fan-out of decisions over one image pays this
-  once, and a crop pays it again. Linux is unmeasured; its synchronisation is expected to cost less.
-- Where the prefill scratch already holds the encode's share, vision costs no VRAM, which is what lets the 16 GB
+  once, and a crop pays it again. The first encode and a cold `point` at 1,024 cost at most +10 ms under `host`
+  against `device`. Linux is unmeasured; its synchronisation is expected to cost less.
+- Under `host`, where the prefill scratch already holds the encode's share, vision costs no VRAM, which is what lets the 16 GB
   profile turn vision on (ADR 0063). A start whose scratch is smaller pays the difference and is not refused.
 - The answers do not change at the same context. On a card whose start adapts its context to free VRAM, the KV `host`
   returns can raise the adapted context, and with it the YaRN factor `auto` rope scaling picks, so answers move, as
