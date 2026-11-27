@@ -36,7 +36,8 @@ written so far, last, with `length` (an
 decision has no partial answer, and an image cut
 short is no image, so those two are errors either way. A chat request's media
 acquisition keeps its own deadline, `--server-request-timeout` from its start;
-at `0` only each fetch's timeout bounds it.
+past it the request is answered `504 request_timeout`, whatever
+`--server-timeout-reply` says; at `0` only each fetch's timeout bounds it.
 
 Upgrading from 0.7.1: the default deadline is 40 minutes, not 120 seconds; a
 request past it is answered with what it generated, not a `504`, unless
