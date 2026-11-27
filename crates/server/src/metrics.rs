@@ -598,7 +598,7 @@ fn decimal(value: u64, scale: u64) -> String {
     format!("{whole}.{}", frac.trim_end_matches('0'))
 }
 
-/// `ignis_structured_repair_seconds`' bucket boundaries (ADR 0017 as amended by ADR 0089,
+/// `ignis_structured_repair_seconds`' bucket boundaries (ADRs 0017 and 0089,
 /// #593), in microseconds: a repair samples one position again from the
 /// round's own scores, tens of microseconds to a few milliseconds, which the
 /// latency scales above (from 50 ms) would put in one bucket.
