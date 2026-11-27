@@ -41,10 +41,9 @@ here.
 The rules are in `docs/agents/domain.md`; these are the places where they
 leave the `/domain-modeling` skill.
 
-- ADRs 0001-0069 keep their long form and the number in their heading; a new
-  ADR is in the short format, its heading the bare title.
 - Every ADR opens with the status frontmatter the skill leaves optional, and
-  `docs/adr/README.md` is an index generated from it.
+  `docs/adr/README.md` is an index generated from it. The status is
+  `proposed`, `accepted` or `deprecated`, never the skill's `superseded by`.
 - An ADR states what holds today: a decision that changes rewrites its ADR in
   place, under its number, where the skill's `superseded by` status has a new
   ADR replace the old one.
@@ -54,7 +53,6 @@ leave the `/domain-modeling` skill.
 - A new ADR takes the next number above every number in `docs/adr/` and in
   that list; the skill's highest number in the folder plus one would use a
   removed last number again.
-- The frontmatter's relations between ADRs, `amends`, `supersedes` and
-  `amended-by`, are not the skill's and are on their way out (#742): each
-  one's effect is written into the ADR it changed and the key dropped, and a
-  new ADR takes none.
+- The frontmatter holds no relation between ADRs, and `make records-check`
+  refuses one (`amends`, `amended-by`, `supersedes`): a change to a decision is
+  written into its ADR, and a superseded ADR is deleted.

@@ -27,7 +27,8 @@
 # whether its heading carries the number or is the bare title of the short
 # format. It also pins when an ADR the range changes is a decision: when its
 # text changed, not its frontmatter or a link's target, by a commit that
-# carries no mark for it (`[adr-cleanup]`, `[typo ADR-NNNN]`), under whatever
+# carries no mark for it (`[adr-cleanup]`, `[typo ADR-NNNN]`), a merge by its
+# own resolution and not by what it brings in, under whatever
 # name its file has, when its status changed, said as "(now ...)", and when
 # its file left the tree, said as "(removed)" unless a marked commit deleted
 # it; the generated index never is.
@@ -124,6 +125,19 @@ adr 0016-typo-then-changed.md 'A decision with a typo, then changed' 'Its reasno
 # The ADRs the range deletes.
 adr 0017-retired.md 'A decision the range retires and removes' 'Its decision.'
 adr 0018-absorbed.md 'A decision the cleanup absorbs into another' 'Its decision.'
+# The ADRs a merge brings in, their first and last rules far enough apart that
+# two branches change one each and merge with no conflict.
+rules() { # <file> <title> <first rule> <last rule>
+    printf '%s\n' '---' 'status: accepted' '---' '' "# $2" '' "$3" '' 'A second rule.' '' \
+        'A third rule.' '' 'A fourth rule.' '' "$4" > "docs/adr/$1"
+}
+rules 0019-merged-cleanup.md 'A decision two cleanup commits meet on' \
+    'Its first rule, with history.' 'Its last rule, with history.'
+rules 0020-merge-resolved.md 'A decision a merge resolves' 'Its first rule.' 'Its last rule.'
+rules 0021-merge-resolved-marked.md 'A decision a marked merge resolves' 'Its first rule.' \
+    'Its last rule.'
+rules 0022-changed-on-a-branch.md 'A decision changed on a merged branch' 'Its first rule.' \
+    'Its last rule, with history.'
 commit "Groundwork, and the earlier half of #20"
 git tag -a v9.9.8 -m v9.9.8
 export GIT_AUTHOR_DATE='2026-01-03T00:00:00Z' GIT_COMMITTER_DATE='2026-01-03T00:00:00Z'
@@ -189,6 +203,44 @@ commit "The decision's reason, changed (#10)"
 # An ADR that leaves the tree is said, unless a cleanup commit deletes it.
 git rm -q docs/adr/0017-retired.md
 commit "A decision, retired and removed (#10)"
+# A merge is judged by what it changes against both parents, its own
+# resolution, which its own mark covers; what it only brings in was judged on
+# the branch. Each branch here leaves the trunk, changes an ADR the trunk
+# changes too, and comes back.
+trunk="$(git rev-parse --abbrev-ref HEAD)"
+git switch -q -c cleanup-a
+rules 0019-merged-cleanup.md 'A decision two cleanup commits meet on' 'Its first rule.' \
+    'Its last rule, with history.'
+commit "A branch shortens a decision (#10) [adr-cleanup]"
+git switch -q "$trunk"
+git switch -q -c change-b
+rules 0022-changed-on-a-branch.md 'A decision changed on a merged branch' 'Another first rule.' \
+    'Its last rule, with history.'
+commit "A branch changes a decision (#10)"
+git switch -q "$trunk"
+rules 0019-merged-cleanup.md 'A decision two cleanup commits meet on' \
+    'Its first rule, with history.' 'Its last rule.'
+rules 0022-changed-on-a-branch.md 'A decision changed on a merged branch' 'Its first rule.' \
+    'Its last rule.'
+commit "The trunk shortens two decisions (#10) [adr-cleanup]"
+git merge -q --no-ff -m "Merge the cleanup branch (#10)" cleanup-a >/dev/null
+git merge -q --no-ff -m "Merge the branch that changed a decision (#10) [adr-cleanup]" change-b >/dev/null
+# Two branches change one rule each way, and the merge's own resolution is a
+# third text: a decision changed by the merge unless its message has the mark.
+for marked in "" " [adr-cleanup]"; do
+    file=0020-merge-resolved.md title='A decision a merge resolves'
+    [ -z "$marked" ] || file=0021-merge-resolved-marked.md title='A decision a marked merge resolves'
+    git switch -q -c "resolve-${file%%-*}"
+    rules "$file" "$title" 'Its first rule, one way.' 'Its last rule.'
+    commit "A branch shortens a decision one way (#10) [adr-cleanup]"
+    git switch -q "$trunk"
+    rules "$file" "$title" 'Its first rule, another way.' 'Its last rule.'
+    commit "The trunk shortens it another way (#10) [adr-cleanup]"
+    git merge -q --no-ff "resolve-${file%%-*}" >/dev/null 2>&1
+    rules "$file" "$title" 'Its first rule, a third way.' 'Its last rule.'
+    git add -A .
+    git commit -q -m "Merge a branch, resolving a decision (#10)$marked"
+done
 commit "The duplicate, mentioned anyway (#40)"
 commit "Merge: a branch"
 commit "ignis 9.9.9"
@@ -309,6 +361,22 @@ has "ADR 0017 — A decision the range retires and removes (removed)" "$decision
 has "ADR 0018" "$decisions" \
     && fail "an ADR a cleanup commit deleted reached the Decisions: $decisions" \
     || note "an ADR a commit with the cleanup mark deletes is not listed"
+
+has "ADR 0019" "$decisions" \
+    && fail "an unmarked merge made amended what marked commits changed on both sides: $decisions" \
+    || note "an unmarked merge of a branch whose ADR change carries the cleanup mark lists nothing"
+
+has "ADR 0020 — A decision a merge resolves (amended)" "$decisions" \
+    && note "a merge whose own resolution changes an ADR's text is judged by its own message" \
+    || fail "the ADR an unmarked merge resolved to a third text is not amended: $decisions"
+
+has "ADR 0021" "$decisions" \
+    && fail "the ADR a marked merge resolved reached the Decisions: $decisions" \
+    || note "a marked merge's own resolution of an ADR is not an amendment"
+
+has "ADR 0022 — A decision changed on a merged branch (amended)" "$decisions" \
+    && note "a decision changed on a merged branch without the mark is amended, a marked merge or not" \
+    || fail "the decision changed on a merged branch is not amended: $decisions"
 
 has "Architecture decision records" "$decisions" \
     && fail "the generated index reached the Decisions: $decisions" \

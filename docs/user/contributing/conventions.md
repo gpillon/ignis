@@ -50,12 +50,12 @@ file of a server `make start` launched is under `.scratch/serve/`.
 - **An ADR** records a decision and why it was taken, in the short format: a
   title as its heading and one to three sentences of context, decision and
   reason, with the options it rejected or its consequences only when they add
-  something, and its status in its frontmatter. Its length has a soft limit:
+  something, and its status in its frontmatter, with no relation to another
+  ADR. Its length has a soft limit:
   `make records-check` prints a note for an ADR that a change added or rewrote
   and that is over it, and still passes, and `make records-long` lists every
-  ADR over it. ADRs 0001 to 0069 keep their longer form with the number
-  in the heading; the release notes name both kinds "ADR NNNN — title", taking
-  a short one's number from its file name. An ADR takes the next free number
+  ADR over it. The heading carries no number: the release notes name an ADR
+  "ADR NNNN — title", taking its number from its file name. An ADR takes the next free number
   when it merges into `main`, and is renumbered, with every line that cites it,
   when another ADR took that number first. It is written when the decision is
   taken, and it states what holds today: when the decision changes, its ADR is

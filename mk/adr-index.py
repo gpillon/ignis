@@ -22,18 +22,17 @@ heading:
 
     ---
     status: accepted
-    amends: [ADR-0016]
-    supersedes: [ADR-0008]
-    amended-by: [ADR-0045, ADR-0054]
     ---
 
-`status` is one of `proposed`, `accepted`, `deprecated`, `superseded by
-ADR-NNNN` (the /domain-modeling vocabulary); the three lists are optional, in
-that order, ascending, and left out when empty. The check refuses anything else
-in the block, a reference to an ADR that does not exist, a back-link missing on
-either side (X `amends` Y with no `amended-by: X` on Y, X `supersedes` Y with no
-`status: superseded by X` on Y, and each the other way), a heading from 0070 on
-that is not the bare title, and an index that is not what --write would write.
+`status` is one of `proposed`, `accepted` and `deprecated`, and the block holds
+nothing else. The check refuses a relation between ADRs, with what to do
+instead: `amends` or `amended-by`, since a decision that changes rewrites its
+ADR in place and the effect is written into the text of the ADR it changed, and
+`supersedes` or `status: superseded by ADR-NNNN`, since a superseded ADR is
+deleted and docs/adr/REMOVED.md names the ADR that holds its decision. It
+refuses anything else in the block too, a heading that is not the bare title
+(the number is the file name's), and an index that is not what --write would
+write.
 
 --write writes the index even when the check would fail, so the table shows
 what the files say, and prints the problems it found; --check is the gate.
@@ -49,8 +48,8 @@ or whose line names another file than the one it had. For each of those ADRs
 whose text changed it prints a
 note, because the live places that cite a changed ADR are reread in the same
 change. The text is compared as mk/changelog.sh compares it, the frontmatter
-dropped and every link target and every path in backticks blanked, so a status,
-a back-link or a moved file's path is not a change. An ADR is found by its
+dropped and every link target and every path in backticks blanked, so a status
+or a moved file's path is not a change. An ADR is found by its
 number, so a file renamed with its title is the same ADR, and the working tree
 is compared, so a status is refused before it is committed. The check reads no
 commit message: the marks `[typo ADR-NNNN]` and `[adr-cleanup]` are for the
@@ -60,7 +59,7 @@ uses, and is skipped with a note in a clone with no origin/main or no git; the
 records workflow passes the push's or the pull request's base.
 
 An ADR is short, and the limit that says so is soft: WORD_LIMIT words of that
-same text, so that a status, a back-link or a link's target never counts. With
+same text, so that a status or a link's target never counts. With
 --since, each ADR over it that was added since the base or whose text changed
 since it, a `proposed` one too, gets a note that names the ADR, its length, the
 limit and the three ways out: shorten it, move the detail to the home that owns
@@ -102,17 +101,28 @@ import subprocess
 import sys
 import tempfile
 
-KEYS = ("status", "amends", "supersedes", "amended-by")
-LIST_KEYS = KEYS[1:]
-STATUS = re.compile(r"(?:proposed|accepted|deprecated|superseded by (ADR-\d{4}))")
-REF_LIST = re.compile(r"\[(ADR-\d{4}(?:, ADR-\d{4})*)\]")
+# The frontmatter holds the status alone.
+KEYS = ("status",)
+STATUS = re.compile(r"proposed|accepted|deprecated")
+# A relation between ADRs, and a status that names another ADR, which the check
+# refuses with what to do instead: an ADR states what holds today, so a decision
+# that changes rewrites its ADR in place, and a superseded ADR is deleted.
+RELATIONS = {
+    "amends": "an ADR carries no amends relation: a decision that changes rewrites its "
+              "ADR in place, so what this one changes is written into the text of {} and "
+              "the key is dropped",
+    "amended-by": "an ADR carries no amends relation: a decision that changes rewrites "
+                  "its ADR in place, so what {} changed is written into this one's text "
+                  "and the key is dropped",
+    "supersedes": "an ADR carries no supersedes relation: a superseded ADR is deleted, "
+                  "once no live part cites it, and its line in docs/adr/REMOVED.md names "
+                  "the ADR that holds the decision",
+}
+SUPERSEDED = re.compile(r"superseded by (ADR-\d{4})")
 KEY_LINE = re.compile(r"([A-Za-z_-]+): (.*)")
 ADR_FILE = re.compile(r"(\d{4})-[a-z0-9][a-z0-9-]*\.md")
-# The short format takes the number from the file name only.
-BARE_TITLE_FROM = 70
+# The heading is the bare title: the number is the file name's.
 NUMBERED = re.compile(r"ADR[ -]?\d{4}\b")
-# "ADR 0001 — title" in the long form; the index shows the title alone.
-NUMBER_PREFIX = re.compile(r"ADR[ -]?\d{4}\s*(?:—|–|-|:)\s*")
 # The soft limit on an ADR's length: the words of its text as `wc -w` counts
 # them, the frontmatter aside. Set by the cleanup's pilot lot (#749).
 WORD_LIMIT = 600
@@ -137,8 +147,8 @@ This file is generated from the ADRs' frontmatter by `mk/adr-index.py`
 (`make records`), and `make records-check` fails when it is out of date: never
 edit it by hand.
 
-| ADR | Title | Status | Amended by |
-|---|---|---|---|
+| ADR | Title | Status |
+|---|---|---|
 """
 
 
@@ -147,25 +157,12 @@ class Adr:
         self.path = path
         self.name = path.name
         self.number = path.name[:4]
-        self.has_frontmatter = False
         self.status = None
-        self.lists = {key: [] for key in LIST_KEYS}
         self.heading = None
 
     @property
-    def superseded_by(self):
-        match = STATUS.fullmatch(self.status or "")
-        return match.group(1) if match else None
-
-    @property
     def title(self):
-        heading = self.heading or self.name
-        prefix = NUMBER_PREFIX.match(heading)
-        return heading[prefix.end():] if prefix else heading
-
-
-def ref(number):
-    return f"ADR-{number}"
+        return self.heading or self.name
 
 
 def parse(path, problems):
@@ -193,7 +190,6 @@ def parse(path, problems):
         problem("the frontmatter is never closed by a '---' line")
         adr.heading = first_heading(1)
         return adr
-    adr.has_frontmatter = True
 
     seen = []
     for offset, line in enumerate(lines[1:end], start=2):
@@ -202,33 +198,29 @@ def parse(path, problems):
             problem(f"line {offset} is not a 'key: value' line: {line!r}")
             continue
         key, value = match.groups()
+        if key in RELATIONS:
+            named = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+            problem(f"{key} {value}: {RELATIONS[key].format(named)} (docs/agents/domain.md)")
+            continue
         if key not in KEYS:
-            problem(f"unknown key {key!r} (the keys are {', '.join(KEYS)})")
+            problem(f"unknown key {key!r} (the frontmatter holds status alone)")
             continue
         if key in seen:
             problem(f"{key} is given twice")
             continue
         seen.append(key)
-        if key == "status":
-            if STATUS.fullmatch(value):
-                adr.status = value
-            else:
-                problem(f"status {value!r} is not one of proposed, accepted, deprecated, "
-                        "'superseded by ADR-NNNN'")
-            continue
-        listed = REF_LIST.fullmatch(value)
-        if not listed:
-            problem(f"{key} {value!r} is not a list like [ADR-0001, ADR-0002] "
-                    "(an empty one is left out)")
-            continue
-        numbers = [item[4:] for item in listed.group(1).split(", ")]
-        if numbers != sorted(set(numbers)):
-            problem(f"{key} is not in ascending order without repeats: {value}")
-        adr.lists[key] = sorted(set(numbers))
+        superseded = SUPERSEDED.fullmatch(value)
+        if STATUS.fullmatch(value):
+            adr.status = value
+        elif superseded:
+            by = superseded.group(1)
+            problem(f"status {value!r}: a superseded ADR is deleted, once no live part cites "
+                    f"it: {by} says why it died and keeps any fact of it that still holds, "
+                    f"and its line in docs/adr/REMOVED.md names {by} (docs/agents/domain.md)")
+        else:
+            problem(f"status {value!r} is not one of proposed, accepted, deprecated")
     if "status" not in seen:
         problem("the frontmatter has no status")
-    if seen != [key for key in KEYS if key in seen]:
-        problem(f"the keys are out of order: {', '.join(seen)} (the order is {', '.join(KEYS)})")
 
     after = lines[end + 1:end + 3]
     if len(after) < 2 or after[0] != "" or not after[1].startswith("# "):
@@ -238,9 +230,8 @@ def parse(path, problems):
         adr.heading = after[1][2:].strip()
     if adr.heading is None:
         problem("no '# ' heading")
-    elif int(adr.number) >= BARE_TITLE_FROM and NUMBERED.match(adr.heading):
-        problem(f"from number 0070 on the heading is the bare title, without its number: "
-                f"{adr.heading!r}")
+    elif NUMBERED.match(adr.heading):
+        problem(f"the heading is the bare title, without its number: {adr.heading!r}")
     return adr
 
 
@@ -261,42 +252,6 @@ def load(adr_dir):
                             f"{adrs[adr.number].name}")
             continue
         adrs[adr.number] = adr
-
-    for adr in adrs.values():
-        def problem(message):
-            problems.append(f"docs/adr/{adr.name}: {message}")
-
-        targets = [(key, number) for key in LIST_KEYS for number in adr.lists[key]]
-        if adr.superseded_by:
-            targets.append(("status", adr.superseded_by[4:]))
-        for key, number in targets:
-            if number == adr.number:
-                problem(f"{key} names the ADR itself")
-            elif number not in adrs:
-                problem(f"{key} names {ref(number)}, which does not exist")
-
-        # A relation that disagrees is reported once, on the file whose side
-        # of it is missing; a file with no frontmatter has its own problem.
-        for number in adr.lists["amends"]:
-            other = adrs.get(number)
-            if other and other.has_frontmatter and adr.number not in other.lists["amended-by"]:
-                problems.append(f"docs/adr/{other.name}: {ref(adr.number)} amends it, but its "
-                                f"amended-by does not list {ref(adr.number)}")
-        for number in adr.lists["amended-by"]:
-            other = adrs.get(number)
-            if other and other.has_frontmatter and adr.number not in other.lists["amends"]:
-                problems.append(f"docs/adr/{other.name}: {ref(adr.number)} lists it under "
-                                f"amended-by, but its amends does not list {ref(adr.number)}")
-        for number in adr.lists["supersedes"]:
-            other = adrs.get(number)
-            if other and other.has_frontmatter and other.superseded_by != ref(adr.number):
-                problems.append(f"docs/adr/{other.name}: {ref(adr.number)} supersedes it, but "
-                                f"its status is not 'superseded by {ref(adr.number)}'")
-        if adr.superseded_by:
-            other = adrs.get(adr.superseded_by[4:])
-            if other and other.has_frontmatter and adr.number not in other.lists["supersedes"]:
-                problems.append(f"docs/adr/{other.name}: {ref(adr.number)} is superseded by it, "
-                                f"but its supersedes does not list {ref(adr.number)}")
     return adrs, problems
 
 
@@ -400,11 +355,12 @@ def dangling(adr_dir, adrs, removed):
         if path in (folder + INDEX, folder + REMOVED) or not (root / path).is_file():
             continue
         data = (root / path).read_bytes()
-        if b"\0" in data or (b"ADR" not in data and b"adr/" not in data):
+        inside = path.startswith(folder)
+        if b"\0" in data or not (inside or b"ADR" in data or b"adr/" in data):
             continue
         text = data.decode("utf-8", "replace")
         start, patterns = 0, [CITED, CITED_PATH]
-        if path.startswith(folder):
+        if inside:
             # The frontmatter's references are the frontmatter check's.
             front = re.match(r"---\r?\n.*?\n---\r?\n", text, re.DOTALL)
             start = front.end() if front else 0
@@ -563,21 +519,11 @@ def over_limit(adr_dir, out=sys.stdout):
 
 
 def render(adrs):
-    def link(number):
-        other = adrs.get(number)
-        return f"[{number}]({other.name})" if other else ref(number)
-
     rows = []
     for number in sorted(adrs):
         adr = adrs[number]
-        if adr.superseded_by:
-            status = f"superseded by {link(adr.superseded_by[4:])}"
-        else:
-            status = adr.status or "(none)"
         title = adr.title.replace("|", "\\|")
-        amended = ", ".join(link(n) for n in adr.lists["amended-by"])
-        cells = [f"[{number}]({adr.name})", title, status] + ([amended] if amended else [])
-        rows.append("| " + " | ".join(cells) + (" |" if amended else " | |"))
+        rows.append(f"| [{number}]({adr.name}) | {title} | {adr.status or '(none)'} |")
     return HEADER + "\n".join(rows) + "\n"
 
 
@@ -624,85 +570,70 @@ def run(adr_dir, mode, out=sys.stdout, err=sys.stderr, since=None):
 # --- selftest ---------------------------------------------------------------
 
 GOOD = {
-    "0001-the-first.md": "---\nstatus: superseded by ADR-0002\namended-by: [ADR-0070]\n---\n\n"
-                         "# ADR 0001 — the first decision\n\n## Status\n\nAccepted.\n",
-    "0002-the-second.md": "---\nstatus: accepted\nsupersedes: [ADR-0001]\n---\n\n"
-                          "# ADR 0002 — the second | with a pipe\n",
-    "0070-a-short-one.md": "---\nstatus: proposed\namends: [ADR-0001]\n---\n\n"
+    "0001-the-first.md": "---\nstatus: deprecated\n---\n\n"
+                         "# The first decision\n\nIts decision, retired.\n",
+    "0002-the-second.md": "---\nstatus: accepted\n---\n\n"
+                          "# The second | with a pipe\n",
+    "0070-a-short-one.md": "---\nstatus: proposed\n---\n\n"
                            "# A short one\n\nIts decision and why. See "
                            "[ADR 0002](0002-the-second.md).\n",
 }
 
 # Each case: what it does to a copy of GOOD, and a fragment the check must print.
 CASES = [
-    ("no frontmatter", {"0002-the-second.md": "# ADR 0002 — the second\n"},
+    ("no frontmatter", {"0002-the-second.md": "# The second\n"},
      "no frontmatter"),
     ("an unclosed frontmatter", {"0002-the-second.md": "---\nstatus: accepted\n\n# x\n"},
      "never closed"),
     ("a status outside the vocabulary",
-     {"0070-a-short-one.md": "---\nstatus: Accepted\namends: [ADR-0001]\n---\n\n# A short one\n"},
-     "status 'Accepted' is not one of"),
+     {"0070-a-short-one.md": "---\nstatus: Accepted\n---\n\n# A short one\n"},
+     "status 'Accepted' is not one of proposed, accepted, deprecated"),
     ("an unknown key",
-     {"0002-the-second.md": "---\nstatus: accepted\nsupersedes: [ADR-0001]\nsuperseded-by: "
-                            "[ADR-0070]\n---\n\n# ADR 0002 — the second\n"},
-     "unknown key 'superseded-by'"),
+     {"0002-the-second.md": "---\nstatus: accepted\nowner: someone\n---\n\n# The second\n"},
+     "unknown key 'owner' (the frontmatter holds status alone)"),
     ("a YAML comment",
-     {"0002-the-second.md": "---\n# why\nstatus: accepted\nsupersedes: [ADR-0001]\n---\n\n"
-                            "# ADR 0002 — the second\n"},
+     {"0002-the-second.md": "---\n# why\nstatus: accepted\n---\n\n# The second\n"},
      "is not a 'key: value' line"),
-    ("a list out of order",
-     {"0001-the-first.md": "---\nstatus: superseded by ADR-0002\namended-by: [ADR-0070, "
-                           "ADR-0002]\n---\n\n# ADR 0001 — the first\n"},
-     "not in ascending order"),
-    ("an empty list",
-     {"0002-the-second.md": "---\nstatus: accepted\namends: []\nsupersedes: [ADR-0001]\n"
-                            "---\n\n# ADR 0002 — the second\n"},
-     "is not a list like"),
-    ("a reference spelled without ADR-",
-     {"0002-the-second.md": "---\nstatus: accepted\nsupersedes: [0001]\n---\n\n"
-                            "# ADR 0002 — the second\n"},
-     "is not a list like"),
-    ("keys out of order",
-     {"0070-a-short-one.md": "---\namends: [ADR-0001]\nstatus: proposed\n---\n\n# A short one\n"},
-     "out of order"),
+    ("a status given twice",
+     {"0002-the-second.md": "---\nstatus: accepted\nstatus: accepted\n---\n\n# The second\n"},
+     "status is given twice"),
     ("no status",
-     {"0070-a-short-one.md": "---\namends: [ADR-0001]\n---\n\n# A short one\n"},
+     {"0070-a-short-one.md": "---\n---\n\n# A short one\n"},
      "has no status"),
     ("no blank line before the heading",
-     {"0002-the-second.md": "---\nstatus: accepted\nsupersedes: [ADR-0001]\n---\n"
-                            "# ADR 0002 — the second\n"},
+     {"0002-the-second.md": "---\nstatus: accepted\n---\n# The second\n"},
      "one blank line and the '# ' heading"),
-    ("a reference to an ADR that does not exist",
-     {"0070-a-short-one.md": "---\nstatus: proposed\namends: [ADR-0001, ADR-0009]\n---\n\n"
-                             "# A short one\n"},
-     "names ADR-0009, which does not exist"),
-    ("a superseder that does not exist",
-     {"0002-the-second.md": "---\nstatus: superseded by ADR-0082\nsupersedes: [ADR-0001]\n"
-                            "---\n\n# ADR 0002 — the second\n"},
-     "status names ADR-0082, which does not exist"),
-    ("the ADR naming itself",
-     {"0002-the-second.md": "---\nstatus: accepted\namends: [ADR-0002]\nsupersedes: [ADR-0001]"
-                            "\n---\n\n# ADR 0002 — the second\n"},
-     "names the ADR itself"),
-    ("amends with no amended-by on the other side",
-     {"0001-the-first.md": "---\nstatus: superseded by ADR-0002\n---\n\n# ADR 0001 — the first\n"},
-     "0001-the-first.md: ADR-0070 amends it, but"),
-    ("amended-by with no amends on the other side",
-     {"0070-a-short-one.md": "---\nstatus: proposed\n---\n\n# A short one\n"},
-     "0070-a-short-one.md: ADR-0001 lists it under amended-by"),
-    ("supersedes with no superseded by on the other side",
+    ("an amends relation",
+     {"0070-a-short-one.md": "---\nstatus: proposed\namends: [ADR-0001]\n---\n\n# A short one\n"},
+     "0070-a-short-one.md: amends [ADR-0001]: an ADR carries no amends relation: a decision "
+     "that changes rewrites its ADR in place, so what this one changes is written into the "
+     "text of ADR-0001 and the key is dropped (docs/agents/domain.md)"),
+    ("an amended-by relation",
      {"0001-the-first.md": "---\nstatus: accepted\namended-by: [ADR-0070]\n---\n\n"
-                           "# ADR 0001 — the first\n"},
-     "0001-the-first.md: ADR-0002 supersedes it, but"),
-    ("superseded by with no supersedes on the other side",
+                           "# The first decision\n"},
+     "0001-the-first.md: amended-by [ADR-0070]: an ADR carries no amends relation: a decision "
+     "that changes rewrites its ADR in place, so what ADR-0070 changed is written into this "
+     "one's text and the key is dropped (docs/agents/domain.md)"),
+    ("a supersedes relation",
+     {"0002-the-second.md": "---\nstatus: accepted\nsupersedes: [ADR-0001]\n---\n\n"
+                            "# The second\n"},
+     "0002-the-second.md: supersedes [ADR-0001]: an ADR carries no supersedes relation: a "
+     "superseded ADR is deleted, once no live part cites it, and its line in "
+     "docs/adr/REMOVED.md names the ADR that holds the decision (docs/agents/domain.md)"),
+    ("a superseded status",
+     {"0001-the-first.md": "---\nstatus: superseded by ADR-0002\n---\n\n"
+                           "# The first decision\n"},
+     "0001-the-first.md: status 'superseded by ADR-0002': a superseded ADR is deleted, once no "
+     "live part cites it: ADR-0002 says why it died and keeps any fact of it that still holds, "
+     "and its line in docs/adr/REMOVED.md names ADR-0002 (docs/agents/domain.md)"),
+    ("a heading carrying its number",
+     {"0070-a-short-one.md": "---\nstatus: proposed\n---\n\n# ADR 0070 — a short one\n"},
+     "the heading is the bare title, without its number: 'ADR 0070 — a short one'"),
+    ("a heading carrying its number, below 0070 too",
      {"0002-the-second.md": "---\nstatus: accepted\n---\n\n# ADR 0002 — the second\n"},
-     "0002-the-second.md: ADR-0001 is superseded by it"),
-    ("a short-format heading carrying its number",
-     {"0070-a-short-one.md": "---\nstatus: proposed\namends: [ADR-0001]\n---\n\n"
-                             "# ADR 0070 — a short one\n"},
-     "the heading is the bare title"),
+     "0002-the-second.md: the heading is the bare title, without its number"),
     ("two files with one number",
-     {"0002-another.md": "---\nstatus: accepted\n---\n\n# ADR 0002 — another\n"},
+     {"0002-another.md": "---\nstatus: accepted\n---\n\n# Another\n"},
      "ADR 0002 is also"),
     ("a file name that is not an ADR's",
      {"81-misnamed.md": "---\nstatus: accepted\n---\n\n# Misnamed\n"},
@@ -714,7 +645,7 @@ CASES = [
 # message (None leaves the change uncommitted), whether the check passes, a
 # fragment it must print and, where one is given, a fragment it must not. A list
 # of changes and a list of messages are commits made in turn.
-THIRD = "---\nstatus: accepted\n---\n\n# ADR 0003 — the third\n\nSee [the finding]({}) and `{}`.\n"
+THIRD = "---\nstatus: accepted\n---\n\n# The third\n\nSee [the finding]({}) and `{}`.\n"
 SINCE_BASE = {**GOOD, "0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md")}
 CHANGED = THIRD.format("../findings/a.md", "docs/a.md").replace("See", "Now see")
 
@@ -730,18 +661,17 @@ def long_adr(words, heading="A long one", front="status: accepted"):
 # The base also holds an ADR over the length limit, which a case leaves alone or
 # changes. What the length note says after the ADR's length is WAYS_OUT: a case
 # gives the whole line.
-OLD_LONG = "ADR 0004 — a long one"
+OLD_LONG = "The long one"
 SINCE_BASE["0004-a-long-one.md"] = long_adr(WORD_LIMIT + 50, OLD_LONG)
 WAYS_OUT = (f"words, over the limit of {WORD_LIMIT}: shorten it, move the detail to the home that "
             "owns it (docs/agents/findings.md, \"Artifact boundaries\"), or say in the final "
             "report that it stays long")
 REREAD = "ADR 0003's text changed since"
 SINCE_CASES = [
-    ("a new ADR that amends an earlier one, whose frontmatter alone changes",
+    ("an ADR whose frontmatter alone changes",
      {"0003-the-third.md": THIRD.format("../findings/a.md", "docs/a.md").replace(
-         "accepted\n", "deprecated\namended-by: [ADR-0071]\n"),
-      "0071-a-new-one.md": "---\nstatus: accepted\namends: [ADR-0003]\n---\n\n# A new one\n"},
-     "The third, amended by a new decision (#1)", True, "index in sync", "text changed"),
+         "accepted\n", "deprecated\n")},
+     "The third, deprecated (#1)", True, "index in sync", "text changed"),
     ("a link's target and a path in backticks that moved",
      {"0003-the-third.md": THIRD.format("../findings/archive/a.md", "docs/archive/a.md")},
      "The finding, archived (#1)", True, "index in sync", "text changed"),
@@ -754,7 +684,7 @@ SINCE_CASES = [
      ["The third, rewritten (#1)", "The third, rewritten again (#1)"], True, REREAD),
     ("a rewrite in place under the file name of its new title",
      {"0003-the-third.md": None,
-      "0003-the-third-renamed.md": CHANGED.replace("the third", "the third, renamed")},
+      "0003-the-third-renamed.md": CHANGED.replace("The third", "The third, renamed")},
      "The third, renamed with its title (#1)", True, REREAD, "is gone"),
     ("a blank line at the end", {"0003-the-third.md": SINCE_BASE["0003-the-third.md"] + "\n"},
      "A blank line (#1)", True, "index in sync", "text changed"),
@@ -773,8 +703,7 @@ SINCE_CASES = [
      "The long one, a word longer (#1)", True,
      f"adr-index: ADR 0004's text is {WORD_LIMIT + 51} {WAYS_OUT}\n"),
     ("a proposed ADR rewritten over the length limit, which gets the note",
-     {"0070-a-short-one.md": long_adr(WORD_LIMIT + 1, "A short one",
-                                      "status: proposed\namends: [ADR-0001]")},
+     {"0070-a-short-one.md": long_adr(WORD_LIMIT + 1, "A short one", "status: proposed")},
      "The proposal, at length (#1)", True,
      f"adr-index: ADR 0070's text is {WORD_LIMIT + 1} {WAYS_OUT}\n"),
     ("in CI, where the length note is an annotation on the ADR's file",
@@ -945,13 +874,11 @@ def selftest():
               + (f" -- {err.text.strip()}" if err.text else ""))
         check("no citation of an ADR was checked" in out.text,
               "outside a git checkout the check says that no citation was checked")
-        check("| [0001](0001-the-first.md) | the first decision | superseded by "
-              "[0002](0002-the-second.md) | [0070](0070-a-short-one.md) |" in index,
-              "a row links the ADR, drops the number from a long-form heading, links the "
-              "superseder and the amending ADR")
-        check("| the second \\| with a pipe |" in index, "a pipe in a title is escaped")
-        check("| [0070](0070-a-short-one.md) | A short one | proposed | |\n" in index,
-              "a row with no amended-by leaves its last cell empty")
+        check("\n| [0001](0001-the-first.md) | The first decision | deprecated |\n" in index,
+              "a row links the ADR and gives its title and its status")
+        check("| The second \\| with a pipe |" in index, "a pipe in a title is escaped")
+        check("\n| ADR | Title | Status |\n|---|---|---|\n" in index and "Amended" not in index,
+              "the index has no column for a relation between ADRs")
         run(adr_dir, "write", Sink(), Sink())
         check((adr_dir / INDEX).read_text(encoding="utf-8") == index, "--write is idempotent")
         (adr_dir / INDEX).write_text(index.replace("proposed", "accepted"), encoding="utf-8",
@@ -973,9 +900,8 @@ def selftest():
               "--long says so when no ADR is over the length limit")
         run(adr_dir, "write", Sink(), Sink())
         index = (adr_dir / INDEX).read_bytes()
-        fixture(root, {"0002-the-second.md": long_adr(
-            WORD_LIMIT + 50, "ADR 0002 — the second | with a pipe",
-            "status: accepted\nsupersedes: [ADR-0001]")})
+        fixture(root, {"0002-the-second.md": long_adr(WORD_LIMIT + 50,
+                                                      "The second | with a pipe")})
         run(adr_dir, "write", Sink(), Sink())
         check((adr_dir / INDEX).read_bytes() == index,
               "an ADR that only grew long leaves the index as it was, byte for byte")

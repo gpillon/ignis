@@ -13,94 +13,94 @@ This file is generated from the ADRs' frontmatter by `mk/adr-index.py`
 (`make records`), and `make records-check` fails when it is out of date: never
 edit it by hand.
 
-| ADR | Title | Status | Amended by |
-|---|---|---|---|
-| [0001](0001-cpp-kernel-leaf-c-abi.md) | C++ kernel leaf behind a C ABI | accepted | |
-| [0002](0002-load-ninfer-artifact.md) | The engine loads `.ninfer` artifacts directly | accepted | |
-| [0004](0004-full-admission-in-v1.md) | Full admission state machine in v1 | accepted | |
-| [0005](0005-performance-first-principle.md) | Performance-first as the organizing principle | accepted | |
-| [0006](0006-exclusive-gpu-testing.md) | Exclusive GPU testing (no concurrent engines) | accepted | |
-| [0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md) | Correctness is self-checked, not matched against a reference engine | accepted | |
-| [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted | |
-| [0010](0010-vendored-reference-kernels.md) | Kernel policy: vendor the reference ops verbatim, under a manifest | accepted | |
-| [0011](0011-tracing-for-structured-logging.md) | `tracing` + `tracing-subscriber` as the structured logging foundation | accepted | |
-| [0012](0012-request-id-as-trace-id.md) | Internal tracing spans reuse `request.id` as the OTel `trace_id` | accepted | |
-| [0013](0013-no-typed-attribute-registry.md) | No typed attribute registry; discipline + regression tests only | accepted | |
-| [0016](0016-step-abi-extensible-options.md) | Step-ABI calls take extensible options structs | accepted | |
-| [0017](0017-prometheus-metrics.md) | Prometheus metrics with zero inference-path work, on by default | accepted | |
-| [0018](0018-chunk-level-prefill-decode-interleaving.md) | Prefill and decode interleave at chunk granularity, driven by the Rust scheduler | accepted | |
-| [0019](0019-decode-cuda-graph-slot-indirection.md) | decode CUDA graph replay via device-resident slot indirection | accepted | |
-| [0020](0020-batch-wide-decode-round.md) | the decode round is one batch-wide model traversal | accepted | |
-| [0022](0022-two-kv-formats-bf16-as-oracle.md) | Two KV formats, with BF16 retained as the correctness oracle | accepted | |
-| [0023](0023-unified-eviction-priority.md) | One eviction priority across GPU residency and the host tier | accepted | |
-| [0024](0024-sequence-state-transfer.md) | Sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse | accepted | |
-| [0025](0025-scheduler-interval-as-a-log-event.md) | Scheduler interval counters are a DEBUG log event | accepted | |
-| [0026](0026-playground-embedded-when-built.md) | The Playground is embedded when built, served by default | accepted | |
-| [0027](0027-make-as-the-dev-entrypoint.md) | make is the development entry point, with per-OS hooks | accepted | |
-| [0028](0028-expose-modes-always-keyed.md) | Exposure is a named mode, and an exposed server always has a key | accepted | |
-| [0029](0029-cross-request-state-reuse.md) | Cross-request state reuse: content-matched retained state across three residency tiers | accepted | |
-| [0030](0030-device-memory-reserved-at-load.md) | Device memory reserved at load, within a VRAM budget | accepted | |
-| [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted | |
-| [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted | |
-| [0033](0033-the-server-fetches-its-own-model.md) | The server fetches its own model, and asks first only when somebody is there | accepted | |
-| [0034](0034-the-leaf-answers-without-generating.md) | The leaf answers without generating | accepted | |
-| [0035](0035-the-vision-embedding-outlives-its-encode.md) | The vision embedding outlives its encode | accepted | |
-| [0036](0036-the-v1-surface-documents-itself.md) | The `/v1` surface documents itself, and its reference needs no key | accepted | |
-| [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | A vendored file may carry a patch that fixes a known correctness bug | accepted | |
-| [0038](0038-the-compute-seam-carries-an-attention-readout.md) | The `Compute` seam carries an attention readout | accepted | |
-| [0041](0041-the-readout-reads-a-text-span.md) | The attention readout reads a text span, in whole rows | accepted | |
-| [0042](0042-locate-copies-over-a-folded-state.md) | A locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted | |
-| [0043](0043-a-second-model-without-a-ninfer-reference.md) | A second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted | |
-| [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted | |
-| [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | The KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted | |
-| [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted | |
-| [0047](0047-a-catalog-the-operator-can-extend.md) | A model catalog the operator can extend, and a `model` command to fetch from it | accepted | |
-| [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | An end of turn drawn inside an open reasoning block closes the block instead | accepted | |
-| [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | An idle model is unloaded, and the next request loads it again | accepted | |
-| [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted | |
-| [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted | |
-| [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | A reasoning loop is taken back, the model is nudged, and the client is told | accepted | |
-| [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | A resident Flash-Next load keeps its experts only in VRAM | accepted | |
-| [0055](0055-a-pinned-hot-set-is-opt-in.md) | A pinned hot set of experts: a field off by default, which the rtx5090 profile sets | accepted | |
-| [0056](0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md) | Speculation past 8 verify rows is numerically equivalent, not bit-exact | accepted | |
-| [0057](0057-rope-scaling-is-auto-by-default.md) | Rope scaling is `auto` by default: the YaRN factor follows the context | accepted | |
-| [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | Every route has a deadline, and a passed one answers what was generated | accepted | |
-| [0059](0059-flash-next-applies-yarn-on-q-and-k.md) | Flash-Next applies YaRN, the attention factor folded into cos and sin on q and k | accepted | |
-| [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | The 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
-| [0061](0061-prefill-attention-reads-the-hq-codec.md) | Prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
-| [0062](0062-the-token-embedding-lives-in-host-memory.md) | The 27B's token embedding lives in pinned host memory, on every card | accepted | |
-| [0063](0063-the-profile-follows-the-card-class.md) | The profile follows the card class, and its defaults adapt to the budget | accepted | |
-| [0064](0064-a-catalog-entry-states-its-card-class.md) | A catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | |
-| [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | The 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | |
-| [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
-| [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | The speech model waits on the host and borrows free KV pages | accepted | |
-| [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | The speech model's CPU executor is ours, in Rust | accepted | |
-| [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | The speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted | |
-| [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted | |
-| [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted | |
-| [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted | |
-| [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) | The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device | accepted | |
-| [0076](0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md) | The running notes send the notes back to the text model and the recap does not | accepted | |
-| [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted | |
-| [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted | |
-| [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted | |
-| [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted | |
-| [0081](0081-an-adr-states-what-holds-today-and-a-changed-decision-rewrites-it-in-place.md) | An ADR states what holds today, and a decision that changes rewrites it in place | accepted | |
-| [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) | The gate is KLD against BF16, DFlash2 on against off and the loop rate | accepted | |
-| [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md) | The north-star is the best local engine for coding, for agentic work and as a companion | accepted | |
-| [0084](0084-ignis-stands-on-its-own.md) | ignis stands on its own | accepted | |
-| [0087](0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md) | Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves | accepted | |
-| [0088](0088-a-vendored-registry-that-lacks-a-case-ignis-needs-may-be-extended-or-rewritten-when-small.md) | A vendored registry that lacks a case ignis needs may be extended, or rewritten when it is small | accepted | |
-| [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) | A grammar checks each sampled token and repairs a miss, and the model is told the schema | accepted | |
-| [0090](0090-the-27bs-sampled-lanes-draw-their-drafts-and-take-them-by-an-accept-of-ignis-s-own.md) | The 27B's sampled lanes draw their drafts and take them by an accept of ignis's own | accepted | |
-| [0091](0091-on-a-card-smaller-than-the-rtx-5090-the-gdn-gating-planner-takes-the-largest-split-it-holds-and-its-test-caps-the-sm-count.md) | On a card smaller than the RTX 5090 the GDN gating planner takes the largest split it holds, and its test caps the SM count | accepted | |
-| [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md) | The CUDA context is measured when it is made, and a reload adds back what the driver reports | accepted | |
-| [0093](0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md) | On Blackwell the 27B's decode and verify rounds attend over hq-e8-2b on ignis's own route, and the vendored kernel stays its oracle | accepted | |
-| [0094](0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md) | A held tool's call is checked as the model writes it, in its own order, and a value ends only where the call continues | accepted | |
-| [0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md) | The 27B has two drafters, and its MTP head keeps attention state over the whole context and a continuation hidden | accepted | |
-| [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) | The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP | accepted | |
-| [0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md) | A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files | accepted | |
-| [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) | A request whose images pass the vision budget together drops its oldest, a block at a time, as text | accepted | |
-| [0104](0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round goes past 8 columns a lane, and is held to its base round's numerical class | accepted | |
-| [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) | A client may unload the active model at once, and load it again without generating | accepted | |
-| [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round may carry lanes of both shapes, and a mixed round is held to its base round's numerical class | accepted | |
+| ADR | Title | Status |
+|---|---|---|
+| [0001](0001-cpp-kernel-leaf-c-abi.md) | C++ kernel leaf behind a C ABI | accepted |
+| [0002](0002-load-ninfer-artifact.md) | The engine loads `.ninfer` artifacts directly | accepted |
+| [0004](0004-full-admission-in-v1.md) | Full admission state machine in v1 | accepted |
+| [0005](0005-performance-first-principle.md) | Performance-first as the organizing principle | accepted |
+| [0006](0006-exclusive-gpu-testing.md) | Exclusive GPU testing (no concurrent engines) | accepted |
+| [0007](0007-correctness-is-self-checked-not-matched-against-a-reference-engine.md) | Correctness is self-checked, not matched against a reference engine | accepted |
+| [0009](0009-step-level-device-resident-abi.md) | Step-level, device-resident C ABI (the forward pass lives in the leaf) | accepted |
+| [0010](0010-vendored-reference-kernels.md) | Kernel policy: vendor the reference ops verbatim, under a manifest | accepted |
+| [0011](0011-tracing-for-structured-logging.md) | `tracing` + `tracing-subscriber` as the structured logging foundation | accepted |
+| [0012](0012-request-id-as-trace-id.md) | Internal tracing spans reuse `request.id` as the OTel `trace_id` | accepted |
+| [0013](0013-no-typed-attribute-registry.md) | No typed attribute registry; discipline + regression tests only | accepted |
+| [0016](0016-step-abi-extensible-options.md) | Step-ABI calls take extensible options structs | accepted |
+| [0017](0017-prometheus-metrics.md) | Prometheus metrics with zero inference-path work, on by default | accepted |
+| [0018](0018-chunk-level-prefill-decode-interleaving.md) | Prefill and decode interleave at chunk granularity, driven by the Rust scheduler | accepted |
+| [0019](0019-decode-cuda-graph-slot-indirection.md) | decode CUDA graph replay via device-resident slot indirection | accepted |
+| [0020](0020-batch-wide-decode-round.md) | the decode round is one batch-wide model traversal | accepted |
+| [0022](0022-two-kv-formats-bf16-as-oracle.md) | Two KV formats, with BF16 retained as the correctness oracle | accepted |
+| [0023](0023-unified-eviction-priority.md) | One eviction priority across GPU residency and the host tier | accepted |
+| [0024](0024-sequence-state-transfer.md) | Sequence state transfer: an opaque versioned blob, and device-to-device cloning for prefix reuse | accepted |
+| [0025](0025-scheduler-interval-as-a-log-event.md) | Scheduler interval counters are a DEBUG log event | accepted |
+| [0026](0026-playground-embedded-when-built.md) | The Playground is embedded when built, served by default | accepted |
+| [0027](0027-make-as-the-dev-entrypoint.md) | make is the development entry point, with per-OS hooks | accepted |
+| [0028](0028-expose-modes-always-keyed.md) | Exposure is a named mode, and an exposed server always has a key | accepted |
+| [0029](0029-cross-request-state-reuse.md) | Cross-request state reuse: content-matched retained state across three residency tiers | accepted |
+| [0030](0030-device-memory-reserved-at-load.md) | Device memory reserved at load, within a VRAM budget | accepted |
+| [0031](0031-vendored-kernel-bottleneck-exemption.md) | A vendored kernel that is measured as the bottleneck is not untouchable | accepted |
+| [0032](0032-release-through-the-container-build.md) | The Linux release is the container build, and it is one pipeline | accepted |
+| [0033](0033-the-server-fetches-its-own-model.md) | The server fetches its own model, and asks first only when somebody is there | accepted |
+| [0034](0034-the-leaf-answers-without-generating.md) | The leaf answers without generating | accepted |
+| [0035](0035-the-vision-embedding-outlives-its-encode.md) | The vision embedding outlives its encode | accepted |
+| [0036](0036-the-v1-surface-documents-itself.md) | The `/v1` surface documents itself, and its reference needs no key | accepted |
+| [0037](0037-a-vendored-file-may-carry-a-correctness-patch.md) | A vendored file may carry a patch that fixes a known correctness bug | accepted |
+| [0038](0038-the-compute-seam-carries-an-attention-readout.md) | The `Compute` seam carries an attention readout | accepted |
+| [0041](0041-the-readout-reads-a-text-span.md) | The attention readout reads a text span, in whole rows | accepted |
+| [0042](0042-locate-copies-over-a-folded-state.md) | A locate narrows by attention heads and decides by a labelled choice, by kind of text | accepted |
+| [0043](0043-a-second-model-without-a-ninfer-reference.md) | A second model, Qwen3.8-Flash-Next, served without a ninfer reference | accepted |
+| [0044](0044-experts-in-trellis-with-a-k-per-expert.md) | Flash-Next's experts are trellis-coded with a bit width per expert, on our own kernels | accepted |
+| [0045](0045-the-kv-pool-follows-residency-and-state-goes-down-to-disk.md) | The KV pool is sized by whether the model is resident, and evicted state goes down to disk | accepted |
+| [0046](0046-one-declaration-per-config-field.md) | One declaration per config field: flag, env, file key, default, validator | accepted |
+| [0047](0047-a-catalog-the-operator-can-extend.md) | A model catalog the operator can extend, and a `model` command to fetch from it | accepted |
+| [0048](0048-an-end-of-turn-inside-the-reasoning-closes-it.md) | An end of turn drawn inside an open reasoning block closes the block instead | accepted |
+| [0049](0049-an-idle-model-is-unloaded-and-loads-again-on-demand.md) | An idle model is unloaded, and the next request loads it again | accepted |
+| [0050](0050-ignis-serves-an-image-model.md) | ignis serves an image model, one model at a time | accepted |
+| [0051](0051-kernel-code-is-ours-adapted-or-vendored.md) | Kernel code is ours, adapted from a named source, or vendored | accepted |
+| [0052](0052-a-reasoning-loop-is-taken-back-and-nudged.md) | A reasoning loop is taken back, the model is nudged, and the client is told | accepted |
+| [0054](0054-a-resident-load-keeps-its-experts-only-in-vram.md) | A resident Flash-Next load keeps its experts only in VRAM | accepted |
+| [0055](0055-a-pinned-hot-set-is-opt-in.md) | A pinned hot set of experts: a field off by default, which the rtx5090 profile sets | accepted |
+| [0056](0056-speculation-past-eight-verify-rows-is-numerically-equivalent.md) | Speculation past 8 verify rows is numerically equivalent, not bit-exact | accepted |
+| [0057](0057-rope-scaling-is-auto-by-default.md) | Rope scaling is `auto` by default: the YaRN factor follows the context | accepted |
+| [0058](0058-every-route-has-a-deadline-and-a-passed-one-answers-what-was-generated.md) | Every route has a deadline, and a passed one answers what was generated | accepted |
+| [0059](0059-flash-next-applies-yarn-on-q-and-k.md) | Flash-Next applies YaRN, the attention factor folded into cos and sin on q and k | accepted |
+| [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | The 27B gets a second body format, trellis, for the 16 GB card class | accepted |
+| [0061](0061-prefill-attention-reads-the-hq-codec.md) | Prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted |
+| [0062](0062-the-token-embedding-lives-in-host-memory.md) | The 27B's token embedding lives in pinned host memory, on every card | accepted |
+| [0063](0063-the-profile-follows-the-card-class.md) | The profile follows the card class, and its defaults adapt to the budget | accepted |
+| [0064](0064-a-catalog-entry-states-its-card-class.md) | A catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted |
+| [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | The 27B's BF16 exception tensors can be held in FP8, converted at load | accepted |
+| [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted |
+| [0067](0067-the-speech-model-waits-on-the-host-and-borrows-free-kv-pages.md) | The speech model waits on the host and borrows free KV pages | accepted |
+| [0068](0068-the-speech-models-cpu-executor-is-ours-in-rust.md) | The speech model's CPU executor is ours, in Rust | accepted |
+| [0069](0069-the-speakers-come-from-nemotron-diarization-beside-qwen3-asr.md) | The speakers come from Nemotron 3 Diarization, beside Qwen3-ASR | accepted |
+| [0071](0071-the-server-downloads-and-removes-models-from-the-server-view.md) | The server downloads and removes models after start, from the Server view | accepted |
+| [0072](0072-the-playgrounds-system-prompt-never-changes.md) | The Playground's system prompt never changes: what changes rides after the history | accepted |
+| [0073](0073-a-workspace-is-kept-by-the-page-and-ignis-stores-no-files.md) | A workspace is kept by the page and ignis stores no files | accepted |
+| [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md) | The vision tower is staged and the embedding pool host-mapped, unless the load asks for the device | accepted |
+| [0076](0076-the-running-notes-send-the-notes-back-and-the-recap-does-not.md) | The running notes send the notes back to the text model and the recap does not | accepted |
+| [0077](0077-a-vendored-file-may-carry-a-portability-patch.md) | A vendored file may carry a portability patch | accepted |
+| [0078](0078-the-built-in-catalog-names-each-entrys-license-and-may-ship-restricted-weights.md) | The built-in catalog names each entry's license and may ship weights whose license restricts commercial use | accepted |
+| [0079](0079-a-catalog-entry-states-the-oldest-gpu-generation-it-loads-on.md) | A catalog entry states the oldest GPU generation it loads on | accepted |
+| [0080](0080-on-sm8x-the-trellis-prefill-decodes-each-matrix-once-per-chunk-and-multiplies-on-the-integer-mma.md) | On sm_8x the trellis prefill decodes each matrix once per chunk and multiplies on the integer MMA | accepted |
+| [0081](0081-an-adr-states-what-holds-today-and-a-changed-decision-rewrites-it-in-place.md) | An ADR states what holds today, and a decision that changes rewrites it in place | accepted |
+| [0082](0082-the-gate-is-kld-against-bf16-dflash2-on-against-off-and-the-loop-rate.md) | The gate is KLD against BF16, DFlash2 on against off and the loop rate | accepted |
+| [0083](0083-the-north-star-is-the-best-local-engine-for-coding-agentic-work-and-as-a-companion.md) | The north-star is the best local engine for coding, for agentic work and as a companion | accepted |
+| [0084](0084-ignis-stands-on-its-own.md) | ignis stands on its own | accepted |
+| [0087](0087-flash-nexts-vision-encoder-ships-in-a-companion-container-and-encodes-in-memory-its-prefill-already-reserves.md) | Flash-Next's vision encoder ships in a companion container and encodes in memory its prefill already reserves | accepted |
+| [0088](0088-a-vendored-registry-that-lacks-a-case-ignis-needs-may-be-extended-or-rewritten-when-small.md) | A vendored registry that lacks a case ignis needs may be extended, or rewritten when it is small | accepted |
+| [0089](0089-a-grammar-checks-each-sampled-token-and-repairs-a-miss-and-the-model-is-told-the-schema.md) | A grammar checks each sampled token and repairs a miss, and the model is told the schema | accepted |
+| [0090](0090-the-27bs-sampled-lanes-draw-their-drafts-and-take-them-by-an-accept-of-ignis-s-own.md) | The 27B's sampled lanes draw their drafts and take them by an accept of ignis's own | accepted |
+| [0091](0091-on-a-card-smaller-than-the-rtx-5090-the-gdn-gating-planner-takes-the-largest-split-it-holds-and-its-test-caps-the-sm-count.md) | On a card smaller than the RTX 5090 the GDN gating planner takes the largest split it holds, and its test caps the SM count | accepted |
+| [0092](0092-the-cuda-context-is-measured-when-it-is-made-and-a-reload-adds-back-what-the-driver-reports.md) | The CUDA context is measured when it is made, and a reload adds back what the driver reports | accepted |
+| [0093](0093-on-blackwell-the-27bs-decode-and-verify-rounds-attend-over-hq-e8-2b-on-ignis-own-route-and-the-vendored-kernel-stays-its-oracle.md) | On Blackwell the 27B's decode and verify rounds attend over hq-e8-2b on ignis's own route, and the vendored kernel stays its oracle | accepted |
+| [0094](0094-a-held-tools-call-is-checked-as-the-model-writes-it-in-its-own-order-and-a-value-ends-only-where-the-call-continues.md) | A held tool's call is checked as the model writes it, in its own order, and a value ends only where the call continues | accepted |
+| [0095](0095-the-27b-has-two-drafters-and-its-mtp-head-keeps-attention-state-over-the-whole-context-and-a-continuation-hidden.md) | The 27B has two drafters, and its MTP head keeps attention state over the whole context and a continuation hidden | accepted |
+| [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) | The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP | accepted |
+| [0099](0099-a-harness-reaches-ignis-through-an-mcp-server-inside-ignis-and-a-skill-ignis-serves-whose-scripts-carry-the-files.md) | A harness reaches ignis through an MCP server inside ignis and a skill ignis serves, whose scripts carry the files | accepted |
+| [0102](0102-a-request-whose-images-pass-the-vision-budget-together-drops-its-oldest-a-block-at-a-time-as-text.md) | A request whose images pass the vision budget together drops its oldest, a block at a time, as text | accepted |
+| [0104](0104-the-27bs-dflash2-verify-round-goes-past-8-columns-a-lane-and-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round goes past 8 columns a lane, and is held to its base round's numerical class | accepted |
+| [0105](0105-a-client-may-unload-the-active-model-at-once-and-load-it-again-without-generating.md) | A client may unload the active model at once, and load it again without generating | accepted |
+| [0106](0106-the-27bs-dflash2-verify-round-may-carry-lanes-of-both-shapes-and-a-mixed-round-is-held-to-its-base-rounds-numerical-class.md) | The 27B's DFlash2 verify round may carry lanes of both shapes, and a mixed round is held to its base round's numerical class | accepted |
