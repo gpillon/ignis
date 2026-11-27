@@ -35,10 +35,12 @@ rule the ladder walks by is the opening comment of `crates/server/src/adaptation
   narrow to the prefill chunk.
 - A shape built by hand, as every GPU gate's is, adapts nothing, so a gate the card cannot hold is refused, never
   served at a context it did not ask for.
-- The order is fixed and puts speed before context length, on purpose: the solo width (ADR 0018), the drafter's
-  proposal head, the context, then the decode lanes. DFlash2 is never switched off by adaptation.
-- A context, and an `auto` solo width, is kept only where, at more than one lane, the KV pool still holds one full
-  sequence and a spare reservation: room for a second request comes before a wider chunk.
+- The order is fixed: the solo width (ADR 0018) first, for its own reason, room for a second request before a wider
+  chunk; then the drafter's proposal head, the context and the decode lanes, an order that puts speed before context
+  length, on purpose. DFlash2 is never switched off by adaptation.
+- An adapted context, and an `auto` solo width, is kept only where, at more than one lane, the KV pool still holds one
+  full sequence and a spare reservation: room for a second request comes before a wider chunk. When none does and the
+  operator named the lanes, the load keeps the largest context the plan holds, and the log says so.
 - The context step, which is also the floor, and the spare reservation are config fields, which a profile may set
   (ADR 0098): a threshold that decides whether or how a load starts is a field, its value the default.
 - A load names each step it took in the VRAM plan's log event, and a refusal must say which adaptations it tried.
@@ -60,7 +62,8 @@ rule the ladder walks by is the opening comment of `crates/server/src/adaptation
 - The drafter's head `auto` is the full head on every card class, so the head's step never fires on a built-in
   profile: the shortlist head is bound beside the full one and frees no bytes, and the one card that measured it
   found it slower too. The rule is revisited when a real 16 GB card measures the trade.
-- The 16 GB and 24 GB profiles pin the 27B's solo width to their prefill chunk: on those classes the KV pool comes
-  before a wider chunk. `auto` stays the default for the RTX 30 and RTX 40 cards no profile pins.
+- The profiles of the classes below 32 GB pin the 27B's solo width to their prefill chunk: on a small class the KV
+  pool comes before a wider chunk. `auto` stays the default for the RTX 30 and RTX 40 cards no profile pins.
 - The 16 GB profile has vision on because under the `host` residency (ADR 0075) vision costs it no context while no
-  image is in flight.
+  image is in flight, at an envelope small enough that the encode fits the prefill scratch the profile reserves
+  anyway.
