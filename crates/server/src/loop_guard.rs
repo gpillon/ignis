@@ -24,14 +24,18 @@
 //! written: on 47M characters of qwen-code reasoning it takes 5 of 7 such
 //! fires away and no harmful loop (the same finding).
 //!
-//! **Persistence** (ADR 0053). The guard acts on the `persist_checks`-th loop
+//! **Persistence.** The guard acts on the `persist_checks`-th loop
 //! score in a row: a loop persists, a list or a log the reasoning transcribes
 //! ends with its content. And it acts only when the cut would keep at least
 //! `min_kept_chars` of the reasoning: a reasoning that opens in a loop, or in
 //! an enumeration scored as one, has no clean window to go back to, so that
-//! run of loop scores is only logged and held ([`Watch::hold`]).
+//! run of loop scores is only logged and held ([`Watch::hold`]), in `log`
+//! mode too, which so still reports what a rewind would do. A run of loop
+//! scores is never a clean window while `clean` is above `ratio`, as at the
+//! defaults. At the default `min_kept_chars` a second rewind always keeps the
+//! first one's text and nudge, so the rule never stops it; a larger one can.
 //!
-//! **Repeats** (GitHub #727, ADR 0053). A loop whose block is longer than the
+//! **Repeats** (GitHub #727). A loop whose block is longer than the
 //! window never shows two copies in it and scores like prose. Each time a
 //! sentence of the scored reasoning ends, the guard also looks for the same
 //! sentences back to back ([`Normalized::repeat`]): `repeat_copies` copies,
@@ -50,7 +54,8 @@
 //! last window that scored clean) and a nudge sentence (`nudge`, then
 //! `nudge_again`: [`LoopGuardParams::nudge_text`]; after a kept text that
 //! ends in a line break, without its own: [`sentence_after`]), with
-//! what is left of `max_tokens` and of the thinking budget. Only the kept
+//! what is left of `max_tokens` and of the thinking budget, and a seed of
+//! its own. Only the kept
 //! tokens and the nudge prefill: the continuation's prompt starts with the
 //! request's own, whose checkpoint the cancelled request published at its
 //! generation opener (ADR 0029), and the engine restores it. Measured at
