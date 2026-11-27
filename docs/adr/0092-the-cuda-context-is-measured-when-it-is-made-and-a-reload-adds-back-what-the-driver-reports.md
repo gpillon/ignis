@@ -40,7 +40,8 @@ a context took 519,270,400 bytes on the RTX 5090, so a cold start there charged 
 - **The plan events say where each figure came from** (`cuda_context_source`, `process_held_source`).
 
 The context is read from NVML's free memory, not from a per-process figure, because only the free memory is a reading
-everywhere the plan runs: on the RTX 5090 under WSL it fell by the context's bytes and counted a 1 GiB allocation on
+everywhere the plan runs: on the RTX 5090 under WSL (the podman machine, kernel-mode driver 610.88) it fell by the
+context's bytes when a probe made the context and counted a 1 GiB allocation on
 top to the byte while NVML's per-process list stayed empty, and under WDDM the driver marks every per-process figure
 not available. The free memory moves with every other process on the card, which is why the window is short and the
 reading it takes is the lowest.
