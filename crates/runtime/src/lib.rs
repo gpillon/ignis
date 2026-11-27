@@ -1550,7 +1550,9 @@ impl<L: StepLeaf> RuntimeCompute<L> {
     /// Not the cache's size: since GitHub #243 an embedding outlives the
     /// request that encoded it, and this counts holders, not residents. A
     /// fan-out still brings it back to zero — see [`Self::cached_media`] for
-    /// what is left behind.
+    /// what is left behind. The two are separate observations, rather than
+    /// this one redefined, so that an assertion of `live_media() == 0` keeps
+    /// its meaning.
     pub fn live_media(&self) -> usize {
         self.media.lock().unwrap().live()
     }
