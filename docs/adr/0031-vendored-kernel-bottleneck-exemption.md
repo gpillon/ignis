@@ -34,20 +34,20 @@ strong was ended by one capture ([finding](../findings/2026-09-18-decode-round-h
     path) and (b) when the right answer is another algorithm or decomposition, that is, when the patch would no
     longer be recognizable as the reference's kernel.
   - One kernel may take both, a patch and later a route of ours beside it, and the replacement may be an adapted op
-    (ADR 0051) that takes parts of the vendored kernel it stands in for. The vendored file is then not edited
-    further and stays in the subtree with its patch, as the oracle and as the route of every card and call that
-    does not take ours (ADR 0093).
+    (ADR 0051) that takes parts of the vendored kernel it stands in for. The route of ours does not edit the
+    vendored file, which stays in the subtree with its patch, as the oracle and as the route of every card and call
+    that does not take ours (ADR 0093).
 - **Every provenance obligation survives.** The manifest stays the source of truth for what is vendored; no vendored
   file is edited outside a recorded patch; the `kernel/NOTICE` attribution stays; anything hand-written carries no
   port claim, so a replacement is ours, labelled ours and never described as a port; `kernel/vendor/VENDOR.md`
   records what left the subtree and why.
-- **A replacement keeps the vendored op's numerical contract, and the vendored op is the oracle.** Where the op is
-  an exact, deterministic selection, the output is bitwise identical on the same input and the test runs both
+- **A replacement must keep the vendored op's numerical contract, and the vendored op is the oracle.** Where the op is
+  an exact, deterministic selection, the output must be bitwise identical on the same input and the test runs both
   implementations and compares: a top-k whose ties break by the lower row index ties constantly on real logits, and
   a replacement with the wrong tie rule would pass any tolerance-based check. Where the op is not exact, as with the
   accumulation order of a GEMM, the oracle is the reference's own op test with its fp64 references and tolerances,
   which ADR 0010 already requires to stay green.
-- **Every patch and every replacement shows its win, per op.** The profile that opened the exemption is taken again
+- **Every patch and every replacement has to show its win, per op.** The profile that opened the exemption is taken again
   on the exclusive card and must show that the time moved, alongside the oracle test. A change made for speed that
   does not show the speed is reverted, not kept because the code reads better. The gate, ADR 0082's where the 99%
   performance gate against the reference once stood, is not run again per kernel: it stays once at phase end, over
