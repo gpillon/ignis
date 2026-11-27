@@ -25,7 +25,8 @@ that build it are its sub-issues, each with its acceptance criteria and with
 the tickets that block it as GitHub's own blocking links
 ([`docs/agents/issue-tracker.md`](../../agents/issue-tracker.md)). An issue
 opened before 2026-10-25 has a short body instead, which links its spec: a
-file under `docs/specs/`, kept as it was and no longer added to.
+file kept whole under the tag `records-2026-11-27`, off the main branch
+([how to open one](../../specs/README.md)).
 
 Each triaged issue carries `bug` or `enhancement`, and one of five state
 labels ([`docs/agents/triage-labels.md`](../../agents/triage-labels.md)):
@@ -65,8 +66,7 @@ file of a server `make start` launched is under `.scratch/serve/`.
   Flash-Next converter's output, for one. It lives in
   [`docs/formats/`](../../formats/), and its header names the ADR that says why
   the format is what it is. Code cites a contract by section number, so a
-  section keeps its number. A contract that began inside a spec under
-  `docs/specs/` left a one-line pointer there.
+  section keeps its number.
 - **A finding** preserves evidence another reader can inspect or reproduce:
   a discovery, a research result or an experiment, with its question, its
   evidence, its limits ([`docs/agents/findings.md`](../../agents/findings.md)).

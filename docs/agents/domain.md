@@ -27,8 +27,8 @@ set of decisions, `docs/adr/`, listed in its generated index
   file: `git log -p -- "docs/adr/NNNN-*"`.
 - When a decision changes, the live places that cite its ADR are reread in the
   same change: the number stays valid, a comment that paraphrases the old
-  decision may not. Live is everything but `docs/findings/`, the release
-  notes, `docs/specs/` and `docs/archive/`; `make records-check` names each
+  decision may not. Live is everything but `docs/findings/` and the release
+  notes; `make records-check` names each
   ADR whose text changed.
 - When an ADR is written:
   - a new decision is a new ADR, `proposed` while it waits for the owner;

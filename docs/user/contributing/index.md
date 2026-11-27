@@ -48,7 +48,8 @@ them.
 | `kernel/` | The C++/CUDA kernel leaf (SM120a), with its own CTest op tests |
 | `web/` | The Playground (React, Vite, vitest), embedded in the server binary |
 | `docs/user/` | This guide; `docs/site/` builds it |
-| `docs/adr/`, `docs/specs/`, `docs/formats/`, `docs/findings/` | Decisions, the specs written before 2026-10-25 (later ones are GitHub issues), the byte and wire contracts code cites, measured results |
+| `docs/adr/`, `docs/formats/`, `docs/findings/` | Decisions, the byte and wire contracts code cites, measured results |
+| `docs/specs/`, `docs/archive/` | One page each: how to open the specs written before 2026-10-25 (later ones are GitHub issues) and the snapshots of September and October 2026, kept under the tag `records-2026-11-27` |
 | `docs/agents/` | The conventions agents (and humans) follow |
 | `CODING_STANDARDS.md` | The rules a review holds a diff to, and what the review leaves out |
 | `tools/`, `scripts/`, `bench/` | Converters and fixtures, local run helpers, bench traces |

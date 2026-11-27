@@ -19,7 +19,9 @@ config's `files` and `task` fields must describe whatever you are actually
 working on *right now*, not a frozen scenario replayed forever.
 `example-session.json` is a worked example (the session that produced the
 first real G4 trace), kept as a template to copy and edit — not a fixture
-to run unmodified for unrelated work.
+to run unmodified for unrelated work. Its main request, and that of
+`g4-gate-session.json`, also pasted the phase 4 spec (GitHub #65), which has
+left the main branch: the two configs list the files still in the tree.
 
 ## Why staggered-but-concurrent
 

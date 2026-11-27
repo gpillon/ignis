@@ -404,7 +404,7 @@ guide's [Why ignis](https://gpillon.github.io/ignis/why-ignis/) section.
   2048x2048**, its FP8 GEMM at 67-73% of the published bar for the card and
   its 8-bit attention at 88-93% ([the image leaf](docs/findings/2026-10-14-image-model-on-the-5090.md)).
   Served end to end, a 2048x2048 generation is **7.87 s** and a two-image
-  edit 9.48 s ([spec 05, live run](docs/specs/image-model/05-image-serving.md)).
+  edit 9.48 s ([spec 05, live run, issue #322](https://github.com/gpillon/ignis/issues/322)).
 - `prompt_enhancement` has the 27B rewrite the prompt with Qwen's own system
   prompts before the image model reads it; with the 27B loaded, the rewrite
   runs first and the server switches once.

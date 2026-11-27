@@ -50,7 +50,7 @@ reads them back with `read_file` when the loaded model has vision
 | The denoising loop: 1.20 s at 1024x1024 (145-152 ms a step) and 6.11 s at 2048x2048 (747-802 ms a step); whole jobs 1.37 s and 6.79 s | in-process, 8 steps, RTX 5090 | [Image model on the 5090](../../findings/2026-10-14-image-model-on-the-5090.md) |
 | Edit at 2048x2048: 7.62 s from one image, 10.72 s from four | in-process | same |
 | The FP8 GEMM runs at 67-73% of the literature's FP8 bar (498-507 TFLOPS against 690-740); the 8-bit attention at 88-93% of its bar | RTX 5090 | same, and [Image model kernels](../../findings/2026-10-13-image-model-kernels-on-the-5090.md) |
-| Served end to end, streamed: a 2048x2048 generation **7.87 s** (denoising 5.91 s of it); a 2-image edit **9.48 s** | the Playground's own calls, RTX 5090 | [Image serving spec, as built](../../specs/image-model/05-image-serving.md), the live run of 2026-10-14 |
+| Served end to end, streamed: a 2048x2048 generation **7.87 s** (denoising 5.91 s of it); a 2-image edit **9.48 s** | the Playground's own calls, RTX 5090 | [Image serving spec, as built, issue #322](https://github.com/gpillon/ignis/issues/322), the live run of 2026-10-14 |
 | Switching 27B to the image model **10.0 s**, and back **11.3 s** | same run | same |
 
 :::note[The ceiling is the GEMM, not the design]
