@@ -16,6 +16,16 @@
 //!   Images API on the image model (`crate::images::routes`, spec
 //!   image-model/05).
 //!
+//! A request's `model` is first the id this card serves it under (ADR 0064,
+//! ADR 0079; `model_on_this_card`): an id another catalog entry answers to
+//! here is rewritten to that entry's before anything else reads it, the lane
+//! tag kept, so the answer names the entry that served it; and a catalog
+//! entry the card cannot load, with no entry answering to it, is refused `409
+//! model_above_card_class` or `409 model_above_gpu_generation` (`422` on
+//! `/v1/decide`, as its other model refusals are) before anything is
+//! prepared, drained or torn down. The loaded model's own id is served as it
+//! is, whatever its class.
+//!
 //! Error shape: OpenAI's `{"error": {message, type, code}}` body with the
 //! matching status (400 bad request, 404 unknown model, 413 oversized
 //! request, 503 engine full, 504 the engine did not finish the request in
@@ -667,8 +677,8 @@ pub(crate) fn model_on_this_card(server: &Server, model: Option<String>) -> Resu
     }))
 }
 
-/// `409 model_above_card_class` or `409 model_above_gpu_generation` (ADR 0064
-/// §3, ADR 0079, [`crate::download::CardRefusal::code`]): the model a request
+/// `409 model_above_card_class` or `409 model_above_gpu_generation` (ADR 0064,
+/// ADR 0079, [`crate::download::CardRefusal::code`]): the model a request
 /// or a switch names is a catalog entry this card cannot load, by its class
 /// or its generation, and no entry that answers to it can either. Refused
 /// before anything is prepared, drained or torn down: the loaded model serves

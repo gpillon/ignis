@@ -19,13 +19,28 @@
 //! text and image model does) and the oldest **GPU generation** (ADR 0079),
 //! and may list **aliases**: its family's default id, or another entry's
 //! served id of its family, which it answers to on a card that cannot load
-//! that id's own entry (ADR 0064, ADR 0074, spec 27b-16gb/04 §6). It may state
+//! that id's own entry (ADR 0064, spec 27b-16gb/04 §6). It may state
 //! its **model family**, and must where an alias involves it and neither its
 //! id nor its aliases name one: the header stays the authority, checked where
 //! an alias resolves. [`Catalog::answering`] is the one card-aware step a
 //! requested id goes through — at start, for a switch, a request, a download
 //! and `GET /v1/models` — so a model the card cannot load is refused before
 //! anything is torn down or fetched.
+//!
+//! The rules of that step and of the aliases it reads (ADR 0064). An entry
+//! that states no class is never refused by class, and the VRAM plan's
+//! refusal still guards it, so a catalog written before card classes still
+//! starts; a number that is no card class refuses the catalog. An id stands
+//! when its own entry fits the card; else the entry of its family that lists
+//! it as an alias and fits answers to it, the one of the largest card class
+//! where several do, never the catalog's order; else it is refused, naming
+//! what the entry needs and the card. An alias is matched exactly, as a
+//! request's `model` is; it resolves only within one model family, and only
+//! to an entry the card can load. The catalog is refused whole for an alias
+//! that is its entry's own id, that is neither a family's own id nor another
+//! entry's served id, that is of another family than its entry, or that two
+//! entries of one card class claim within a layer; an operator entry claims
+//! none a built-in entry claims, whatever its class (`claimed_once`).
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -135,8 +150,8 @@ pub struct CatalogEntry {
     /// switched to. `None` for the rest: a text or image model, told apart
     /// by its artifact's header.
     pub kind: Option<ModelKind>,
-    /// The smallest card class it loads on (`card_class`, in GB; ADR 0064
-    /// §1), when it states one. Optional in both layers, by one rule: an
+    /// The smallest card class it loads on (`card_class`, in GB; ADR 0064),
+    /// when it states one. Optional in both layers, by one rule: an
     /// entry that states none is never refused by class, and the VRAM plan's
     /// refusal still guards it — so an operator catalog written before card
     /// classes still starts. Every built-in text and image model states one.
@@ -146,14 +161,14 @@ pub struct CatalogEntry {
     /// on every generation the build runs on, the route checks of GitHub #456
     /// still guarding a load with no route on the card.
     pub generation: Option<GpuGeneration>,
-    /// The model family it states (`family`, ADR 0074), by the family's own
+    /// The model family it states (`family`, ADR 0064), by the family's own
     /// id, when it states one: required where an alias involves the entry
     /// and neither its id nor its aliases is a family's own id, and agreeing
     /// with them where they are. [`CatalogEntry::family()`] is the family the
     /// catalog tells, whichever says it.
     pub family: Option<ModelFamily>,
-    /// The ids it also answers to (`aliases`, ADR 0064 §2): its family's
-    /// default id, or another entry's served id of its family (ADR 0074), so
+    /// The ids it also answers to (`aliases`, ADR 0064): its family's
+    /// default id, or another entry's served id of its family, so
     /// that on a card class below that id's own entry a request naming it is
     /// served by this one. Usually none.
     pub aliases: Vec<String>,
@@ -179,7 +194,7 @@ impl CatalogEntry {
     }
 
     /// The model family the entry is of, as far as the catalog tells it
-    /// (ADR 0074): the one it states, else the family whose own id it is, or
+    /// (ADR 0064): the one it states, else the family whose own id it is, or
     /// whose own id it answers to as an alias — the catalog refuses an entry
     /// where these disagree. `None` for any other: no alias involves it, and
     /// the family stays the artifact's header's (ADR 0047).
@@ -230,7 +245,7 @@ impl CatalogEntry {
         files
     }
 
-    /// The rule (ADR 0064 §1, ADR 0079), the one place it is written: why
+    /// The rule (ADR 0064, ADR 0079), the one place it is written: why
     /// the entry does not load on `card` — its class above the card's, its
     /// generation newer than the card's, or both. `None` when it fits both:
     /// an axis the entry states nothing on, or the card has nothing known of
@@ -278,7 +293,7 @@ impl Catalog {
         self.entries.iter().map(|entry| entry.id.as_str()).collect()
     }
 
-    /// The entry `id` itself does not load on `card` (ADR 0064 §1, §3, ADR
+    /// The entry `id` itself does not load on `card` (ADR 0064, ADR
     /// 0079): its refusal ([`CatalogEntry::refusal_on`]), naming what the entry
     /// needs and the card. `None` when it fits, no card was read (`None`: a
     /// build with no CUDA, NVML unread by a `model` verb, the CPU tests), or
@@ -296,7 +311,7 @@ impl Catalog {
         self.entries.iter().find(|entry| entry.id == id)?.refusal_on(card)
     }
 
-    /// The card-aware step (ADR 0064 §2-3, ADR 0079, spec 27b-16gb/04 §6)
+    /// The card-aware step (ADR 0064, ADR 0079, spec 27b-16gb/04 §6)
     /// every adapter takes — the start, a switch, a request, a download, the
     /// model lists: which entry answers to `requested` on `card` in its place.
     /// `Ok(None)` when `requested` stands as it is — its own entry is not
@@ -310,7 +325,7 @@ impl Catalog {
     /// Matched exactly, as
     /// [`Catalog::refusal_on`] matches. The family is the one the catalog
     /// tells of `requested`'s entry ([`CatalogEntry::family()`]): its id's,
-    /// or the one it states (ADR 0074) — an entry of no family the catalog
+    /// or the one it states (ADR 0064) — an entry of no family the catalog
     /// tells has none to answer to it.
     pub fn answering(&self, requested: &str, card: Option<&CardReading>) -> Result<Option<&CatalogEntry>, CardRefusal> {
         let Some(refusal) = self.refusal_on(requested, card) else {
@@ -328,7 +343,7 @@ impl Catalog {
     }
 
     /// Why the entry `id` itself is not available on `card`, as `model list`
-    /// says it (ADR 0064 §3, ADR 0079): its refusal, and the entry that
+    /// says it (ADR 0064, ADR 0079): its refusal, and the entry that
     /// serves a request naming it here when one answers to it
     /// ([`Catalog::answering`]). `None` for an entry that loads, an id no
     /// entry has, or no card read. The server's lists say the same, with the
@@ -346,13 +361,13 @@ impl Catalog {
         self.entries.iter().find(|entry| entry.id == id).and_then(CatalogEntry::family)
     }
 
-    /// ADR 0064 §2 on the artifact itself, read once it is on disk: `entry`,
+    /// ADR 0064 on the artifact itself, read once it is on disk: `entry`,
     /// which answers to `requested` on `card` ([`Catalog::answering`]),
     /// holds an artifact whose header names
     /// `header` (ADR 0047: the header is the authority, the catalog's family
     /// a claim it checks). An alias only ever resolves within one model
     /// family, so that must be `requested`'s family as the catalog tells it
-    /// — its id's, or the one its entry states (ADR 0074); else the alias
+    /// — its id's, or the one its entry states (ADR 0064); else the alias
     /// does not resolve, refused naming both families — a header that names
     /// no family is refused too, the safe side. `Ok` when no alias is in
     /// play: `requested`'s own entry loads on the card.
@@ -369,7 +384,7 @@ impl Catalog {
     }
 }
 
-/// A catalog entry the card cannot load (ADR 0064 §3, ADR 0079): refused
+/// A catalog entry the card cannot load (ADR 0064, ADR 0079): refused
 /// before anything is torn down or fetched. Its class, its generation, or
 /// both are above the card's.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -422,14 +437,14 @@ pub struct GenerationGap {
 }
 
 /// An entry that would answer to an alias but holds an artifact of another
-/// family than the alias's (ADR 0064 §2).
+/// family than the alias's (ADR 0064).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtherFamily {
     /// The entry's id.
     pub entry: String,
     /// The family its artifact's header names; `None` for none.
     pub artifact: Option<ModelFamily>,
-    /// The alias's family, as the catalog tells it (ADR 0074): the family
+    /// The alias's family, as the catalog tells it (ADR 0064): the family
     /// whose own id the alias is, or the one its entry states.
     pub alias_family: Option<ModelFamily>,
 }
@@ -468,7 +483,7 @@ impl std::fmt::Display for CardRefusal {
 impl std::error::Error for CardRefusal {}
 
 /// Why a catalog entry is not available on the card, as the model lists say
-/// it (ADR 0064 §3, ADR 0079): the refusal a switch to it or a download of
+/// it (ADR 0064, ADR 0079): the refusal a switch to it or a download of
 /// it answers, and the entry that serves a request naming it here, when one
 /// answers to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,7 +543,7 @@ pub fn load(files: &dyn Files, path: Option<&Path>) -> Result<Catalog, CatalogEr
 /// entries. `origin` (the file's path) is named in every refusal.
 ///
 /// An operator entry may answer to a built-in entry's id as an alias (ADR
-/// 0064 §2: an operator's own build of Flash-Next for a smaller class
+/// 0064: an operator's own build of Flash-Next for a smaller class
 /// answering to `qwen3.8-flash-next`). That is not the silent re-pin ADR 0047
 /// refuses: the built-in entry keeps its id and its pins and serves it
 /// wherever it fits, the alias is consulted only on a card below its class,
@@ -597,7 +612,7 @@ pub fn parse(document: &Value, origin: &str, layer: CatalogLayer) -> Result<Vec<
 
 /// Every alias claimed by one entry of each card class at most within a
 /// layer, and an operator entry claiming none a built-in entry claims (ADR
-/// 0064 §2, ADR 0098): where several entries answer to an id, the one of the
+/// 0064, ADR 0098): where several entries answer to an id, the one of the
 /// largest class that fits answers ([`Catalog::answering`]), so two of one
 /// class would leave it to the catalog's order. An entry that states no class
 /// is one class of its own here. Checked over one file's entries, and again
@@ -621,7 +636,7 @@ fn claimed_once(entries: &[CatalogEntry]) -> Result<(), String> {
     Ok(())
 }
 
-/// Every alias within its entry's model family (ADR 0064 §2, ADR 0074),
+/// Every alias within its entry's model family (ADR 0064),
 /// over a whole catalog — the built-in one, and the merged one once an
 /// operator's entries join it, since an operator's alias may be a built-in
 /// entry's id. An alias that is an entry's served id, matched exactly as a
@@ -807,7 +822,7 @@ fn generation(map: &Map<String, Value>) -> Result<Option<GpuGeneration>, String>
 
 /// `family`, when stated: a model family's own id ([`ModelFamily::ALL`]),
 /// matched exactly, and the family the entry's own id is, when it is one's
-/// (ADR 0074). Its aliases are held to it by [`aliases`].
+/// (ADR 0064). Its aliases are held to it by [`aliases`].
 fn family(map: &Map<String, Value>, id: &str) -> Result<Option<ModelFamily>, String> {
     let Some(value) = map.get("family") else {
         return Ok(None);
@@ -831,7 +846,7 @@ fn family(map: &Map<String, Value>, id: &str) -> Result<Option<ModelFamily>, Str
 /// other such aliases are. One that is not names another entry's served id,
 /// held to the entry's family over the whole catalog
 /// ([`aliases_within_families`]) — so an entry listing one, whose id and
-/// aliases name no family, states `family` (ADR 0074). That is what keeps an
+/// aliases name no family, states `family` (ADR 0064). That is what keeps an
 /// alias within one family.
 fn aliases(map: &Map<String, Value>, id: &str, stated: Option<ModelFamily>) -> Result<Vec<String>, String> {
     let listed = match map.get("aliases") {
@@ -874,7 +889,7 @@ fn aliases(map: &Map<String, Value>, id: &str, stated: Option<ModelFamily>) -> R
     let named = ModelFamily::of_model_id(id).is_some() || aliases.iter().any(|alias| ModelFamily::of_model_id(alias).is_some());
     if !aliases.is_empty() && stated.is_none() && !named {
         return Err(format!(
-            "it lists aliases, and neither its id nor its aliases is a model family's own id, so it must state `family` ({}), the family it is of (ADR 0074)",
+            "it lists aliases, and neither its id nor its aliases is a model family's own id, so it must state `family` ({}), the family it is of (ADR 0064)",
             family_ids()
         ));
     }
@@ -986,7 +1001,7 @@ mod tests {
     /// hold, value for value (`id`, `repo`, `revision`, `artifact`, its
     /// `card_class` in GB, its `generation`, its model family, its aliases,
     /// then each file's name, bytes and SHA-256 in the order listed). Every
-    /// built-in entry states its card class (ADR 0064 §1: an operator's may
+    /// built-in entry states its card class (ADR 0064: an operator's may
     /// leave it out, a built-in one never does), the 32 GB one for each but
     /// the three 16 GB entries and the two 12 GB ones, and its generation by
     /// one rule (spec #474, ADR 0079): `blackwell` for an NVFP4 artifact,
@@ -996,9 +1011,9 @@ mod tests {
     /// trellis builds are the only ones with an alias: the 16 GB 27B's
     /// (GitHub #338, spec 27b-16gb/01) and the 12 GB 27B's (spec #630)
     /// `qwen3.8-27b`, its uncensored variant's two builds' (GitHub #423,
-    /// GitHub #706, ADR 0074) `qwen3.8-27b-abliterated`, and Swift 1.5's
+    /// GitHub #706, ADR 0064) `qwen3.8-27b-abliterated`, and Swift 1.5's
     /// (GitHub #473) `swift-1.5-27b`, each the 32 GB entry's served id. Every
-    /// one is of a family the catalog tells (ADR 0074): its own id's, its
+    /// one is of a family the catalog tells (ADR 0064): its own id's, its
     /// alias's, or the one it states — the abliterated 27B's, Swift's and
     /// their trellis builds', whose ids name none.
     #[allow(clippy::type_complexity)]
@@ -1474,12 +1489,12 @@ mod tests {
             ("sha256: abb1000000000000000000000000000000000000000000000000000000000002", "sha256: abb1", vec![entry, "`sha256`", "64"]),
             ("bytes: 48211", "bytes: 0", vec![entry, "`bytes` is 0"]),
             ("bytes: 48211", "bytes: lots", vec![entry, "`bytes`"]),
-            // ADR 0064 §1: a card class stated is one of the classes there
+            // ADR 0064: a card class stated is one of the classes there
             // are.
             ("card_class: 32", "card_class: 48", vec![entry, "`card_class`", "12, 16, 24, 32, 96", "got 48"]),
             ("card_class: 32", "card_class: \"32\"", vec![entry, "`card_class`", "12, 16, 24, 32, 96"]),
             ("card_class: 32", "card_class: -16", vec![entry, "`card_class`"]),
-            // ADR 0064 §2: an alias is of one family, never the entry's own
+            // ADR 0064: an alias is of one family, never the entry's own
             // id.
             ("card_class: 32", "card_class: 32\n    aliases: qwen3.8-27b", vec![entry, "`aliases` must be a list"]),
             ("card_class: 32", "card_class: 32\n    aliases: [acme-qwen3.8-27b-ft]", vec![entry, "own id"]),
@@ -1496,7 +1511,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074: `family` is a model family's own id and agrees with what
+    /// ADR 0064: `family` is a model family's own id and agrees with what
     /// the entry's id and aliases say; an alias is a family's own id or
     /// another entry's served id, of the entry's own family, and an entry an
     /// alias involves is of a family the catalog tells. Each refusal names
@@ -1561,7 +1576,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074: a catalog written before `family` existed loads unchanged:
+    /// ADR 0064: a catalog written before `family` existed loads unchanged:
     /// an entry no alias involves, and one whose alias is a family's own id,
     /// state none and need none.
     #[test]
@@ -1662,10 +1677,10 @@ mod tests {
         assert!(err.contains("entry 2 (`ACME-Qwen3.8-27B-FT`)") && err.contains("`acme-qwen3.8-27b-ft`"), "{err}");
     }
 
-    /// ADR 0064 §1-2: an entry states the smallest card class it loads on
+    /// ADR 0064: an entry states the smallest card class it loads on
     /// and may list the ids it also answers to; the family the catalog can
     /// tell is the one whose own id it is or answers to, or the one it
-    /// states (ADR 0074), and no other — the rest is the artifact's header's
+    /// states (ADR 0064), and no other — the rest is the artifact's header's
     /// (ADR 0047).
     #[test]
     fn an_entry_states_its_card_class_and_may_list_aliases() {
@@ -1680,7 +1695,7 @@ mod tests {
         assert_eq!(catalog.entry("qwen3.8-27b").unwrap().family(), Some(ModelFamily::Qwen38_27b));
         assert_eq!(catalog.entry("ignis-image-2.1-turbo").unwrap().family(), Some(ModelFamily::QwenImage21));
         let abliterated = catalog.entry("qwen3.8-27b-abliterated").unwrap();
-        assert_eq!((abliterated.family, abliterated.family()), (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::Qwen38_27b)), "its id names none: it states it (ADR 0074)");
+        assert_eq!((abliterated.family, abliterated.family()), (Some(ModelFamily::Qwen38_27b), Some(ModelFamily::Qwen38_27b)), "its id names none: it states it (ADR 0064)");
         assert_eq!((sixteen.family, catalog.entry("qwen3.8-27b").unwrap().family), (None, None), "their ids and aliases say it: they state none");
         let json = serde_json::to_string(&Format::Yaml.read(SIXTEEN).unwrap()).unwrap();
         assert_eq!(parse_operator_over(&thirty_two(), &json, Format::Json, "acme.json").unwrap(), catalog);
@@ -1705,7 +1720,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §1 as built: `card_class` is optional, by one rule — an
+    /// ADR 0064: `card_class` is optional, by one rule — an
     /// entry that states none is never refused by class, as its own id or
     /// answering to an alias; the VRAM plan's refusal still guards it. So an
     /// operator catalog written before card classes still starts.
@@ -1723,7 +1738,7 @@ mod tests {
         assert_eq!(resolved(&classless, "qwen3.8-27b", Some(&on(Gb16))), Ok("qwen3.8-27b-16g"), "it answers to its alias on any card");
     }
 
-    /// ADR 0064 §2: an alias resolves only within one model family — an
+    /// ADR 0064: an alias resolves only within one model family — an
     /// entry whose own id is a family's may not answer to another's.
     #[test]
     fn an_alias_of_another_family_than_the_entrys_own_id_is_refused() {
@@ -1732,7 +1747,7 @@ mod tests {
         assert!(err.contains("`qwen3.8-flash-next`") && err.contains("`qwen3.8-27b`") && err.contains("one model family"), "{err}");
     }
 
-    /// ADR 0064 §2, ADR 0098: an id answers for one entry of each card class,
+    /// ADR 0064, ADR 0098: an id answers for one entry of each card class,
     /// or which one served it would be the catalog's order — two of one class
     /// are refused within a file. Two of different classes both answer to it,
     /// the larger one where both fit, the smaller one below it.
@@ -1752,7 +1767,7 @@ mod tests {
         assert_eq!(resolved(&catalog, "qwen3.8-27b", Some(&on(CardClass::Gb12))), Ok("acme-27b-12g"));
     }
 
-    /// ADR 0064 §2 across the two layers: an operator entry claiming an alias
+    /// ADR 0064 across the two layers: an operator entry claiming an alias
     /// a built-in entry claims is refused by the check over the merged
     /// catalog, each file being valid on its own, of whatever class it is
     /// (ADR 0098: the per-class rule holds within a layer); an operator entry
@@ -1798,10 +1813,10 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §2: on a card below the id's own entry, the entry of its
+    /// ADR 0064: on a card below the id's own entry, the entry of its
     /// family that answers to it, and fits, serves it — each id its own
     /// answering entry: the 27B's default id the 16 GB 27B, the uncensored
-    /// variant's its 16 GB build (ADR 0074), Swift 1.5's its own (GitHub #473);
+    /// variant's its 16 GB build (ADR 0064), Swift 1.5's its own (GitHub #473);
     /// on a 16 GB card and on a 24 GB one (GitHub #480), which no built-in
     /// entry states.
     #[test]
@@ -1815,7 +1830,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §3: with no entry answering to it, the id is refused naming
+    /// ADR 0064: with no entry answering to it, the id is refused naming
     /// its entry's class and the card's — the 27B's default id on a 16 GB
     /// card in a catalog without the 16 GB 27B.
     #[test]
@@ -1865,7 +1880,7 @@ mod tests {
         assert_eq!(catalog.refusal_on("some-other-model", Some(&card)), None, "an artifact the catalog has no entry for");
     }
 
-    /// Spec #701 (GitHub #706, ADR 0074, ADR 0098): on a 12 GB card of each
+    /// Spec #701 (GitHub #706, ADR 0064, ADR 0098): on a 12 GB card of each
     /// generation the uncensored variant's id is served by
     /// `qwen3.8-27b-abliterated-12g`, which stands as it is there, and the
     /// listing names it as the entry that serves the 32 GB entry's id; the
@@ -1924,7 +1939,7 @@ mod tests {
         }
     }
 
-    /// ADR 0064 §2 on the artifact: the entry that answers to an alias must
+    /// ADR 0064 on the artifact: the entry that answers to an alias must
     /// hold an artifact of the alias's family by its header (ADR 0047) —
     /// else the alias does not resolve, refused naming both families, and a
     /// header of no family is refused too. With no alias in play (the id's
@@ -1951,7 +1966,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074: an alias may be another entry's served id of the same
+    /// ADR 0064: an alias may be another entry's served id of the same
     /// family, answered on a card below that entry's class. The built-in
     /// 16 GB build of the uncensored variant (GitHub #423) states the 27B's
     /// family and answers to `qwen3.8-27b-abliterated`, whose entry states it
@@ -1970,7 +1985,7 @@ mod tests {
         }
     }
 
-    /// ADR 0074 on the artifact: the alias's family is the one its entry
+    /// ADR 0064 on the artifact: the alias's family is the one its entry
     /// states when its id names none, and the header stays the authority —
     /// the abliterated 16 GB build holding an artifact of another family does
     /// not answer to `qwen3.8-27b-abliterated`, refused naming both families.
@@ -1996,7 +2011,7 @@ mod tests {
         assert_eq!(catalog.alias_holds("qwen3.8-27b-abliterated", entry, Some(ModelFamily::FlashNext), Some(&on(CardClass::Gb32))), Ok(()), "no alias in play");
     }
 
-    /// ADR 0064 §2: an entry answering to an alias never serves another
+    /// ADR 0064: an entry answering to an alias never serves another
     /// family's id: on a 16 GB card, where the 27B's two 16 GB entries answer
     /// to their own aliases, Flash-Next's and the image model's are refused.
     #[test]

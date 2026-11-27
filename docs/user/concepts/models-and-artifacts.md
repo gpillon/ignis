@@ -164,7 +164,6 @@ three `-16g` entries, which load on 16 GB and answer to `qwen3.8-27b`, to
 the two `-12g` entries, which load on 12 GB and answer to `qwen3.8-27b` and to
 `qwen3.8-27b-abliterated` on a 12 GB card
 ([ADR 0064](../../adr/0064-a-catalog-entry-states-its-card-class.md),
-[ADR 0074](../../adr/0074-a-catalog-entry-may-state-its-family-and-an-alias-may-be-another-entrys-id.md),
 [ADR 0098](../../adr/0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md))
 ([the catalog](../guides/models.md#the-catalog)). All but the trellis
 entries (`-16g`, `-12g`) also state the oldest **GPU generation** they load on, Blackwell: on an

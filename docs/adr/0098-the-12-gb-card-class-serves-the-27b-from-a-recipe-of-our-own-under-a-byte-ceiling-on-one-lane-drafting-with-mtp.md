@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0063, ADR-0064, ADR-0079]
+amends: [ADR-0063, ADR-0079]
 ---
 
 # The 12 GB card class serves the 27B from a recipe of our own under a byte ceiling, on one lane, drafting with MTP

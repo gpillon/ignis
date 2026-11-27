@@ -9,6 +9,12 @@
 //! written fresh, printed, or merged into an existing file. Nothing here
 //! writes: a verb that writes returns [`ConfigOutcome::Write`] and `main`
 //! performs it, so resolution stays testable without a disk.
+//!
+//! `model download` and `model list` are fitted to the card a start would
+//! read (ADR 0064, ADR 0079): its class and its GPU generation say which
+//! entry a download fetches for an id, which download is refused before
+//! anything is fetched, and which entries the list marks as not loading
+//! here. With no card read, nothing is refused.
 
 use std::path::PathBuf;
 
@@ -683,7 +689,7 @@ mod tests {
         crate::config::resolve_on(&argv, |_: &str| None, files, &move || card.clone())
     }
 
-    /// ADR 0064 §3, through the command line: `model download` is fitted to
+    /// ADR 0064, through the command line: `model download` is fitted to
     /// the class of the card the start reads — on a 16 GB card the default
     /// id fetches the built-in entry that answers to it (GitHub #338), and an
     /// entry no 16 GB card loads is refused before anything is fetched; on a

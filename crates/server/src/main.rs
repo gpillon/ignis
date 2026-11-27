@@ -27,6 +27,13 @@
 //! comment does not repeat it. `main` resolves once, builds the load from the
 //! options fitted to the artifact's family, and serves `GET`/`PATCH
 //! /v1/config` over the running configuration.
+//!
+//! With no artifact named, the model is the catalog's, fitted to the card
+//! before it is looked for or fetched (ADR 0064, ADR 0079): an id another
+//! entry of its family answers to on this card starts that entry, under that
+//! entry's own id, and one the card cannot load refuses the start. A named
+//! artifact is the operator's word, which only the VRAM plan and the route
+//! checks guard.
 
 use std::sync::Arc;
 
@@ -402,7 +409,7 @@ async fn main() {
     };
 
     // The entry the card chose in `model`'s place is served under its
-    // own id (ADR 0064 §2), as a switch to it would serve it — once its
+    // own id (ADR 0064), as a switch to it would serve it — once its
     // artifact's header says it is of the configured id's family.
     let artifact_family = |path: &std::path::Path| ignis_server::loader::artifact_family(path).ok().flatten();
     let start_options = match download::served_start_options(start_options, &served, artifact.as_deref(), &catalog, card.as_ref(), &artifact_family) {
@@ -463,7 +470,7 @@ async fn main() {
     } else {
         // Why there is no artifact was said once, with its reason, where the
         // decision was made (`ignis.model.placeholder_template` above).
-        // Under the id the start resolved (ADR 0064 §2), the one the catalog
+        // Under the id the start resolved (ADR 0064), the one the catalog
         // and the switcher know it by.
         (Server::from_active(placeholder_model(&served, default_max_tokens)), start_options.clone())
     };

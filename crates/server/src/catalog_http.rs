@@ -94,7 +94,7 @@ pub(crate) struct CatalogRow {
     /// artifact's header's when it is on disk, which wins (ADR 0047), the
     /// 27B's for a header of no family, as a load serves it; else what the
     /// catalog tells of the entry: its `kind` (a speech model, the diarizer)
-    /// or its family's (ADR 0074). Absent when neither tells: an operator
+    /// or its family's (ADR 0064). Absent when neither tells: an operator
     /// entry of no family not downloaded, a known model whose file is gone or
     /// has no header. For the loaded model, what it runs.
     #[serde(skip_serializing_if = "Option::is_none")]

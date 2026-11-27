@@ -260,7 +260,7 @@ fn container(path: &Path, model_id: &str) -> u64 {
 /// GitHub #448: every row says its `kind` — the artifact header's when the
 /// file is there, which wins (ADR 0047), the 27B's for a header of no family,
 /// as a load serves it; else what the catalog tells of the entry, its `kind`
-/// or its family's (ADR 0074); else none.
+/// or its family's (ADR 0064); else none.
 #[tokio::test]
 async fn every_row_says_its_kind_the_headers_when_the_file_is_there_else_the_catalogs() {
     /// What an entry's artifact is under `download.path`.
