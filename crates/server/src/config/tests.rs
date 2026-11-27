@@ -3407,7 +3407,7 @@ fn the_vision_residency_defaults_to_the_host() {
     assert_eq!(device.vision.map(|v| v.residency()), Some(VisionResidency::Device));
 }
 
-/// ADR 0063 as amended by ADR 0075 (GitHub #416): the 5090 takes `host`; the
+/// ADR 0075 (GitHub #416): the 5090 takes `host`; the
 /// 96 GB card, where tower and pool are ~0.8% of the KV pool and the host may
 /// be short of RAM, takes `device`.
 #[test]
@@ -5092,7 +5092,7 @@ fn rtx_24gb_keeps_the_27b_s_device_retained_slots_and_its_context() {
     }
 }
 
-/// GitHub #418 (ADR 0063 as amended by ADR 0075): `rtx50-16gb` turns vision
+/// GitHub #418 (ADR 0063, ADR 0075): `rtx50-16gb` turns vision
 /// on at a 4,096-token envelope, residency `host`; an operator's own
 /// `--vision-enabled false` or `--vision-max-tokens` wins, and the 5090's
 /// profile keeps the 32,768 default.
@@ -5109,7 +5109,7 @@ fn rtx50_16gb_turns_vision_on_at_a_4096_token_envelope_and_the_operator_wins() {
     assert_eq!(envelope(&[], 31.8), Some(DEFAULT_VISION_MAX_TOKENS), "rtx5090's vision is on at the default");
 }
 
-/// ADR 0063 §3: a value the profile or the hardcoded default gave adapts at
+/// ADR 0063: a value the profile or the hardcoded default gave adapts at
 /// load; one the operator wrote -- by flag, env or file, even a file's value
 /// at the hardcoded default -- never does, each of the three alone.
 #[test]
@@ -5133,7 +5133,7 @@ fn only_the_profiles_and_the_defaults_values_adapt() {
     assert_eq!(qwen(config(&["--profile", "none"])), Adaptable::ALL);
 }
 
-/// ADR 0063 §3, review of #336 part D: the adaptation ladder's step and
+/// ADR 0063, review of #336 part D: the adaptation ladder's step and
 /// spare reservation are fields, 65,536 tokens each unless named, by flag,
 /// env or file; they reach the 27B's ladder.
 #[test]
@@ -5165,7 +5165,7 @@ fn an_adaptation_step_that_is_not_whole_kv_pages_is_refused() {
     assert!(refused(&["--vram-adapt-spare-tokens", "-1"]).contains("--vram-adapt-spare-tokens"));
 }
 
-/// Both fields are the 27B's alone (Flash-Next does not adapt, ADR 0063 §3):
+/// Both fields are the 27B's alone (Flash-Next does not adapt, ADR 0063):
 /// a Flash-Next start refuses an explicit value by name, and the defaults are
 /// no one's business.
 #[test]

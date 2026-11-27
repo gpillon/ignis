@@ -1,4 +1,4 @@
-//! ADR 0063 §3, spec 27b-16gb/04 AC 4 and 5 (GitHub #336): a 27B load under
+//! ADR 0063, spec 27b-16gb/04 AC 4 and 5 (GitHub #336): a 27B load under
 //! `rtx5090` whose explicit VRAM budget refuses the profile's 917,504 tokens
 //! adapts the values the profile gave, logs each step in
 //! `ignis.runtime.vram_plan`'s `adapted`, and serves at the values it kept --

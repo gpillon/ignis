@@ -166,7 +166,7 @@ LOOP_GUARD ?=
 # Defaults: the 27B's context left to the server -- the card class's profile
 # (`auto`): 917,504 tokens on the 5090, which the load adapts down to the
 # largest the free memory holds rather than refusing or dropping lanes (ADR
-# 0063 §3; a context named here is explicit and never adapts) -- then
+# 0063; a context named here is explicit and never adapts) -- then
 # hq-e8-2b KV, DFlash2 speculation with a 7-token draft window. MAX_CONTEXT=n
 # names a context (524288 was make's own until #336). The G5 gate legs
 # (GitHub #66) ran at MAX_CONTEXT=262144 ROPE_SCALING=none.

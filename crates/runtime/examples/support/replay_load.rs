@@ -10,7 +10,7 @@
 //! server refuses a start.
 //!
 //! Where it is not the server's load:
-//! - It does not adapt (ADR 0063 §3): a plan that does not fit is refused,
+//! - It does not adapt (ADR 0063): a plan that does not fit is refused,
 //!   naming its shortfall, and the shape is never moved to make it fit.
 //! - It runs no host plan (ADR 0062): the server measures available RAM
 //!   against the pinned token embedding (the trellis body's), KV-disk

@@ -126,7 +126,7 @@ done
 
 out="$(flags)"
 lacks "27B" "$out" "--spec-decode-lanes"
-# GitHub #336 (ADR 0063 §3): the 27B's context is the profile's, which the
+# GitHub #336 (ADR 0063): the 27B's context is the profile's, which the
 # load adapts to the free memory; a named one is explicit and never adapts.
 lacks "27B context" "$out" "--model-max-context"
 has "27B MAX_CONTEXT=524288" "$(flags MAX_CONTEXT=524288)" "--model-max-context 524288"

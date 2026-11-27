@@ -7,6 +7,18 @@
 //! on the device and wrap the loaded model behind
 //! [`ignis_runtime::CudaLeaf`] — the binary falls back to CPU `MockCompute`
 //! (`main.rs`) only without this feature or without an artifact.
+//!
+//! A 27B load plans before it allocates, and adapts ([`crate::adaptation`],
+//! ADR 0063): `qwen27b_load` gives the ladder the closure that plans the
+//! leaf's lines again at each attempt's context, lanes, head and solo width.
+//! The [`EngineShape`] carries which values may adapt and the ladder's two
+//! fields, both set by the resolution alone ([`EngineShape::from`]): a shape
+//! built by hand adapts nothing and names its rope table, so a gate the card
+//! cannot hold is refused, never served at a context it did not ask for. The
+//! values the load kept are the load's everywhere after the plan
+//! ([`EngineShape::at`]): the leaf's, the scheduler's, KV disk's identity,
+//! an `auto` rope table resolved again for the context kept (ADR 0057);
+//! `GET /v1/config` keeps the values configured.
 
 use std::sync::Arc;
 
@@ -120,14 +132,14 @@ pub struct EngineShape {
     /// ([`Self::at`]); a spelled-out one stays.
     pub rope_setting: ignis_core::RopeSetting,
     /// Which of the 27B's context, decode lanes and drafter head its load
-    /// may lower when the VRAM plan refuses them (ADR 0063 §3): those the
+    /// may lower when the VRAM plan refuses them (ADR 0063): those the
     /// profile or the hardcoded default gave, as the resolution says
     /// ([`crate::config::Config::adaptable`]). The default shape, which no
     /// resolution made, adapts nothing; Flash-Next's load adapts nothing.
     pub adaptable: crate::adaptation::Adaptable,
     /// The 27B's adaptation ladder: its context step and its spare
     /// reservation (`--model-adapt-context-step`, `--vram-adapt-spare-tokens`,
-    /// ADR 0063 §3).
+    /// ADR 0063).
     pub adapt_ladder: crate::adaptation::Ladder,
     /// The 27B's prompt attention precision (`--model-prefill-attention`,
     /// GitHub #335); Flash-Next ignores it.
@@ -351,7 +363,7 @@ impl EngineShape {
     }
 
     /// The solo widths a load of `family` tries before adapting (GitHub
-    /// #489, ADR 0063 §3 as amended): `auto`'s, the card's ladder above the
+    /// #489, ADR 0063): `auto`'s, the card's ladder above the
     /// prefill chunk and within the context; or the width named.
     pub fn solo_widths(&self, family: ignis_core::compute::ModelFamily) -> crate::adaptation::SoloCandidates {
         match self.prefill_chunk_solo {
@@ -366,7 +378,7 @@ impl EngineShape {
         }
     }
 
-    /// The values the 27B's adaptation starts from (ADR 0063 §3): this
+    /// The values the 27B's adaptation starts from (ADR 0063): this
     /// shape's context, its lanes and its drafter's head, at the prefill
     /// chunk, above which `adaptation::adapt_solo` tries the solo widths.
     pub fn adaptation_start(&self) -> crate::adaptation::Attempt {
@@ -384,7 +396,7 @@ impl EngineShape {
         }
     }
 
-    /// This 27B shape at `attempt`'s values (ADR 0063 §3), each changed only
+    /// This 27B shape at `attempt`'s values (ADR 0063), each changed only
     /// where it differs, with what follows it: the context, an `auto` rope
     /// table re-resolved for it (ADR 0057), and the vision encoder's item
     /// bound kept within the envelope at it; the lanes, and the host retained
@@ -584,8 +596,8 @@ pub struct RetainedSlotsPlan {
 /// the free memory this process already held and `process_held_source` where
 /// that figure came from, and `cuda_context_source` says whether the
 /// `cuda_context` line was measured or is the fallback.
-/// `adapted` is every adaptation the load took to fit the plan (ADR 0063
-/// §3), in order: the event's `adapted`, empty when it took none.
+/// `adapted` is every adaptation the load took to fit the plan (ADR 0063),
+/// in order: the event's `adapted`, empty when it took none.
 /// `vision` is where a vision load keeps its tower (ADR 0075), the event's
 /// `vision_residency`; a text load (`None`) logs none.
 pub fn log_vram_plan(
@@ -951,7 +963,7 @@ pub fn qwen27b_pin_refused(error: &str, request: &ignis_core::residency::HostPla
 
 /// Why a 27B load failed: its host plan's refusal (ADR 0062), kept whole so
 /// a switch can report it in bytes as Flash-Next's is; its VRAM plan's
-/// refusal after every adaptation it could take (ADR 0063 §3), kept whole so
+/// refusal after every adaptation it could take (ADR 0063), kept whole so
 /// a caller reads the deficit from its fields; or anything else, as the text
 /// it always was.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1247,7 +1259,7 @@ fn bound_index(bound: &[BoundScope], scope: ignis_artifact::ModelScope) -> Optio
 
 /// The binder's plan and handles for `scope`, bound the first time a load
 /// asks for it: adaptation plans at a second scope only when it drops the
-/// shortlist head (ADR 0063 §3), which is bound beside the full one.
+/// shortlist head (ADR 0063), which is bound beside the full one.
 #[cfg(feature = "cuda")]
 fn bound_scope<'a>(
     reader: &ignis_artifact::Reader,
@@ -1271,7 +1283,7 @@ fn bound_scope<'a>(
 /// ([`Qwen27bLoadError::VramPlan`]): the server's load reads them, and a GPU
 /// test reads a plan's deficit from the second. Beside the scheduler and its
 /// reservations, the shape the load runs: `shape` at the values its
-/// adaptation kept (ADR 0063 §3) -- `shape` itself when the plan fit as
+/// adaptation kept (ADR 0063) -- `shape` itself when the plan fit as
 /// configured -- and the adaptations that got there, in order (none when it
 /// fit), which `GET /v1/models` reports (#340).
 #[cfg(feature = "cuda")]
@@ -1298,7 +1310,7 @@ pub fn qwen27b_load(
     // the plan's `cuda_context` line is that figure.
     let (start, mut device) = ignis_runtime::plan_start(ignis_core::compute::ModelFamily::Qwen38_27b)?;
     let free_at_start_bytes = start.free_at_start_bytes;
-    // ADR 0063 §3: the plan at the shape's values, and when it refuses them
+    // ADR 0063: the plan at the shape's values, and when it refuses them
     // below its minimum, at each adaptation's in turn -- the leaf's lines
     // planned again at the attempt's context (the hq prompt planes, the rope
     // table), lanes and head, before anything is allocated.
@@ -1306,8 +1318,7 @@ pub fn qwen27b_load(
     // objects are bound and uploaded only when the operator asked for them;
     // otherwise the plan is the text scope's alone, as before.
     let mut bound = Vec::new();
-    // GitHub #489: the solo width first, at the shape's values (ADR 0063 §3
-    // as amended).
+    // GitHub #489: the solo width first, at the shape's values (ADR 0063).
     let solo = shape.solo_widths(ignis_core::compute::ModelFamily::Qwen38_27b);
     let adapted = crate::adaptation::adapt_solo(shape.adaptation_start(), &solo, shape.adaptable, shape.adapt_ladder, |attempt| {
         let shape = shape.at(attempt);
@@ -1997,7 +2008,7 @@ mod tests {
             panic!("expected a runnable config");
         };
         // A resolution says what may adapt and that the rope table is
-        // `auto`'s; a shape built by hand adapts nothing (ADR 0063 §3). It also
+        // `auto`'s; a shape built by hand adapts nothing (ADR 0063). It also
         // knows the generation of the card it read, the 5090 `resolve`
         // injects, where a shape built by hand read none (GitHub #508). On that
         // card `auto`'s exception weights resolve to fp8 (ADR 0065), where a
@@ -2548,7 +2559,7 @@ mod tests {
         }
     }
 
-    /// ADR 0063 §3: the shape carries what may adapt, and at an adapted
+    /// ADR 0063: the shape carries what may adapt, and at an adapted
     /// attempt re-resolves what follows its values -- an `auto` rope table
     /// for the context (ADR 0057; a spelled-out one stays), the host retained
     /// slots nobody named for the lanes (two a lane), the drafter's head.
@@ -3171,7 +3182,7 @@ mod tests {
         assert_eq!(field("retained_device_slots"), DEFAULT_RETAINED.device_slots);
         assert_eq!(field("retained_host_slots"), DEFAULT_RETAINED.host_slots);
         assert_eq!(field("retained_host_bytes"), DEFAULT_RETAINED.host_bytes);
-        // ADR 0063 §3: a load that adapted nothing says so.
+        // ADR 0063: a load that adapted nothing says so.
         assert_eq!(field("adapted"), "");
     }
 
@@ -3196,7 +3207,7 @@ mod tests {
         assert!(text.get("vision_residency").is_none(), "a text load has no residency: {text}");
     }
 
-    /// ADR 0063 §3 (AC 4): the plan event names every adaptation the load
+    /// ADR 0063 (AC 4): the plan event names every adaptation the load
     /// took, in the order taken, as one list.
     #[test]
     fn the_vram_plan_event_names_the_adaptations_the_load_took() {

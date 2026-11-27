@@ -1,4 +1,4 @@
-//! GitHub #489 (ADR 0018, and ADR 0063 §3 as amended): the solo width on the
+//! GitHub #489 (ADR 0018 and ADR 0063): the solo width on the
 //! two built-in profiles of the RTX 30 and RTX 40 classes, as a card of theirs
 //! loads them.
 //!

@@ -27,6 +27,14 @@
 //! resolved [`super::Config`]) is what lets one start's options be resolved
 //! again later for a family the artifact names, or with a patch on top,
 //! without the process environment or argv being read twice.
+//!
+//! A [`Resolution`] also remembers where each value came from, and answers
+//! two questions that differ on purpose. [`Resolution::explicit`] (ADR 0046):
+//! did the operator write the field as something other than its default.
+//! [`Resolution::adapts`] (ADR 0063): may a 27B load lower the value when its
+//! VRAM plan refuses it, which is by source alone: only what a profile or
+//! the hardcoded default gave, never what the operator wrote, a file's value
+//! equal to the default included.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -415,7 +423,7 @@ impl Resolution {
     }
 
     /// Whether `<group>.<name>`'s value is the profile's or the hardcoded
-    /// default's: what a load's **adaptation** may lower (ADR 0063 §3). By
+    /// default's: what a load's **adaptation** may lower (ADR 0063). By
     /// source alone -- a value the operator wrote never adapts, not even one
     /// equal to the default, since a file `config generate` wrote names the
     /// numbers of the card it was generated on.

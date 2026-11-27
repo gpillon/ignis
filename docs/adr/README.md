@@ -71,7 +71,7 @@ edit it by hand.
 | [0060](0060-the-27b-has-a-trellis-body-for-small-cards.md) | The 27B gets a second body format, trellis, for the 16 GB card class | accepted | |
 | [0061](0061-prefill-attention-reads-the-hq-codec.md) | Prefill attention reads the hq-e8-2b codec: no prompt planes, on every card | accepted | |
 | [0062](0062-the-token-embedding-lives-in-host-memory.md) | The 27B's token embedding lives in pinned host memory, on every card | accepted | |
-| [0063](0063-the-profile-follows-the-card-class.md) | the profile follows the card class, and its defaults adapt to the budget | accepted | [0075](0075-the-vision-tower-is-staged-and-the-embedding-pool-host-mapped-unless-the-load-asks-for-the-device.md), [0098](0098-the-12-gb-card-class-serves-the-27b-from-a-recipe-of-our-own-under-a-byte-ceiling-on-one-lane-drafting-with-mtp.md) |
+| [0063](0063-the-profile-follows-the-card-class.md) | The profile follows the card class, and its defaults adapt to the budget | accepted | |
 | [0064](0064-a-catalog-entry-states-its-card-class.md) | A catalog entry states the smallest card class it loads on; aliases resolve within a family; a switch refuses before teardown | accepted | |
 | [0065](0065-the-bf16-exception-tensors-can-be-held-in-fp8.md) | The 27B's BF16 exception tensors can be held in FP8, converted at load | accepted | |
 | [0066](0066-the-user-guide-is-a-site-built-from-docs-user.md) | The user guide is a Starlight site built from `docs/user/` alone, published with each release | accepted | |
