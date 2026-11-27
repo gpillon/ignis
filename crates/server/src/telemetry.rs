@@ -5,7 +5,7 @@
 //! - the request lifecycle — `ignis.request.admitted`/`ttft`/`done`/
 //!   `evicted`/`restored` (GitHub #79, #125);
 //! - the scheduler counters — `ignis.scheduler.interval` at DEBUG, emitted
-//!   when `waiting` / `running` / `kv_evictions` change (ADR 0025). Until
+//!   when `waiting` / `running` / `kv_used_pct` / `kv_evictions` change (ADR 0025). Until
 //!   ADR 0025 these were a `{"kind":"interval",...}` JSONL line written
 //!   straight to stdout on every step, past the operator's log format.
 //!
@@ -772,7 +772,7 @@ impl Telemetry {
     /// Two kinds arrive here since GitHub #188: a concurrent sibling's prefix,
     /// and a **retained prefix** left by a request that has already finished.
     /// `retained` tells them apart (#190), so `ignis_prefix_reused_tokens_total`
-    /// keeps the *sibling*-prefix meaning ADR 0017's row gives it, and
+    /// keeps its *sibling*-prefix meaning (`metrics.rs`, at the series), and
     /// cross-request reuse is counted as reuse of retained state, on the tier
     /// the prefix came from: the same tier its hit and its `done` line name
     /// (#325).

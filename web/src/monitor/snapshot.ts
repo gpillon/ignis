@@ -1,6 +1,6 @@
 import type { Exposition, Sample } from "./exposition.ts";
 
-// One scrape read against ADR 0017's contract table, widened by ADR 0030
+// One scrape read against ADR 0017's metrics contract, widened by ADR 0030
 // §Observability: the series the panel knows how to draw, by name. Anything
 // else ignis serves is kept in `unknown` and listed raw, never dropped
 // silently.
@@ -164,8 +164,8 @@ export type Speculation = {
 export type ClassPhaseMatrix = Record<ExpertClass, Record<ExpertPhase, number | null>>;
 
 /**
- * Flash-Next's expert residency (GitHub #301, ADR 0017's amendment of
- * 2026-10-05): what the VRAM expert cache served, what it copied in, and
+ * Flash-Next's expert residency (GitHub #301, ADR 0017):
+ * what the VRAM expert cache served, what it copied in, and
  * its slots. Only a Flash-Next load exports it.
  */
 export type ExpertResidency = {
@@ -196,7 +196,7 @@ export const IMAGE_PHASES = ["queued", "encoding", "denoising", "decoding"] as c
 export type ImagePhase = (typeof IMAGE_PHASES)[number];
 
 /**
- * The image jobs (GitHub #324, ADR 0017's amendment of 2026-10-15): by
+ * The image jobs (GitHub #324, ADR 0017): by
  * outcome, the images made, the seconds each phase took, the duration of the
  * completed jobs and the queue. Absent until the image model has admitted a
  * job, so null on a text-only server.
@@ -210,7 +210,7 @@ export type ImageJobs = {
   running: number | null;
 };
 
-/** How a transcription ended (spec speech/02, ADR 0017's amendment of 2026-10-24): `ignis_speech_transcriptions_total`'s `outcome` label. */
+/** How a transcription ended (spec speech/02, ADR 0017): `ignis_speech_transcriptions_total`'s `outcome` label. */
 export const SPEECH_OUTCOMES = ["completed", "cancelled", "failed", "timed_out"] as const;
 export type SpeechOutcome = (typeof SPEECH_OUTCOMES)[number];
 
@@ -238,7 +238,7 @@ export const LOOP_OUTCOMES = ["rewound", "closed", "detected", "too_little_kept"
 export type LoopOutcome = (typeof LOOP_OUTCOMES)[number];
 
 /**
- * The loop guard's tallies (GitHub #330, ADR 0017's amendment): the requests
+ * The loop guard's tallies (GitHub #330, ADR 0017): the requests
  * it watched and those that looped, every loop by what it did about it, the
  * tokens its rewinds took back, and the lowest loop score each watched request
  * reached. The server writes the whole family at the first watched request,
@@ -261,7 +261,7 @@ export const STRUCTURED_TYPES = ["json_object", "json_schema", "tool"] as const;
 export type StructuredType = (typeof STRUCTURED_TYPES)[number];
 
 /**
- * Structured output (#593, ADR 0089, amending ADR 0017): the completed
+ * Structured output (#593, ADR 0089, ADR 0017): the completed
  * requests held to a grammar, the sampled tokens it rejected and the repairs
  * that answered them, by type, and how long a repair took. Absent until the
  * first such request ended, so null on a server that never served one.

@@ -3835,7 +3835,7 @@ async fn ask(
                         // Counted like any other decision and observing no
                         // answer mass, because it has none: its answer is a
                         // run of sampled tokens, not a restricted softmax
-                        // over one position (ADR 0017's row says so).
+                        // over one position (`Metrics::record_decision`).
                         metrics.record_decision(question.kind.primitive(), None);
                     }
                     constrained_answer_for(question, &drawn, pixels)

@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0017, ADR-0030, ADR-0104]
+amends: [ADR-0030, ADR-0104]
 ---
 
 # The 27B's DFlash2 verify round may carry lanes of both shapes, and a mixed round is held to its base round's numerical class

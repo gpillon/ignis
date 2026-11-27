@@ -92,11 +92,11 @@ Everything goes through one structured log on stdout, in the format
 ```
 
 - The scheduler counters are the DEBUG event `ignis.scheduler.interval`, emitted
-  whenever `waiting`, `running` or `kv_evictions` change
+  whenever `waiting`, `running`, `kv_used_pct` or `kv_evictions` change
   ([ADR 0025](../../adr/0025-scheduler-interval-as-a-log-event.md)):
 
 ```text
-2026-09-13T10:00:00.000Z DEBUG ignis.scheduler.interval - scheduler counters changed {tick=123, waiting=2, running=3, kv_evictions=1}
+2026-09-13T10:00:00.000Z DEBUG ignis.scheduler.interval - scheduler counters changed {tick=123, waiting=2, running=3, kv_used_pct=41, kv_evictions=1}
 ```
 
 - The VRAM layout decided at load is the `ignis.runtime.vram_plan` event.

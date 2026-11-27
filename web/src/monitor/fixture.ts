@@ -456,7 +456,7 @@ export const TOOL_CALL_EXPOSITION = `${IGNIS_EXPOSITION}${TOOL_CALL_FAMILIES}`;
 
 export const LOOP_GUARD_EXPOSITION = `${IGNIS_EXPOSITION}${LOOP_GUARD_FAMILIES}${THINKING_FORCED_CLOSES}`;
 
-// The speech families (spec speech/02, ADR 0017's amendment of 2026-10-24),
+// The speech families (spec speech/02, ADR 0017),
 // which the server renders from the first transcription (zeros included) and
 // only then. Five transcriptions on the CPU ended: four completed (80 s of
 // audio, a median wait of 2.5 s or so), one failed; one waits behind the one
