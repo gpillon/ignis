@@ -9,8 +9,8 @@ consumer card up, from one binary. It no longer serves one model to coding agent
 the image model, two speech models and a diarizer, and the Playground has views for more than the chat. The uses:
 
 - **coding**: decode speed, DFlash2 speculation, long contexts, reasoning that finishes;
-- **agentic work**: an agent and its subagents on lanes of their own at once, state reused across turns, tool calls,
-  the Responses API over a WebSocket;
+- **agentic work**: an agent and its subagents on lanes of their own at once, saturating the GPU in prefill and
+  decode, state reused across turns, tool calls, the Responses API over a WebSocket;
 - **a companion**: the utilities a person uses directly, each a view of the Playground over the same `/v1` routes a
   client calls. **Transcribe** writes a conversation down with its speakers, from the microphone, a call or a file,
   and the text model keeps its notes. **Decide** answers many questions over one piece of evidence. **Image** makes

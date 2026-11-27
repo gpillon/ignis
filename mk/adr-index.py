@@ -312,7 +312,7 @@ HISTORICAL = ("docs/findings/", "docs/specs/", "docs/archive/", "docs/user/chang
 FIXTURES = ("mk/adr-index.py", "mk/changelog-selftest.sh",
             "docs/site/src/plugins/relative-links.test.mjs")
 # A citation is "ADR 0029" or "ADR-0029", a list or a range after it ("ADRs
-# 0029, 0030 and 0045", "ADR 0015/0021", "ADRs 0001-0069": a range's two ends),
+# 0029, 0030 and 0045", "ADR 0029/0030", "ADRs 0001-0069": a range's two ends),
 # and a file of docs/adr/ by its path. Prose wraps, so a number may open the
 # next line behind a comment leader; a number there or further along a list is
 # read only with its leading zero, so a date or a size after a citation is not
