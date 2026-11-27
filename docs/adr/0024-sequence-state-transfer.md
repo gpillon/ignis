@@ -37,7 +37,8 @@ a visible omission rather than a silent one.
 - A retained checkpoint or prefix spills as the blob its sequence would have written, so it restores like any other.
 - Per-sequence state lives where these calls can reach it, in the pool: they take a pool and a sequence, never a
   model, so a section must be addressable from those two alone. The drafter's window is the sequence pool's for that
-  reason, and the MTP head's state travels as sections too (ADR 0095).
+  reason, and the MTP head's state travels as sections too, its snapshot point earned at a completed chunk boundary
+  and after a committed round, not inherited (ADR 0095).
 
 **Prefix reuse.**
 
