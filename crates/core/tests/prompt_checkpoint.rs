@@ -986,8 +986,8 @@ fn retained_then_hungry(prompt_reuse: bool) -> (Vec<SchedEvent>, Arc<MockCompute
 
 #[test]
 fn a_retained_entry_never_causes_an_admission_refusal_or_wait() {
-    // Retained state is the *first victim* on the device (ADR 0023 as amended
-    // by 0029): a live request that needs the pages takes them back before
+    // Retained state is the *first victim* on the device (ADR 0023):
+    // a live request that needs the pages takes them back before
     // admission considers freezing a protection or evicting anybody.
     //
     // The proof is a comparison, not an absolute: the same request, against

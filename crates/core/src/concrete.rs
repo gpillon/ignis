@@ -2048,7 +2048,7 @@ impl ConcreteScheduler {
     }
 
     /// Take retained pages back until `idx` can materialize, or until nothing
-    /// is retained (GitHub #186, ADR 0029/0023 as amended).
+    /// is retained (GitHub #186, ADRs 0029 and 0023).
     ///
     /// This is the **first victim** rule, and it runs *before* the eviction
     /// machinery is asked for anything: a bet is given up before any certain
@@ -5072,7 +5072,7 @@ impl Scheduler for ConcreteScheduler {
                     if self.outranked_by_a_moved_sequence(i) {
                         break;
                     }
-                    // GitHub #186 (ADR 0023 as amended by 0029): retained
+                    // GitHub #186 (ADR 0023): retained
                     // state is the first victim, so it goes back *before*
                     // anything else is considered. A live request never waits
                     // for a bet and is never refused because of one.

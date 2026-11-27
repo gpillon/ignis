@@ -30,7 +30,7 @@
 //!   request needing the pages ([`CheckpointPool::discard_victim`]), or
 //!   another publish or capture needing a slot: retained state is the first
 //!   victim on the device, always, and it never delays or refuses an
-//!   admission (ADR 0023 as amended by ADR 0029).
+//!   admission (ADR 0023).
 //! - **Entries are addressed by content, never by session.** The match is the
 //!   longest retained entry whose [`MatchKey`] — a hash chain over the token
 //!   ids, with each media item's identity mixed in (GitHub #189,
@@ -1020,7 +1020,7 @@ impl CheckpointPool {
     /// release its image and its shared-prefix claim. `None` when the pool is
     /// empty.
     ///
-    /// This is the **first victim** path (ADR 0023 as amended): a live request
+    /// This is the **first victim** path (ADR 0023): a live request
     /// that cannot materialize takes retained pages back before admission
     /// considers evicting anybody. Until #190, released means discarded —
     /// where it goes instead is [`TierList::below`]'s answer.

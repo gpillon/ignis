@@ -1,163 +1,61 @@
 ---
 status: accepted
-amended-by: [ADR-0029, ADR-0045]
 ---
 
-# ADR 0023 — one eviction priority across GPU residency and the host tier
+# One eviction priority across GPU residency and the host tier
 
-## Current decision
+What loses residency is decided by one priority model across the tiers, the device, KV-RAM and KV-disk, whose shared
+key is the request class, `Agent` before `Interactive`. Two independent policies, the admission machine's and a host
+tier with no notion of class, would let a request's class change meaning the moment its state crosses the PCIe bus:
+an accident of where the machinery was written, not a tier policy. A single ordering shared by every level was
+rejected, so it is one model and not one ordering. On the device something is being served, so the admission
+machinery's protection and entitlement (ADR 0004) must outrank class: a protected lane mid-stream is not a victim
+because its owner is an agent. Below the device nothing is being served, protection has no meaning, and class is
+the only thing left that says whose work costs most to lose. Eviction is reactive: it runs on the path where a need
+finds no room, never pre-emptively.
 
-One priority model across the tiers, its shared key the request class
-(`Agent` before `Interactive`). Eviction stays reactive, on the path where a
-need finds no room. ADR 0029, GitHub #190 and ADR 0045 amended the
-orderings; what leaves each tier today:
+**Retained state goes first, on the device and in the tiers below** (ADR 0029). Prompt checkpoints and retained
+prefixes are state no live request needs, and the loss is asymmetric: an evicted live sequence is work that will
+certainly be redone, a retained entry is a bet that it will be needed. On the device it never causes an admission
+refusal or a wait. A retained entry carries the class of the request that produced it.
 
-- **The card.** Retained state (prompt checkpoints, retained prefixes) goes
-  before any live sequence. It spills to KV-RAM, displacing there only
-  retained entries that rank below it, and the device discards it when even
-  those are not enough. A live sequence is then a victim only at a chunk or
-  round boundary, protection still ranking first. A lane shortage takes a
-  lane holder before a lane-less request, then follows this ADR's order:
-  class, least-recently-used, lane id. A page shortage moves only state that
-  ranks below its requester (class, then submission order): `Agent` before
-  `Interactive`, then what is not in the decode round before lane holders,
-  then the latest-submitted. A moved sequence goes to KV-RAM, else KV-disk.
-- **KV-RAM.** Retained entries before evicted live sequences, then class,
-  then probation before protected, then least-recently-used. An
-  `Interactive` entry idle past `--reuse-retained-interactive-ttl` (300 s)
-  ranks as an `Agent`'s probation entry. With KV-disk on (by default on
-  Flash-Next, not on the 27B), a live sequence leaving KV-RAM moves to the
-  disk, which follows KV-RAM's order, and is never discarded; without it, it
-  can still be discarded there.
+**What leaves the device.**
 
-Reservations do not grow: P0 picked ADR 0045's fixed branch
-([finding](../findings/2026-10-08-kv-page-growth-gate.md)), so the growth
-case the Status names never arises. One structured retention score in place
-of these orderings is still open (GitHub #199).
+- Retained state, before any live sequence is considered, prompt checkpoints before retained prefixes (ADR 0029). It
+  spills to KV-RAM, where a spill displaces only retained entries that rank strictly below it in KV-RAM's order and
+  never a live snapshot. When even all of those are not enough, nothing is discarded there and the device discards
+  the newcomer: the room is planned before anything goes, so a spill that fails costs no other entry.
+- Then a live sequence, eligible only at a chunk or round boundary, protection ranking first: protected lanes are
+  last. One that holds a shared prefix is a victim like any other, since its snapshot materializes the prefix's pages
+  (ADR 0024) and it resumes rather than re-prefilling.
+- A shortage of lanes takes a lane holder before a lane-less request, since moving a lane-less request frees no lane,
+  so a lane-less prefilling request is chosen only when every lane is protected. Then class, least recently used,
+  and the lane id as the last tie-break.
+- A shortage of pages (ADR 0045) moves only state that ranks below its requester, rank being class and then
+  submission order, the earlier above the later; never the requester, a sequence mid-transfer, or one the admission
+  machine protects, a protection donor or a lane reserved for an earlier `Interactive` request. Among those it may
+  move: `Agent` before `Interactive`, then sequences not in the decode round before lane holders, then the
+  latest-submitted, since every decode lane carries the same use tick and least recently used among them was only
+  the lane id. A moved sequence goes to KV-RAM, else to KV-disk.
 
-## History
+**What leaves KV-RAM.** Retained entries before evicted live sequences, then class, then probation before protected,
+then least recently used. An `Interactive` entry idle past `--reuse-retained-interactive-ttl` ranks as an `Agent`'s
+probation entry: class alone would let conversations nobody returns to hold KV-RAM against every subagent. `Agent`
+entries have no TTL.
 
-### Status
+**What leaves KV-disk** (ADR 0045). On a load with KV-disk, leaving KV-RAM is a move to the disk, a spill into the
+disk displaces only what ranks below it, and leaving the disk is a discard in KV-RAM's order. An evicted live
+sequence is then never discarded to make room, in KV-RAM or on the disk: only a failed read loses one. When no tier
+has room, the request that needed it waits. Without KV-disk, a live sequence in KV-RAM can still be discarded there
+for a newer victim, and re-prefills.
 
-Accepted (2026-09-11) — GitHub #65, phase 4. Spec:
-linked from the tickets of #65. Extends ADR 0004 (the
-full admission state machine in v1) to the tier below the GPU.
-Amended 2026-10-07 by ADR 0045: the priority reaches one tier further down.
-On a load with KV-disk, leaving KV-RAM is a move to the disk, and leaving the
-disk follows KV-RAM's order. An evicted live sequence is then never discarded
-to make room.
-Amended 2026-10-08 by ADR 0045 (live moves; reservations grow by pages if
-its P0 gate passes):
+## Consequences
 
-- **A page shortage takes what is not decoding first.** That covers an
-  admission, and on the growth branch a lane's growth. Sequences not in the decode round go before lane
-  holders, within a class. This reverses the #190 amendment's lane-holder-first
-  order for pages only. A lane shortage keeps it, since moving a lane-less
-  request frees no lane.
-- **A need moves only state that ranks below its requester.** Rank is class,
-  then submission order.
-- **For a page shortage, the latest-submitted goes first.** All decode lanes
-  carry the same use tick, so least-recently-used among them was only the
-  lane id.
-
-### Context
-
-Two eviction policies exist in the tree and were written years apart in spirit.
-`admission.rs` decides which resident lane is the better victim: request class
-first — `Agent` before `Interactive` — then least-recently-used within a class,
-then lane id as a tie-break (`retained_lane_is_better_victim`). `host.rs`
-decides what the host tier discards: probation before protected, then LRU, with
-no notion of class at all, because when it was written no request could state
-one.
-
-Phase 4 makes both policies real at once: the host tier starts holding actual
-device state (ADR 0024), and requests start declaring their class over HTTP. If
-the two policies stay independent, a request's class changes meaning the moment
-it crosses the PCIe bus — an `Interactive` snapshot would be discarded ahead of
-an `Agent` snapshot merely because the `Interactive` one landed in probation
-more recently. That is not a tier policy; it is an accident of where the
-machinery was written.
-
-A single ordering shared by both levels was considered and rejected. On the
-GPU, something is actively being served, so the admission machinery's
-protection and entitlement must outrank class: a protected lane mid-stream is
-not a victim because its owner is an agent. In the host tier nothing is being
-served, so protection has no meaning there, and class is the only thing left
-that says whose work costs most to lose.
-
-### Decision
-
-One priority model, expressed as two orderings that share a class definition.
-
-**GPU to host — what leaves the card:**
-
-1. eligibility and protection (a sequence is eligible only at a chunk boundary;
-   protected lanes are last)
-2. request class (`Agent` before `Interactive`)
-3. least-recently-used, with lane id as the final tie-break
-
-**Host to discard — what the tier drops or re-prefills:**
-
-1. request class (`Agent` before `Interactive`)
-2. probation before protected
-3. least-recently-used
-
-Eviction from the GPU runs on the admission-refusal path, not pre-emptively.
-When both tiers are full, admission refuses, as it does today.
-
-This ordering is expected to change as workloads teach us more; it is recorded
-here so that a change is a decision rather than a drift.
-
-### Consequences
-
-- `host.rs`'s two-tier machinery keeps its structure and gains the class it
-  never had. The probation and protected tiers become the *second* key, not the
-  first.
-- The policy is only as good as the class, so the class has to arrive from the
-  workload. That is the tagged-lanes work in the same phase; without it every
-  request is `Interactive` and both orderings collapse to their old behaviour,
-  which is a safe default rather than a broken one.
-- The asymmetry between the two levels is deliberate and has to be tested as
-  such. The case that proves it: an `Interactive` snapshot in probation
-  outliving an `Agent` snapshot in protected.
-- A third request class, if one is ever added, changes two orderings rather than
-  one.
-
-### Amendment (2026-09-16) — retained state goes first (ADR 0029)
-
-**Retained state** — prompt checkpoints and retained prefixes, which no live
-request needs — is placed ahead of both orderings.
-
-- **On the device**, retained state is released before any lane is
-  considered. It spills to KV-RAM if the budget can hold it, and is discarded
-  otherwise. It never causes an admission refusal or wait.
-- **In KV-RAM**, a new first key is added: retained entries before evicted
-  live sequences. Request class, probation before protected, and
-  least-recently-used then follow as above. A retained entry carries the
-  class of the request that produced it.
-
-The reason is asymmetry of loss. An evicted live sequence is work that will
-certainly be redone; a retained entry is a bet that it will be needed.
-
-### Amendment (2026-09-16) — spill admission and the Interactive TTL (#190)
-
-Owner decision, replacing "discarded otherwise" in the device bullet above.
-
-- **A spill displaces only what ranks below it.** When KV-RAM cannot hold a
-  checkpoint the device is giving up, retained entries ranking strictly below
-  the newcomer in KV-RAM's order may be discarded for it; if even all of those
-  are not enough, nothing is discarded and the device discards the newcomer.
-  The room is planned before anything goes, so a spill that fails costs no
-  other entry. Live snapshots are never displaced by a spill.
-- **An Interactive entry idle past a TTL ranks as an Agent's probation entry**
-  (`--retained-interactive-ttl`, default 300 s, a starting value). Class alone
-  would let conversations nobody returns to hold KV-RAM against every
-  subagent. Agent entries have no TTL yet.
-- **A live sequence holding a shared prefix is a victim like any other.** Its
-  snapshot materializes the prefix's pages (ADR 0024 as amended), so it
-  resumes rather than re-prefilling. A lane holder is still preferred over a
-  lane-less candidate, so a lane-less `Prefilling` request is now chosen only
-  when every lane is protected.
-
-A single structured retention score that would replace these orderings is
-#199.
+- The asymmetry between the device and the tiers below is deliberate and has to be tested as such. The case that
+  proves it: an `Interactive` snapshot in probation outlives an `Agent` snapshot in protected.
+- The policy is only as good as the class, so the class has to arrive from the workload. Where no request states
+  one, every request is `Interactive` and the orderings collapse to what they were before class: a safe default, not
+  a broken one.
+- A third request class, if one is ever added, changes two orderings rather than one.
+- The ordering is expected to change as workloads teach more, and it is recorded here so that a change is a decision
+  rather than a drift. One structured retention score in place of these orderings is open (#199).

@@ -1,6 +1,6 @@
 ---
 status: accepted
-amends: [ADR-0023, ADR-0024]
+amends: [ADR-0024]
 amended-by: [ADR-0045, ADR-0100]
 ---
 
