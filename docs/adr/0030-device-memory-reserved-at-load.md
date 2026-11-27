@@ -15,7 +15,7 @@ slows, erratically. The reference engine reserves everything once and forbids a 
   (`--vram-headroom-bytes`), or explicit (`--vram-budget-bytes`), never both. An explicit budget above free memory
   refuses the start unless `--vram-allow-oversubscription`, valid only beside an explicit budget, makes that a
   warning, which says the allocation will fail where the system cannot page device memory. A later load in the same
-  process, a model switch or the reload after an idle unload, adds back what the process already holds: the budget
+  process, a model switch or the reload after an idle unload, adds back what the process already holds: the derived budget
   still starts from what was free before the process held anything, so the CUDA context and the 27B's per-process
   state are not charged twice (ADR 0092 says where both figures come from).
 - **The plan is printed, and a plan that does not fit refuses the start.** The reservations are named lines in a
@@ -38,8 +38,9 @@ slows, erratically. The reference engine reserves everything once and forbids a 
 - **Retained state lives in retained slots** fixed at load, each a place for one mutable-state image the size of a
   lane's own state: the images of prompt checkpoints and of shared prefixes, whether retained, chained or still
   claimed. They are ADR 0029's device pool of retained images made physical, its semantics unchanged (first victim,
-  a full pool skips the capture). Device slots (`--reuse-retained-device`) are the plan's `retained_slots` line and
-  are handed out first; host slots (`--reuse-retained-host`) sit in one pinned host block reserved at load, whose
+  a full pool skips the capture). Device slots (`--reuse-retained-device`), which a load has only where a profile or
+  the operator names some, are the plan's `retained_slots` line and are handed out first; host slots
+  (`--reuse-retained-host`), a load's retained slots by default, sit in one pinned host block reserved at load, whose
   failed allocation refuses the start and which Windows counts as shared GPU memory, as it does the arena. When no
   slot is free, the lowest-ranked retained state gives its slot up, in ADR 0023's order, spilling to KV-RAM; when
   nothing can, the publish or capture is skipped and the request runs without leaving reuse behind. With prompt
@@ -85,7 +86,8 @@ slows, erratically. The reference engine reserves everything once and forbids a 
 - **What a load holds on the device is a line of the plan, whoever adds it**, 0 on a load without it: the hq
   residual window of every lane and device slot, the trellis body's workspace and its dense prefill buffer, the
   mixed rounds' graphs (ADR 0106), which the driver keeps after a teardown, so a reload adds that line back too,
-  and the vision embedding pool (ADR 0035), under the name, the place and the refusal rule of the one item's output
+  and the vision embedding pool (ADR 0035), in whole pages and sized by `--vision-embedding-pool-mib`, whose default
+  leaves the line what it was, under the name, the place and the refusal rule of the one item's output
   the `media_embedding` line once held: a pool the budget cannot hold fails the load by name.
 - **On Windows the W4A4 TMA products' descriptor slots are such a line, `tma_descriptors`.** There the NVFP4 body's
   products take their tensor maps through a pointer, and upstream's launchers allocated a device copy of them from
