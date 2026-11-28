@@ -26,7 +26,9 @@ instead.
   binding: #267's teacher-forced replay of recorded agent turns, tokens per round against the counterpart's, with the
   0.90 floor that earlier admissions held as binding.
 - **Loop rate.** On the loop set, one build, the same prompts and seeds, the artifact does not loop more than its
-  counterpart at a one-sided Fisher exact p below 0.05. It is the one leg that runs with the loop guard at its
+  counterpart at a one-sided Fisher exact p below 0.05. A request loops if the guard rewound it, if its
+  reasoning repeats a 6-gram, or if a window of it compresses, past the thresholds `docs/agents/testing/gate.md`
+  holds. It is the one leg that runs with the loop guard at its
   default, since a rewind is one of its calls.
 
 **The limits are the ones the repo has registered**, and the point estimate decides against them:
@@ -42,7 +44,8 @@ instead.
   most 0.5 points under it (`docs/agents/testing.md`, "The sm_86 gate").
 
 A change with no registered limit gets one in its spec before the run, approved by the owner. A failing leg stops the
-work, and the owner decides. What a spec measures besides, MMLU-Pro or a refusal A/B, is that spec's, not the gate.
+work, and the owner decides. The gate runs once at a phase's end, over the phase's changes together, and for a new
+artifact at its admission; a replacement held to its oracle's bytes re-runs none (ADR 0093). What a spec measures besides, MMLU-Pro or a refusal A/B, is that spec's, not the gate.
 Flash-Next keeps ADR 0043's gate against its checkpoint, of the same kind. The speech and image models keep the checks
 `docs/agents/testing/speech.md` and `docs/agents/testing/image-model.md` name.
 
@@ -51,7 +54,9 @@ independent launches per build, the server stopped and started again between the
 throughput band, which repetition inside a launch cannot cancel
 ([finding](../findings/2026-09-10-one-process-launch-picks-its-own-throughput-band.md),
 `docs/agents/testing/bench.md`). A spec that needs a speed floor states its cells and its floor, as ADR 0043 did for
-Flash-Next, and the owner approves it.
+Flash-Next, and the owner approves it. Any change to the hot path (code that runs per token, per layer or per kernel
+launch, in prefill or decode) is shown by measurement, before merge, not to slow prefill or decode, measured as a
+speed claim is; a floor holds only where a spec states it.
 
 ## Consequences
 

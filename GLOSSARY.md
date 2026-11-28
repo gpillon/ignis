@@ -1972,9 +1972,9 @@ logs, and spans (ADR 0012).
 Normal INFO operation must not emit one record per
 token/layer/kernel/allocation on the prefill/decode path; any logging or
 tracing change touching that path must be shown by measurement, before merge,
-not to regress prefill or decode speed, ignis against ignis as ADR 0082
-states for a speed claim (a branch against main, at least two launches per
-build), not just design review.
+not to regress prefill or decode speed, by ADR 0082's hot-path rule (ignis
+against ignis, a branch against main, at least two launches per build), not
+just design review.
 
 **Hotpath lint**:
 The grep-based, hand-maintained scan over a fixed list of
