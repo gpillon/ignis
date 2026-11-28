@@ -41,9 +41,11 @@ met in this order, each step only as far as the one before fell short:
 On an admission nothing is given up unless steps 2 to 4 together cover the
 need: otherwise no retained state or claim is given up and nothing moves,
 since what moved would only come back into the room it left. When they do,
-step 2 goes first, until the entry fits (`reclaim_retained`), and the test
-(`room_can_be_made`) reads the same arithmetic as `make_room` before anything
-is given up. A claim
+step 2 goes first, until the entry fits (`reclaim_retained`). The test
+(`room_can_be_made`) runs before anything is given up and counts all that
+would come back once steps 2 to 4 had all gone, the most step 2 and
+`make_room` can free, so an entry it turns away could not have entered in that
+advance. A claim
 that makes the room alone goes before anything moves. A shortage of lanes is a
 different path with its own order (`evict_one_victim`): there a lane holder
 goes before a lane-less request, since moving a lane-less request frees no

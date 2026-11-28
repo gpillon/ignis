@@ -186,6 +186,12 @@ impl Run {
         self.first(f).is_some()
     }
 
+    /// Where the first event `f` holds of is among the run's events: two
+    /// events of one advance come in the order they happened.
+    fn event_index(&self, f: impl Fn(&SchedEvent) -> bool) -> Option<usize> {
+        self.events.iter().position(|(_, e)| f(e))
+    }
+
     /// Any sequence leaving the device, to KV-RAM or to the disk.
     fn moved_any(&self) -> bool {
         self.has(|e| {
@@ -1130,15 +1136,12 @@ fn two_waiting_claims_that_free_a_block_only_together_both_go() {
 
 // ── GitHub #764: nothing is given up for an admission that waits anyway ─────
 
-/// Whether retained state left the device in the run: spilled to KV-RAM or
-/// discarded.
-fn gave_up_retained_state(run: &Run) -> Option<usize> {
-    run.events.iter().position(|(_, e)| {
-        matches!(
-            e,
-            SchedEvent::RetainedState { operation: RetainedStateOperation::Spill | RetainedStateOperation::Discard, .. }
-        )
-    })
+/// Retained state leaving the device: spilled to KV-RAM or discarded.
+fn retained_state_given_up(e: &SchedEvent) -> bool {
+    matches!(
+        e,
+        SchedEvent::RetainedState { operation: RetainedStateOperation::Spill | RetainedStateOperation::Discard, .. }
+    )
 }
 
 #[test]
@@ -1175,7 +1178,7 @@ fn an_admission_that_waits_anyway_leaves_the_retained_state_on_the_device() {
         }
         assert!(waited > 100, "KV-RAM {host}: E waited {waited} advances");
         run.to_idle();
-        assert_eq!(gave_up_retained_state(&run), None, "KV-RAM {host}: no retained state was spilled or discarded");
+        assert!(!run.has(retained_state_given_up), "KV-RAM {host}: no retained state was spilled or discarded");
         assert_eq!(run.sched.retained_tail_pages(), 1, "KV-RAM {host}: P's checkpoint is still on the device");
         assert!(!run.moved_any(), "KV-RAM {host}: nothing moved");
         for (r, max) in [(h, 604), (p, 300), (e, 476)] {
@@ -1204,7 +1207,7 @@ fn an_admission_that_fits_with_the_retained_state_takes_it_in_the_advance_it_arr
         let e = run.submit(live(10, 380), RequestClass::Agent); // 24 pages
         run.step();
         assert_eq!(run.state(e), Some(RequestState::Running), "KV-RAM {host}: E entered in the advance it arrived");
-        assert!(gave_up_retained_state(&run).is_some(), "KV-RAM {host}: the checkpoint went for it");
+        assert!(run.has(retained_state_given_up), "KV-RAM {host}: the checkpoint went for it");
         assert_eq!(run.sched.retained_tail_pages(), 0, "KV-RAM {host}: its tail page with it");
         run.to_idle();
         assert!(!run.moved_any(), "KV-RAM {host}: nothing moved");
@@ -1233,13 +1236,93 @@ fn an_admission_that_needs_the_retained_state_and_a_move_gives_up_the_retained_s
     let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
     run.step();
     assert_eq!(run.state(i), Some(RequestState::Running), "I entered in the advance it arrived");
-    let moved = run.events.iter().position(|(_, e)| matches!(e, SchedEvent::Evicted { request, .. } if *request == a));
-    let given_up = gave_up_retained_state(&run);
+    let moved = run.event_index(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a));
+    let given_up = run.event_index(retained_state_given_up);
     assert!(moved.is_some(), "A moved for I");
     assert!(given_up.is_some() && given_up < moved, "the checkpoint went before A moved");
     assert_eq!(run.sched.retained_tail_pages(), 0, "its tail page with it");
     run.to_idle();
     for (r, max) in [(a, 476), (p, 300), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn a_need_counts_the_block_a_victim_frees_once_the_retained_link_beside_it_goes() {
+    // P, an Interactive turn, is done and left its two-page system block as a
+    // retained prefix, the two-page link over it that its checkpoint stands
+    // on, and the checkpoint's tail page. V, an Agent opening with the block,
+    // claimed it and decodes on 47 pages of its own; 12 are free. I,
+    // Interactive, needs 63. The link and the tail page are retained state
+    // alone: 3 pages. Moving V frees its 47, and the block once the link
+    // over it has gone, since nothing but the block's retention holds it
+    // then: 12 + 3 + 47 + 2 = 64 cover I. Counted with the link still
+    // standing over the block, the block stays with it and 62 fall short.
+    // The retained state goes first, V moves, and I enters in the advance it
+    // arrives.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let p = run.submit(agent_turn_with_block(), RequestClass::Interactive);
+    run.until(|run| run.done(p));
+    assert_eq!(run.sched.prefix_pinned_pages(), 4, "P left its block and the link over it");
+    assert_eq!(run.sched.retained_tail_pages(), 1, "and its checkpoint's tail page");
+    let v = run.submit(block_then(800), RequestClass::Agent);
+    run.steps(2);
+    assert_eq!(run.sched.shared_prefix_of(v).map(|(_, tokens)| tokens), Some(32), "V stands on P's block");
+    assert_eq!(run.state(v), Some(RequestState::Running), "V decodes");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.step();
+    assert!(run.evicted(v), "V moved for I");
+    assert_eq!(run.state(i), Some(RequestState::Running), "I entered in the advance it arrived");
+    let moved = run.event_index(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == v));
+    let given_up = run.event_index(retained_state_given_up);
+    assert!(given_up.is_some() && given_up < moved, "the retained state went before V moved");
+    assert_eq!(run.sched.prefix_pinned_pages(), 0, "the block went too");
+    run.to_idle_within(3_000);
+    for (r, max) in [(p, 300), (v, 700), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+#[test]
+fn an_admission_that_retained_state_and_every_move_together_cannot_cover_gives_up_nothing() {
+    // P, an Interactive turn, is done and left its checkpoint on the device:
+    // 5 pages. J, Interactive, decodes on 20 pages and A, an Agent, on 30; 9
+    // are free. I, Interactive and after J, needs 45: the 9 free, the
+    // checkpoint's 5 and A's 30, all of them, fall short, and J outranks I.
+    // While J decodes nothing is given up and nothing moves. Once J is done
+    // the 29 free and the checkpoint fall short alone, so the checkpoint goes
+    // first, A moves, and I enters in the next advance.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+    run.until(|run| run.done(p));
+    assert_eq!(run.sched.retained_tail_pages(), 1, "P left its checkpoint");
+    let j = run.submit(live(600, 316), RequestClass::Interactive); // 20 pages
+    let a = run.submit(live(100, 476), RequestClass::Agent); // 30 pages
+    run.steps(2);
+    assert_eq!(run.state(a), Some(RequestState::Running), "A decodes beside J");
+
+    let i = run.submit(live(500, 716), RequestClass::Interactive); // 45 pages
+    while !run.done(j) {
+        run.step();
+        assert_eq!(run.state(i), Some(RequestState::Admitted), "I waits for J");
+        assert_eq!(run.sched.retained_tail_pages(), 1, "the checkpoint's tail page stays");
+        assert_eq!(run.sched.prefix_pinned_pages(), 4, "and so do the pages below it");
+    }
+    assert!(!run.has(retained_state_given_up), "no retained state was spilled or discarded while I waited");
+    assert!(!run.moved_any(), "and nothing moved");
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I entered in the advance after J's end");
+    assert!(run.evicted(a), "A moved for it");
+    let moved = run.event_index(|e| matches!(e, SchedEvent::Evicted { request, .. } if *request == a));
+    let given_up = run.event_index(retained_state_given_up);
+    assert!(given_up.is_some() && given_up < moved, "the checkpoint went before A moved");
+    run.to_idle();
+    for (r, max) in [(p, 300), (j, 316), (a, 476), (i, 716)] {
         assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }
     run.assert_no_work_lost();

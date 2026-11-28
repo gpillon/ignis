@@ -107,7 +107,8 @@ Retained state is always the first to go: on the device it never delays or
 refuses an admission, and in KV-RAM it is discarded before any evicted live
 sequence. It goes only for a request it lets in: one that has to wait anyway,
 behind work ranked above it, leaves it on the device for the requests that
-reuse it. On the device, prompt checkpoints go before retained prefixes, the
+reuse it (from 0.11.2; 0.11.1 gives it up even for a request that then
+waits). On the device, prompt checkpoints go before retained prefixes, the
 least recently used first within each: a checkpoint serves one conversation's
 next turn, a retained prefix every later request that opens with the same
 system block. State reaches KV-RAM lazily, only when the device is about to discard

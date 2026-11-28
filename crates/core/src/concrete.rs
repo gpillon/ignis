@@ -1279,9 +1279,19 @@ impl ConcreteScheduler {
     /// tail page of every device checkpoint no claimant at or above `rank` is
     /// about to be built from.
     fn pages_given_up_for(&self, rank: Rank) -> u32 {
+        self.pages_given_up_beside(rank, &[])
+    }
+
+    /// [`Self::pages_given_up_for`] with the live sequences `moved` off the
+    /// device too (GitHub #764): each lets go of the link it stands on, and a
+    /// link they all leave to retained state and the claims below `rank` goes
+    /// with them. Their own reservations are not counted here.
+    fn pages_given_up_beside(&self, rank: Rank, moved: &[&Request]) -> u32 {
         let claims = self.waiting_claims_below(rank);
         let tails = self.tail_pages_that_go(&self.claimed_device_checkpoints_but(&claims));
-        let links = self.prefix.links_let_go(|p| self.holders_let_go(p, &claims));
+        let links = self.prefix.links_let_go(|p| {
+            self.holders_let_go(p, &claims) + moved.iter().filter(|r| r.prefix_entry == Some(p)).count() as u32
+        });
         tails + links.into_iter().map(|p| self.prefix.pages_of(p)).sum::<u32>()
     }
 
@@ -3515,8 +3525,15 @@ impl ConcreteScheduler {
             if need_fits(self) {
                 return true;
             }
-            let given_up = self.room_given_up_for(rank);
-            if self.covers(needed, &given_up)
+            let given_up = AdmissionResources {
+                kv_pages: self.pages_given_up_for(rank),
+                ..AdmissionResources::default()
+            };
+            if self
+                .charged()
+                .add(needed)
+                .sub(&given_up)
+                .is_none_or(|after| after.fits(&self.capacity))
                 && self.reclaim_retained_until(need_fits, GiveUp::ClaimsBelow(rank), events)
             {
                 return true;
@@ -3527,7 +3544,39 @@ impl ConcreteScheduler {
             if self.moving_out() {
                 return false;
             }
-            let Some(victim) = self.victim_that_covers(requester, needed, &given_up) else {
+            let victims = page_shortage_victims(rank, &self.page_shortage_candidates(requester));
+            let victim_requests = || victims.iter().filter_map(|&id| self.requests.iter().find(|r| r.id == id));
+            let freed = victim_requests().fold(AdmissionResources::default(), |freed, r| {
+                freed.add(&AdmissionResources {
+                    kv_pages: r.resources.kv_pages,
+                    resident_slots: 1,
+                    ..AdmissionResources::default()
+                })
+            });
+            let covers = |freed: &AdmissionResources| {
+                self.charged()
+                    .add(needed)
+                    .sub(freed)
+                    .is_none_or(|after| after.fits(&self.capacity))
+            };
+            // Two victims standing on one link each see the other's reference,
+            // so neither counts it: the sum never counts a page twice, and it
+            // under-counts a link only a set of victims would free together.
+            // GitHub #445: the claims waiting below the requester let go beside
+            // retained state, and what they give up off the victims' chains
+            // counts too, as it comes back once the victims have gone.
+            let coverable = covers(&freed) || {
+                let claims = self.waiting_claims_below(rank);
+                covers(&freed.add(&AdmissionResources {
+                    kv_pages: victim_requests()
+                        .filter_map(|r| r.prefix_entry)
+                        .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.holders_let_go(p, &claims)))
+                        .sum::<u32>()
+                        + given_up.kv_pages,
+                    ..AdmissionResources::default()
+                }))
+            };
+            let Some(&victim) = victims.first().filter(|_| coverable) else {
                 return false;
             };
             if self.move_down(victim, events) != Moved::Now {
@@ -3539,78 +3588,38 @@ impl ConcreteScheduler {
         }
     }
 
-    /// Whether the room for `needed`, `requester`'s admission, can be made
-    /// now (GitHub #764, ADR 0045): out of free room, retained state and the
-    /// claims waiting below the requester together, or out of those and the
-    /// moves [`Self::make_room`] may make. The same arithmetic as
-    /// `make_room`'s, read before anything is given up, so retained state is
-    /// given up only for an admission it helps in. When this is false the
-    /// first-victim pass and `make_room` together could not have admitted the
-    /// requester in this advance either: it would only give up retained state
-    /// for nothing, every advance the requester waits.
+    /// Whether the room for `needed`, `requester`'s admission, can be made in
+    /// this advance (GitHub #764, ADR 0045), read before anything is given
+    /// up: everything that comes back once retained state, the claims waiting
+    /// below the requester and, while no move is under way, every live
+    /// sequence [`Self::make_room`] may move have all gone. That is the most
+    /// the first-victim pass and `make_room` can free, in whatever order they
+    /// go, so when it falls short the requester could not enter in this
+    /// advance and giving retained state up would buy nothing, every advance
+    /// it waits. It is a bound, not `make_room`'s own count: where it holds
+    /// and `make_room` still refuses (a link only a set of victims frees
+    /// together, a move that cannot start), retained state goes as before.
     fn room_can_be_made(&self, requester: usize, needed: &AdmissionResources) -> bool {
-        let given_up = self.room_given_up_for(Self::rank_of(&self.requests[requester]));
-        self.covers(needed, &given_up)
-            || (!self.moving_out() && self.victim_that_covers(requester, needed, &given_up).is_some())
-    }
-
-    /// The room that comes back for a need ranked `rank` once retained state
-    /// and the waiting claims below it are given up
-    /// ([`Self::pages_given_up_for`]): pages only.
-    fn room_given_up_for(&self, rank: Rank) -> AdmissionResources {
-        AdmissionResources {
-            kv_pages: self.pages_given_up_for(rank),
+        let rank = Self::rank_of(&self.requests[requester]);
+        // Spec vram-budget/03: one move at a time.
+        let victims: Vec<&Request> = if self.moving_out() {
+            Vec::new()
+        } else {
+            page_shortage_victims(rank, &self.page_shortage_candidates(requester))
+                .into_iter()
+                .filter_map(|id| self.requests.iter().find(|r| r.id == id))
+                .collect()
+        };
+        let freed = AdmissionResources {
+            kv_pages: self.pages_given_up_beside(rank, &victims)
+                + victims.iter().map(|r| r.resources.kv_pages).sum::<u32>(),
+            resident_slots: victims.len() as u32,
             ..AdmissionResources::default()
-        }
-    }
-
-    /// Whether `needed` fits beside what is charged once `freed` comes back.
-    fn covers(&self, needed: &AdmissionResources, freed: &AdmissionResources) -> bool {
+        };
         self.charged()
             .add(needed)
-            .sub(freed)
+            .sub(&freed)
             .is_none_or(|after| after.fits(&self.capacity))
-    }
-
-    /// The live sequence `requester`'s admission moves first for `needed`
-    /// (ADR 0045): the first of [`page_shortage_victims`], when those victims,
-    /// all of them moved, beside the room `given_up` returns, would make the
-    /// whole room. `None` when nothing may move, or all of it would fall
-    /// short.
-    fn victim_that_covers(
-        &self,
-        requester: usize,
-        needed: &AdmissionResources,
-        given_up: &AdmissionResources,
-    ) -> Option<RequestId> {
-        let rank = Self::rank_of(&self.requests[requester]);
-        let victims = page_shortage_victims(rank, &self.page_shortage_candidates(requester));
-        let victim_requests = || victims.iter().filter_map(|&id| self.requests.iter().find(|r| r.id == id));
-        let freed = victim_requests().fold(AdmissionResources::default(), |freed, r| {
-            freed.add(&AdmissionResources {
-                kv_pages: r.resources.kv_pages,
-                resident_slots: 1,
-                ..AdmissionResources::default()
-            })
-        });
-        // Two victims standing on one link each see the other's reference,
-        // so neither counts it: the sum never counts a page twice, and it
-        // under-counts a link only a set of victims would free together.
-        // GitHub #445: the claims waiting below the requester let go beside
-        // retained state, and what they give up off the victims' chains
-        // counts too, as it comes back once the victims have gone.
-        let coverable = self.covers(needed, &freed) || {
-            let claims = self.waiting_claims_below(rank);
-            self.covers(needed, &freed.add(&AdmissionResources {
-                kv_pages: victim_requests()
-                    .filter_map(|r| r.prefix_entry)
-                    .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.holders_let_go(p, &claims)))
-                    .sum::<u32>()
-                    + given_up.kv_pages,
-                ..AdmissionResources::default()
-            }))
-        };
-        victims.first().copied().filter(|_| coverable)
     }
 
     /// What is charged now, against [`Self::capacity`]: the lanes dealt, the
@@ -5135,8 +5144,8 @@ impl Scheduler for ConcreteScheduler {
                     // for a bet and is never refused because of one. GitHub
                     // #764 (ADR 0045): but only once free room, retained
                     // state, the claims waiting below `i` and the moves it may
-                    // make cover its need together; otherwise nothing is given
-                    // up.
+                    // make could cover its need together; otherwise nothing is
+                    // given up.
                     if !self.fits_for_materialization(&self.requests[i]) {
                         let needed = AdmissionResources {
                             lanes: 0,

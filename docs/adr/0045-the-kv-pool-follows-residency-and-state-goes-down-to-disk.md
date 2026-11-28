@@ -57,8 +57,8 @@ never waits for a file to commit. How the modules carry it out is in
   claimed; then a live sequence that ranks below the requester, moved down a tier, KV-RAM else KV-disk, at a round
   or chunk boundary, mid-generation if need be, and only when that makes the whole room. Retained state, the claims
   below the entry and, on an admission, the moves it may make must cover the need together; otherwise nothing is
-  given up, and when they do, retained state goes first. With nothing left the admission waits in the queue, no
-  lane ever parks, and every sequence on the device keeps decoding to its end: no
+  given up, and when they do, retained state goes first. With nothing left the
+  admission waits in the queue, no lane ever parks, and every sequence on the device keeps decoding to its end: no
   refusal, no 503, nothing discarded. The in-flight cap's 503 is unchanged: it concerns lanes, not tiers.
 - **The trigger is reactive** (ADR 0023) and an admission is the only one: a restore never moves anything.
 - **Rank gates the victim**: class first, `Interactive` above `Agent`, then submission order, and a moved sequence
