@@ -7,6 +7,8 @@ left the main branch on 2026-11-27 and are whole under the tag
 spec is a GitHub issue and its tickets are its sub-issues
 (`docs/agents/issue-tracker.md`).
 
+A comment's `spec <feature>/<nn>` names `docs/specs/<feature>/<nn>-*.md` at the tag.
+
 To open one, and to list them:
 
 ```sh

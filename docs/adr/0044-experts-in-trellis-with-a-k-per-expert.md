@@ -47,7 +47,9 @@ on every layer and the owner chose a rate allocated per expert
 - Allocation trades robustness on unseen languages for quality on calibrated ones, so the calibration corpus is part
   of the artifact's contract: a language that matters must be in it. The artifact records its corpus manifest and
   its K map.
-- A conversion that misses the study's quality has a fallback, a 3.0-bit average, which still fits RAM (45.3 GB
-  pinned).
+- The study's quality is the floor. A conversion below it is judged case by case and the owner decides: to serve it,
+  or to convert again, with the 3.0-bit average as the fallback that still fits RAM (45.3 GB pinned). The served
+  artifact is one point under the MMLU floor (70.11% against 71%, equal to its quantized reference) and is served at
+  2.5 bits by the owner's decision ([finding](../findings/2026-10-06-flash-next-on-the-5090.md)).
 - Updating the exllamav3 pin is a converter change, re-verified by the bit-exact decode test.
 - A uniform K remains expressible: one K for every expert is a degenerate map.

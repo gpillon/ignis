@@ -89,7 +89,7 @@ diagnosis; a false rewind found later reopens that default. The margins between 
 in-sample: a false rewind or a missed harmful loop found later reopens the defaults. A server built without a
 config (the in-process tests, the output-comparing GPU tests) runs the guard `off`, so no test meets a rewind it
 did not ask for. Output differs from the reference whenever the guard acts, so benches and gates set
-`loop_guard=off` explicitly.
+`loop_guard=off` explicitly, except the gate's loop-rate leg, which runs it at its default (ADR 0082).
 
 ## Considered Options
 

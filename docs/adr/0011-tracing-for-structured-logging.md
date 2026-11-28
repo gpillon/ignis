@@ -21,8 +21,8 @@ the server already depends on, so the HTTP root span comes for free.
 - **A logging change that touches the emission of `ignis.prefill.*`, `ignis.decode.*` or `ignis.cuda.graph.*` events
   must be shown by measurement, before merge, not to regress prefill or decode speed**, as an explicit condition of
   the merge and not by code review alone, in every phase of the logging work that touches the prefill, decode or CUDA
-  graph path: ignis against ignis, as ADR 0082 states for a speed claim (a branch against main, at least two launches
-  per build), where the 99% performance gate against the reference (ADR 0007) stood when this was decided. The design
+  graph path: ADR 0082's hot-path rule, ignis against ignis as for a speed claim (a branch against main, at least two
+  launches per build). The design
   intent, no per-token, per-layer or per-kernel INFO log, is necessary but not sufficient proof of no regression.
 - **`crates/logging` owns the subscriber setup, the JSON and pretty layers and the resolution of the log format and
   level.** Every other crate depends on it for macros and init only, never the reverse. It is named `logging`, not

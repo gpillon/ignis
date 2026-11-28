@@ -36,8 +36,8 @@ and its start-time behaviour stand.
   the header verifies (ADR 0064). What an entry states of the cards it loads on, and the other ids it answers to
   there (its aliases), is ADR 0064's and ADR 0079's.
 - **`ignis-server model download` and `model list`** share the catalog and the transfer with the start-time fetch.
-  The download is an explicit yes: it asks nothing, ignores `download.enabled`, which gates only the implicit
-  start-time fetch, and runs on a build without `cuda`. The gate ADR 0033 put on the start path keeps CI off the
+  The download is an explicit yes: it asks nothing, ignores `download.enabled`, which gates the implicit
+  start-time fetch and the server's own downloads (ADR 0071), and runs on a build without `cuda`. The gate ADR 0033 put on the start path keeps CI off the
   network by construction, and a typed command cannot fire by accident.
 - **A catalog entry already on disk is a known model.** Its id joins the switch's known models, an explicit
   `switch.known_models` entry winning, so a `model download` is enough for a running server to switch to it. A

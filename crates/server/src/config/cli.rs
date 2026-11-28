@@ -263,8 +263,8 @@ pub(super) fn model(args: &[String], env: &dyn Fn(&str) -> Option<String>, files
 /// entry, every entry with `--all`, or the configured `model.id` with
 /// neither, into `--out` or `download.path`, from `download.endpoint` with
 /// the token [`download::bearer_token`] picks. The ids may stand anywhere
-/// among the flags. `download.enabled` is not read: it gates only the start's own
-/// fetch, and this command is the operator's explicit yes.
+/// among the flags. `download.enabled` is not read: it gates the start's own
+/// fetch and the server's own downloads, and this command is the operator's explicit yes.
 fn model_download(args: &mut Vec<String>, env: &dyn Fn(&str) -> Option<String>, files: &dyn Files, card: &dyn Fn() -> Card) -> Result<ConfigOutcome, ConfigError> {
     let all = take_switch(args, "--all");
     let out = take_value(args, "--out")?.map(PathBuf::from);
