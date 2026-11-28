@@ -265,10 +265,16 @@ pub const NONE_PROFILE: &str = "none";
 /// 20 GiB.
 /// Derived, not measured: no 16 GB card exists in the project. It serves the 27B
 /// (the 16 GB catalog entry) at the 262,144 positions it was trained on, with
-/// DFlash2 at 7 tokens, as every other profile but `rtx5090`, and vision on, explicit
+/// DFlash2 at 7 tokens, as every other profile but `rtx5090` (to be tuned on
+/// a real card: speculation yields less on a compute-poor card), and vision
+/// on, explicit
 /// (ADR 0063, ADR 0075): at a 4,096-token envelope, an item bound
 /// of about 2,048 x 2,048 pixels, and residency `host`, written out so the
-/// profile table shows it. The tower sits in pinned host RAM and the pool is
+/// profile table shows it. The envelope is no larger because encoding an item
+/// at that bound, with the ring, needs 302.4 MB of prefill scratch: the
+/// default scratch is 395,898,880 bytes, and the smallest seen, at a
+/// 65,536-token context and one lane (GitHub #360), is 303,619,584 bytes, so
+/// it fits by about 1 MB. The tower sits in pinned host RAM and the pool is
 /// host-mapped, so a load with no image in flight keeps the text-only KV pool
 /// (7,956 pages at 1,024 and at 4,096, measured on the 5090 on a 16 GB budget).
 /// A reporter's RTX 5060 Ti under Linux (GitHub #407, #360), with the tower

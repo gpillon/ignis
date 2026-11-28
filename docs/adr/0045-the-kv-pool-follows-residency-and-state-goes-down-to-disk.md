@@ -55,7 +55,10 @@ never waits for a file to commit. How the modules carry it out is in
 
 - **A need is met in order**: free pages; retained state on the device; what requests waiting below the entry
   claimed; then a live sequence that ranks below the requester, moved down a tier, KV-RAM else KV-disk, at a round
-  or chunk boundary, mid-generation if need be, and only when that makes the whole room. With nothing left the
+  or chunk boundary, mid-generation if need be, and only when that makes the whole room. Retained state, the claims
+  below the entry and, on an admission, the moves it may make must cover the need together; otherwise nothing is
+  given up, and when they do, retained state goes first. The code does not hold this yet: it gives up retained
+  state before the test (#764). With nothing left the
   admission waits in the queue, no lane ever parks, and every sequence on the device keeps decoding to its end: no
   refusal, no 503, nothing discarded. The in-flight cap's 503 is unchanged: it concerns lanes, not tiers.
 - **The trigger is reactive** (ADR 0023) and an admission is the only one: a restore never moves anything.
@@ -89,8 +92,9 @@ never waits for a file to commit. How the modules carry it out is in
 - **No lost work.** With the tier on, an evicted live sequence is never discarded to make room, in KV-RAM or on
   disk; only a failed read loses one. When no tier has room the request waits and no victim is taken. Without the
   tier the 27B keeps its earlier guarantee, no stronger: KV-RAM still discards a live blob to take a newer victim.
-- **The eviction priority goes one tier down** (ADR 0023): leaving KV-RAM, on a load with the tier, is a move to
-  KV-disk, leaving KV-disk is a discard in the same order, and a spill displaces only what ranks below it.
+- **The eviction priority goes one tier down** (ADR 0023): on a load with the tier, a checkpoint leaving KV-RAM moves
+  to KV-disk and a retained prefix leaving it is discarded, leaving KV-disk is a discard in the same order, and a
+  spill displaces only what ranks below it.
 - **Lazy**: a blob reaches disk only when the tier above gives it up, never as a copy of state still resident.
 - **The budget is a ceiling, not a reservation**: nothing is preallocated, and a write that would cross the
   volume's margin, or that fails, is refused with the blob left where it was. The tier never refuses a start: it
