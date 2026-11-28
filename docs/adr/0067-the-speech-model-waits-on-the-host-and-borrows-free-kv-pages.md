@@ -26,7 +26,8 @@ speech model on the host. ADR 0050's "one model at a time" still holds between t
   compute worker: Realtime sessions go first, batch requests fill the gaps, and past a limit of open sessions or of
   waiting requests (config fields) a request gets `503` with `Retry-After`.
 
-**The GPU is borrowed, and only from the KV pool's free pages.** On a signal (a Realtime session opening, a mic
+**The GPU is borrowed, and only from the KV pool's free pages.** The loan is decided, not built: phase 3, #356,
+parked. Until then every transcription runs on the CPU and the `speech.loan_*` fields are not read. On a signal (a Realtime session opening, a mic
 press, a batch request), the speech model asks the text model's KV pool for free pages. It reserves them as a
 sequence would, and its weights, its own KV and its workspace live on them. The loan reserves within the planned
 pool, so ADR 0030 holds: nothing is allocated on the device while serving. The weights it uploads are the same GGUF

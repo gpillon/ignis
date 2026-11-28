@@ -36,8 +36,8 @@ claim that is not a manifest entry is not a port claim.
 An adapted op is our code containing parts copied from a named upstream: ours
 to change, no parity claim, tested against our own fp64 references. Each file
 header names the upstream repo, commit, path and licence; this section lists
-the same. Only MIT, BSD or Apache-2.0 code is copied (never CUTLASS 3.x, never
-FlashInfer's `csrc/fmha_v2`).
+the same. The kernel copies MIT, BSD or Apache-2.0 code, among the licences ADR
+0051 allows (never CUTLASS 3.x, never FlashInfer's `csrc/fmha_v2`).
 
 ### `kernel/src/image/attn8.cu` (spec image-model/02 acceptance 4, GitHub #319)
 The image model's 8-bit DiT attention kernel (`ignis_image_attn`).

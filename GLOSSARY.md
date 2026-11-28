@@ -27,13 +27,13 @@ of the vendored ops. Ours, not vendored (ADR 0009).
 
 **Vendored op**:
 An operator copied *verbatim* from a named upstream (the reference, or a third
-party under MIT, BSD or Apache-2.0: ADR 0051) and tracked by a manifest (pinned
+party under MIT, BSD, Apache-2.0 or MIT-CMU (HPND): ADR 0051) and tracked by a manifest (pinned
 commit, content hashes, recorded patches). Anything hand-written is not one,
 and carries no port claim (ADR 0010).
 
 **Adapted op**:
 Our own operator that contains parts copied from a named upstream under MIT,
-BSD or Apache-2.0, with its repo, commit, path and licence in the file header
+BSD, Apache-2.0 or MIT-CMU (HPND), with its repo, commit, path and licence in the file header
 and in `kernel/NOTICE`. Ours to change; no parity claim (ADR 0051).
 _Avoid_: port, vendored (for an adapted op).
 
@@ -1526,6 +1526,20 @@ index and the sampler's key.
 One question put to the model about supplied evidence, whose answer is a
 distribution over a declared set of options rather than generated text. It is
 the unit a decision request is made of: one evidence, many decisions.
+
+**noul**:
+A **decision** answered yes or no, as the probability of yes, by a **readout**
+at one position. Imported: the decision API whose wire shape `/v1/decide`
+copies names it, and it is spelled that API's way (ADR 0034).
+
+**criteria**:
+A question's options: a `choice`'s options with their descriptions, in the
+order declared, a `score`'s ordered levels, or a `noul`'s two descriptions.
+Imported from the same decision API (ADR 0034).
+
+**instructions**:
+A question's text: what the model is asked to decide about the evidence.
+Imported from the same decision API (ADR 0034).
 
 **Readout**:
 Reading the logits of named tokens at one position instead of sampling a token

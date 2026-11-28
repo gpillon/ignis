@@ -84,5 +84,6 @@ decides, with a reading per kind of text, and the vote stays as the other method
 - `ignis_locates_total`, by kind, method, compression and found, joins the metrics contract (ADR 0017).
 - The acceptance on registered sets is partial
   ([finding](../findings/2026-09-28-locate-shortlist-acceptance-partial.md)): every rule judged on the runs made
-  holds but the one on `auto`, which misread one window before the fold's rule was corrected, and the runs not made
-  are a verification still to make.
+  holds but the one on `auto`, which misread one window before the fold's rule was corrected. Accepted on the
+  partial acceptance (owner, 2026-11-08, #544). The runs not made are owed in #462, R3's Apache and Proxifier
+  windows under the corrected fold first.

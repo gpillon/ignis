@@ -16,6 +16,9 @@ downloads: a start that blocks forever on a question nobody will answer is worse
   always has. A typo must stay a typo rather than become a download fetched somewhere else.
 - **Only on a build with `cuda`.** A binary that cannot run the weights has no use for them. This, not a
   remembered flag, is what keeps the mock, the tests and every CPU CI job off the network.
+- **An off switch.** `download.enabled` false turns the start-time fetch off: the machine that must never spend
+  the bandwidth says so, and a missing model then starts on the placeholder, as a
+  build without `cuda` does.
 - **A flat destination**: the repo's file names under the download path, exactly what a download from the hub by
   hand produces, so a model fetched by hand and one fetched by the server are the same file, and a machine that
   already has it downloads nothing.

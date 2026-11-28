@@ -35,7 +35,8 @@ knob. A switch carried the 27B's arena size to Flash-Next's host plan and was re
   the diarizer, loaded beside it, are slots of their own. So a field only the diarizer takes is judged against the
   diarizer, never against the active text model: a 27B start that sets one is not refused.
 - **A value both models take is not one family's field.** `--spec-backend mtp` is both models' value, since the 27B
-  drafts with its MTP head too (ADR 0095), so a switch to the 27B keeps an MTP setting instead of dropping it. A
+  drafts with its MTP head too (ADR 0095), so a switch to the 27B keeps an MTP setting instead of dropping it. DFlash2 is the 27B's
+  alone: named for Flash-Next it is refused at the start and dropped on a switch to Flash-Next. A
   rule only the loading model decides runs where the configuration is fitted to it, never where every model's
   values are validated, or a value for one would refuse a start of the other.
 - **Validators are a small typed set** (a numeric range, a nonzero multiple of a step, one of a set of spellings),

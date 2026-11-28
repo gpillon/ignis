@@ -6,7 +6,8 @@
 //! discovery, `--config`, the environment and the field flags all apply —
 //! and handed to `main` as a [`ModelCommand`], which [`run`] carries out.
 //! Nothing here asks: a typed command is the operator's yes, so it ignores
-//! `download.enabled`, which gates only the implicit start-time fetch. And
+//! `download.enabled`, which gates the implicit start-time fetch and the
+//! server's own downloads. And
 //! nothing here needs `cuda`: any machine can fetch the files an air-gapped
 //! one is carried.
 //!
