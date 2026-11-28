@@ -3592,11 +3592,13 @@ impl ConcreteScheduler {
     /// this advance (GitHub #764, ADR 0045), read before anything is given
     /// up: everything that comes back once retained state, the claims waiting
     /// below the requester and, while no move is under way, every live
-    /// sequence [`Self::make_room`] may move have all gone. That is the most
-    /// the first-victim pass and `make_room` can free, in whatever order they
-    /// go, so when it falls short the requester could not enter in this
-    /// advance and giving retained state up would buy nothing, every advance
-    /// it waits. It is a bound, not `make_room`'s own count: where it holds
+    /// sequence [`Self::make_room`] may move have all gone. Every way the
+    /// requester enters in this advance needs that room: the first-victim pass
+    /// alone, the claims below beside it, or a first move, which `make_room`
+    /// makes only when the victims it sees then would cover the need. So when
+    /// it falls short the requester could not enter in this advance, and
+    /// giving retained state up would buy nothing, every advance it waits. It
+    /// is a bound, not `make_room`'s own count: where it holds
     /// and `make_room` still refuses (a link only a set of victims frees
     /// together, a move that cannot start), retained state goes as before.
     fn room_can_be_made(&self, requester: usize, needed: &AdmissionResources) -> bool {
