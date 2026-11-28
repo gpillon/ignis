@@ -50,7 +50,7 @@ which trace a given verdict replayed.
 5. **The `gate` report** (the 99% threshold **and** the self-consistency
    check, ADR 0007's correctness check; it decides no gate since ADR 0082):
    `ignis-bench gate --ours bench/traces/<load>-ignis.json --ref bench/traces/<load>-ninfer.json --canary bench/traces/<load>-canary.json --out bench/traces/<load>-v1-gate.json`
-   — exits 0 only when the v1 verdict passes (≥ 99% of the reference's
+   — exits 0 only when the v1 verdict (a detector, no gate) passes (≥ 99% of the reference's
    speed per class **and** self-consistent canaries). A performance-only
    comparison (no canary section) is `ignis-bench report`.
 
