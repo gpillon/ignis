@@ -145,7 +145,7 @@ impl Verdict {
     /// The terminal rendering: one line per cell, then the verdict.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("G3 gate check  session={}\n", self.session));
+        out.push_str(&format!("G3 detector check  session={}\n", self.session));
         out.push_str(&format!(
             "  {} ({}) profile={} date={}\n",
             self.ours_label, self.ours_engine, self.ours_profile, self.ours_date

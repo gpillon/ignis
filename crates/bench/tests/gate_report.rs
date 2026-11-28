@@ -70,7 +70,7 @@ fn divergent_canaries() -> Vec<CanaryResult> {
 
 /// Load `ours` / `reference` / the canary results from JSON, exactly as the
 /// `gate` subcommand does (the `replay --out` / `canary --out` files). The
-/// v1 verdict is the *conjunction* of the performance gate and the
+/// v1 verdict is the *conjunction* of the performance threshold and the
 /// self-consistency check (spec 02), so the canary file is always present.
 fn load_shipped(ours: &Run, reference: &Run, canary: &[CanaryResult]) -> GateReport {
     let ours_json = serde_json::to_string_pretty(ours).expect("serialize ours");
