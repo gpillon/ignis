@@ -2074,6 +2074,8 @@ impl ConcreteScheduler {
     /// machinery is asked for anything: a bet is given up before any certain
     /// work is disturbed, so a retained entry can never cause a live request
     /// to be refused, evicted or made to wait. Returns whether `idx` fits now.
+    /// The admission asks [`Self::room_can_be_made`] first (GitHub #764): an
+    /// entry that would wait anyway gives nothing up.
     fn reclaim_retained(&mut self, idx: usize, events: &mut Vec<SchedEvent>) -> bool {
         self.reclaim_retained_until(|s| s.fits_for_materialization(&s.requests[idx]), GiveUp::RetainedState, events)
     }
@@ -3513,15 +3515,8 @@ impl ConcreteScheduler {
             if need_fits(self) {
                 return true;
             }
-            let given_up = AdmissionResources {
-                kv_pages: self.pages_given_up_for(rank),
-                ..AdmissionResources::default()
-            };
-            if self
-                .charged()
-                .add(needed)
-                .sub(&given_up)
-                .is_none_or(|after| after.fits(&self.capacity))
+            let given_up = self.room_given_up_for(rank);
+            if self.covers(needed, &given_up)
                 && self.reclaim_retained_until(need_fits, GiveUp::ClaimsBelow(rank), events)
             {
                 return true;
@@ -3532,39 +3527,7 @@ impl ConcreteScheduler {
             if self.moving_out() {
                 return false;
             }
-            let victims = page_shortage_victims(rank, &self.page_shortage_candidates(requester));
-            let victim_requests = || victims.iter().filter_map(|&id| self.requests.iter().find(|r| r.id == id));
-            let freed = victim_requests().fold(AdmissionResources::default(), |freed, r| {
-                freed.add(&AdmissionResources {
-                    kv_pages: r.resources.kv_pages,
-                    resident_slots: 1,
-                    ..AdmissionResources::default()
-                })
-            });
-            let covers = |freed: &AdmissionResources| {
-                self.charged()
-                    .add(needed)
-                    .sub(freed)
-                    .is_none_or(|after| after.fits(&self.capacity))
-            };
-            // Two victims standing on one link each see the other's reference,
-            // so neither counts it: the sum never counts a page twice, and it
-            // under-counts a link only a set of victims would free together.
-            // GitHub #445: the claims waiting below the requester let go beside
-            // retained state, and what they give up off the victims' chains
-            // counts too, as it comes back once the victims have gone.
-            let coverable = covers(&freed) || {
-                let claims = self.waiting_claims_below(rank);
-                covers(&freed.add(&AdmissionResources {
-                    kv_pages: victim_requests()
-                        .filter_map(|r| r.prefix_entry)
-                        .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.holders_let_go(p, &claims)))
-                        .sum::<u32>()
-                        + given_up.kv_pages,
-                    ..AdmissionResources::default()
-                }))
-            };
-            let Some(&victim) = victims.first().filter(|_| coverable) else {
+            let Some(victim) = self.victim_that_covers(requester, needed, &given_up) else {
                 return false;
             };
             if self.move_down(victim, events) != Moved::Now {
@@ -3574,6 +3537,80 @@ impl ConcreteScheduler {
             // state now, given up first as ever (ADR 0029).
             self.reclaim_retained_until(need_fits, GiveUp::RetainedState, events);
         }
+    }
+
+    /// Whether the room for `needed`, `requester`'s admission, can be made
+    /// now (GitHub #764, ADR 0045): out of free room, retained state and the
+    /// claims waiting below the requester together, or out of those and the
+    /// moves [`Self::make_room`] may make. The same arithmetic as
+    /// `make_room`'s, read before anything is given up, so retained state is
+    /// given up only for an admission it helps in. When this is false the
+    /// first-victim pass and `make_room` together could not have admitted the
+    /// requester in this advance either: it would only give up retained state
+    /// for nothing, every advance the requester waits.
+    fn room_can_be_made(&self, requester: usize, needed: &AdmissionResources) -> bool {
+        let given_up = self.room_given_up_for(Self::rank_of(&self.requests[requester]));
+        self.covers(needed, &given_up)
+            || (!self.moving_out() && self.victim_that_covers(requester, needed, &given_up).is_some())
+    }
+
+    /// The room that comes back for a need ranked `rank` once retained state
+    /// and the waiting claims below it are given up
+    /// ([`Self::pages_given_up_for`]): pages only.
+    fn room_given_up_for(&self, rank: Rank) -> AdmissionResources {
+        AdmissionResources {
+            kv_pages: self.pages_given_up_for(rank),
+            ..AdmissionResources::default()
+        }
+    }
+
+    /// Whether `needed` fits beside what is charged once `freed` comes back.
+    fn covers(&self, needed: &AdmissionResources, freed: &AdmissionResources) -> bool {
+        self.charged()
+            .add(needed)
+            .sub(freed)
+            .is_none_or(|after| after.fits(&self.capacity))
+    }
+
+    /// The live sequence `requester`'s admission moves first for `needed`
+    /// (ADR 0045): the first of [`page_shortage_victims`], when those victims,
+    /// all of them moved, beside the room `given_up` returns, would make the
+    /// whole room. `None` when nothing may move, or all of it would fall
+    /// short.
+    fn victim_that_covers(
+        &self,
+        requester: usize,
+        needed: &AdmissionResources,
+        given_up: &AdmissionResources,
+    ) -> Option<RequestId> {
+        let rank = Self::rank_of(&self.requests[requester]);
+        let victims = page_shortage_victims(rank, &self.page_shortage_candidates(requester));
+        let victim_requests = || victims.iter().filter_map(|&id| self.requests.iter().find(|r| r.id == id));
+        let freed = victim_requests().fold(AdmissionResources::default(), |freed, r| {
+            freed.add(&AdmissionResources {
+                kv_pages: r.resources.kv_pages,
+                resident_slots: 1,
+                ..AdmissionResources::default()
+            })
+        });
+        // Two victims standing on one link each see the other's reference,
+        // so neither counts it: the sum never counts a page twice, and it
+        // under-counts a link only a set of victims would free together.
+        // GitHub #445: the claims waiting below the requester let go beside
+        // retained state, and what they give up off the victims' chains
+        // counts too, as it comes back once the victims have gone.
+        let coverable = self.covers(needed, &freed) || {
+            let claims = self.waiting_claims_below(rank);
+            self.covers(needed, &freed.add(&AdmissionResources {
+                kv_pages: victim_requests()
+                    .filter_map(|r| r.prefix_entry)
+                    .map(|entry| self.prefix.pages_a_holder_frees(entry, |p| self.holders_let_go(p, &claims)))
+                    .sum::<u32>()
+                    + given_up.kv_pages,
+                ..AdmissionResources::default()
+            }))
+        };
+        victims.first().copied().filter(|_| coverable)
     }
 
     /// What is charged now, against [`Self::capacity`]: the lanes dealt, the
@@ -5095,10 +5132,11 @@ impl Scheduler for ConcreteScheduler {
                     // GitHub #186 (ADR 0023): retained
                     // state is the first victim, so it goes back *before*
                     // anything else is considered. A live request never waits
-                    // for a bet and is never refused because of one.
-                    if !self.fits_for_materialization(&self.requests[i]) {
-                        self.reclaim_retained(i, &mut events);
-                    }
+                    // for a bet and is never refused because of one. GitHub
+                    // #764 (ADR 0045): but only once free room, retained
+                    // state, the claims waiting below `i` and the moves it may
+                    // make cover its need together; otherwise nothing is given
+                    // up.
                     if !self.fits_for_materialization(&self.requests[i]) {
                         let needed = AdmissionResources {
                             lanes: 0,
@@ -5106,7 +5144,13 @@ impl Scheduler for ConcreteScheduler {
                             backend_pages: 0,
                             resident_slots: 1,
                         };
-                        if !self.make_room(i, &needed, &mut events) {
+                        if !self.room_can_be_made(i, &needed) {
+                            break;
+                        }
+                        self.reclaim_retained(i, &mut events);
+                        if !self.fits_for_materialization(&self.requests[i])
+                            && !self.make_room(i, &needed, &mut events)
+                        {
                             // No room, and none could be made: stop the
                             // batch here — `i` (and anything sorted after
                             // it) waits for a later tick.

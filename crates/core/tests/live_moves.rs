@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ignis_core::checkpoint::ReuseSource;
+use ignis_core::checkpoint::{RetainedStateOperation, ReuseSource};
 use ignis_core::disk::disk_file_bytes;
 use ignis_core::scheduler::{DiskBlob, DiskSource};
 use ignis_core::types::{DecodeParams, RequestClass, RequestId, RequestInput, RequestState, SchedEvent};
@@ -1123,6 +1123,123 @@ fn two_waiting_claims_that_free_a_block_only_together_both_go() {
     assert_eq!(run.sched.prefix_pinned_pages(), 0, "and the block with them");
     run.to_idle_within(3_000);
     for (r, max) in [(a, 300), (j1, 700), (j2, 700), (i, 1000)] {
+        assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
+    }
+    run.assert_no_work_lost();
+}
+
+// ── GitHub #764: nothing is given up for an admission that waits anyway ─────
+
+/// Whether retained state left the device in the run: spilled to KV-RAM or
+/// discarded.
+fn gave_up_retained_state(run: &Run) -> Option<usize> {
+    run.events.iter().position(|(_, e)| {
+        matches!(
+            e,
+            SchedEvent::RetainedState { operation: RetainedStateOperation::Spill | RetainedStateOperation::Discard, .. }
+        )
+    })
+}
+
+#[test]
+fn an_admission_that_waits_anyway_leaves_the_retained_state_on_the_device() {
+    // H, Interactive, decodes on 38 pages to its end. P, an Interactive turn,
+    // is done and left its checkpoint on the device: the four pages below its
+    // opener and its tail page. E, an Agent with nothing to reuse, needs 30
+    // pages: the 21 free and the checkpoint's 5 fall short, and H outranks E,
+    // so no move can make the rest. E waits for H, and the checkpoint stays
+    // on the device all the while: giving it up would buy E nothing. Once H
+    // is done E fits in the free pages alone. Before #764 the checkpoint went
+    // in E's first advance, spilled to KV-RAM when there is one and discarded
+    // when there is none.
+    for host in [4, 0] {
+        let compute = Arc::new(MockCompute::new());
+        let mut run = Run::new(ConcreteScheduler::with_config(
+            SchedulerConfig { host_capacity_bytes: host, ..reuse_pool() },
+            compute.clone(),
+        ));
+        let h = run.submit(live(600, 604), RequestClass::Interactive); // 38 pages
+        let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+        run.until(|run| run.done(p));
+        assert_eq!(run.sched.retained_tail_pages(), 1, "KV-RAM {host}: P left its checkpoint's tail page");
+        assert_eq!(run.sched.prefix_pinned_pages(), 4, "KV-RAM {host}: and the four pages below its opener");
+
+        let e = run.submit(live(10, 476), RequestClass::Agent); // 30 pages
+        let mut waited = 0;
+        while !run.done(h) {
+            run.step();
+            assert_eq!(run.state(e), Some(RequestState::Admitted), "KV-RAM {host}: E waits for H");
+            assert_eq!(run.sched.retained_tail_pages(), 1, "KV-RAM {host}: the checkpoint's tail page stays");
+            assert_eq!(run.sched.prefix_pinned_pages(), 4, "KV-RAM {host}: and so do the pages below it");
+            waited += 1;
+        }
+        assert!(waited > 100, "KV-RAM {host}: E waited {waited} advances");
+        run.to_idle();
+        assert_eq!(gave_up_retained_state(&run), None, "KV-RAM {host}: no retained state was spilled or discarded");
+        assert_eq!(run.sched.retained_tail_pages(), 1, "KV-RAM {host}: P's checkpoint is still on the device");
+        assert!(!run.moved_any(), "KV-RAM {host}: nothing moved");
+        for (r, max) in [(h, 604), (p, 300), (e, 476)] {
+            assert_eq!(run.tokens(r), expected(&compute, r, max), "KV-RAM {host}: {r} generated all of it, unbroken");
+        }
+        run.assert_no_work_lost();
+    }
+}
+
+#[test]
+fn an_admission_that_fits_with_the_retained_state_takes_it_in_the_advance_it_arrives() {
+    // As above, but E needs 24 pages: the 21 free and the checkpoint's 5 cover
+    // it. The checkpoint goes for E and E enters in the advance it arrives,
+    // moving nothing.
+    for host in [4, 0] {
+        let compute = Arc::new(MockCompute::new());
+        let mut run = Run::new(ConcreteScheduler::with_config(
+            SchedulerConfig { host_capacity_bytes: host, ..reuse_pool() },
+            compute.clone(),
+        ));
+        let h = run.submit(live(600, 604), RequestClass::Interactive); // 38 pages
+        let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+        run.until(|run| run.done(p));
+        assert_eq!(run.sched.retained_tail_pages(), 1, "KV-RAM {host}: P left its checkpoint");
+
+        let e = run.submit(live(10, 380), RequestClass::Agent); // 24 pages
+        run.step();
+        assert_eq!(run.state(e), Some(RequestState::Running), "KV-RAM {host}: E entered in the advance it arrived");
+        assert!(gave_up_retained_state(&run).is_some(), "KV-RAM {host}: the checkpoint went for it");
+        assert_eq!(run.sched.retained_tail_pages(), 0, "KV-RAM {host}: its tail page with it");
+        run.to_idle();
+        assert!(!run.moved_any(), "KV-RAM {host}: nothing moved");
+        for (r, max) in [(h, 604), (p, 300), (e, 380)] {
+            assert_eq!(run.tokens(r), expected(&compute, r, max), "KV-RAM {host}: {r} generated all of it, unbroken");
+        }
+        run.assert_no_work_lost();
+    }
+}
+
+#[test]
+fn an_admission_that_needs_the_retained_state_and_a_move_gives_up_the_retained_state_first() {
+    // A, an Agent, decodes on 30 pages. P, an Interactive turn, is done and
+    // left its checkpoint on the device: 5 pages. I, Interactive, needs 63:
+    // the 29 free and A's 30 fall short, and so do the 29 and the
+    // checkpoint's 5. The three together cover it, so the checkpoint goes
+    // first, then A moves to KV-RAM, and I enters in the advance it arrives.
+    let compute = Arc::new(MockCompute::new());
+    let mut run = Run::new(ConcreteScheduler::with_config(reuse_pool(), compute.clone()));
+    let a = run.submit(live(100, 476), RequestClass::Agent); // 30 pages
+    let p = run.submit(agent_turn(), RequestClass::Interactive); // 24 pages and a tail page
+    run.until(|run| run.done(p));
+    assert_eq!(run.sched.retained_tail_pages(), 1, "P left its checkpoint");
+    assert!(!run.moved_any(), "A and P fit together");
+
+    let i = run.submit(live(500, 1000), RequestClass::Interactive); // 63 pages
+    run.step();
+    assert_eq!(run.state(i), Some(RequestState::Running), "I entered in the advance it arrived");
+    let moved = run.events.iter().position(|(_, e)| matches!(e, SchedEvent::Evicted { request, .. } if *request == a));
+    let given_up = gave_up_retained_state(&run);
+    assert!(moved.is_some(), "A moved for I");
+    assert!(given_up.is_some() && given_up < moved, "the checkpoint went before A moved");
+    assert_eq!(run.sched.retained_tail_pages(), 0, "its tail page with it");
+    run.to_idle();
+    for (r, max) in [(a, 476), (p, 300), (i, 1000)] {
         assert_eq!(run.tokens(r), expected(&compute, r, max), "{r} generated all of it, unbroken");
     }
     run.assert_no_work_lost();
