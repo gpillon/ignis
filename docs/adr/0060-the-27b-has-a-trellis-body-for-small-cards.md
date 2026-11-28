@@ -74,7 +74,9 @@ Among trellis bodies:
 - Two artifacts of one family to convert, publish and keep in step: two Hugging Face repos, two catalog entries
   ([ADR 0064](0064-a-catalog-entry-states-its-card-class.md)).
 - Prefill on GeForce runs on FP16 tensor cores, without an FP4 copy of the weights, so prefix reuse carries the
-  agentic load on these cards.
+  agentic load on these cards. The kernels' prefill rate is measured in
+  [a finding](../findings/2026-10-23-dense-trellis-kernels-on-the-5090.md), and the decode estimate made from them in
+  [another](../findings/2026-10-24-27b-16gb-speed-estimate.md).
 - The body's capacity and quality are measured on the RTX 5090. Its decode speed on a 16 GB card is stated as an
   estimate until a real 16 GB card measures it; there is none in the project.
 - Two phases: the first is this artifact on the 16 GB card class; the second, Flash-Next on 16 GB, the abliterated

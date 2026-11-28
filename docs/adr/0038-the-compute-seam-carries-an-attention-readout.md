@@ -29,7 +29,7 @@ to read, and exactly that comes back.
   taken at write time. The kernels are ours, not vendored, and the readout's room comes from the prefill chunk's own
   scratch, reserved by the load's plan, an image's only on a vision load (a text span's room is ADR 0041's).
 - **A read the leaf cannot make is a failed question, never a wrong point and never a partial set.** The small-T
-  route materializes no keys and a banded prompt keeps only its last band: the leaf then reports the readout unread,
+  route materializes no keys, and a span past the history has none: the leaf then reports the readout unread,
   the prefill itself stands, and the scheduler ends that request with an error. The readout is read only when every
   armed layer read. The scheduler keeps a readout's last chunk long enough to take the prompt route: the chunk cut,
   the reuse trim and the retained prefix's reach all hold back that tail.

@@ -22,8 +22,9 @@ unused slack, carried over from an unrelated oracle.
 - **hq earns its own acceptance in-house**: the op-level codec error is measured on real KV rows, and the hq
   attention route is checked against the BF16 route on identical keys and values. The tolerance is derived from the
   measured codec error and never copied from another oracle.
-- **The KV pool is sized by a byte budget.** Token capacity is derived from the format in force and reported at load.
-  No token count is compiled in.
+- **The KV pool is sized by a byte budget.** A resident pool is what the budget leaves, and an offloaded one is ADR
+  0045's token default. Either way, the pages are derived from the format in force, and the capacity is reported at
+  load.
 
 ## Considered Options
 
@@ -37,7 +38,7 @@ unused slack, carried over from an unrelated oracle.
 
 - Two attention route families are live, and both are in the GPU profile. The cost is real, and is accepted in
   exchange for keeping a non-lossy reference path inside the engine.
-- A format change is a restart, not a runtime switch. There is one decode-graph capture set per process, and the
-  round's widths are unchanged (ADRs 0019 and 0020).
+- A format change is a new load (a restart or a reloading PATCH), never a switch within a load; one decode-graph
+  capture set per load, and the round's widths are unchanged (ADRs 0019 and 0020).
 - Anything that depends on the exact bytes of the KV cache (an exact-key side store, the host tier's snapshot layout,
   a drafter's KV carry) must be written against the section table (ADR 0024), not against one format.

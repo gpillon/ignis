@@ -8,8 +8,9 @@ The VRAM plan (ADR 0030) charges the CUDA context as a line, and a later load in
 process already holds: ignis never resets the context, and a 27B load leaves per-process state beside it. Both
 figures were constants read from the WDDM counter on the RTX 5090 under Windows, charged and added back on every card
 and OS, so each is now taken from what can measure it. The RTX 5080 under Linux holds 299,892,736 bytes after a 27B
-teardown (NVML's figure for the process, measured in the fork GitHub #604 links), so its cold start charged
-236,597,248 bytes more than the process holds, and planned 4,858 KV pages where its reload planned 5,242; under WSL
+teardown (NVML's figure for the process, measured in the fork GitHub #604 links), so its cold start charged,
+with the constants of that day, 236,597,248 bytes more than the process holds, and planned 4,858 KV pages where its
+reload planned 5,242; under WSL
 a context took 519,270,400 bytes on the RTX 5090, so a cold start there charged less than its context takes.
 
 - **The context is measured when it is made.** The process's first device reads NVML's free memory just before it

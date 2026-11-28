@@ -13,13 +13,15 @@ Italian to Qwen3-ASR.
 
 - **The diarizer is a model of its own kind**, the fourth beside text, image and speech: it takes audio and gives
   back who spoke when, and never transcribes. It has its own catalog entry, of kind `diarizer`, downloaded with the
-  `model download` command and chosen by `diarizer.model` (`auto`, `off` or an id). It is not in `/v1/models`, since
-  no request names it; the Server view shows it beside the speech model.
+  `model download` command and chosen by `diarizer.model` (`auto`, `off` or an id). It is no entry of `/v1/models`'
+  `data`, since no request names it; the `speech` object's `diarizer` member there says whether it is available, and
+  the Server view shows it beside the speech model.
 - **Ours, in Rust, on the CPU**, with no vendored runtime (ADR 0068's rule). Its graph and streaming state are
-  restated from NeMo's Apache-2.0 source as an adapted op under ADR 0051, as the VAD's Silero port is, with
+  ported from the checkpoint's Transformers code, which restates NeMo's Apache-2.0 source, as an adapted op under
+  ADR 0051, as the VAD's Silero port is, with
   provenance in the file header and in `NOTICE`. The weights keep their OpenMDW-1.1 licence beside them. Their
   stored format is chosen by measurement in the port, since FP32 beat Q8_0 in the spike: each step is one large
-  GEMM. NeMo-Speech.cpp and the checkpoint's Transformers code are out-of-tree references and oracles only.
+  GEMM. NeMo-Speech.cpp is an out-of-tree reference.
 - **Never resident in VRAM**, and loaded beside the text or image model, like the speech model (ADR 0067). It is
   loaded at the first session that asks for speakers, and unloaded with the speech model at `speech.idle_unload`.
 - **It runs on a thread and a pool of its own** (`diarizer.threads`), beside the speech model's worker, on the
