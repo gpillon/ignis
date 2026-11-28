@@ -93,9 +93,9 @@ fn the_v1_gate_artifact_is_built_from_shipped_json() {
     let artifact = load_shipped(&ours, &reference, &consistent_canaries());
     assert!(
         artifact.performance.gate_passed(),
-        "the 99% performance gate holds"
+        "the 99% performance threshold holds"
     );
-    assert!(artifact.passed(), "the v1 gate must pass");
+    assert!(artifact.passed(), "the v1 verdict must pass");
 
     // The artifact itself is the shipped file: it round-trips through JSON
     // (`ignis-bench gate --out` writes it, the next run reads it back).
@@ -123,11 +123,11 @@ fn a_divergent_canary_fails_the_shipped_v1_gate() {
     );
     assert!(
         !artifact.passed(),
-        "a divergent canary must fail the v1 gate"
+        "a divergent canary must fail the v1 verdict"
     );
     let text = artifact.render();
     assert!(
-        text.contains("v1 gate: FAIL"),
+        text.contains("v1 verdict: FAIL"),
         "the rendered verdict is FAIL: {text}"
     );
     assert!(

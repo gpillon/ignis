@@ -1,4 +1,4 @@
-//! ignis-bench CLI: trace-replay harness + canary suite + v1 gate.
+//! ignis-bench CLI: trace-replay harness + canary suite + v1 report.
 //!
 //! Subcommands:
 //!   `replay  --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F]
@@ -50,12 +50,12 @@
 //!       Run the canary suite (self-consistency: sane + greedy-deterministic)
 //!       against a running endpoint; ship the divergence report as JSON.
 //!   `report  --ours <ours.json> --ref <ref.json>`
-//!       Compare two runs and print the performance report + the 99% gate
-//!       verdict (ADR 0007). Exits non-zero when the gate fails.
+//!       Compare two runs and print the performance report + the 99%
+//!       detector verdict (no gate, ADR 0082). Exits non-zero below it.
 //!   `gate    --ours <ours.json> --ref <ref.json> --canary <canary.json>
 //!             [--out <gate.json>]`
-//!       The v1 acceptance artifact (ADR 0007): the performance report (the
-//!       99% gate, per class) + the divergence report (canary
+//!       The v1 acceptance artifact (ADR 0007's correctness check, no gate
+//!       since ADR 0082): the performance report (the 99% threshold, per class) + the divergence report (canary
 //!       self-consistency — the v1 verdict is their conjunction), shipped
 //!       as a single JSON file. Exits non-zero when the v1 verdict fails.
 //!   `ttft    --endpoint <url> --artifact <artifact.ninfer> --cells 8192,32768
@@ -589,7 +589,7 @@ fn cmd_report(args: &[String]) -> ExitCode {
     if report.gate_passed() {
         ExitCode::SUCCESS
     } else {
-        eprintln!("gate FAILED (ADR 0007: >= {}% of reference speed)", report.threshold * 100.0);
+        eprintln!("below the detector's threshold (>= {}% of reference speed; no gate, ADR 0082)", report.threshold * 100.0);
         ExitCode::FAILURE
     }
 }
@@ -648,8 +648,8 @@ fn cmd_gate(args: &[String]) -> ExitCode {
         }
     };
 
-    // The v1 acceptance artifact (ADR 0007): the performance report (the
-    // 99% gate, per class) + the divergence report (canary
+    // The v1 acceptance artifact (ADR 0007's correctness check, no gate
+    // since ADR 0082): the performance report (the 99% threshold, per class) + the divergence report (canary
     // self-consistency), a single overall verdict.
     let artifact = GateReport::new(PerformanceReport::new(&ours, &reference), canary);
     print!("{}{}{}", artifact.render(), ours.queueing_note(), reference.queueing_note());
@@ -681,7 +681,7 @@ fn cmd_gate(args: &[String]) -> ExitCode {
             (true, false) => "the self-consistency check failed (a canary diverged)",
             (true, true) => unreachable!("gate_passed() && consistent but passed() is false"),
         };
-        eprintln!("v1 gate FAILED (ADR 0007): {detail}");
+        eprintln!("v1 verdict below the detector's threshold (no gate, ADR 0082): {detail}");
         ExitCode::FAILURE
     }
 }
@@ -1096,7 +1096,7 @@ fn cmd_g2(args: &[String]) -> ExitCode {
     if verdict.passed {
         ExitCode::SUCCESS
     } else {
-        eprintln!("G2 gate FAILED (ratio <= {} per cell)", verdict.threshold);
+        eprintln!("G2 below the detector's threshold (ratio <= {} per cell; no gate, ADR 0082)", verdict.threshold);
         ExitCode::FAILURE
     }
 }
@@ -1254,8 +1254,8 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G3 gate FAILED (tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / \
-             <= {} tolerated-with-warning)",
+            "G3 below the detector's threshold (tok/s ratio >= {} on C=1/C=4, ITL p95 ratio <= {} clean / \
+             <= {} tolerated-with-warning; no gate, ADR 0082)",
             verdict.throughput_threshold, verdict.itl_pass_threshold, verdict.itl_fail_threshold
         );
         ExitCode::FAILURE
@@ -1437,8 +1437,8 @@ fn cmd_g4_gate(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G4 gate FAILED (pooled tok/s ratio >= {} per class and aggregate, every \
-             needle cell retrieved)",
+            "G4 below the detector's threshold (pooled tok/s ratio >= {} per class and aggregate, every \
+             needle cell retrieved; no gate, ADR 0082)",
             verdict.threshold
         );
         ExitCode::FAILURE
@@ -1594,7 +1594,7 @@ fn cmd_g5_gate(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "G5 gate FAILED (pooled committed tok/s ratio >= {} at every depth)",
+            "G5 below the detector's threshold (pooled committed tok/s ratio >= {} at every depth; no gate, ADR 0082)",
             verdict.threshold
         );
         ExitCode::FAILURE
