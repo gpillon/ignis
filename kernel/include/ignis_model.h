@@ -639,6 +639,44 @@ struct ignis_model_load_options {
   uint32_t shape_mixed_period_ratios[12];
 };
 
+#ifdef __cplusplus
+/* Fields appended into the tail padding left `size` as it was (GitHub #275,
+ * #414), so the size check cannot tell those layouts apart: both sides pin
+ * every field (ADR 0016; here, and crates/core/src/model_load.rs's mirror
+ * test, GitHub #762). */
+static_assert(sizeof(struct ignis_model_load_options) == 192,
+              "ignis_model_load_options drifted from crates/core/src/model_load.rs IgnisModelLoadOptions");
+static_assert(offsetof(struct ignis_model_load_options, size) == 0 &&
+                  offsetof(struct ignis_model_load_options, speculative_backend) == 4 &&
+                  offsetof(struct ignis_model_load_options, draft_tokens) == 8 &&
+                  offsetof(struct ignis_model_load_options, vision_max_tokens) == 12 &&
+                  offsetof(struct ignis_model_load_options, vision_embedding_pool_bytes) == 16 &&
+                  offsetof(struct ignis_model_load_options, rope_scaling_factor) == 24 &&
+                  offsetof(struct ignis_model_load_options, rope_scaling_temperature) == 28 &&
+                  offsetof(struct ignis_model_load_options, rope_scaling_beta_fast) == 32 &&
+                  offsetof(struct ignis_model_load_options, rope_scaling_beta_slow) == 36 &&
+                  offsetof(struct ignis_model_load_options, vision_item_max_tokens) == 40 &&
+                  offsetof(struct ignis_model_load_options, attention_text_max_keys) == 44 &&
+                  offsetof(struct ignis_model_load_options, decode_lanes) == 48 &&
+                  offsetof(struct ignis_model_load_options, residency) == 56 &&
+                  offsetof(struct ignis_model_load_options, draft_row_budget) == 64 &&
+                  offsetof(struct ignis_model_load_options, mtp_expert_slots) == 72 &&
+                  offsetof(struct ignis_model_load_options, prefill_attention) == 80 &&
+                  offsetof(struct ignis_model_load_options, vision_residency) == 84 &&
+                  offsetof(struct ignis_model_load_options, prefill_linear) == 88 &&
+                  offsetof(struct ignis_model_load_options, draft_rule) == 92 &&
+                  offsetof(struct ignis_model_load_options, drafter_temperature_factor) == 96 &&
+                  offsetof(struct ignis_model_load_options, drafter_top_p) == 100 &&
+                  offsetof(struct ignis_model_load_options, shape_enter_accepted) == 104 &&
+                  offsetof(struct ignis_model_load_options, shape_stay_accepted) == 108 &&
+                  offsetof(struct ignis_model_load_options, shape_policy) == 112 &&
+                  offsetof(struct ignis_model_load_options, shape_estimate_rounds) == 116 &&
+                  offsetof(struct ignis_model_load_options, shape_period_ratios) == 120 &&
+                  offsetof(struct ignis_model_load_options, retained_device_slots) == 136 &&
+                  offsetof(struct ignis_model_load_options, shape_mixed_period_ratios) == 140,
+              "ignis_model_load_options's field offsets drifted from crates/core/src/model_load.rs IgnisModelLoadOptions");
+#endif
+
 /* GitHub #576 (spec #574, ADR 0090): how a verify round's sampling lanes
  * draft and accept. A greedy lane drafts the selector walk's draft and
  * accepts it when the target's argmax agrees under either rule. */

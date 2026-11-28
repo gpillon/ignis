@@ -2021,7 +2021,21 @@ mod tests {
         // padded to the pointer's alignment.
         // GitHub #715: then the cost table's twelve mixed entries, uint32,
         // in that padding and on, padded to the pointer's alignment.
+        // Every field is pinned, the leaf's static_asserts the same list
+        // (kernel/include/ignis_model.h, GitHub #762): an append into the
+        // padding leaves the size as it was.
         assert_eq!(std::mem::size_of::<ffi::IgnisModelLoadOptions>(), 192);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, size), 0);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, speculative_backend), 4);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, draft_tokens), 8);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, vision_max_tokens), 12);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, vision_embedding_pool_bytes), 16);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, rope_scaling_factor), 24);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, rope_scaling_temperature), 28);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, rope_scaling_beta_fast), 32);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, rope_scaling_beta_slow), 36);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, vision_item_max_tokens), 40);
+        assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, attention_text_max_keys), 44);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, retained_device_slots), 136);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_mixed_period_ratios), 140);
         assert_eq!(std::mem::offset_of!(ffi::IgnisModelLoadOptions, shape_policy), 112);
