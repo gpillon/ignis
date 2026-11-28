@@ -1,4 +1,4 @@
-# bench/traces — recorded traces + gate artifacts (the v1 gate input)
+# bench/traces — recorded traces + gate artifacts (the v1 report input)
 
 Repo-root layout per `records-2026-11-27:docs/archive/ignis-v1.md` §6: the *recorded* load
 traces (JSONL) and the artifacts the `ignis-bench` harness produces from

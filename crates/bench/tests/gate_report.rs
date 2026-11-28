@@ -93,7 +93,7 @@ fn the_v1_gate_artifact_is_built_from_shipped_json() {
     let artifact = load_shipped(&ours, &reference, &consistent_canaries());
     assert!(
         artifact.performance.gate_passed(),
-        "the 99% performance gate holds"
+        "the 99% performance threshold holds"
     );
     assert!(artifact.passed(), "the v1 verdict must pass");
 

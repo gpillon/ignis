@@ -26,7 +26,7 @@ use crate::report::PerformanceReport;
 /// single JSON file (`ignis-bench gate --out`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateReport {
-    /// The performance report + the per-class 99% gate verdict.
+    /// The performance report + the per-class 99% threshold verdict (no gate, ADR 0082).
     pub performance: PerformanceReport,
     /// The canary (divergence) results, from the suite run against the
     /// engine under test: the self-consistency half of the verdict (the
@@ -57,7 +57,7 @@ impl GateReport {
     /// report, the divergence report, and the overall v1 verdict.
     pub fn render(&self) -> String {
         let mut out = format!(
-            "v1 gate (ADR 0007): {} vs {}\n",
+            "v1 report (ADR 0082, no gate): {} vs {}\n",
             self.performance.ours, self.performance.reference
         );
         out.push_str("  performance (99% detector threshold, per class):\n");
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn the_v1_gate_passes_when_performance_and_self_consistency_hold() {
         let artifact = build(false, consistent_canaries());
-        assert!(artifact.performance.gate_passed(), "the 99% performance gate holds");
+        assert!(artifact.performance.gate_passed(), "the 99% performance threshold holds");
         assert!(artifact.passed(), "the v1 verdict must pass");
     }
 
@@ -190,7 +190,7 @@ mod tests {
         let artifact = build(true, consistent_canaries());
         assert!(
             !artifact.performance.gate_passed(),
-            "the 99% performance gate must fail"
+            "the 99% performance threshold must fail"
         );
         assert!(
             !artifact.passed(),

@@ -1,4 +1,4 @@
-//! ignis-bench CLI: trace-replay harness + canary suite + v1 gate.
+//! ignis-bench CLI: trace-replay harness + canary suite + v1 report.
 //!
 //! Subcommands:
 //!   `replay  --trace <trace.jsonl> --endpoint <url> [--conc N] [--scale F]

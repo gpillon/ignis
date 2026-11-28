@@ -44,7 +44,7 @@ fn runs_round_trip_through_json_and_the_gate_is_computed() {
     assert_eq!(ours.classes(), vec![RequestClass::Main, RequestClass::Sub]);
 
     let report = PerformanceReport::new(&ours, &reference);
-    assert!(report.gate_passed(), "identical runs must pass the 99% gate");
+    assert!(report.gate_passed(), "identical runs must pass the 99% threshold");
     assert!(report.render().contains("gate: PASS"));
 }
 
