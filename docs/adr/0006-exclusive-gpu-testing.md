@@ -20,8 +20,8 @@ engine itself does not refuse to start because another process uses the GPU.
   (`GPU_LOCK_WAIT`), then fail naming it. A holder that has exited, or whose pid now names another process, holds
   nothing, so a run killed before it could clean up leaves no lock standing. Two runs therefore no longer race
   between the check and the start, and an agent can run its own GPU tests while others share the card.
-- **A GPU test fails, never skips.** One that cannot get the card waits the lock's wait, then fails saying why. The
-  `CpuDevice` mock exists so that everything else is tested without the card.
+- **Under the GPU profile a GPU test fails, never skips**: it waits for the lock, then fails saying why. Outside the
+  profile it says SKIP and proves nothing. The `CpuDevice` mock exists so that everything else is tested without the card.
 - **The lock is added to the preflight, not put in its place**: the profile's pass marker and the process check
   stay, since the engine's test helper reads the marker and a worktree on an older commit knows only those two.
 - **Who stops what** depends on where the agent that runs the test is served, on the card or elsewhere. If its own

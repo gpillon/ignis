@@ -38,12 +38,12 @@ met in this order, each step only as far as the one before fell short:
 5. Nothing left: the admission waits in the queue, held as `make_room` already
    holds a head, and is admitted when room frees.
 
-On an admission step 2 goes first and unconditionally, until the entry fits
-or nothing is retained (`reclaim_retained`). Steps 3 and 4 go only when, with
-what retained state gives, they cover the need together: otherwise no claim is
-given up and nothing moves, since what moved would only come back into the
-room it left. A claim that
-makes the room alone goes before anything moves. A shortage of lanes is a
+On an admission nothing is given up unless steps 2 to 4 together cover the
+need: otherwise no retained state or claim is given up and nothing moves,
+since what moved would only come back into the room it left. When they do,
+step 2 goes first, until the entry fits (`reclaim_retained`). The code does
+not hold this yet: it gives up retained state before the test (#764). A claim
+that makes the room alone goes before anything moves. A shortage of lanes is a
 different path with its own order (`evict_one_victim`): there a lane holder
 goes before a lane-less request, since moving a lane-less request frees no
 lane.
@@ -167,8 +167,9 @@ restore floor; it comes back whenever room returns.
 - **Lazy.** A blob reaches the disk only when the tier above gives it up,
   never as a copy of state still resident, and only from a snapshot point.
 - **The ledger** (`crates/core/src/disk.rs`) is a byte ledger walked in the
-  eviction priority's order. Leaving KV-RAM, on a load with the tier, is a move
-  to the disk; leaving the disk is a discard, in KV-RAM's order. A spill
+  eviction priority's order. On a load with the tier, a checkpoint leaving
+  KV-RAM moves to the disk and a retained prefix leaving it is discarded;
+  leaving the disk is a discard, in KV-RAM's order. A spill
   displaces only what ranks below it, and a live blob is never discarded for
   room.
 - **One file per blob**, in a directory the process owns: the filesystem

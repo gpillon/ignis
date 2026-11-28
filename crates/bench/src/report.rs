@@ -113,7 +113,7 @@ impl PerformanceReport {
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "performance report: {} vs {} (gate >= {}%)\n",
+            "performance report: {} vs {} (detector threshold >= {}%)\n",
             self.ours,
             self.reference,
             self.threshold * 100.0
@@ -132,7 +132,7 @@ impl PerformanceReport {
             ));
         }
         out.push_str(&format!(
-            "  gate: {}\n",
+            "  threshold: {}\n",
             if self.gate_passed() { "PASS" } else { "FAIL" }
         ));
         out
@@ -250,7 +250,7 @@ mod tests {
         );
         let report = PerformanceReport::new(&ref_run, &ref_run);
         let text = report.render();
-        assert!(text.contains("gate: PASS"));
+        assert!(text.contains("threshold: PASS"));
         assert!(text.contains("tok-s ratio"));
     }
 }

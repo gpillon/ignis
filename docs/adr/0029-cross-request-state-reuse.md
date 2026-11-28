@@ -98,8 +98,9 @@ and correctness oracles.
   own. No publish point ends inside a media item's placeholders. A multimodal claim always leaves one prompt token
   to prefill, because a claimant is built from cloned pages and mutable state, neither of which carries the
   sequence's `rope_delta`, and only a prefill span hands it to the leaf; so neither a shared prefix nor a prompt
-  checkpoint reaching a multimodal prompt's last token is offered: in that rare case it resumes from the longest
-  recorded point before the prompt's end. A prompt that ends exactly at a held checkpoint's opener may therefore not claim it and prefills again; the
+  checkpoint reaching a multimodal prompt's last token is offered: the prompt then resumes from the longest
+  recorded point before its end. A prompt that ends exactly at a held checkpoint's opener therefore does not claim
+  it and prefills from that earlier point; the
   served template ends neither thinking setting that way. Lifting the limit means carrying `rope_delta` with the
   reused state (GitHub #201, open).
 - **A blob's compatibility identity** is the artifact content hash, the KV format, the blob layout version and the

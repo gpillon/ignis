@@ -636,8 +636,8 @@ fn cmd_gate(args: &[String]) -> ExitCode {
         }
     };
     // The canary (divergence) results (`canary --out`): the
-    // self-consistency half of the v1 verdict (ADR 0007). The v1 gate is
-    // the *conjunction* of the performance gate and the self-consistency
+    // self-consistency half of the v1 verdict (ADR 0007). The v1 verdict is
+    // the *conjunction* of the performance threshold and the self-consistency
     // check (spec 02), so the canary file is required; the performance-
     // only comparison lives in `report`.
     let canary = match load_canaries(&canary_path) {
@@ -675,13 +675,13 @@ fn cmd_gate(args: &[String]) -> ExitCode {
         let consistent = canary::suite_consistent(&artifact.canary);
         let detail = match (perf, consistent) {
             (false, false) => {
-                "the 99% performance gate failed AND the self-consistency check failed (a canary diverged)"
+                "ours is below the 99% performance threshold AND the self-consistency check failed (a canary diverged)"
             }
-            (false, true) => "the 99% performance gate failed",
+            (false, true) => "ours is below the 99% performance threshold",
             (true, false) => "the self-consistency check failed (a canary diverged)",
             (true, true) => unreachable!("gate_passed() && consistent but passed() is false"),
         };
-        eprintln!("v1 verdict below the detector's threshold (no gate, ADR 0082): {detail}");
+        eprintln!("v1 verdict FAIL (no gate, ADR 0082): {detail}");
         ExitCode::FAILURE
     }
 }
@@ -1080,7 +1080,7 @@ fn cmd_g2(args: &[String]) -> ExitCode {
     let mut verdict = match g2::check(&ours, &reference) {
         Ok(v) => v,
         Err(refusal) => {
-            eprintln!("G2 gate check REFUSED: {refusal}");
+            eprintln!("G2 detector check REFUSED: {refusal}");
             return ExitCode::FAILURE;
         }
     };
@@ -1234,7 +1234,7 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
     let mut verdict = match g3_gate::check(&ours, &reference) {
         Ok(v) => v,
         Err(refusal) => {
-            eprintln!("G3 gate check REFUSED: {refusal}");
+            eprintln!("G3 detector check REFUSED: {refusal}");
             return ExitCode::FAILURE;
         }
     };
@@ -1249,7 +1249,7 @@ fn cmd_g3_gate(args: &[String]) -> ExitCode {
     }
     if verdict.passed {
         if let Some(warning) = &verdict.itl.warning {
-            eprintln!("G3 gate PASSED, but flagged: {warning}");
+            eprintln!("G3 within the detector's threshold, but flagged: {warning}");
         }
         ExitCode::SUCCESS
     } else {
@@ -1420,7 +1420,7 @@ fn cmd_g4_gate(args: &[String]) -> ExitCode {
     let mut verdict = match g4_gate::check(&ours, &reference) {
         Ok(v) => v,
         Err(refusal) => {
-            eprintln!("G4 gate check REFUSED: {refusal}");
+            eprintln!("G4 detector check REFUSED: {refusal}");
             return ExitCode::FAILURE;
         }
     };
@@ -1577,7 +1577,7 @@ fn cmd_g5_gate(args: &[String]) -> ExitCode {
     let mut verdict = match g5_gate::check(&ours, &reference) {
         Ok(v) => v,
         Err(refusal) => {
-            eprintln!("G5 gate check REFUSED: {refusal}");
+            eprintln!("G5 detector check REFUSED: {refusal}");
             return ExitCode::FAILURE;
         }
     };

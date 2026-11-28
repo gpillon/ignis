@@ -38,7 +38,8 @@ to read, and exactly that comes back.
   they are never read on an artifact they were not
   chosen for. The head set is calibrated beside its pointing head, with its fallback cells per grid: the first and
   the last image cell on any grid, and the cells measured on a grid. A load with a head set answers a `point` by the
-  anchored reading and a `box` with `"method": "head"` by the extent; a load with a pointing head only answers a
+  anchored reading, the extent's centre, and a `box` with `"method": "head"` by the extent; a load with a pointing
+  head only answers a
   `point` from that head and refuses a head `box`; a load with neither answers both by the digit chain and says so
   at startup.
 - **A head point or a head box is a decision.** It reads at its last prefill position and generates nothing, so

@@ -1,7 +1,8 @@
 # KV-disk file
 
 One file holds one blob of the KV-disk tier (ADR 0045): a live sequence's
-snapshot, a retained checkpoint or a retained prefix. `FileHeader` in
+snapshot or a retained checkpoint. Kind 3, a retained prefix, is defined and
+never written (#763). `FileHeader` in
 `crates/runtime/src/kv_disk.rs` writes and reads it; the sizes are
 `ignis_core::disk`'s (`DISK_HEADER_BYTES`, `DISK_IO_ALIGNMENT`). A process reads
 only files it wrote itself, in the directory it holds locked, and nothing is

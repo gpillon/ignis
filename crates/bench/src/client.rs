@@ -835,7 +835,7 @@ impl HttpEndpoint {
         // format is prompt-based; the shared "system + tools" prefix is
         // carried inside the prompt text) — unless `--as-recorded` and the
         // prompt is a recorded chat body. `temperature: 0` + `seed: 0` pin
-        // the greedy + fixed-seed contract of the v1 gate (ADR 0007 — the
+        // the greedy + fixed-seed contract of the v1 report (ADR 0007 — the
         // server's defaults, sent explicitly).
         let mut base = self
             .as_recorded

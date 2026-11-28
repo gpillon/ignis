@@ -63,7 +63,7 @@ impl GateReport {
         out.push_str("  performance (99% detector threshold, per class):\n");
         // The performance report's own header line is redundant here (the
         // artifact's header already names both runs) — keep the per-class
-        // lines and its gate line.
+        // lines and its threshold line.
         for line in self.performance.render().lines().skip(1) {
             out.push_str(&format!("    {line}\n"));
         }

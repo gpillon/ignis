@@ -103,7 +103,7 @@ impl Verdict {
     /// The terminal rendering: one line per depth, then the verdict.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!("G5 gate check  session={}\n", self.session));
+        out.push_str(&format!("G5 detector check  session={}\n", self.session));
         out.push_str(&format!(
             "  {} ({} launches)  vs  {} ({} launches)\n",
             self.ours_label, self.ours_launches, self.reference_label, self.reference_launches

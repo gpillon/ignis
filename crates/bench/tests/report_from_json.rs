@@ -1,6 +1,6 @@
 //! Integration test: the `report` workflow end-to-end — two recorded runs are
-//! serialized to JSON, deserialized back, and the performance report + 99% gate
-//! (ADR 0007) is computed. This mirrors the `ignis-bench report` subcommand and
+//! serialized to JSON, deserialized back, and the performance report + 99%
+//! threshold (no gate, ADR 0082) is computed. This mirrors the `ignis-bench report` subcommand and
 //! pins the JSON round-trip of `Run` / `RequestMetrics` / `RequestClass`.
 
 use ignis_bench::metrics::{RequestMetrics, Run};
@@ -45,7 +45,7 @@ fn runs_round_trip_through_json_and_the_gate_is_computed() {
 
     let report = PerformanceReport::new(&ours, &reference);
     assert!(report.gate_passed(), "identical runs must pass the 99% threshold");
-    assert!(report.render().contains("gate: PASS"));
+    assert!(report.render().contains("threshold: PASS"));
 }
 
 #[test]

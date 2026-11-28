@@ -154,7 +154,7 @@ impl Verdict {
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(&format!(
-            "G4 gate check  session={}  trace={}\n",
+            "G4 detector check  session={}  trace={}\n",
             self.session, self.trace_sha256
         ));
         out.push_str(&format!(
