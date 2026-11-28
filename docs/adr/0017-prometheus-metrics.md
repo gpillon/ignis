@@ -62,8 +62,9 @@ renders, zeros included, so a label value never vanishes with its count.
 
 **The listener.** Prometheus scrapes `GET /metrics` on a listener of its own, `server.metrics_bind`: it asks for no
 API key, is never the API's `bind`, is never tunnelled by `--server-expose` (the tunnel of ADR 0028), and is refused
-beside an explicit `server.metrics: false`. Its default address is a fixed port, which a second server on the host
-finds taken, so a default address that cannot be bound is a warning and the server serves without that listener:
+beside an explicit `server.metrics: false`. Its default address is a fixed port on loopback, so a listener that asks
+for no key is reachable from the host alone unless the operator names another; a second server on the host finds the
+port taken, so a default address that cannot be bound is a warning and the server serves without that listener:
 refusing would make a default feature a reason not to start. An address other than the default that the operator
 named (a flag, its environment variable, a file) is theirs, and refuses the start when it cannot be bound. The API
 listener has no `/metrics`: with the Playground on, it serves the same exposition at `GET /ui/metrics`, behind the API

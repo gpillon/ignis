@@ -14,7 +14,9 @@ slows, erratically. The reference engine reserves everything once and forbids a 
   default, the memory free at start less a headroom left to the desktop and other processes
   (`--vram-headroom-bytes`), or explicit (`--vram-budget-bytes`), never both. An explicit budget above free memory
   refuses the start unless `--vram-allow-oversubscription`, valid only beside an explicit budget, makes that a
-  warning, which says the allocation will fail where the system cannot page device memory. A later load in the same
+  warning, which says the allocation will fail where the system cannot page device memory. Under
+  `--vram-allow-oversubscription` a plan over its budget warns and starts with the floor pool; a named pool below the
+  floor is still refused. A later load in the same
   process, a model switch or the reload after an idle unload, adds back what the process already holds: the derived budget
   still starts from what was free before the process held anything, so the CUDA context and the 27B's per-process
   state are not charged twice (ADR 0092 says where both figures come from).

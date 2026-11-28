@@ -9,8 +9,10 @@ its pool by whether every weight is on the device: a **resident** load gives the
 has no other use, and an **offloaded** one, its experts streaming over PCIe, reserves a default pool first and gives
 the cache the rest. A request reserves its whole bound at admission, and when the pool runs out the lowest-ranked
 sequence below the requester moves down a tier and later resumes bit-exact where it stopped: no work lost, never a
-503, on both models by one mechanism. **KV-disk**, the tier below KV-RAM, takes the blob KV-RAM must give up, which
-went nowhere before, and the device victim KV-RAM cannot take. How the modules carry it out is in
+503, on both models by one mechanism. **KV-disk**, the tier below KV-RAM, takes what KV-RAM gives up of a
+checkpoint, which went nowhere before, and the live victim KV-RAM cannot take. A retained prefix KV-RAM gives up, and
+a device checkpoint KV-RAM cannot take, are discarded: nothing brings a prefix back from the disk, and retained state
+never waits for a file to commit. How the modules carry it out is in
 `docs/design/kv-tiers-and-live-moves.md`.
 
 ## The pool

@@ -34,7 +34,8 @@ already cost a gate run.
   capture, the eager path. A width whose graph failed to build at startup runs eagerly in every round at that
   width: the model load still succeeds and only that width's decode throughput degrades. A capture failure degrades
   performance and never refuses service.
-- **The graphs are captured right after the sequence pool is created, before any sequence is allocated.**
+- **A load captures once, after the pool is created and before any sequence is allocated.** The call asks only
+  that no decode runs beside it, and a test's second capture replaces the graphs (#674).
 - **The decode call's signature is unchanged**: inside, it dispatches to the width's graph when one is ready and
   to the eager path otherwise, with no ABI break and no new Rust call site on the hot path. Capture and its
   last-error query are entry points of their own, a one-time startup action being a lifecycle call like model load

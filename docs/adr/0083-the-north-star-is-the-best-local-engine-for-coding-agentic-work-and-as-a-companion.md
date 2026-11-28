@@ -4,8 +4,9 @@ status: accepted
 
 # The north-star is the best local engine for coding, for agentic work and as a companion
 
-ignis aims to be the best local engine for three uses, on one NVIDIA card in the user's own machine, from a 16 GB
-consumer card up, from one binary. It no longer serves one model to coding agents alone: it also serves Flash-Next,
+ignis aims to be the best local engine for three uses, on one NVIDIA card in the user's own machine, from a 12 GB
+consumer card up (one lane on the 12 GB class, ADR 0098), from one binary. It no longer serves one model to coding
+agents alone: it also serves Flash-Next,
 the image model, two speech models and a diarizer, and the Playground has views for more than the chat. The uses:
 
 - **coding**: decode speed, DFlash2 speculation, long contexts, reasoning that finishes;

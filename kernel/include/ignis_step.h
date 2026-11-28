@@ -225,8 +225,7 @@ struct ignis_prefill_options {
    * attention row and no logits row crosses. `*out_attention_read` is set to
    * 1 when every score was written from those keys and to 0 when the keys
    * were not there to read (a small-T route, which materializes none; a span
-   * outside the one band the hq prompt route materializes; a span past the
-   * history) -- the prefill itself still succeeds, and the caller fails the
+   * past the history) -- the prefill itself still succeeds, and the caller fails the
    * question rather than answering from any other copy of the keys. */
   int32_t attention_gqa_ordinal;
   int32_t attention_query_head;

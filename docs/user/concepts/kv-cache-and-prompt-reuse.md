@@ -224,7 +224,8 @@ retained tokens:
   short question puts the opener in the picture's last KV page, so an
   identical repeat and the conversation's next turn resume there. A
   multimodal claim always leaves at least one prompt token to prefill, so a
-  prompt that ends exactly at a retained opener is prefilled whole.
+  prompt that ends exactly at a retained opener resumes from the longest
+  recorded point before the prompt's end.
 
 `ignis_retained_state_misses_total` counts, by tier and kind, each prefill run
 (a re-queued request counts again) that found nothing retained of that kind

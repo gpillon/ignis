@@ -54,8 +54,9 @@ and correctness oracles.
   (`ConcreteScheduler::reclaimable_prefixes`), which must go on listing both whichever goes first.
 - **Three residency tiers: the device, KV-RAM and KV-disk** (ADR 0045, which built the third). A tier receives
   retained state lazily, only when the tier above would otherwise discard it, and gives it up before any evicted
-  live sequence. What KV-RAM gives up goes to the disk, a device victim KV-RAM cannot take goes straight there, a
-  spill displaces only what ranks below it, and with the disk on an evicted live sequence is never discarded to make
+  live sequence. What KV-RAM gives up of a checkpoint goes to the disk. A retained prefix KV-RAM gives up, and a
+  device checkpoint KV-RAM cannot take, are discarded: nothing brings a prefix back from the disk, and retained
+  state never waits for a file to commit. A spill displaces only what ranks below it, and with the disk on an evicted live sequence is never discarded to make
   room. A retained prefix spills to KV-RAM too, ranked with the checkpoints there, and comes back to the device
   once, for its whole burst, taking pages from retained state only: it never evicts live work.
 - **A restore must beat the best reuse still above it by a restore floor**, a sibling's or a retained prefix
@@ -97,8 +98,8 @@ and correctness oracles.
   own. No publish point ends inside a media item's placeholders. A multimodal claim always leaves one prompt token
   to prefill, because a claimant is built from cloned pages and mutable state, neither of which carries the
   sequence's `rope_delta`, and only a prefill span hands it to the leaf; so neither a shared prefix nor a prompt
-  checkpoint reaching a multimodal prompt's last token is offered, which costs one prefilled token in that rare
-  case. A prompt that ends exactly at a held checkpoint's opener may therefore not claim it and prefills again; the
+  checkpoint reaching a multimodal prompt's last token is offered: in that rare case it resumes from the longest
+  recorded point before the prompt's end. A prompt that ends exactly at a held checkpoint's opener may therefore not claim it and prefills again; the
   served template ends neither thinking setting that way. Lifting the limit means carrying `rope_delta` with the
   reused state (GitHub #201, open).
 - **A blob's compatibility identity** is the artifact content hash, the KV format, the blob layout version and the
